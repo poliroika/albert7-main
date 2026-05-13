@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi_agent_debate_graph"
+version = "0.1.0"
+description = "Debate graph on gMAS"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "frontier-ai-gmas",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+frontier-ai-gmas = { path = "../../gmas", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

@@ -1,0 +1,96 @@
+line-length = 120
+target-version = "py313"
+unsafe-fixes = true
+
+[lint]
+select = [
+    "ALL", # include all the rules, including new ones
+]
+ignore = [
+    #### modules
+    "ANN", # flake8-annotations
+    "COM", # flake8-commas
+    "C90", # mccabe complexity
+    "DJ",  # django
+    "EXE", # flake8-executable
+    "T10", # debugger
+    "TID", # flake8-tidy-imports
+
+    "RUF001", # ambiguous characters
+    "RUF002",
+    "RUF003",
+
+    "PLC0415",
+    "PLE0605",
+    "FBT001",
+    "FBT002",
+
+    #### specific rules
+    "D100",   # ignore missing docs
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D200",
+    "D205",
+    "D203",
+    "D212",
+    "D400",
+    "D401",
+    "D415",
+    "TRY003", # external messages in exceptions are too verbose
+    "TD002",
+    "TD003",
+    "FIX002", # too verbose descriptions of todos
+    "S311",   # standard pseudo-random generators are fine for non-cryptographic use
+]
+
+[lint.pylint]
+max-args = 20
+max-returns = 16
+[lint.extend-per-file-ignores]
+# Also ignore `E402` in all `__init__.py` files.
+"__init__.py" = ["E402"]
+"notebooks/**" = ["ALL"]
+
+"tests/**" = [
+    "S101",
+    "PLR2004",
+    "PLR0913",
+    "ARG001",
+    "ARG002",
+    "SLF001",
+    "DTZ005",
+    "S105",
+    "S106",
+]
+
+"benchmarks/*.py" = [
+    "T201",
+    "PLW0603",
+    "PLR2004",
+    "BLE001",
+    "ARG001",
+    "PLR0912",
+    "PLR0915",
+    "E731",
+    "F401",
+    "SLF001",
+    "SIM115",
+    "S603",
+]
+
+# Security exceptions for tools that intentionally use dynamic code execution
+"src/gmas/tools/shell.py" = ["S602", "PLW1510"]
+"src/gmas/tools/code_interpreter.py" = ["S102", "S307", "S603", "SIM115", "BLE001"]
+"src/gmas/tools/web_search.py" = ["S310"]
+"src/gmas/tools/file_search.py" = ["PLR2004"]
+"src/gmas/tools/computer_use/**" = ["S101", "PLR0912", "PLR0915"]
+# Event bus isolates user-provided handlers — broad catch is intentional
+# ARG002: can_handle exposes `event` in signature for subclass API consistency; base impl always returns True
+"src/gmas/core/events.py" = ["BLE001", "ARG002"]
+# Examples are demonstration scripts: print() and eval() are intentional
+"examples/**" = ["T201", "S307", "BLE001"]

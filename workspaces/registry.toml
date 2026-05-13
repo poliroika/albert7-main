@@ -1,0 +1,14 @@
+# Workspace Registry
+# workspaces/registry.toml
+#
+# This file defines the workspace registry for the repository.
+# It tracks which registered workspaces are discovered.
+# and their metadata.
+
+version = "0.1.0"
+
+# List of registered seed workspaces
+seeds = ["multi_agent_debate_graph"]
+
+# List of active task instances (populated at runtime)
+instances = []

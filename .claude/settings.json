@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/poliroika/Documents/umbrella/$APPDATA/Claude/**)",
+      "Read(//c/Users/poliroika/Documents/umbrella/$HOME/.claude/**)",
+      "Read(//c/Users/poliroika/Documents/umbrella/$HOME/Library/Application Support/Claude/**)",
+      "WebSearch",
+      "Bash(echo $APPDATA)",
+      "Bash(..venvScriptspython.exe --version)",
+      "Bash(\".venv/Scripts/python.exe\" --version)",
+      "Bash(\".venv/Scripts/python.exe\" -m pytest -q umbrella/tests)",
+      "Bash(\".venv/Scripts/python.exe\" -c \"import sys; sys.path.insert\\(0, ''.''\\); from umbrella.policies.engine import *; print\\(''Policy engine loaded successfully''\\)\")",
+      "Bash(\".venv/Scripts/python.exe\" -m pytest umbrella/tests/test_memory.py -v --tb=short)",
+      "Bash(\".venv/Scripts/python.exe\" -m pytest -q umbrella/tests/)",
+      "Bash(wc -l umbrella/memory/*.py)",
+      "Bash(\".venv/Scripts/python.exe\" -m pytest umbrella/tests/test_memory.py -v --tb=line)",
+      "Bash(\".venv/Scripts/python.exe\" -c \":*)"
+    ]
+  }
+}

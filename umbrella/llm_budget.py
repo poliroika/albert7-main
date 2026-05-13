@@ -1,0 +1,38 @@
+"""Token budget helpers from environment (aligned with Ouroboros context limits)."""
+
+import os
+
+
+def estimate_tokens(text: str) -> int:
+    """Heuristic ~4 characters per token (matches ouroboros.context.estimate_tokens style)."""
+    if not text:
+        return 0
+    return max(1, len(str(text)) // 4)
+
+
+def get_model_context_tokens() -> int:
+    """Soft cap for full prompt vs model window (default 128k)."""
+    try:
+        return max(
+            4096, int(os.environ.get("OUROBOROS_MODEL_CONTEXT_TOKENS", "128000"))
+        )
+    except (ValueError, TypeError):
+        return 128000
+
+
+def get_gmas_context_tokens() -> int:
+    """Budget for ``build_gmas_context`` aggregated retrieval (default 60k)."""
+    try:
+        return max(2000, int(os.environ.get("OUROBOROS_GMAS_CONTEXT_TOKENS", "60000")))
+    except (ValueError, TypeError):
+        return 60000
+
+
+def get_prior_knowledge_tokens() -> int:
+    """Budget for Prior knowledge section in workspace prompt (default 20k)."""
+    try:
+        return max(
+            1000, int(os.environ.get("OUROBOROS_PRIOR_KNOWLEDGE_TOKENS", "20000"))
+        )
+    except (ValueError, TypeError):
+        return 20000

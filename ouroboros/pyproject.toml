@@ -1,0 +1,18 @@
+[project]
+name = "ouroboros"
+version = "6.2.0"
+description = "Self-creating agent"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "flask>=3.0",
+    "flask-cors>=4.0",
+    "pytest>=7.0",
+]
+
+[project.optional-dependencies]
+# Deep / provider-backed web search via GMAS (optional; tool falls back when absent).
+# From the Umbrella repo root: ``uv pip install -e ./gmas[web-search]`` or use this extra with a path override.
+deep-search = [
+    "frontier-ai-gmas[web-search]",
+]

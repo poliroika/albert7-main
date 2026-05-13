@@ -1,0 +1,21 @@
+{
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Task 1",
+      "priority": "medium",
+      "tags": [],
+      "created_at": "2024-01-01T00:00:00Z",
+      "done_at": null
+    },
+    {
+      "id": 3,
+      "title": "Task 3",
+      "priority": "medium",
+      "tags": [],
+      "created_at": "2024-01-01T00:00:00Z",
+      "done_at": null
+    }
+  ],
+  "next_id": 16
+}

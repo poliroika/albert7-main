@@ -1,0 +1,4 @@
+# CLI Tasks Tracker Requirements
+# Python 3.11+ required
+# All dependencies are from Python standard library
+# No external packages needed

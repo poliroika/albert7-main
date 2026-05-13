@@ -1,0 +1,79 @@
+[tox]
+requires = ["tox>=4.50.3", "tox-uv>=1.33.4"]
+skip_missing_interpreters = true
+
+[env_base.test]
+factors = [["py312", "py313"]]
+description = "Run tests with coverage on Python {factor_py}"
+dependency_groups = ["test"]
+extras = ["web-search", "mcp", "selenium"]
+setenv = { COVERAGE_FILE = ".coverage.{env_name}" }
+commands = [
+    [
+        "pytest",
+        "-n",
+        "auto",
+        "--cov=src",
+        "--cov-report=term-missing",
+        "--cov-report=xml",
+        "--cov-report=html",
+        "tests/",
+        "-v",
+        "--tb=short",
+    ],
+]
+
+[env.lint]
+description = "Run ruff linter and formatter check"
+base_python = ["3.12"]
+skip_install = true
+dependency_groups = ["lint"]
+commands = [
+    [
+        "ruff",
+        "check",
+        "src/",
+        "tests/",
+        "examples/",
+        "benchmarks/",
+    ],
+    [
+        "ruff",
+        "format",
+        "--check",
+        "src/",
+        "tests/",
+        "examples/",
+        "benchmarks/",
+    ],
+]
+
+[env.typecheck]
+description = "Run ty type checking"
+base_python = ["3.12"]
+dependency_groups = ["typecheck", "dev"]
+extras = ["web-search", "mcp", "selenium", "web-fast"]
+ignore_outcome = true
+commands = [["ty", "check", "--ignore", "unresolved-import", "src/", "tests/"]]
+
+[env.benchmarks]
+description = "Run benchmark suite"
+extras = ["benchmarks", "web-search"]
+commands = [
+    [
+        "python",
+        "-m",
+        "pytest",
+        "-n",
+        "auto",
+        "benchmarks/",
+        "-v",
+        "--tb=short",
+    ],
+]
+
+[env.quick]
+description = "Run tests without coverage for faster feedback"
+dependency_groups = ["test"]
+extras = ["web-search", "mcp", "selenium"]
+commands = [["pytest", "-n", "auto", "tests/", "-v", "--tb=short"]]

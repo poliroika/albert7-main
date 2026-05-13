@@ -1,0 +1,114 @@
+# Default repository policy. Parsed by umbrella.policies.defaults.load_policy_from_file.
+# Human-oriented summary: umbrella/policies/README.md
+
+system_boundary:
+  workspace_first: true
+  standalone_workspace_required: true
+  documentation_first_retrieval: true
+  bm25_first_retrieval: true
+
+  self_improvement:
+    min_repeated_failures: 3
+    min_stalled_iterations: 5
+    retrieval_confidence_threshold: 0.3
+    explicit_request_allows: true
+
+  framework_boundary:
+    gmas_readonly: true
+    requires_human_approval: true
+    documentation_first_retrieval: true
+    bm25_first_retrieval: true
+    framework_paths:
+      - "gmas/"
+
+  edit_surface:
+    framework_readonly: true
+    manager_editable_under_self_improvement: true
+    workspace_seed_requires_promotion: true
+    workspace_instance_editable: true
+    artifacts_editable: true
+    integration_editable: true
+
+  sandbox_self_edit:
+    enabled: true
+    allowed_surfaces:
+      - ouroboros
+      - umbrella
+    rollback_on_task_end: true
+    max_changed_files: 15
+    require_capability_gap: true
+    snapshot_method: git_stash  # git_stash | git_branch | copy
+
+  workspace_mutation:
+    seed_requires_evidence: true
+    min_promotion_score: 0.7
+
+  escalation:
+    mass_edit_threshold: 10
+    escalate_self_improvement: true
+
+# Reference: system roles (documentation; extend loader if you need these in code)
+roles:
+  gmas:
+    type: framework
+    description: GMAS execution framework
+    policy: read-only
+  ouroboros:
+    type: manager
+    description: Long-horizon manager and self-improvement control plane
+    policy: mutable-under-self-improvement
+  workspaces:
+    type: workspace-container
+    description: Seed and task-specific workspace instances
+    policy: workspace-first-optimization-target
+  umbrella:
+    type: integration
+    description: Integration layer connecting GMAS, ouroboros, and workspaces
+    policy: freely-mutable
+
+# Runtime configuration for the Umbrella manager loop.
+# Loaded by umbrella.config.load_runtime_config.
+# All values can be overridden via CLI flags.
+runtime:
+  # Budget — set to null for unlimited
+  max_budget_usd: null
+  max_iterations: null
+  max_duration_seconds: null
+
+  # Quality gate — minimum overall eval score to declare a task complete
+  quality_completion_threshold: 0.85
+  min_article_word_count: 1500
+  required_artifact_types:
+    - report
+
+  # Self-improvement triggers
+  self_improve_after_stalled_iterations: 2
+  self_improve_max_total_iterations: 50
+
+  # Human review checkpoints (workspace stage names that trigger review).
+  # Set human_review_timeout_seconds > 0 to block until human approves.
+  human_review_stages:
+    - outline_approved
+    - final_draft
+  human_review_timeout_seconds: 0  # Disabled by default; opt in for blocking review
+
+  # Instance retention / disk hygiene
+  instance_cleanup_enabled: true
+  keep_recent_runs_per_instance: 2
+  keep_recent_snapshots_per_instance: 1
+  keep_recent_reports_per_instance: 4
+  keep_latest_detached_instances: 1
+
+  # Supervisor heartbeat
+  heartbeat_interval_seconds: 30.0
+
+gmas_retrieval:
+  mode: bm25_first
+  code_aware: true
+  preferred_sources:
+    - gmas/README.md
+    - gmas/QUICKSTART.md
+    - gmas/DOCUMENTATION.md
+    - gmas/docs/
+    - gmas/src/
+    - gmas/examples/

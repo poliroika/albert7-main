@@ -1,0 +1,4 @@
+[run]
+omit =
+    */_remote_module_non_scriptable*
+    */tests/*

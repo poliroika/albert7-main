@@ -1,0 +1,119 @@
+# Сборка статики для GitLab Pages: mkdocs build → каталог public/
+# Локально: pip install mkdocs-material && mkdocs serve
+
+site_name: Umbrella
+site_description: Документация и технический отчёт
+docs_dir: docs
+site_dir: public
+
+theme:
+  name: material
+  language: ru
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: Тёмная тема
+    - scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: Светлая тема
+  font:
+    text: Roboto
+    code: Roboto Mono
+  icon:
+    repo: fontawesome/brands/gitlab
+    logo: material/robot
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.path
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.tooltips
+    - announce.dismiss
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      permalink_title: Ссылка на этот раздел
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.mark
+  - pymdownx.critic
+  - pymdownx.keys
+  - pymdownx.smartsymbols
+
+# Редирект-заглушка technical-report.md не нужна на сайте (дублирует раздел)
+exclude_docs: |
+  technical-report.md
+
+nav:
+  - Главная: README.md
+  - Архитектура: architecture.md
+  - Workspaces:
+      - Обзор: workspaces.md
+      - Создание workspace: creating-workspaces.md
+  - Компоненты:
+      - GMAS: gmas.md
+      - Umbrella: umbrella-layer.md
+      - Ouroboros: ouroboros.md
+      - Meta-Harness (план): meta-harness-improvement-plan.md
+      - Технический долг (harness): agent_harness_refactor_debt.md
+  - Технический отчёт:
+      - Оглавление: technical-report/README.md
+      - "1. Цели и термины": technical-report/01-scope-terms.md
+      - "2. Контекст системы": technical-report/02-system-context.md
+      - "3. Топология репозитория": technical-report/03-repository-topology.md
+      - "4. Артефакты .umbrella": technical-report/04-runtime-artifacts.md
+      - "5. Слои и потоки": technical-report/05-architecture-flows.md
+      - "6. Подсистемы Umbrella": technical-report/06-umbrella-subsystems.md
+      - "7. Workspaces и политика": technical-report/07-workspaces-and-policy.md
+      - "8. Ouroboros": technical-report/08-ouroboros-runtime.md
+      - "9. Verification": technical-report/09-verification.md
+      - "10. Web bridge": technical-report/10-web-bridge.md
+      - "11. Конфигурация": technical-report/11-configuration.md
+      - "12. Meta-Harness": technical-report/12-meta-harness.md
+      - "13. Эксплуатация": technical-report/13-operations.md
+      - "14. Тесты и документация": technical-report/14-testing-and-docs.md
+      - "15. Task Planner": technical-report/15-task-planner.md
