@@ -36,6 +36,7 @@ class ToolContext:
     pending_events: list[dict[str, Any]] = field(default_factory=list)
     current_chat_id: int | None = None
     current_task_type: str | None = None
+    context_overlays: dict[str, Any] = field(default_factory=dict)
     workspace_root_overrides: dict[str, str] = field(default_factory=dict)
     last_push_succeeded: bool = False
     emit_progress_fn: Callable[[str], None] = field(default=lambda _: None)
@@ -181,11 +182,9 @@ CORE_TOOL_NAMES = {
 }
 
 
-# Web search is gated by env: if OUROBOROS_DEEP_SEARCH_ENABLED is on
-# (default), expose the intent-aware ``deep_search`` path and hide the
-# legacy unguarded ``web_search`` from the registry. Operators can set
-# OUROBOROS_LEGACY_WEB_SEARCH_DISABLED=0 to re-enable the old tool while
-# keeping ``deep_search`` available.
+# Web search is gated by env only when the operator explicitly asks for it.
+# ``deep_search`` stays core and preferred, while ``web_search`` remains a
+# non-core escape hatch that phase manifests may expose deliberately.
 def _legacy_web_search_disabled() -> bool:
     raw = (
         str(os.environ.get("OUROBOROS_LEGACY_WEB_SEARCH_DISABLED") or "")
@@ -194,10 +193,7 @@ def _legacy_web_search_disabled() -> bool:
     )
     if raw:
         return raw in {"1", "true", "yes", "on"}
-    deep_raw = (
-        str(os.environ.get("OUROBOROS_DEEP_SEARCH_ENABLED") or "").strip().lower()
-    )
-    return deep_raw not in {"0", "false", "no", "off"}
+    return False
 
 
 DISABLED_TOOL_NAMES: set[str] = set()
@@ -310,9 +306,27 @@ class ToolRegistry:
         entry = self._entries.get(name)
         return entry.timeout_sec if entry is not None else 120
 
+    def set_permission_envelope(self, envelope: Any) -> None:
+        """Attach a PermissionEnvelope; checked before every tool call."""
+        self._permission_envelope = envelope
+
     def execute(self, name: str, args: dict[str, Any]) -> str:
         if name in DISABLED_TOOL_NAMES:
             return f"⚠️ TOOL_DISABLED ({name}): temporarily disabled by runtime policy."
+        # PermissionEnvelope pre-hook (set by umbrella phase runner)
+        envelope = getattr(self, "_permission_envelope", None)
+        if envelope is not None:
+            paths = []
+            for key in ("path", "paths", "working_directory", "file_path", "filepath"):
+                val = args.get(key)
+                if isinstance(val, str):
+                    paths.append(val)
+                elif isinstance(val, list):
+                    paths.extend(str(p) for p in val)
+            cmd = args.get("cmd") or args.get("command") or args.get("script")
+            result = envelope.check(name, paths=paths, cmd=str(cmd) if cmd else None)
+            if not result:
+                return f"⚠️ TOOL_DENIED_BY_ENVELOPE ({name}): {result.reason}"
         entry = self._entries.get(name)
         if entry is None:
             return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"

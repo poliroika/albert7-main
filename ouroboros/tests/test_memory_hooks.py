@@ -326,6 +326,47 @@ class TestAutoRecallInjection(unittest.TestCase):
         self.assertEqual(last, 100)
         self.assertEqual(messages[-1]["content"], "[MEMORY_RECALL] x")
 
+    def test_periodic_recall_filters_stale_run_scoped_change_memory(self):
+        workspace_palace = _FakePalace(
+            recent_payload=[
+                {
+                    "id": "old",
+                    "content": "old run write",
+                    "room": "changes",
+                    "task_id": "run-old:execute",
+                },
+                {
+                    "id": "current",
+                    "content": "current run write",
+                    "room": "changes",
+                    "task_id": "run-new:execute",
+                },
+                {
+                    "id": "lesson",
+                    "content": "durable lesson",
+                    "room": "lessons",
+                },
+            ],
+            search_payload=[],
+        )
+        manager_palace = _FakePalace(recent_payload=[], search_payload=[])
+
+        def _safe(_repo_root, workspace_id):
+            return workspace_palace if workspace_id else manager_palace
+
+        with patch.object(memory_hooks, "_safe_palace", side_effect=_safe):
+            out = memory_hooks.recall_periodic(
+                workspace_id="JKX",
+                round_idx=3,
+                recent_actions_summary="changed x",
+                repo_root=Path("/tmp"),
+                task_id="run-new:execute",
+            )
+
+        self.assertIn("current run write", out)
+        self.assertIn("durable lesson", out)
+        self.assertNotIn("old run write", out)
+
 
 class TestRecordWorkspaceChange(unittest.TestCase):
     def test_records_to_changes_room_on_success(self):
@@ -345,6 +386,22 @@ class TestRecordWorkspaceChange(unittest.TestCase):
         self.assertEqual(call["room"], "changes")
         self.assertEqual(call["event_type"], "change")
         self.assertIn("update_workspace_seed", call["tags"])
+
+    def test_records_task_and_run_metadata_for_auto_changes(self):
+        palace = _FakePalace()
+        with patch.object(memory_hooks, "_safe_palace", return_value=palace):
+            memory_hooks.record_workspace_change(
+                workspace_id="JKX",
+                tool_name="apply_workspace_patch",
+                args_summary="file_path=src/app.py",
+                result_summary="ok",
+                repo_root=Path("/tmp"),
+                success=True,
+                task_id="run-42:execute",
+            )
+        call = palace.add_calls[0]
+        self.assertEqual(call["task_id"], "run-42:execute")
+        self.assertEqual(call["metadata_extra"]["run_id"], "run-42")
 
     def test_records_to_errors_room_on_failure(self):
         palace = _FakePalace()
@@ -386,11 +443,13 @@ class TestRecordWorkspaceChange(unittest.TestCase):
 
 
 class TestMirrorSubtaskToMemory(unittest.TestCase):
-    def test_evidence_without_verify_is_stored_as_unverified(self):
+    def test_mirror_subtask_writes_to_palace(self):
+        """mirror_subtask_to_memory writes to palace.subtask via MemPalace (non-fatal on failure)."""
         plan = SimpleNamespace(
-            task_id="task1", cursor=0, revisions=0, subtasks=[object()]
+            task_id="task1", run_id="run1", cursor=0, revisions=0, subtasks=[object()]
         )
         subtask = SimpleNamespace(
+            id="st-1",
             status="done",
             title="Implement CLI",
             description="Build the command",
@@ -398,14 +457,11 @@ class TestMirrorSubtaskToMemory(unittest.TestCase):
             summary="Done",
             evidence=["manual note: looks good"],
         )
+        palace_calls = []
 
-        with (
-            patch("umbrella.memory.hierarchical.HierarchicalMemory") as hm_cls,
-            patch(
-                "umbrella.memory.paths.workspace_memory_root",
-                return_value=Path("/tmp/mem"),
-            ),
-        ):
+        with patch("umbrella.memory.palace.facade.MemPalace") as mock_palace_cls:
+            mock_palace = mock_palace_cls.return_value
+            mock_palace.add.side_effect = lambda **kw: palace_calls.append(kw)
             memory_hooks.mirror_subtask_to_memory(
                 plan=plan,
                 subtask=subtask,
@@ -413,45 +469,26 @@ class TestMirrorSubtaskToMemory(unittest.TestCase):
                 workspace_id="JKX",
             )
 
-        call = hm_cls.return_value.add.call_args.kwargs
-        self.assertIn("done_unverified", call["title"])
-        self.assertIn("verified_evidence: false", call["content"])
-        self.assertIn("done_unverified", call["tags"])
-        self.assertFalse(call["metadata"]["verified_evidence"])
+        self.assertEqual(len(palace_calls), 1)
+        call = palace_calls[0]
+        self.assertEqual(call["store"], "palace.subtask")
+        self.assertEqual(call["scope"], "subtask_scoped")
+        self.assertEqual(call["subtask_id"], "st-1")
+        self.assertEqual(call["run_id"], "run1")
+        self.assertEqual(call["extra"]["task_id"], "task1")
+        self.assertNotIn("workspace_id", call)
 
-    def test_verify_pass_evidence_keeps_reported_status(self):
-        plan = SimpleNamespace(
-            task_id="task1", cursor=0, revisions=0, subtasks=[object()]
-        )
-        subtask = SimpleNamespace(
-            status="done",
-            title="Implement CLI",
-            description="Build the command",
-            success_check="CLI works",
-            summary="Done",
-            evidence=[
-                "run_workspace_verify verify_run_id=verify-JKX-1 passed exit_code=0"
-            ],
-        )
-
-        with (
-            patch("umbrella.memory.hierarchical.HierarchicalMemory") as hm_cls,
-            patch(
-                "umbrella.memory.paths.workspace_memory_root",
-                return_value=Path("/tmp/mem"),
-            ),
-        ):
+    def test_mirror_subtask_does_not_raise_on_palace_error(self):
+        """mirror_subtask_to_memory is non-fatal when MemPalace raises."""
+        plan = SimpleNamespace(task_id="t", cursor=0, revisions=0, subtasks=[object()])
+        subtask = SimpleNamespace(id="st-2", title="T", description="D", evidence=[])
+        with patch("umbrella.memory.palace.facade.MemPalace", side_effect=Exception("unavailable")):
             memory_hooks.mirror_subtask_to_memory(
                 plan=plan,
                 subtask=subtask,
                 repo_root=Path("/tmp/repo"),
-                workspace_id="JKX",
+                workspace_id="ws",
             )
-
-        call = hm_cls.return_value.add.call_args.kwargs
-        self.assertIn("[done]", call["title"])
-        self.assertIn("verified_evidence: true", call["content"])
-        self.assertTrue(call["metadata"]["verified_evidence"])
 
 
 class TestObserveToolCalls(unittest.TestCase):

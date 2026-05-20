@@ -6,6 +6,7 @@ that uses Umbrella's infrastructure.
 """
 
 import logging
+import hashlib
 import pathlib
 import threading
 import time
@@ -26,6 +27,27 @@ from umbrella.control_plane.sandbox_self_edit import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _task_artifact_stem(task_id: str | None, *, max_len: int = 120) -> str:
+    raw = str(task_id or "").strip() or "task"
+    safe: list[str] = []
+    changed = False
+    for ch in raw:
+        if ord(ch) < 32 or ch in '<>:"/\\|?*':
+            safe.append("_")
+            changed = True
+        else:
+            safe.append(ch)
+    stem = "".join(safe).strip(" .") or "task"
+    if len(stem) > max_len:
+        stem = stem[:max_len].rstrip(" ._") or "task"
+        changed = True
+    if changed or stem != raw:
+        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+        room = max(1, max_len - len(suffix) - 1)
+        stem = f"{stem[:room].rstrip(' ._')}_{suffix}"
+    return stem
 
 
 def resolve_drive_root(
@@ -339,7 +361,7 @@ class OuroborosLauncher:
             os.environ.setdefault("OUROBOROS_NO_WRITE_TOOL_NUDGE_INTERVAL", "1")
             os.environ.setdefault("OUROBOROS_NO_WRITE_TOOL_ABORT_AFTER_NUDGES", "1")
             os.environ.setdefault("OUROBOROS_PLANNER_PHASE_ROUNDS", "14")
-            os.environ.setdefault("OUROBOROS_MAX_ROUNDS", "120")
+            os.environ.setdefault("OUROBOROS_MAX_ROUNDS", "200")
             # Per-tool-round token cap. Set high enough to emit large
             # files (full HTML/JS dashboards, ~500-line modules) in a
             # single ``update_workspace_seed`` call without truncation.
@@ -401,7 +423,7 @@ class OuroborosLauncher:
             )
 
             agent = make_agent(
-                repo_dir=str(self.ouroboros_repo_root),
+                repo_dir=str(self.repo_root),
                 drive_root=str(task_drive_root),
                 host_repo_root=str(self.repo_root),
                 memory_hooks=None,
@@ -481,7 +503,9 @@ class OuroborosLauncher:
     ) -> str:
         """Read the persisted task result text emitted by the agent."""
         result_file = (
-            (drive_root or self.drive_root) / "task_results" / f"{task_id}.json"
+            (drive_root or self.drive_root)
+            / "task_results"
+            / f"{_task_artifact_stem(task_id)}.json"
         )
         if not result_file.exists():
             return ""

@@ -25,6 +25,40 @@ from ouroboros.llm import use_anthropic_style_cache_extensions
 log = logging.getLogger(__name__)
 
 
+def _run_id_from_task_id(task_id: str) -> str:
+    task = str(task_id or "").strip()
+    if not task:
+        return ""
+    return task.split(":", 1)[0]
+
+
+def _filter_terminal_scrollback_for_task(scrollback_raw: str, task_id: str) -> str:
+    """Return terminal blocks from the current task/run only."""
+
+    if not task_id:
+        return scrollback_raw
+    run_id = _run_id_from_task_id(task_id)
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in scrollback_raw.splitlines():
+        if line.startswith("## ws="):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    matched: list[str] = []
+    for block in blocks:
+        header = block[0]
+        if f"task={task_id}" in header or (run_id and f"run={run_id}" in header):
+            matched.extend(block)
+            matched.append("")
+    return "\n".join(matched).strip()
+
+
 def _build_user_content(task: dict[str, Any]) -> Any:
     """Build user message content. Supports text + optional image."""
     text = (
@@ -149,6 +183,9 @@ def _build_recent_sections(memory: Memory, env: Any, task_id: str = "") -> list[
         scrollback_path = memory.drive_root / "memory" / "terminal_scrollback.md"
         if scrollback_path.exists():
             scrollback_raw = read_text(scrollback_path)
+            scrollback_raw = _filter_terminal_scrollback_for_task(
+                scrollback_raw, task_id
+            )
             if scrollback_raw.strip():
                 tail_lines = scrollback_raw.splitlines()[-200:]
                 tail_text = "\n".join(tail_lines)
@@ -475,6 +512,45 @@ def build_llm_messages(
     prompt_governance = _task_context_overlay(task, "prompt_governance")
     if prompt_governance:
         dynamic_parts.append(prompt_governance)
+
+    # Phase-manifest overlay: inject phase context from Umbrella PhaseRunner
+    phase_manifest_raw = _task_context_overlay(task, "phase_manifest")
+    if phase_manifest_raw:
+        try:
+            import json as _json
+            pm = _json.loads(phase_manifest_raw) if isinstance(phase_manifest_raw, str) else phase_manifest_raw
+            phase_id = pm.get("id", "")
+            phase_desc = pm.get("description", "")
+            allowed_tools = pm.get("allowed_tools", [])
+            allowed_skills = pm.get("allowed_skills", [])
+            phase_block = f"[PHASE: {phase_id}]\n{phase_desc}"
+            if allowed_tools:
+                phase_block += f"\nAllowed tools: {', '.join(sorted(allowed_tools))}"
+            if allowed_skills:
+                phase_block += (
+                    "\nRecommended skills (skill slugs; load with `load_skill`, "
+                    "do not pass them to `enable_tools`): "
+                    f"{', '.join(sorted(allowed_skills))}"
+                )
+            dynamic_parts.append(phase_block)
+        except Exception:
+            pass
+
+    recall_bundle_raw = _task_context_overlay(task, "recall_bundle")
+    if recall_bundle_raw:
+        try:
+            import json as _json
+            rb = _json.loads(recall_bundle_raw) if isinstance(recall_bundle_raw, str) else recall_bundle_raw
+            always_on = rb.get("always_on", [])
+            if always_on:
+                ctx_lines = ["[ALWAYS-ON CONTEXT]"]
+                for node in always_on[:8]:
+                    content = str(node.get("content", ""))[:400]
+                    if content:
+                        ctx_lines.append(f"• {content}")
+                dynamic_parts.append("\n".join(ctx_lines))
+        except Exception:
+            pass
 
     dynamic_text = "\n\n".join(dynamic_parts)
 

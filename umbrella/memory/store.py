@@ -32,6 +32,9 @@ class MemoryStore:
 
     Uses JSONL for human-readability and easy appending.
     Maintains in-memory indices for fast queries.
+
+    # MIGRATION: MemoryStore JSONL is being replaced by umbrella.memory.palace.MemPalace.
+    # This class remains for backward compatibility. New code should use MemPalace.add() directly.
     """
 
     def __init__(self, config: MemoryConfig | None = None) -> None:

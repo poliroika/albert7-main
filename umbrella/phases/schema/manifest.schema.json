@@ -1,0 +1,181 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "umbrella/phases/schema/manifest.schema.json",
+  "title": "PhaseManifest",
+  "type": "object",
+  "required": ["id", "version", "description", "prompt_files", "allowed_tools", "forbidden_tools", "allowed_skills", "memory", "permissions", "exit_criteria"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "Kebab-case or snake_case phase id, unique across manifests"
+    },
+    "version": {"type": "integer", "minimum": 1},
+    "description": {"type": "string"},
+    "prompt_files": {
+      "type": "object",
+      "required": ["system"],
+      "additionalProperties": false,
+      "properties": {
+        "system": {
+          "type": "array", "items": {"type": "string"}, "minItems": 1
+        },
+        "user_overlay": {"type": "array", "items": {"type": "string"}},
+        "charter_blocks": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "allowed_tools": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "forbidden_tools": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "allowed_skills": {"type": "array", "items": {"type": "string"}},
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "always_on": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["store"],
+            "properties": {
+              "store": {"type": "string"},
+              "tier": {"type": "string", "enum": ["always_on", "hot", "warm", "cold", "transient"]}
+            }
+          }
+        },
+        "hot": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["store"],
+            "properties": {
+              "store": {"type": "string"},
+              "tags": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
+        "warm_search": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["store"],
+            "properties": {
+              "store": {"type": "string"},
+              "n": {"type": "integer", "minimum": 1},
+              "filter": {"type": "object"}
+            }
+          }
+        },
+        "graph": {
+          "type": "object",
+          "properties": {
+            "walk_edges": {"type": "array", "items": {"type": "string"}},
+            "hops": {"type": "integer", "minimum": 0, "maximum": 3}
+          }
+        },
+        "write_rules": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["store", "tier", "scope"],
+            "properties": {
+              "store": {"type": "string"},
+              "tier": {"type": "string", "enum": ["always_on", "hot", "warm", "cold", "transient"]},
+              "scope": {"type": "string", "enum": ["cross_run_durable", "run_scoped", "phase_scoped", "subtask_scoped", "transient"]},
+              "verified": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "required": ["rules"],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "oneOf": [
+              {
+                "required": ["allow_tools"],
+                "properties": {
+                  "allow_tools": {"type": "array", "items": {"type": "string"}},
+                  "args": {"type": "object"}
+                }
+              },
+              {
+                "required": ["allow_tool"],
+                "properties": {
+                  "allow_tool": {"type": "string"},
+                  "args": {"type": "object"}
+                }
+              },
+              {
+                "required": ["deny_tools"],
+                "properties": {
+                  "deny_tools": {"type": "array", "items": {"type": "string"}}
+                }
+              },
+              {
+                "required": ["deny_tool"],
+                "properties": {
+                  "deny_tool": {"type": "string"},
+                  "args": {"type": "object"}
+                }
+              },
+              {
+                "required": ["deny_path"],
+                "properties": {
+                  "deny_path": {"type": "array", "items": {"type": "string"}}
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "exit_criteria": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required_calls": {"type": "array", "items": {"type": "string"}},
+        "required_prior_calls": {"type": "array", "items": {"type": "string"}},
+        "required_palace_writes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["store"],
+            "properties": {
+              "store": {"type": "string"},
+              "tag": {"type": "string"},
+              "n": {"type": "integer"}
+            }
+          }
+        },
+        "min_palace_writes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["store", "n"],
+            "properties": {
+              "store": {"type": "string"},
+              "n": {"type": "integer", "minimum": 1}
+            }
+          }
+        }
+      }
+    },
+    "mini_review_after": {"type": ["string", "null"]},
+    "temp_tools_allowed": {"type": "boolean"},
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens": {"type": "integer", "minimum": 1},
+        "max_seconds": {"type": "integer", "minimum": 1},
+        "max_tool_calls": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

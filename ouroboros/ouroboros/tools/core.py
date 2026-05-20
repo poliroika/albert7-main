@@ -33,8 +33,88 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> list[str]
     return items
 
 
-def _repo_read(ctx: ToolContext, path: str) -> str:
-    return read_text(ctx.repo_path(path))
+def _coerce_nonnegative_int(value: object, default: int = 0) -> int:
+    try:
+        return max(0, int(value or default))
+    except (TypeError, ValueError):
+        return max(0, int(default))
+
+
+def _slice_text_by_lines(text: str, line_start: int, line_count: int = 160) -> str:
+    start = _coerce_nonnegative_int(line_start)
+    if start <= 0:
+        return text
+    count = _coerce_nonnegative_int(line_count, 160) or 160
+    lines = text.splitlines(keepends=True)
+    return "".join(lines[start - 1 : start - 1 + count])
+
+
+def _repo_read(
+    ctx: ToolContext,
+    path: str,
+    offset: int = 0,
+    max_chars: int = 0,
+    line_start: int = 0,
+    line_count: int = 160,
+) -> str:
+    target = ctx.repo_path(path)
+    content = read_text(target)
+    if _coerce_nonnegative_int(line_start) > 0:
+        content = _slice_text_by_lines(content, line_start, line_count)
+        start = 0
+    else:
+        start = _coerce_nonnegative_int(offset)
+    cap = _coerce_nonnegative_int(max_chars)
+    if start or cap > 0:
+        end = start + cap if cap > 0 else None
+        content = content[start:end]
+    _mark_workspace_read_from_repo_path(ctx, path, target)
+    return content
+
+
+def _mark_workspace_read_from_repo_path(
+    ctx: ToolContext, raw_path: str, target: pathlib.Path
+) -> None:
+    """Let repo_read satisfy workspace read-before-patch when it reads a workspace file."""
+    try:
+        view = getattr(ctx, "loop_state_view", None)
+        workspace_id = ""
+        if isinstance(view, dict):
+            workspace_id = str(
+                view.get("active_workspace_id")
+                or view.get("workspace_id")
+                or ""
+            ).strip()
+        workspace_id = workspace_id or str(
+            getattr(ctx, "active_workspace_id", "") or ""
+        ).strip()
+        raw = str(raw_path or "").replace("\\", "/").strip().lstrip("/")
+        if not workspace_id and raw.startswith("workspaces/"):
+            parts = raw.split("/", 2)
+            if len(parts) >= 3 and parts[1].strip():
+                workspace_id = parts[1].strip()
+        if not workspace_id:
+            return
+        repo_root = (ctx.host_repo_root or ctx.repo_dir).resolve()
+        workspace_root = (repo_root / "workspaces" / workspace_id).resolve()
+        rel_path = ""
+        prefix = f"workspaces/{workspace_id}/"
+        if raw.startswith(prefix):
+            rel_path = raw[len(prefix) :]
+        else:
+            try:
+                rel_path = str(target.resolve().relative_to(workspace_root)).replace(
+                    "\\", "/"
+                )
+            except ValueError:
+                return
+        if not rel_path:
+            return
+        from ouroboros.tools import umbrella_tools
+
+        umbrella_tools._mark_workspace_file_read(ctx, workspace_id, rel_path)
+    except Exception:
+        log.debug("Failed to mark repo_read workspace file read", exc_info=True)
 
 
 def _repo_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
@@ -361,10 +441,25 @@ def get_tools() -> list[ToolEntry]:
             "repo_read",
             {
                 "name": "repo_read",
-                "description": "Read a UTF-8 text file from the GitHub repo (relative path).",
+                "description": (
+                    "Read a UTF-8 text file from the GitHub repo (relative path). "
+                    "Use optional `offset` (character offset) and `max_chars` to inspect "
+                    "long files in chunks. When you have line numbers from pytest, rg, "
+                    "findstr, or stack traces, use `line_start`/`line_count` instead of "
+                    "`offset`; `offset` is not a line number. "
+                    "For active workspace files, prefer phase `read_file`; "
+                    "`repo_read(\"workspaces/<workspace_id>/<path>\")` also "
+                    "counts as the required pre-read before `apply_workspace_patch`."
+                ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"path": {"type": "string"}},
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "integer", "default": 0},
+                        "max_chars": {"type": "integer", "default": 0},
+                        "line_start": {"type": "integer", "default": 0},
+                        "line_count": {"type": "integer", "default": 160},
+                    },
                     "required": ["path"],
                 },
             },

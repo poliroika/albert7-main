@@ -56,7 +56,6 @@ def test_prompt_patch_proposal_roundtrip_with_checkpoint_resolution():
         )
 
         assert proposal_payload["proposal_id"]
-        assert proposal_payload["manager_checkpoint_id"]
         assert proposal_payload["human_checkpoint_id"]
 
         saved_proposal = json.loads(

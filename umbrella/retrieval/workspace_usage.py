@@ -12,7 +12,7 @@ import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 
 log = logging.getLogger(__name__)
@@ -34,6 +34,40 @@ _SKIP_DIR_PARTS = frozenset(
 
 def _should_skip_path(path: Path) -> bool:
     return any(part in _SKIP_DIR_PARTS for part in path.parts)
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _workspace_usage_index_opted_in(workspace_path: Path) -> bool:
+    """Return true only for workspaces approved as reusable GMAS examples."""
+
+    config_path = workspace_path / "workspace.toml"
+    if not config_path.exists():
+        return False
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    for key in ("workspace_usage_index", "reusable_gmas_usage"):
+        if _truthy(data.get(key)):
+            return True
+
+    for section_name in ("retrieval", "workspace_usage"):
+        section = data.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for key in ("index", "enabled", "workspace_usage", "reusable_gmas_usage"):
+            if _truthy(section.get(key)):
+                return True
+
+    return False
 
 
 @dataclass
@@ -180,10 +214,14 @@ class WorkspaceUsageIndex:
                     if (
                         instance_dir.is_dir()
                         and (instance_dir / "workspace.toml").exists()
+                        and _workspace_usage_index_opted_in(instance_dir)
                     ):
                         self.index_workspace(instance_dir)
                 continue
-            if (item / "workspace.toml").exists():
+            if (
+                (item / "workspace.toml").exists()
+                and _workspace_usage_index_opted_in(item)
+            ):
                 self.index_workspace(item)
 
         log.info(f"Indexed {len(self._by_workspace)} workspaces")

@@ -1,121 +1,131 @@
-# Часть 14. Тестирование и сопровождение документации
+# Part 14: Testing and Documentation
 
-[← Оглавление](README.md) · [← Часть 13](13-operations.md) · [Далее: Task Planner →](15-task-planner.md)
+[← Table of contents](README.md) · [← Part 13](13-operations.md) · [Next: Task Planner →](15-task-planner.md)
 
 ---
 
-## 14.1 Запуск тестов
+## 14.1 Running tests
 
-Из корня репозитория:
+From the repository root:
 
 ```bash
 uv sync --extra dev
 uv run pytest -q
 ```
 
-Конфигурация `pyproject.toml` включает **`umbrella/tests`** и **`ouroboros/tests`** и добавляет `pythonpath` для пакета `ouroboros`. Если тесты не находят модуль менеджера, первым делом проверяют запуск из корня через `uv run`, а не голый `pytest` из произвольной cwd.
+`pyproject.toml` sets `testpaths` to `umbrella/tests` and `ouroboros/tests` and adds `pythonpath` for the `ouroboros` package. Always run from the repo root via `uv run pytest`; ad-hoc `pytest` from another working directory often fails imports.
 
 ---
 
-## 14.2 Таргетированные наборы
+## 14.2 Focused test subsets
 
-При работе с конкретной подсистемой экономят время:
+When working on a subsystem, narrow the run:
 
-=== "Umbrella"
+=== "Phase machine and orchestration"
+
     ```bash
-    uv run pytest -q umbrella/tests/test_app_ouroboros.py
-    uv run pytest -q umbrella/tests/test_web_bridge_harness.py
-    uv run pytest -q umbrella/tests/test_harness_orchestrator.py
+    uv run pytest -q umbrella/tests/test_phase_manifests_valid.py
+    uv run pytest -q umbrella/tests/test_phase_runner.py
+    uv run pytest -q umbrella/tests/test_phase_plan_mutation.py
+    ```
+
+=== "Permissions and watcher"
+
+    ```bash
+    uv run pytest -q umbrella/tests/test_permission_envelope.py
+    uv run pytest -q umbrella/tests/test_watcher_envelope.py
+    uv run pytest -q umbrella/tests/test_watcher_signals.py
+    ```
+
+=== "MemPalace"
+
+    ```bash
+    uv run pytest -q umbrella/tests/test_palace_facade.py
+    uv run pytest -q umbrella/tests/test_palace_migrators.py
+    uv run pytest -q umbrella/tests/test_palace_backend_filter.py
+    ```
+
+=== "Verification"
+
+    ```bash
     uv run pytest -q umbrella/tests/test_verification.py
+    uv run pytest -q umbrella/tests/test_app_ouroboros.py
+    ```
+
+=== "Web bridge"
+
+    ```bash
+    uv run pytest -q umbrella/tests/test_web_bridge_mcp.py
     ```
 
 === "Ouroboros"
+
     ```bash
     uv run pytest -q ouroboros/tests/
     uv run pytest -q ouroboros/tests/test_completion_gates.py
     ```
 
-=== "Workspace news_cards_ai"
-    ```bash
-    uv run pytest -q workspaces/news_cards_ai/tests/
-    ```
-
-Точный список файлов меняется; ориентир — имена `test_*.py` рядом с кодом.
+The exact file list evolves; search for `test_*.py` next to the code you change.
 
 ---
 
-## 14.3 Описание ключевых наборов
+## 14.3 Notable test modules (post-refactor)
 
-### `ouroboros/tests/test_completion_gates.py`
-
-Тесты **completion gates** из `ouroboros/ouroboros/tools/control.py`. Покрывают инварианты Tier 1.3 + Tier 3.1 + Tier 3.2 без запуска полного loop:
-
-| Тест | Что проверяет |
-|------|--------------|
-| `test_check_discovery_gate_silent_when_subtask_is_not_domain_unknown` | Gate не срабатывает для обычных подзадач |
-| `test_check_discovery_gate_blocks_domain_unknown_with_no_discovery` | Gate блокирует `domain_unknown` без discovery-вызовов |
-| `test_check_discovery_gate_passes_after_any_discovery_call` | Gate пропускает после ≥1 discovery-вызова |
-| `test_planner_discovery_gate_default_on` | Planner discovery gate включён по умолчанию |
-| `test_behavior_evidence_warning_*` | Паттерны behavior evidence (pytest passed, exit 0, ...) |
-| `test_validate_delivery_contract_*` | Валидация delivery_contract |
-| `test_check_verify_evidence_gate_*` | Verify-evidence gate |
-
-### `umbrella/tests/test_verification.py`
-
-Тесты `umbrella/verification/` включая `source_policy.py`:
-
-- Загрузка спецификации из `workspace.toml`.
-- Source policy scanner — обнаружение mock-паттернов.
-- Исключение мета-файлов из сканирования.
+| Module | What it covers |
+|--------|------------------|
+| `umbrella/tests/test_phase_manifests_valid.py` | Every YAML under `umbrella/phases/manifests/` validates against `manifest.schema.json`. |
+| `umbrella/tests/test_phase_runner.py` | PhaseRunner happy-path and integration with fake LLM / fixtures. |
+| `umbrella/tests/test_permission_envelope.py` | Allow/deny rules, path globs, command regex, interaction with global rules. |
+| `umbrella/tests/test_watcher_signals.py` | Watcher → Runner signal file protocol and handling. |
+| `umbrella/tests/test_palace_facade.py` | `MemPalace` add/search/recall/link/walk/promote/expire semantics. |
+| `ouroboros/tests/test_completion_gates.py` | Completion gates in `ouroboros/ouroboros/tools/control.py` (planner discovery, delivery contract hints, verify-evidence checks) without a full LLM loop. |
 
 ---
 
-## 14.4 Что гонять перед релизом изменений
+## 14.4 Pre-merge smoke matrix
 
-| Область правок | Минимальный набор |
-|----------------|-------------------|
+| Area you touch | Minimum tests |
+|----------------|---------------|
+| `umbrella/phases/` | `test_phase_manifests_valid.py` |
+| `umbrella/orchestrator/` | `test_phase_runner.py` + affected orchestrator tests |
+| `umbrella/permissions/` | `test_permission_envelope.py` |
+| `umbrella/memory/palace/` | `test_palace_facade.py` (+ migrators if schema changes) |
 | `umbrella/verification/` | `test_verification.py` + `test_app_ouroboros.py` |
-| `umbrella/web_bridge/` | web bridge tests, harness tests |
-| `umbrella/control_plane/ouroboros_integration.py` | ouroboros integration tests, `test_app_ouroboros.py` |
-| `ouroboros/` (loop, tools) | `ouroboros/tests/` |
-| `ouroboros/ouroboros/tools/control.py` | `test_completion_gates.py` |
-| `ouroboros/ouroboros/task_planner.py` | `ouroboros/tests/` + ручной smoke с `OUROBOROS_PLANNER_MODE=always` |
+| `umbrella/web_bridge/` | web bridge tests under `umbrella/tests/` |
+| `ouroboros/ouroboros/loop.py` or `tools/` | `ouroboros/tests/` |
 
 ---
 
-## 14.5 Поддержка документации
+## 14.5 Documentation maintenance
 
-Правило одно: **если меняется поведение, видимое оператору или разработчику control-plane, меняется соответствующая глава** (`docs/technical-report/NN-*.md`). Оглавление в [README.md](README.md) обновляют при добавлении новых файлов.
+**Rule:** If operator- or developer-visible control-plane behavior changes, update the matching chapter under `docs/technical-report/NN-*.md` and any user-facing page in `docs/*.md`.
 
-**Новые модули → новые главы:**
+**When adding modules:** extend [README.md](README.md) table of contents and `mkdocs.yml` nav.
 
-- `ouroboros/ouroboros/task_planner.py` → [15-task-planner.md](15-task-planner.md)
-- `umbrella/verification/source_policy.py` → раздел 9.4 в [09-verification.md](09-verification.md)
-- `ouroboros/ouroboros/tools/control.py` → разделы 8.4, 15.4
+**Cross-links:**
+
+- Phase manifests → [Part 6](06-umbrella-subsystems.md), [Part 11](11-configuration.md)
+- Verification → [Part 9](09-verification.md)
+- Ouroboros loop and tools → [Part 8](08-ouroboros-runtime.md), [Part 15](15-task-planner.md)
 
 ---
 
-## 14.6 Сборка документации
+## 14.6 Building the docs site
 
 ```bash
-# Установить mkdocs-material
 pip install mkdocs-material
-
-# Локальный сервер с горячей перезагрузкой
 mkdocs serve
-
-# Сборка статики
 mkdocs build
 ```
 
-После успешной сборки сайт появляется в `public/`. CI-job `pages` в `.gitlab-ci.yml` выполняет ту же команду для GitLab Pages.
+Output goes to `public/`. GitLab CI job `pages` in `.gitlab-ci.yml` runs the same build for GitLab Pages.
 
 ---
 
-## 14.7 Версионирование документации
+## 14.7 Versioning
 
-Техотчёт описывает **текущее** состояние ветки. Для исторических решений используют git blame и архив обсуждений PR; дублировать prose историю в техотчёте не обязательно.
+The technical report describes the **current** branch. Use git history for past decisions; avoid duplicating long narrative history in these files.
 
 ---
 
-[↑ В начало раздела](README.md)
+[↑ Back to technical report](README.md)

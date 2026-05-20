@@ -495,6 +495,38 @@ def _normalize_revise_remaining_plan_args(
     return args, None
 
 
+def _normalize_propose_phase_plan_args(
+    args: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Collapse common artifact-envelope aliases for ``propose_phase_plan``.
+
+    Some models use the generic artifact key ``content`` even when the tool's
+    canonical field is ``plan``. Normalize it before registry dispatch so
+    valid plan objects do not turn into ``unexpected keyword`` failures.
+    """
+    if not isinstance(args, dict):
+        return args, None
+    notes: list[str] = []
+
+    if "plan" not in args:
+        for alias in ("content", "phase_plan", "proposal", "payload", "data"):
+            if alias in args:
+                args["plan"] = args.pop(alias)
+                notes.append(f"alias_{alias}_to_plan")
+                break
+
+    if "notes" not in args:
+        for alias in ("note", "rationale", "explanation", "summary"):
+            if isinstance(args.get(alias), str) and args[alias].strip():
+                args["notes"] = args.pop(alias).strip()
+                notes.append(f"alias_{alias}_to_notes")
+                break
+
+    if notes:
+        return args, "+".join(notes)
+    return args, None
+
+
 _FILE_PATH_ALIASES: tuple[str, ...] = (
     "path",
     "file",
@@ -782,6 +814,12 @@ def _postprocess_tool_args(
             return args, f"{note}+{extra}"
     if fn_name == "revise_remaining_plan":
         args, extra = _normalize_revise_remaining_plan_args(args)
+        if extra:
+            if note in {"ok", "already_dict"}:
+                return args, extra
+            return args, f"{note}+{extra}"
+    if fn_name == "propose_phase_plan":
+        args, extra = _normalize_propose_phase_plan_args(args)
         if extra:
             if note in {"ok", "already_dict"}:
                 return args, extra

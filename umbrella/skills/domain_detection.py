@@ -1,4 +1,4 @@
-"""Detect task domains in a language-agnostic way.
+﻿"""Detect task domains in a language-agnostic way.
 
 Strategy (in order):
 
@@ -53,8 +53,9 @@ _CLASSIFIER_SYSTEM = (
     'prose. The schema is: {"domains": [<list of domain ids>], '
     '"rationale": <short string>}.\n\n'
     "Available domain ids:\n"
-    '- "multi_agent_gmas": fire this domain whenever the task involves '
-    "**any** LLM / language-model usage, prompt orchestration, "
+    '- "multi_agent_gmas": fire this domain whenever the deliverable '
+    "requires implementing or running actual LLM / language-model usage, "
+    "prompt orchestration, "
     "summarization, classification, generation, embeddings, RAG, agents, "
     "chatbots, autonomous workflows, planners, tool-using agents, "
     "evaluator/judge nodes, or any pipeline whose nodes call a model. "
@@ -62,9 +63,11 @@ _CLASSIFIER_SYSTEM = (
     '`gmas` graph -- so even seemingly trivial "call an LLM to '
     'summarize X" features count. Only skip this domain when the task '
     "has zero LLM/model involvement (pure plumbing, dependency bumps, "
-    "non-AI web/data work, etc.). When in doubt and the task mentions "
-    "an LLM, model, prompt, summarize, classify, generate, agent, or "
-    "completion in any language, fire it.\n\n"
+    "non-AI web/data work, file creation, verification scaffolding, "
+    "documentation, or labels that merely mention LLM/model/agent words). "
+    "Do not fire for a task whose concrete output is just a static file, "
+    "config edit, smoke marker, or report about LLMs unless the requested "
+    "implementation itself calls or orchestrates a model.\n\n"
     'If no domain applies, return {"domains": [], "rationale": "..."}. '
     "Do not invent domain ids."
 )
@@ -201,50 +204,102 @@ def classify_with_llm(
     return _parse_classifier_json(text)
 
 
-_KEYWORD_PATTERNS: dict[Domain, tuple[re.Pattern[str], ...]] = {
-    Domain.MULTI_AGENT_GMAS: (
-        # Project-specific names (kept verbatim from the original
-        # narrow fallback so existing signals still fire).
-        re.compile(r"\bgmas\b", re.IGNORECASE),
-        re.compile(r"\brolegraph\b", re.IGNORECASE),
-        re.compile(r"\bmacprunner\b", re.IGNORECASE),
-        re.compile(r"\bagentprofile\b", re.IGNORECASE),
-        re.compile(r"build_property_graph", re.IGNORECASE),
-        # Generic LLM / agent signals. In this repo every LLM-touching
-        # feature is expressed as a gmas graph (often single-node), so
-        # any of these keywords means "use gmas, don't roll your own
-        # request loop". The list intentionally covers EN + RU because
-        # workspace TASK_MAIN files are routinely written in Russian.
-        re.compile(r"\bllm[s]?\b", re.IGNORECASE),
-        re.compile(r"\bllm[-_]?(?:api|model|key|base[-_]?url)\b", re.IGNORECASE),
-        re.compile(r"\bai\b", re.IGNORECASE),
-        re.compile(r"\blanguage\s+model\b", re.IGNORECASE),
-        re.compile(r"\bgpt[-_ ]?\d", re.IGNORECASE),
-        re.compile(r"\bopenai\b", re.IGNORECASE),
-        re.compile(r"\banthropic\b", re.IGNORECASE),
-        re.compile(r"\bopenrouter\b", re.IGNORECASE),
-        re.compile(r"\bclaude\b", re.IGNORECASE),
-        re.compile(r"\bprompt(?:ing|s)?\b", re.IGNORECASE),
-        re.compile(r"\bcompletion(?:s)?\b", re.IGNORECASE),
-        re.compile(r"\bembedding(?:s)?\b", re.IGNORECASE),
-        re.compile(r"\bgenerat(?:e|es|ed|ing|ion|ive)\b", re.IGNORECASE),
-        re.compile(r"\bsummar(?:y|ize|izes|ized|izing|ization)\b", re.IGNORECASE),
-        re.compile(r"\bclassif(?:y|ies|ied|ying|ication)\b", re.IGNORECASE),
-        re.compile(r"\bagent(?:s|ic)?\b", re.IGNORECASE),
-        re.compile(r"\bmulti[-_\s]?agent\b", re.IGNORECASE),
-        re.compile(r"\bchat[-_\s]?bot\b", re.IGNORECASE),
-        # Russian / Cyrillic markers that show up in workspace seeds.
-        re.compile(r"мульти[-\s]?агент", re.IGNORECASE),
-        re.compile(r"агент[ыовами]*", re.IGNORECASE),
-        re.compile(r"\bЛЛМ\b", re.IGNORECASE),
-        re.compile(r"языков[аоые]*\s+модел", re.IGNORECASE),
-        re.compile(r"промпт[аыовиеа]*", re.IGNORECASE),
-        re.compile(r"генерац[ияиюей]+", re.IGNORECASE),
-        re.compile(r"аннотац[ияиюей]+", re.IGNORECASE),
-        re.compile(r"саммар(?:изац|и)", re.IGNORECASE),
-        re.compile(r"эмбеддинг", re.IGNORECASE),
+
+_PROJECT_GMAS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bgmas\b", re.IGNORECASE),
+    re.compile(r"\brolegraph\b", re.IGNORECASE),
+    re.compile(r"\bmacprunner\b", re.IGNORECASE),
+    re.compile(r"\bagentprofile\b", re.IGNORECASE),
+    re.compile(r"build_property_graph", re.IGNORECASE),
+)
+
+_AGENT_WORKFLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bmulti[-_\s]?agent\b", re.IGNORECASE),
+    re.compile(r"\bgraph\s+of\s+(?:cooperating\s+)?agents\b", re.IGNORECASE),
+    re.compile(r"\bagent(?:ic)?\s+(?:workflow|system|graph|orchestration)\b", re.IGNORECASE),
+    re.compile(r"\btool[-_\s]?using\s+agents?\b", re.IGNORECASE),
+    re.compile(r"\bautonomous\s+(?:agent|workflow|planner)\b", re.IGNORECASE),
+    re.compile(r"мульти[-\s]?агент", re.IGNORECASE),
+)
+
+_MODEL_IMPLEMENTATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:call|invoke|query|route|orchestrate|integrate|wrap|use)\s+"
+        r"(?:an?\s+)?(?:llm|language\s+model|model|openai|anthropic|claude|gpt)\b",
+        re.IGNORECASE,
     ),
-}
+    re.compile(
+        r"\b(?:llm|language\s+model|model|openai|anthropic|claude|gpt)"
+        r"[-_\s]*(?:call|pipeline|workflow|node|router|judge|evaluator|agent|"
+        r"chatbot|rag|embedding|enrichment|summarization|classification|generation)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:summarize|summarise|classify|generate|embed|enrich|retrieve|rag)\b"
+        r".{0,80}\b(?:with|using|via|through)\s+"
+        r"(?:an?\s+)?(?:llm|language\s+model|model|openai|anthropic|claude|gpt)\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"\b(?:build|implement|create|wire)\b.{0,80}\b"
+        r"(?:llm|language\s+model|openai|anthropic|claude|gpt)\b.{0,80}\b"
+        r"(?:agent|chatbot|pipeline|workflow|summarizer|summariser|classifier|"
+        r"generator|enricher|rag|embedding)\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"\b(?:llm|language\s+model|openai|anthropic|claude|gpt)"
+        r"[-_\s]*(?:powered|backed|driven|based)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:через|с помощью|используя|на основе)\s+"
+        r"(?:ллм|языков\w*\s+модел\w*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:ллм|языков\w*\s+модел\w*).{0,120}"
+        r"(?:бот|агент|эконом|диплом|стратег|решени|генерац)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"(?:бот|агент|эконом|диплом|стратег).{0,120}"
+        r"(?:ллм|языков\w*\s+модел\w*)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"\bprompt\s+orchestration\b", re.IGNORECASE),
+)
+
+_NEGATED_MODEL_IMPLEMENTATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:do\s+not|don't|no|without|not)\b.{0,80}\b"
+        r"(?:llm|language\s+model|model|openai|anthropic|claude|gpt)\b.{0,80}\b"
+        r"(?:call|pipeline|workflow|agent|chatbot|rag|embedding|enrichment|"
+        r"summarization|classification|generation|implementation|implement)\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"\b(?:do\s+not|don't|no|without|not)\b.{0,80}\b"
+        r"(?:implement|build|create|call|invoke|use|integrate|orchestrate)\b"
+        r".{0,80}\b(?:llm|language\s+model|model|openai|anthropic|claude|gpt)\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"(?:без|не\s+использ\w+|не\s+нужн\w+).{0,80}"
+        r"(?:ллм|языков\w*\s+модел\w*)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+)
+
+
+def _looks_like_gmas_task(task_text: str) -> bool:
+    if any(pattern.search(task_text) for pattern in _PROJECT_GMAS_PATTERNS):
+        return True
+    if any(pattern.search(task_text) for pattern in _AGENT_WORKFLOW_PATTERNS):
+        return True
+    if any(pattern.search(task_text) for pattern in _NEGATED_MODEL_IMPLEMENTATION_PATTERNS):
+        return False
+    return any(pattern.search(task_text) for pattern in _MODEL_IMPLEMENTATION_PATTERNS)
 
 
 def classify_with_keywords(task_text: str) -> set[Domain]:
@@ -258,18 +313,17 @@ def classify_with_keywords(task_text: str) -> set[Domain]:
     less) without ever saying the word "gmas", so detection silently
     returned an empty set and the agent fell back to ad-hoc
     ``requests`` / FastAPI code instead of using the in-repo framework.
-    The patterns above now also recognise generic LLM / agent
-    vocabulary in English and Russian. The classifier is still bounded
-    -- pure non-AI tasks (e.g. "bump dependency X", "fix a typo") will
-    still match nothing.
+    The fallback now recognises project-specific GMAS names, high-signal
+    multi-agent workflow language, and model implementation phrases such
+    as "call an LLM" or "LLM enrichment pipeline". It deliberately ignores
+    meta labels like "LLM smoke verification" when the concrete deliverable
+    is just a static file/config/doc.
     """
     if not task_text:
         return set()
-    detected: set[Domain] = set()
-    for domain, patterns in _KEYWORD_PATTERNS.items():
-        if any(p.search(task_text) for p in patterns):
-            detected.add(domain)
-    return detected
+    if _looks_like_gmas_task(task_text):
+        return {Domain.MULTI_AGENT_GMAS}
+    return set()
 
 
 def detect_task_domains(*texts: str, client: _ChatClient | None = None) -> set[Domain]:
@@ -290,7 +344,13 @@ def detect_task_domains(*texts: str, client: _ChatClient | None = None) -> set[D
 
     if llm_hits is None:
         return keyword_hits
-    return keyword_hits | llm_hits
+    detected = keyword_hits | llm_hits
+    if (
+        Domain.MULTI_AGENT_GMAS in detected
+        and not _looks_like_gmas_task(haystack)
+    ):
+        detected.discard(Domain.MULTI_AGENT_GMAS)
+    return detected
 
 
 def summarize_domains(domains: set[Domain]) -> str:

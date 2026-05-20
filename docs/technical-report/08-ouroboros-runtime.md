@@ -1,171 +1,122 @@
-# Часть 8. Ouroboros как рантайм менеджера
+# Part 8: Ouroboros Runtime
 
-[← Оглавление](README.md) · [← Часть 7](07-workspaces-and-policy.md) · [Далее: verification →](09-verification.md)
+Ouroboros is the deep LLM agent that executes individual phases. This chapter covers its internal architecture: the tool loop, context building, manifest consumption, and tool registry.
 
----
+## Main Loop (`loop.py`)
 
-## 8.1 Два места, где живёт «Ouroboros» в коде
+The main loop (~5800 lines) manages the LLM conversation with tool calls:
 
-Ouroboros реализован в двух самостоятельных зонах репозитория:
+1. **Round start**: Build messages via `context.py::build_llm_messages()`.
+2. **LLM call**: Send messages, receive response (possibly with tool calls).
+3. **Tool execution**: For each tool call:
+   - Check `allowed_tool_names` from `tool_filter` (derived from phase manifest).
+   - If forbidden: return `TOOL_DENIED_BY_ENVELOPE` with strike counting.
+   - If allowed: execute via `ToolRegistry.execute()` (which runs PermissionEnvelope pre-hook).
+   - Append tool result to messages.
+4. **Watcher signal check**: At round boundary, read `drive/state/watcher_signal.json`.
+5. **Phase completion**: Check exit criteria (required tool calls, palace writes).
+6. **Repeat** until budget exhausted or completion tool called.
 
-| Зона | Модуль | Что делает |
-|------|--------|------------|
-| `ouroboros/` | Цикл, плановщик, инструменты, память | Исполнение итерации: LLM-раунды, tool-calling, subtask-декомпозиция |
-| `umbrella/control_plane/ouroboros_integration.py` | Интеграция с Umbrella | Поднимает цикл в своём процессе, собирает git-диффы, обрабатывает verification-outcome, прикрепляет candidate-id |
+### Phase Label Tracking
 
-!!! warning "При отладке не смешивайте уровни"
-    Падение в `ouroboros/loop.py` и отказ в `ouroboros_integration.py` — разные классы инцидентов с разными точками входа в логах.
+The loop tracks `phase_label` (e.g., `"subtask_*"`, `"remediation_*"`) used in:
+- Error messages and logging.
+- Forbidden tool error formatting.
+- Phase-specific behavior branching.
 
----
-
-## 8.2 Инструменты и граница доверия
-
-Ouroboros действует через инструменты, которые экспонирует Umbrella: файловая система workspace, pytest-обвязка, retrieval, память, управляющие вызовы. Это сознательное ограничение поверхности: менеджер не получает произвольный `exec` по всему диску без прохождения слоя инструментов.
-
-Перечень инструментов эволюционирует; ориентир — `ouroboros/ouroboros/tools/` и `umbrella/mcp/registry.py` для MCP.
-
----
-
-## 8.3 Adaptive Task Planner
-
-> Ключевое нововведение в `ouroboros/ouroboros/task_planner.py`.
-
-До появления плановщика `run_llm_loop` работал как единый линейный поток LLM-раундов: агент получал `TASK_MAIN` и обрабатывал всё сразу до финального ответа. Для нетривиальных задач это нестабильно — контекст разрастается безгранично, частичный прогресс не фиксируется, перезапуск заново восстанавливает намерение «с нуля».
-
-Плановщик добавляет три ортогональные возможности **без жёсткой привязки к домену**:
-
-=== "1. Декомпозиция"
-    **Upfront decomposition** — выделенный «planner-раунд» запрашивает у LLM структурированный список подзадач (`propose_task_plan`). Каждая подзадача имеет `title`, `description` и `success_check`. План — небольшой JSON, сохраняемый в `drive/task_plans/`.
-
-=== "2. Фокусированное исполнение"
-    **Sequential execution with focus block** — оркестратор проходит план по одной подзадаче, инжектируя системное сообщение `[SUBTASK i/N]` перед каждой фазой. Фаза заканчивается, когда LLM вызывает `mark_subtask_complete`.
-
-=== "3. Адаптивный реплан"
-    **Adaptive replanning** — после каждой подзадачи короткая review-фаза позволяет LLM вызвать `revise_remaining_plan` с новым хвостом плана. Число ревизий ограничено, чтобы исключить осцилляции.
-
-### Конфигурация плановщика
-
-| Переменная окружения | Значения | По умолчанию | Смысл |
-|---------------------|----------|-------------|-------|
-| `OUROBOROS_PLANNER_MODE` | `auto` / `always` / `off` | `auto` | `auto` — включить для задач длиннее 220 символов; `off` — CI, чат |
-| `OUROBOROS_PLANNER_MAX_STEPS` | целое 1–20 | `7` | Максимальное число подзадач |
-| `OUROBOROS_REQUIRE_PLANNER_DISCOVERY` | `1` / `0` | `1` | Блокировать завершение плана до вызова discovery-инструментов |
-
-### Как план сохраняется
-
-```
-workspaces/<id>/.memory/drive/task_plans/
-    <task_id>.json                 # активный план
-    <task_id>.before_remediation_<n>.json  # снимок перед реплланированием
-```
-
-Файл плана — канонический источник состояния. `HierarchicalMemory` зеркалирует завершённые подзадачи как recall-записи, но оркестратор для возобновления всегда читает файл плана, а не память.
-
----
-
-## 8.4 Control Gates (`ouroboros/ouroboros/tools/control.py`)
-
-`control.py` — тонкий адаптер над Umbrella control-plane API. Логика владения фазами, governance промптов, human-checkpoints и семантика promotion остаются в `umbrella.control_plane` / `umbrella.memory`.
-
-Модуль реализует набор **completion gates** — проверок, блокирующих преждевременное закрытие плана, подзадачи или remediation при отсутствии discovery- или verification-evidence.
-
-```mermaid
-flowchart LR
-    A[propose_task_plan] -->|delivery_contract?| G1{validate_delivery_contract}
-    G1 -->|warn| A
-    G1 -->|OK| B[mark_subtask_complete]
-    B -->|domain_unknown tag?| G2{check_discovery_gate}
-    G2 -->|no discovery calls| BLOCK["⛔ Blocked: must call\ndiscovery tool first"]
-    G2 -->|OK| C[verify evidence]
-    C --> G3{check_verify_evidence_gate}
-    G3 -->|no behavior evidence| WARN["⚠️ Warning injected\ninto next round"]
-    G3 -->|OK| D[subtask complete]
-```
-
-### Delivery contract
-
-`propose_task_plan` требует поля `delivery_contract` — объект, описывающий:
-
-- `outcome` — что получает пользователь в рантайме;
-- команду/проверку, доказывающую результат;
-- ожидаемый артефакт/файл/HTTP-ответ.
-
-Отсутствие или пустой `delivery_contract` вызывает предупреждение, не блокируя исполнение.
-
-### Discovery gate
-
-Подзадачи с тегом `domain_unknown` (неизвестная технология или незнакомое API) **не могут** быть завершены через `mark_subtask_complete` без предшествующего вызова хотя бы одного discovery-инструмента:
+### Forbidden Tool Handling
 
 ```python
-_DISCOVERY_SOURCE_TOOLS = {
-    "web": {"deep_search", "web_fetch"},
-    "github": {"github_project_search", "github_extract_snippets"},
-    "mcp": {"mcp_discover", "mcp_install"},
-    ...
-}
+allowed_tool_names = _allowed_tool_names_from_schemas(tool_schemas)
+# Returns frozenset or None (all tools)
+
+for tool_call in response.tool_calls:
+    if allowed_tool_names is not None and fn_name not in allowed_tool_names:
+        forbidden_strike_counts[fn_name] += 1
+        return _format_forbidden_tool_error(fn_name, phase_label)
+    # else: execute normally
 ```
 
-### Behavior evidence gate
+After repeated strikes, the loop may auto-delegate or flag the phase.
 
-`_check_verify_evidence_gate` проверяет, что в тексте итерации присутствуют признаки реального запуска (не просто импорта):
+## Context Builder (`context.py`)
 
-```python
-_BEHAVIOR_EVIDENCE_RE = re.compile(
-    r"(?i)\b(run_workspace_verify|pytest|test[s]? passed|"
-    r"created .*\.(?:pptx|pdf|png|jpg|csv|json)|"
-    r"exit_code\s*[=:]\s*0|http\s+200)\b"
-)
-```
+`build_llm_messages()` assembles the LLM prompt from multiple sources:
 
-При отсутствии таких признаков в раунд инжектируется предупреждение — но это **не hard-block**, а мягкая сигнализация.
+1. **System prompt**: from phase manifest `prompt_files.system`.
+2. **Charter blocks**: from `prompt_files.charter_blocks` (palace.charter nodes).
+3. **Recall bundle**: from `context_overlays.recall_bundle` (always_on, hot, warm, graph neighbours).
+4. **Permission display**: from `context_overlays.permissions` (agent sees its own envelope).
+5. **User overlay**: from phase manifest `prompt_files.user_overlay` (task-specific content).
+6. **Previous messages**: conversation history with compaction.
+
+New overlay sections (added during refactoring):
+- `phase_manifest` overlay: manifest data for self-aware agent.
+- `recall_bundle` overlay: pre-loaded memory context.
+- `permissions` overlay: compiled permission rules.
+
+## Agent (`agent.py`)
+
+Thin orchestrator that delegates to:
+- `loop.py` for the main execution cycle.
+- `llm.py` for LLM API calls.
+- `context.py` for message assembly.
+- `tools/registry.py` for tool discovery and execution.
+- `memory.py` for scratchpad.
+- `review.py` for code collection.
+
+Bifurcation: if `task["context_overlays"]["phase_manifest"]` exists -> phase-driven mode; otherwise -> legacy fallback.
+
+## Tool Registry (`tools/registry.py`)
+
+Plugin architecture that auto-discovers tool modules via `pkgutil.iter_modules`:
+
+1. Scan `ouroboros/ouroboros/tools/` for modules.
+2. Each module registers tools via `@registry.register` decorator.
+3. `ToolRegistry.execute(name, args)` dispatches to the handler.
+
+**PermissionEnvelope pre-hook**: inserted after module loading, before execution. Calls `envelope.check(phase_id, tool_name, paths, commands)` and returns `TOOL_DENIED_BY_ENVELOPE` on deny.
+
+## Phase Control Tools (`tools/phase_control.py`)
+
+In-run self-modification tools that communicate with the PhaseRunner via `drive/state/` JSON files:
+
+| Tool | Action |
+|------|--------|
+| `mutate_phase_plan(patch)` | Patch the active PhasePlan |
+| `add_phase(after, manifest)` | Insert an extra phase |
+| `loop_back_to(phase)` | Return to a previous phase |
+| `submit_research_summary(architecture_id, findings_ids)` | Signal research completion |
+| `submit_micro_review(verdict, revisions)` | Submit ok/revise/abort verdict |
+| `submit_phase_plan(plan_id)` | Signal planning completion |
+| `submit_final_review(verdict)` | Submit ok/loop_back verdict |
+| `submit_verification(pass, details)` | Submit verify result |
+| `submit_reflection(text, evidence_refs)` | Submit evidence-backed reflection |
+| `submit_preflight_report(status, blockers)` | Report ready/blocked |
+| `edit_subtask_card(subtask_id, patch)` | Modify subtask recipe |
+| `mark_subtask_complete(subtask_id)` | Mark subtask done |
+| `request_watcher_review(reason)` | Ask Watcher to review |
+| `harness_run(subtask_id, n, strategy)` | Run N parallel candidates |
+
+All tools read/write `drive/state/phase_plan.json` and `drive/state/watcher_signal.json`.
+
+## LLM Client (`llm.py`)
+
+- Chat completion calls with pricing calculation.
+- Model resolution from env vars (`LLM_MODEL`, `LLM_BASE_URL`, `LLM_API_KEY`).
+- Budget tracking and reporting.
+
+## Supervisor (`ouroboros/supervisor/`)
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `telegram.py` | ~550 | Telegram notifications: messages, photos, budget alerts |
+| `events.py` | ~520 | Event dispatcher: 15 event types -> handlers |
+| `queue.py` | ~490 | Task queue: priority, persistence, scheduling |
+| `workers.py` | ~655 | Worker process lifecycle, health checks |
+| `state.py` | ~760 | Drive state: atomic load/save, file locks, budget |
+| `git_ops.py` | ~510 | Git operations: clone, checkout, stash, rescue |
 
 ---
 
-## 8.5 Память
-
-Менеджер ведёт долгую память (lessons, сигналы компетенций) через hook'и и storage под `ouroboros/` и `.umbrella`. Продуктовое описание контура: [../ouroboros.md](../ouroboros.md).
-
-Drive-layout создаётся под `.umbrella/ouroboros_drive/` (или под `workspaces/<id>/.memory/drive/` при запуске через umbrella-workspace flow):
-
-```
-drive/
-    logs/
-        events.jsonl
-        round_io.jsonl
-        tools.jsonl
-        verification_failures.jsonl
-    memory/
-        knowledge/
-    state/
-        state.json
-        run_snapshot.json
-    task_plans/        # файлы плановщика
-    task_results/
-```
-
----
-
-## 8.6 Лимиты раундов
-
-Umbrella может экспортировать `OUROBOROS_MAX_ROUNDS` из флага `--max-rounds` (`app_ouroboros.py`), чтобы согласовать «безлимитный» CLI с внутренним потолком цикла менеджера.
-
-!!! note "Исторический cap"
-    Несогласованность `OUROBOROS_MAX_ROUNDS` historically давала тихий cap на 200 итераций — см. комментарии в коде `_apply_max_rounds_env`.
-
----
-
-## 8.7 Self-improvement как вторичный контур
-
-Когда основной контур (правки workspace) исчерпывает себя, политика может инициировать улучшение самого менеджера. Это **не** отменяет workspace-first дисциплину: после обновления инструментария цикл возвращается к работе с прикладным пакетом.
-
-Триггеры (из `default_policy.yaml`):
-
-| Триггер | Порог |
-|---------|-------|
-| Повторяющиеся неудачи workspace-итераций | `min_repeated_failures: 3` |
-| Стагнация без прогресса | `min_stalled_iterations: 5` |
-| Низкий confidence retrieval по GMAS | `retrieval_confidence_threshold: 0.3` |
-
----
-
-Далее формальный гейт качества — [09-verification.md](09-verification.md).
+Next: [Part 9 — Verification](09-verification.md)

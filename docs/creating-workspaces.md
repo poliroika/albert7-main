@@ -1,45 +1,30 @@
-# Создание workspace
+# Creating Workspaces
 
-Workspace можно создать тремя способами: вручную как новый seed, программно как task-instance
-через Umbrella control plane, или операторскими скриптами из корня репозитория.
+Workspaces can be created in three ways: manually as a new seed, programmatically as a task-instance, or via the CLI runner.
 
-## Способ 1: новый seed workspace вручную
+## Method 1: New Seed Workspace (Manual)
 
-Seed workspace — это стабильный шаблон для класса задач. Создание нового seed сводится
-к пяти шагам.
+Creating a new seed is a five-step process.
 
-### Шаг 1. Скопировать структуру
+### Step 1. Copy the structure
 
-Возьмите существующий seed как образец. Канонический пример — `workspaces/agent_research/`:
+Use an existing seed as a template:
 
 ```powershell
-Copy-Item -Recurse workspaces\agent_research workspaces\my_workspace
+Copy-Item -Recurse workspaces\multi_agent_debate_graph workspaces\my_workspace
 ```
 
-Удалите из копии каталоги, генерируемые в рантайме (`runs/`, `snapshots/`, `reports/`,
-`memory/`, `logs/`, `instances/`), и файлы, специфичные для исходного seed
-(`instance_metadata.json`).
+Remove runtime-generated directories from the copy: `runs/`, `snapshots/`, `reports/`, `memory/`, `logs/`, `instances/`, and any `instance_metadata.json`.
 
-### Шаг 2. Заполнить workspace.toml
+### Step 2. Fill in workspace.toml
 
-Откройте `workspaces/my_workspace/workspace.toml` и замените метаданные:
+Open `workspaces/my_workspace/workspace.toml` and update the metadata:
 
 ```toml
 workspace_id = "my_workspace"
 name = "My Workspace"
-description = "Описание назначения workspace"
+description = "Description of the workspace purpose"
 task_main_file = "TASK_MAIN.md"
-graph_file = "graph/topology.toml"
-agents_dir = "agents"
-prompts_dir = "prompts"
-tools_allowlist_file = "tools/allowlist.toml"
-models_file = "models/models.toml"
-policies_file = "policies.toml"
-evals_dir = "evals"
-experiments_dir = "experiments"
-runs_dir = "runs"
-snapshots_dir = "snapshots"
-reports_dir = "reports"
 
 mutable_paths = [
     "graph", "agents", "prompts", "tools", "models",
@@ -53,66 +38,57 @@ engine_mutable = false
 notes = "Standalone workspace."
 ```
 
-Обязательные поля: `workspace_id`, `name`, `description`, `task_main_file`.
-Поле `metadata.engine = "gmas"` гарантирует, что workspace использует GMAS как фреймворк.
+Required fields: `workspace_id`, `name`, `description`, `task_main_file`.
 
-### Шаг 3. Написать TASK_MAIN.md
-
-Создайте `workspaces/my_workspace/TASK_MAIN.md` с описанием задачи:
+### Step 3. Write TASK_MAIN.md
 
 ```markdown
 # My Workspace
 
 ## Objective
-Что должен делать workspace — чёткая формулировка цели.
+What the workspace should do.
 
 ## Final Deliverable
-Какой артефакт workspace производит.
+What artifact the workspace produces.
 
 ## Success Criteria
-- Критерий 1
-- Критерий 2
+- Criterion 1
+- Criterion 2
 
 ## Constraints
-- Ограничение 1
+- Constraint 1
 ```
 
-Этот файл станет основным task brief для менеджера и рантайма.
+### Step 4. Register the seed
 
-### Шаг 4. Зарегистрировать seed
-
-Добавьте workspace в `workspaces/registry.toml`:
+Add the workspace to `workspaces/registry.toml`:
 
 ```toml
-seeds = ["agent_research", "world_prediction", "my_workspace"]
+seeds = ["multi_agent_debate_graph", "my_workspace"]
 ```
 
-При желании создайте `seed_profile.toml` с capabilities и selection hints, чтобы
-Umbrella мог автоматически выбирать workspace:
+Optionally create `seed_profile.toml` for automatic selection:
 
 ```toml
 name = "My Workspace"
 maturity = "experimental"
 primary_task_classes = ["my_task_class"]
-human_dependency_level = "low"
 
 [[capabilities]]
 name = "my_capability"
-description = "Что умеет workspace"
+description = "What the workspace does"
 weight = 1.0
 
 [selection_hints]
-task_classes = ["my_task_class"]
 keywords = ["keyword1", "keyword2"]
 ```
 
-### Шаг 5. Настроить граф агентов
+### Step 5. Configure the agent graph
 
-Опишите топологию в `graph/topology.toml`:
+Define the topology in `graph/topology.toml`:
 
 ```toml
 name = "my_graph"
-description = "Описание графа"
 start_node = "first_agent"
 end_node = "last_agent"
 agents = ["first_agent", "processor", "last_agent"]
@@ -128,11 +104,9 @@ target = "last_agent"
 weight = 1.0
 ```
 
-Для каждого агента создайте `.toml` в `agents/` и соответствующий промпт в `prompts/`.
+For each agent, create a `.toml` config in `agents/` and a corresponding prompt in `prompts/`.
 
-### Проверка
-
-Убедитесь, что workspace обнаруживается реестром:
+### Verification
 
 ```powershell
 uv run python -c "
@@ -144,29 +118,11 @@ print([w.workspace_id for w in found])
 "
 ```
 
-## Способ 2: task-instance через код (программный)
+## Method 2: Task-Instance via Code (Programmatic)
 
-Task-instance создаётся автоматически, когда Umbrella получает задачу. Вот как это работает
-внутри.
+Task-instances are created automatically when the PhaseRunner picks a workspace for a task.
 
-### Через ControlPlaneEngine
-
-Основной путь — через control plane. Когда менеджер выбрал workspace, вызывается
-`ControlPlaneEngine._handle_workspace_selected()` в `umbrella/control_plane/engine.py`:
-
-```python
-instance = create_task_instance(
-    seed_profile,
-    runtime_task_brief,
-    instances_root=self.workspaces_root / seed_profile.workspace_id / "instances",
-    task_id=task.id,
-    copy_seed_files=True,
-)
-```
-
-### Через create_task_instance напрямую
-
-Можно создать instance программно, без control plane:
+### Via create_task_instance directly
 
 ```python
 from pathlib import Path
@@ -174,24 +130,19 @@ from umbrella.workspace_registry.discovery import load_seed_profile
 from umbrella.workspace_registry.models import TaskBrief
 from umbrella.workspace_runtime.instances import create_task_instance
 
-seed = load_seed_profile(Path("workspaces/agent_research"))
+seed = load_seed_profile(Path("workspaces/multi_agent_debate_graph"))
 brief = TaskBrief(
-    description="Исследовать и написать техническую статью о transformer архитектурах",
-    task_id="task_transformers_article",
-    task_class="article_writing",
-    domains=["technology", "software_engineering"],
+    description="Solve a specific problem using multi-agent debate",
+    task_id="task_debate_001",
+    task_class="debate",
 )
 instance = create_task_instance(seed, brief, copy_seed_files=True)
 print(f"Instance path: {instance.path}")
 ```
 
-Результат: новая директория `workspaces/agent_research/instances/<id>_<timestamp>/`
-с копией seed, собственным `TASK_MAIN.md`, и пустыми `runs/`, `snapshots/`, `reports/`,
-`memory/`, `logs/`.
+Result: a new directory `workspaces/<seed_id>/instances/<id>_<timestamp>/` with a copy of the seed, its own `TASK_MAIN.md`, and empty `runs/`, `snapshots/`, `reports/`, `memory/`, `logs/`.
 
-### Через UmbrellaServices (полный стек)
-
-Для запуска полного цикла используйте `UmbrellaServices`:
+### Via UmbrellaServices
 
 ```python
 from pathlib import Path
@@ -203,65 +154,41 @@ services = UmbrellaServices(
     llm_model="anthropic/claude-sonnet-4-20250514",
     llm_api_key="sk-...",
 )
-
-cp = services.get_control_plane()
-# Control plane сам выберет workspace, создаст instance и запустит его
 ```
 
-## Способ 3: операторские скрипты
+The PhaseRunner handles workspace selection, instance creation, and the full phase lifecycle.
 
-### run_ouroboros_self_improve.py
-
-Главный скрипт непрерывного улучшения. Читает `TASK_MAIN.md` из workspace, рендерит
-промпт для Ouroboros и запускает цикл итераций:
-
-```powershell
-uv run python run_ouroboros_self_improve.py
-```
-
-Конфигурация через параметры `continuous_improvement_loop()`:
-
-| Параметр | По умолчанию | Назначение |
-|----------|-------------|------------|
-| `workspace_id` | `"agent_research"` | Целевой seed workspace |
-| `max_iterations` | `None` (без лимита) | Максимум итераций |
-| `quality_threshold` | `0.70` | Минимальный eval score для завершения |
-| `auto_promote` | `True` | Автоматический promotion в seed |
-| `max_budget_usd` | `None` | Бюджет в USD |
-| `timeout_hours` | `24.0` | Таймаут в часах |
-
-После каждой успешной итерации скрипт пытается promote изменённые файлы из instance
-обратно в seed (если `auto_promote=True`).
+## Method 3: CLI Runner
 
 ### umbrella/app_ouroboros.py
 
-Актуальный single-run entrypoint в Ouroboros-first модели:
+The current single-run entrypoint:
 
 ```powershell
-uv run python umbrella\app_ouroboros.py workspaces\agent_research
+uv run python umbrella/app_ouroboros.py workspaces/<workspace_id> --live --verbose --max-verify-retries 3
 ```
 
-Скрипт собирает workspace mission из `TASK_MAIN.md` и запускает
-итерацию Ouroboros через инструменты Umbrella.
+The script reads the workspace's `TASK_MAIN.md`, builds a mission prompt, and runs the PhaseRunner through the full phase lifecycle.
 
-### Legacy entrypoint
+Key flags: `--task`, `--task-file`, `--timeout-hours`, `--max-budget`, `--max-rounds`, `--mock`, `--no-verify`, `--verification-timeout-seconds`, `--allow-seed-writes`.
 
-`run_continuous_improvement.py` был удалён как часть
-verification-loop-интеграции. Используйте Ouroboros-first entrypoints:
-`umbrella/app_ouroboros.py` для одиночного прогона и
-`run_ouroboros_self_improve.py` для непрерывного цикла с verification-гейтом.
+### Web Bridge
 
-## Проверка окружения
-
-Перед созданием workspace убедитесь, что тесты проходят:
+Start the operator UI and run workspaces through the web interface:
 
 ```powershell
-# Все тесты
+cd web && yarn install && yarn build && cd ..
+uv run bridge
+```
+
+Open `http://127.0.0.1:8765`, navigate to the Chat page, select a workspace, and start a run. The UI shows the PhasePlan, timeline, agent requests, and final report.
+
+## Environment Check
+
+Before creating workspaces, verify that tests pass:
+
+```powershell
 uv run pytest -q umbrella/tests
-
-# Тест реестра
 uv run pytest -q umbrella/tests/test_workspace_registry.py
-
-# Тест рантайма
 uv run pytest -q umbrella/tests/test_workspace_runtime.py
 ```

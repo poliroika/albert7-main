@@ -2,6 +2,7 @@
 name: Strict_Verification_Sync
 status: candidate
 domains: ["workflow_orchestration", "debugging"]
+phases: ["execute", "verify", "subtask_review"]
 when_to_use: "Immediately after executing shell commands or test suites that determine task completion."
 params: [{"name": "success_exit_codes", "description": "A list of integers (e.g., [0]) that define a successful execution state."}]
 created_by: reflection

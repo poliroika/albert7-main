@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from http.client import HTTPConnection
 from pathlib import Path
@@ -35,6 +36,19 @@ def _get_json(host: str, port: int, path: str) -> tuple[int, object]:
     conn.close()
     data = json.loads(body) if body else None
     return r.status, data
+
+
+def test_web_phase_defaults_enable_no_key_web_fallback(monkeypatch, tmp_path):
+    app = WebBridgeApp(tmp_path)
+    for name in app._FAST_SEARCH_PROVIDER_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("OUROBOROS_DEEP_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK", raising=False)
+    monkeypatch.delenv("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO", raising=False)
+
+    app._ensure_web_discovery_defaults()
+
+    assert os.environ["OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK"] == "1"
 
 
 def test_health_and_workspaces(httpd: int) -> None:
@@ -75,6 +89,67 @@ def test_get_settings_repo_dotenv_overrides_stale_shell_model(
     assert models[0]["id"] == "GLM-from-file"
 
 
+def test_web_phase_defaults_use_documented_ouroboros_round_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OUROBOROS_MAX_ROUNDS", raising=False)
+    with patch("umbrella.web_bridge.app.load_env"):
+        app = WebBridgeApp(tmp_path)
+
+    assert app._current_max_rounds() == 200
+
+
+def test_phase_runner_worker_applies_web_round_and_verify_limits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, str | None] = {}
+
+    class FakePhaseRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, task_text, *, run_id):
+            captured["max_rounds"] = os.environ.get("OUROBOROS_MAX_ROUNDS")
+            captured["verify_retries"] = os.environ.get(
+                "OUROBOROS_WEB_MAX_VERIFY_RETRIES"
+            )
+            return []
+
+    monkeypatch.setattr("umbrella.orchestrator.runner.PhaseRunner", FakePhaseRunner)
+    monkeypatch.setattr(WebBridgeApp, "_upsert_web_run", lambda self, rid, patch: {})
+    monkeypatch.setattr(
+        WebBridgeApp,
+        "_run_log_summary",
+        lambda self, ws_id, run_id: {"tools_used": [], "llm_rounds": 0},
+    )
+    monkeypatch.setattr(WebBridgeApp, "_clear_stop_requests", lambda self, ws_id: None)
+    monkeypatch.setattr(
+        WebBridgeApp, "_stop_was_requested", lambda self, run_id, ws_id: False
+    )
+    monkeypatch.setattr(
+        WebBridgeApp,
+        "_append_thread_finalize_message",
+        lambda self, thread_id, run_id, final_run: None,
+    )
+    monkeypatch.delenv("OUROBOROS_MAX_ROUNDS", raising=False)
+    monkeypatch.delenv("OUROBOROS_WEB_MAX_VERIFY_RETRIES", raising=False)
+    app = WebBridgeApp(tmp_path)
+
+    app._run_phase_runner_worker(
+        "run-limits",
+        "ws-limits",
+        "build project",
+        "GLM-test",
+        1,
+        240,
+        12,
+    )
+
+    assert captured == {"max_rounds": "240", "verify_retries": "12"}
+    assert os.environ.get("OUROBOROS_MAX_ROUNDS") is None
+    assert os.environ.get("OUROBOROS_WEB_MAX_VERIFY_RETRIES") is None
+
+
 def test_cancel_run_writes_workspace_drive_stop_file(tmp_path) -> None:
     repo = tmp_path
     (repo / "workspaces" / "ws_cancel" / ".memory" / "drive" / "state").mkdir(
@@ -109,6 +184,34 @@ def test_cancel_run_writes_workspace_drive_stop_file(tmp_path) -> None:
     assert stop_path.is_file()
     payload = json.loads(stop_path.read_text(encoding="utf-8"))
     assert payload.get("run_id") == "ui_run_testcancel"
+
+
+def test_detached_cancelled_worker_still_blocks_new_workspace_run(tmp_path) -> None:
+    repo = tmp_path
+    (repo / "workspaces" / "ws_busy").mkdir(parents=True)
+    app = WebBridgeApp(repo)
+    stop = threading.Event()
+    worker = threading.Thread(target=stop.wait, daemon=True)
+    worker.start()
+    app._run_threads["run_old"] = worker
+    app._upsert_web_run(
+        "run_old",
+        {
+            "id": "run_old",
+            "workspace_id": "ws_busy",
+            "status": "cancelled",
+            "result_preview": "detached but still draining",
+        },
+    )
+
+    active = app._active_run_for_workspace("ws_busy")
+
+    stop.set()
+    worker.join(timeout=2)
+    assert active is not None
+    assert active["id"] == "run_old"
+    assert active["status"] == "stopping"
+    assert active["detached_worker_alive"] is True
 
 
 def test_delete_run_removes_task_result_json(tmp_path) -> None:
@@ -217,6 +320,53 @@ def test_delete_thread_detaches_still_stopping_run(tmp_path) -> None:
     assert out.get("ok") is True
     assert out.get("detached_run_ids") == [run_id]
     assert saved["threads.json"] == []
+
+
+def test_phase_task_ids_match_parent_run_for_log_summaries(tmp_path) -> None:
+    app = WebBridgeApp(tmp_path)
+    assert app._task_id_matches_run("phase_web_abc:preflight", "phase_web_abc")
+    assert app._task_id_matches_run(
+        "phase_web_abc__a2:execute",
+        "phase_web_abc",
+        {"phase_web_abc__a2"},
+    )
+
+
+def test_run_log_summary_counts_phase_runner_rounds(tmp_path) -> None:
+    repo = tmp_path
+    ws = "ws_phase_logs"
+    run_id = "phase_web_live"
+    drive = repo / "workspaces" / ws / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    (drive / "logs" / "round_io.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": f"{run_id}:preflight",
+                "model": "GLM-test",
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (drive / "logs" / "tools.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": f"{run_id}:preflight",
+                "tool": "submit_preflight_report",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    app = WebBridgeApp(repo)
+    summary = app._run_log_summary(ws, run_id)
+    assert summary["llm_rounds"] == 1
+    assert summary["prompt_tokens"] == 11
+    assert summary["completion_tokens"] == 7
+    assert summary["models"] == ["GLM-test"]
+    assert summary["tools_used"] == ["submit_preflight_report"]
 
 
 def test_list_memory_nodes_matches_memory_graph_contract(tmp_path) -> None:
@@ -429,54 +579,6 @@ def test_delete_memory_node_unknown_type_returns_reason(tmp_path) -> None:
     assert out.get("reason") == "node_type_not_deletable"
 
 
-def test_start_workspace_run_uses_harness_worker_when_harness_mode(
-    tmp_path, monkeypatch
-) -> None:
-    repo = tmp_path
-    ws = "ws_harness"
-    workspace_dir = repo / "workspaces" / ws
-    workspace_dir.mkdir(parents=True)
-    (workspace_dir / "TASK_MAIN.md").write_text("# task", encoding="utf-8")
-    (workspace_dir / "workspace.toml").write_text(
-        f'[workspace]\nid = "{ws}"\nname = "test"\nlanguage = "python"\n',
-        encoding="utf-8",
-    )
-
-    app = WebBridgeApp(repo)
-
-    started_workers: list[str] = []
-
-    def fake_harness_worker(*args, **kwargs):
-        started_workers.append("harness")
-
-    def fake_default_worker(*args, **kwargs):
-        started_workers.append("default")
-
-    monkeypatch.setattr(app, "_run_harness_worker", fake_harness_worker)
-    monkeypatch.setattr(app, "_run_ouroboros_worker", fake_default_worker)
-    with (
-        patch("umbrella.web_bridge.app.load_store", return_value={}),
-        patch("umbrella.web_bridge.app.save_store"),
-    ):
-        run = app.start_workspace_run(
-            {
-                "workspace_id": ws,
-                "harness_mode": True,
-                "harness_candidates": 3,
-            }
-        )
-
-    assert run["mode"] == "harness"
-    assert run["id"].startswith("harness_web_")
-    assert run.get("harness_meta", {}).get("candidates") == 3
-    # Wait for daemon worker thread to finish (it just records into a list).
-    worker = app._run_threads.get(run["id"])
-    if worker is not None:
-        worker.join(timeout=2)
-    assert "harness" in started_workers
-    assert "default" not in started_workers
-
-
 def test_cancel_run_propagates_to_harness_candidate_run_ids(tmp_path) -> None:
     repo = tmp_path
     ws = "ws_h_cancel"
@@ -547,7 +649,12 @@ def test_run_steps_and_logs_include_preflight_and_terminal_scrollback(tmp_path) 
         + "\n",
         encoding="utf-8",
     )
-    terminal_path.write_text("terminal line one\nterminal line two\n", encoding="utf-8")
+    terminal_path.write_text(
+        "## ws=ws_logs task=sync_improve_web_logs run=sync_improve_web_logs "
+        "ts=2026-05-08T00:00:02Z exit=0 backend=test\n"
+        "terminal line one\nterminal line two\n",
+        encoding="utf-8",
+    )
     app = WebBridgeApp(repo)
     app._upsert_web_run(
         run_id,
@@ -750,48 +857,6 @@ def test_cleanup_task_id_matches_handles_remediation_descendants() -> None:
     assert not _task_id_matches_run("other_run__remediation_1", rid, set())
 
 
-def test_delete_run_wipes_run_quality_and_meta_harness_workspace(tmp_path) -> None:
-    repo = tmp_path
-    ws = "ws_full_clean"
-    workspace_memory = repo / "workspaces" / ws / ".memory"
-    (workspace_memory / "drive" / "task_results").mkdir(parents=True)
-    rid = "sync_improve_web_clean1"
-    (workspace_memory / "drive" / "task_results" / f"{rid}.json").write_text(
-        json.dumps({"task_id": rid, "status": "completed"}), encoding="utf-8"
-    )
-    rq_path = workspace_memory / "drive" / "task_results" / "run_quality.json"
-    rq_path.write_text(json.dumps({"task_id": rid, "rounds": 5}), encoding="utf-8")
-
-    meta_ws_dir = repo / ".umbrella" / "meta_harness" / "workspaces" / f"{rid}__s1__c1"
-    meta_ws_dir.mkdir(parents=True)
-    (meta_ws_dir / "marker.txt").write_text("x", encoding="utf-8")
-
-    other_meta_ws = (
-        repo / ".umbrella" / "meta_harness" / "workspaces" / "other_run__s1__c1"
-    )
-    other_meta_ws.mkdir(parents=True)
-    (other_meta_ws / "marker.txt").write_text("keep", encoding="utf-8")
-
-    lessons_path = repo / ".umbrella" / "memory" / "lessons.jsonl"
-    lessons_path.parent.mkdir(parents=True, exist_ok=True)
-    lessons_path.write_text(
-        json.dumps({"id": "L1", "task_id": "unrelated", "text": "keep me"}) + "\n",
-        encoding="utf-8",
-    )
-
-    app = WebBridgeApp(repo)
-    out = app.delete_run(rid, ws)
-    assert out.get("ok") is True
-    assert not rq_path.exists()
-    assert not meta_ws_dir.exists()
-    assert other_meta_ws.exists(), (
-        "delete must not touch unrelated meta_harness workspaces"
-    )
-    assert lessons_path.exists(), "moderate Delete must keep long-term lessons memory"
-    remaining = lessons_path.read_text(encoding="utf-8")
-    assert "keep me" in remaining
-
-
 def test_cancel_run_calls_orchestrator_cancel_when_registered(tmp_path) -> None:
     repo = tmp_path
     ws = "ws_h_cancel_orch"
@@ -855,194 +920,6 @@ def test_cancel_run_accepts_wait_and_force_after(tmp_path) -> None:
     assert "stop_method" in out
 
 
-def test_normalize_final_message_returns_russian_structured_summary() -> None:
-    """The web UI must always show a Russian structured report with
-    sections "Что сделано / Где проблемы / Что осталось" — regardless
-    of what the last LLM turn happened to print.
-    """
-    from umbrella.control_plane.ouroboros_integration import (
-        _normalize_final_message_for_status,
-    )
-
-    llm_empty = (
-        "⚠️ Failed to get a response from model GLM-4.7 after 3 attempts. "
-        "All fallback models match the active one. Try rephrasing your request."
-    )
-
-    out_ok = _normalize_final_message_for_status(
-        final_status="verified",
-        final_message=llm_empty,
-        verification_payload={"summary": "Verification: PASS (12/12)"},
-        changes_made=["src/main.py", "tests/test_main.py"],
-        remediation_attempts_used=2,
-    )
-    assert "## Готово (верификация пройдена)" in out_ok
-    assert "### Что сделано" in out_ok
-    assert "### Где проблемы" in out_ok
-    assert "### Что осталось" in out_ok
-    assert "src/main.py" in out_ok
-    assert "Циклов self-verify" in out_ok
-    # The empty LLM warning must be suppressed in the structured summary.
-    assert "Failed to get a response from model" not in out_ok
-
-    out_fail = _normalize_final_message_for_status(
-        final_status="failed_verification",
-        final_message="agent said it's done",
-        verification_payload={
-            "summary": "Verification: FAIL",
-            "results": [
-                {
-                    "name": "tests::pytest_smoke",
-                    "kind": "command",
-                    "status": "failed",
-                    "summary": "ImportError: No module named src.config",
-                    "optional": False,
-                },
-                {
-                    "name": "lint",
-                    "kind": "command",
-                    "status": "passed",
-                    "optional": False,
-                },
-            ],
-        },
-        changes_made=["src/agents.py"],
-    )
-    assert "## Не пройдена верификация" in out_fail
-    assert "### Где проблемы" in out_fail
-    assert "tests::pytest_smoke" in out_fail
-    # passed checks must NOT appear in "Где проблемы"
-    assert "lint" not in out_fail.split("### Что осталось")[0]
-    assert "verification_failure_context.md" in out_fail
-
-
-def test_normalize_final_message_explains_skipped_verification_in_russian() -> None:
-    """When a workspace has no ``[verification]`` spec the run finishes
-    as ``failed_verification`` with a ``verification_skipped_no_spec``
-    warning. The Russian summary must explain that verification did NOT
-    run and tell the agent/operator how to add a spec.
-    """
-    from umbrella.control_plane.ouroboros_integration import (
-        _normalize_final_message_for_status,
-    )
-
-    out = _normalize_final_message_for_status(
-        final_status="failed_verification",
-        final_message="agent said it's done",
-        verification_payload={
-            "summary": "No verification steps declared or auto-detected.",
-            "skipped": True,
-            "passed": False,
-            "results": [],
-        },
-        completion_warnings=["verification_skipped_no_spec"],
-        changes_made=["docs/news_cards.docx"],
-    )
-    assert "## Не пройдена верификация" in out
-    assert "Верификация не запускалась" in out
-    assert "[verification]" in out
-    assert "workspace.toml" in out
-    # Must NOT also dump the raw cosmetic warning code as a bullet —
-    # the explanatory paragraph already covers it.
-    assert "verification_skipped_no_spec" not in out
-    # Must still list what was changed.
-    assert "docs/news_cards.docx" in out
-
-
-def test_remediation_archives_cached_plan_so_planner_runs_again(tmp_path) -> None:
-    """End-to-end pin: when the remediation loop re-submits the SAME
-    ``task_id``, it MUST archive the cached completed plan first.
-
-    Without this archival step, ``plan_store.load(task_id)`` finds the
-    previous attempt's plan with every subtask marked ``done`` →
-    ``plan.is_complete()`` short-circuits the subtask phase → the loop
-    drops straight into ``final_aggregation`` with ``tool_schemas=[]``
-    and the model gets the failure context but **cannot call any
-    tool to fix it**. Symptom in production: every remediation cycle
-    has ``tool_calls=0`` and ``workspace_write_tools=0`` while the
-    same 3 verification checks keep failing, then the run ends as
-    ``failed`` after exhausting all 8 attempts.
-
-    This test calls ``_archive_plan_before_remediation`` directly and
-    verifies it actually moves the plan file aside, so a future
-    refactor cannot silently re-introduce the regression.
-    """
-    from umbrella.control_plane.ouroboros_integration import (
-        _archive_plan_before_remediation,
-    )
-    from ouroboros.task_planner import TaskPlanStore
-
-    repo_root = tmp_path / "repo"
-    workspace_id = "demo_ws"
-    drive_root = repo_root / "workspaces" / workspace_id / ".memory" / "drive"
-    drive_root.mkdir(parents=True)
-    store = TaskPlanStore(drive_root)
-    store.create_from_steps(
-        task_id="task_remed",
-        workspace_id=workspace_id,
-        objective_digest="initial work",
-        steps=[
-            {"title": "do thing", "description": "...", "success_check": "ok"},
-        ],
-    )
-    plan_path = drive_root / "task_plans" / "task_remed.json"
-    assert plan_path.exists(), "test setup: plan must exist before archive"
-
-    _archive_plan_before_remediation(
-        repo_root=repo_root,
-        workspace_id=workspace_id,
-        task_id="task_remed",
-        attempt=1,
-    )
-
-    assert not plan_path.exists(), (
-        "Live plan must be moved aside so the next planner pass runs "
-        "on the new remediation prompt instead of seeing a 'completed' "
-        "plan and skipping straight to final_aggregation"
-    )
-    assert store.load("task_remed") is None, (
-        "After archive, store.load() MUST return None — otherwise "
-        "loop.py will short-circuit the subtask phase and the model "
-        "will not get any tool calls during remediation"
-    )
-
-    archived = list(
-        (drive_root / "task_plans").glob("task_remed.before_remediation_1.*.json")
-    )
-    assert len(archived) == 1, (
-        f"Expected exactly one archived copy named "
-        f"task_remed.before_remediation_1.*.json, found: {archived}"
-    )
-    body = json.loads(archived[0].read_text(encoding="utf-8"))
-    assert body["task_id"] == "task_remed"
-    assert body["objective_digest"] == "initial work"
-
-
-def test_remediation_keeps_same_task_id_no_child_run_split() -> None:
-    """Verification remediation must not append ``__remediation_N`` to the
-    task id. The whole fix-verify-fix cycle stays under the parent
-    ``task_id`` so the UI shows ONE row and the round counter / events
-    remain attached to the original run.
-
-    We pin this contract by source inspection: the integration test of
-    the full launcher loop is too heavy and brittle, but the loss-of-id
-    bug is a single line change that the code must keep.
-    """
-    src = Path("umbrella/control_plane/ouroboros_integration.py").read_text(
-        encoding="utf-8",
-    )
-    # The new contract: ``current_task_id = base_task_id``. The previous
-    # bug was ``f"{base_task_id}__remediation_{remediation_attempts_used}"``.
-    assert "current_task_id = base_task_id" in src, (
-        "Remediation must reuse the parent task_id; "
-        "do NOT append __remediation_N or the run will visually split."
-    )
-    assert 'f"{base_task_id}__remediation_{remediation_attempts_used}"' not in src, (
-        "Found legacy __remediation_N suffix — this resurrects the "
-        "fragmented-runs UI bug. Remove it."
-    )
-
-
 def test_agent_writes_active_model_into_task_result(tmp_path, monkeypatch) -> None:
     """``agent.py`` must persist ``model`` in ``task_results/<id>.json``.
 
@@ -1075,7 +952,9 @@ def test_agent_writes_active_model_into_task_result(tmp_path, monkeypatch) -> No
         "model": active_model or None,
         "ts": "2026-05-08T00:00:00+00:00",
     }
-    out_path = drive_root / "task_results" / f"{task['id']}.json"
+    from umbrella.artifacts.task_ids import task_artifact_stem
+
+    out_path = drive_root / "task_results" / f"{task_artifact_stem(task['id'])}.json"
     out_path.write_text(json.dumps(result_data), encoding="utf-8")
 
     payload = json.loads(out_path.read_text(encoding="utf-8"))
@@ -1308,98 +1187,6 @@ def test_remediation_prompt_injects_recalled_lessons(tmp_path) -> None:
     assert "## Past Lessons" in text
     assert "Skip lesson files" in text
     assert "exclude record_verification_lessons.py" in text
-
-
-def test_verification_spec_is_shallow_detects_only_static_steps() -> None:
-    """A spec with only ``import_check`` / ``file_exists`` is shallow;
-    adding even one ``shell`` step makes it non-shallow."""
-    from umbrella.control_plane.ouroboros_integration import (
-        _verification_spec_is_shallow,
-    )
-
-    shallow = {
-        "results": [
-            {"name": "imports", "kind": "import_check", "status": "passed"},
-            {"name": "file", "kind": "file_exists", "status": "passed"},
-        ],
-    }
-    non_shallow = {
-        "results": [
-            {"name": "imports", "kind": "import_check", "status": "passed"},
-            {"name": "tests", "kind": "shell", "status": "passed"},
-        ],
-    }
-    assert _verification_spec_is_shallow(shallow) is True
-    assert _verification_spec_is_shallow(non_shallow) is False
-    # Empty / failed-only specs are NOT shallow (caller wants
-    # ``promote`` blocked for a different reason in those cases).
-    assert _verification_spec_is_shallow({"results": []}) is False
-    assert _verification_spec_is_shallow(None) is False
-
-
-def test_workspace_allows_shallow_promotion_reads_toml(tmp_path) -> None:
-    """Opt-in via ``[promotion] allow_shallow_verification`` only."""
-    from umbrella.control_plane.ouroboros_integration import (
-        _workspace_allows_shallow_promotion,
-    )
-
-    repo = tmp_path
-    ws = "ws_promote"
-    ws_dir = repo / "workspaces" / ws
-    ws_dir.mkdir(parents=True)
-    assert _workspace_allows_shallow_promotion(repo, ws) is False
-    (ws_dir / "workspace.toml").write_text(
-        "[promotion]\nallow_shallow_verification = true\n",
-        encoding="utf-8",
-    )
-    assert _workspace_allows_shallow_promotion(repo, ws) is True
-
-
-def test_normalize_final_message_includes_how_to_run_when_verified(tmp_path) -> None:
-    """For verified runs with writes, the Russian summary must include
-    ``### Что реализовано``, ``### Идея решения`` (if a plan exists)
-    and ``### Как запустить`` (if a README has a usage block)."""
-    from umbrella.control_plane.ouroboros_integration import (
-        _normalize_final_message_for_status,
-    )
-
-    repo = tmp_path
-    ws = "ws_human"
-    ws_dir = repo / "workspaces" / ws
-    ws_dir.mkdir(parents=True)
-    (ws_dir / "README.md").write_text(
-        "# Demo\n\n## Usage\n\n```bash\npython main.py --serve\n```\n",
-        encoding="utf-8",
-    )
-    plan_dir = ws_dir / ".memory" / "drive" / "task_plans"
-    plan_dir.mkdir(parents=True)
-    (plan_dir / "task_xyz.json").write_text(
-        json.dumps(
-            {
-                "subtasks": [
-                    {"title": "Build CLI entrypoint", "status": "done"},
-                    {"title": "Write smoke test", "status": "done"},
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    text = _normalize_final_message_for_status(
-        final_status="verified",
-        final_message="ok",
-        verification_payload={"passed": True, "results": []},
-        completion_warnings=[],
-        changes_made=["main.py", "README.md"],
-        remediation_attempts_used=0,
-        repo_root=repo,
-        workspace_id=ws,
-        base_task_id="task_xyz",
-    )
-    assert "### Что реализовано" in text
-    assert "### Идея решения" in text
-    assert "### Как запустить" in text
-    assert "python main.py --serve" in text
 
 
 def test_read_workspace_file_cache_hits_on_unchanged_mtime(
@@ -1801,617 +1588,6 @@ def test_parse_self_review_response_handles_lgtm_needs_fix_and_ambiguous() -> No
     assert "did not start with LGTM or NEEDS_FIX" in body
 
 
-def test_self_review_remediation_prompt_embeds_fixlist() -> None:
-    """The self-review-driven remediation prompt must surface the
-    agent's own fixlist verbatim (no ``failing checks`` block — the
-    spec already passed)."""
-    from umbrella.control_plane.ouroboros_integration import (
-        _render_self_review_remediation_prompt,
-    )
-
-    text = _render_self_review_remediation_prompt(
-        original_task="Build a CLI",
-        fixlist_body="1. Parser broken at news/parser.py:42\n2. Empty stdout",
-        attempt=1,
-        max_attempts=3,
-    )
-    assert "Self-Review Remediation" in text
-    assert "Parser broken at news/parser.py:42" in text
-    assert "Empty stdout" in text
-    assert "Failing Required Checks" not in text
-
-
-def test_self_review_already_run_in_aggregate_detects_marker() -> None:
-    from umbrella.control_plane.ouroboros_integration import (
-        _self_review_already_run_in_aggregate,
-    )
-
-    assert _self_review_already_run_in_aggregate([]) is False
-    assert (
-        _self_review_already_run_in_aggregate(
-            [
-                {"type": "task_metrics"},
-                {"type": "self_review_started"},
-            ]
-        )
-        is True
-    )
-    assert (
-        _self_review_already_run_in_aggregate(
-            [
-                {"type": "remediation_started"},
-            ]
-        )
-        is False
-    )
-
-
-# ---------------------------------------------------------------------------
-# Stop-signal regression tests
-# ---------------------------------------------------------------------------
-#
-# Background: the user clicked Stop in the dashboard partway through a
-# run. The stop file was correctly written to
-# ``workspaces/<id>/.memory/drive/state/stop_requested.json``. The first
-# ``_check_stop_requested`` inside the LLM loop fired and returned
-# ``"Stop requested by dashboard: …"`` to the integration. But the
-# integration then ran verification, found no writes / failed checks,
-# and entered the remediation cycle. Each subsequent remediation
-# submission ALSO hit ``_check_stop_requested`` immediately (same
-# task_id), exited in <1 s with 0 LLM rounds, and the loop kept
-# spinning until the user wandered off. The fix below adds a
-# launch-time stale-stop sweep + per-iteration stop check + agent
-# response sniffing so a click on Stop is honoured exactly once and
-# the remediation budget is never burned on a cancelled run.
-
-
-def test_stop_request_targets_task_matches_run_id_and_descendants() -> None:
-    from umbrella.control_plane.ouroboros_integration import (
-        _stop_request_targets_task,
-    )
-
-    payload = {
-        "run_id": "task_42",
-        "task_id": "task_42",
-        "attempt_task_ids": ["task_42", "task_42__attempt_2"],
-    }
-    assert _stop_request_targets_task(payload, "task_42") is True
-    assert _stop_request_targets_task(payload, "task_42__attempt_2") is True
-    # ``task_42__remediation_1`` shares the ``task_42__`` prefix so it
-    # IS treated as a descendant of task_42 — stopping task_42 must also
-    # stop its remediation/self-review children.
-    assert _stop_request_targets_task(payload, "task_42__remediation_1") is True
-    assert _stop_request_targets_task(payload, "task_42_extra") is False, (
-        "Match only on exact id or ``id__`` prefix — sharing a literal "
-        "substring is not enough."
-    )
-    assert _stop_request_targets_task(payload, "other_task") is False
-    # Empty payload is treated as a global stop (legacy semantics).
-    assert _stop_request_targets_task({}, "task_42") is True
-    assert _stop_request_targets_task(None, "task_42") is True
-
-
-def test_clear_stop_requests_for_task_only_drops_matching_payloads(
-    tmp_path,
-) -> None:
-    """A new run id MUST NOT silently cancel a different running run by
-    deleting its stop file. We only clear stop files whose payload
-    targets OUR new task id."""
-    from umbrella.control_plane.ouroboros_integration import (
-        _clear_stop_requests_for_task,
-        _stop_request_paths,
-    )
-
-    repo_root = tmp_path / "repo"
-    workspace_id = "demo_ws"
-    drive_root = repo_root / "workspaces" / workspace_id / ".memory" / "drive"
-    drive_root.mkdir(parents=True)
-    (repo_root / ".umbrella" / "launcher").mkdir(parents=True, exist_ok=True)
-    (repo_root / ".umbrella" / "ouroboros_drive" / "state").mkdir(
-        parents=True, exist_ok=True
-    )
-    (drive_root / "state").mkdir(parents=True, exist_ok=True)
-
-    # File A: targets the new task id — must be removed
-    (drive_root / "state" / "stop_requested.json").write_text(
-        json.dumps({"run_id": "fresh_task", "task_id": "fresh_task"}),
-        encoding="utf-8",
-    )
-    # File B: targets a different running run — must SURVIVE
-    (repo_root / ".umbrella" / "launcher" / "stop_requested.json").write_text(
-        json.dumps({"run_id": "other_run", "task_id": "other_run"}),
-        encoding="utf-8",
-    )
-
-    _clear_stop_requests_for_task(repo_root, workspace_id, "fresh_task")
-
-    assert not (drive_root / "state" / "stop_requested.json").exists(), (
-        "Stale stop file targeting our task id must be deleted on "
-        "fresh launch — otherwise the in-loop stop check fires "
-        "instantly and the run dies before doing any work."
-    )
-    assert (repo_root / ".umbrella" / "launcher" / "stop_requested.json").exists(), (
-        "Stop file for an unrelated run must be left alone."
-    )
-    # And _stop_request_paths must include all three locations.
-    paths = {p.name for p in _stop_request_paths(repo_root, workspace_id)}
-    assert paths == {"stop_requested.json"}  # all three files share the name
-
-
-def test_read_stop_request_for_task_returns_payload_when_targeted(tmp_path) -> None:
-    from umbrella.control_plane.ouroboros_integration import (
-        _read_stop_request_for_task,
-    )
-
-    repo_root = tmp_path / "repo"
-    workspace_id = "ws_read"
-    state_dir = repo_root / "workspaces" / workspace_id / ".memory" / "drive" / "state"
-    state_dir.mkdir(parents=True)
-    payload = {
-        "run_id": "task_99",
-        "task_id": "task_99",
-        "reason": "user clicked stop",
-    }
-    (state_dir / "stop_requested.json").write_text(
-        json.dumps(payload),
-        encoding="utf-8",
-    )
-    found = _read_stop_request_for_task(repo_root, workspace_id, "task_99")
-    assert isinstance(found, dict)
-    assert found["reason"] == "user clicked stop"
-
-    not_found = _read_stop_request_for_task(repo_root, workspace_id, "task_xx")
-    assert not_found is None
-
-
-def test_final_message_indicates_stop_detects_loop_response() -> None:
-    from umbrella.control_plane.ouroboros_integration import (
-        _final_message_indicates_stop,
-    )
-
-    assert (
-        _final_message_indicates_stop(
-            "Stop requested by dashboard: stop requested from the web UI"
-        )
-        is True
-    )
-    assert (
-        _final_message_indicates_stop("  Stop requested by dashboard: x  \n\nmore text")
-        is True
-    )
-    assert _final_message_indicates_stop("Some normal final message.") is False
-    assert _final_message_indicates_stop("") is False
-    assert _final_message_indicates_stop(None) is False
-
-
-def test_build_cancellation_message_renders_russian_summary() -> None:
-    from umbrella.control_plane.ouroboros_integration import (
-        _build_cancellation_message,
-    )
-
-    text = _build_cancellation_message(
-        stop_payload={"reason": "пользователь нажал стоп"},
-        remediation_attempts_used=2,
-        final_message_from_agent="Stop requested by dashboard: stop requested",
-    )
-    assert "Run остановлен пользователем" in text
-    assert text.lstrip().startswith("# Run"), (
-        "First line must be a markdown heading so the UI renders it big"
-    )
-    assert "пользователь нажал стоп" in text
-    assert "Использованных циклов remediation до остановки: `2`" in text
-    # The agent's loop-side stop reply must NOT be re-quoted (it would
-    # be circular — that prefix is the stop signal itself).
-    assert "Stop requested by dashboard" not in text
-
-
-def test_normalize_final_message_for_cancelled_status_short_circuits(
-    tmp_path,
-) -> None:
-    """For ``cancelled`` status the summary must be the cancellation
-    explanation, not the verification post-mortem (verification was
-    never the deciding gate — the user was)."""
-    from umbrella.control_plane.ouroboros_integration import (
-        _normalize_final_message_for_status,
-    )
-
-    text = _normalize_final_message_for_status(
-        final_status="cancelled",
-        final_message="# Run остановлен пользователем\nПричина: stop from web UI.",
-        verification_payload={
-            "passed": False,
-            "results": [{"name": "smoke", "status": "failed", "kind": "shell"}],
-        },
-        completion_warnings=["cancelled_by_user"],
-        changes_made=["workspaces/demo/main.py"],
-        remediation_attempts_used=1,
-        repo_root=tmp_path,
-        workspace_id="demo",
-        base_task_id="task_x",
-    )
-    assert "Остановлено пользователем" in text
-    assert "main.py" in text, "partial writes must be surfaced for review"
-    # Verification post-mortem must not leak into a cancelled summary —
-    # otherwise the user sees a misleading "Не пройдена верификация"
-    # block for a run they themselves killed.
-    assert "Где проблемы" not in text
-    assert "Что осталось" not in text
-    assert "smoke" not in text
-
-
-def test_run_ouroboros_improvement_sync_breaks_on_stop_request_mid_loop(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    """End-to-end pin for the actual remediation-spin bug: when the user
-    clicks Stop AFTER a run has already submitted its first iteration,
-    the next iteration's pre-flight stop check must abort the loop
-    before submitting another wasteful task. We simulate this by
-    writing the stop file from inside the launcher fake (i.e. the user
-    clicks Stop while iteration N is running) and asserting that
-    iteration N+1 never reaches the launcher."""
-    import umbrella.control_plane.ouroboros_integration as integ
-
-    repo_root = tmp_path / "repo"
-    workspace_id = "ws_demo"
-    drive_root = repo_root / "workspaces" / workspace_id / ".memory" / "drive"
-    drive_root.mkdir(parents=True)
-    (drive_root / "state").mkdir(parents=True, exist_ok=True)
-
-    submit_calls: list[dict] = []
-
-    def fake_run_launcher_task_once(*, repo_root, task, timeout_seconds):
-        submit_calls.append(dict(task))
-        # First call: produce a verification-failing result and "user
-        # clicks Stop right now" by writing the stop file. The second
-        # iteration of the integration loop must observe it and abort
-        # without ever calling us again.
-        if len(submit_calls) == 1:
-            (drive_root / "state" / "stop_requested.json").write_text(
-                json.dumps(
-                    {
-                        "run_id": "task_mid",
-                        "task_id": "task_mid",
-                        "reason": "user clicked stop",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return task["id"], {
-                "status": "failed_verification",
-                "task_id": task["id"],
-                "events": [
-                    {"type": "send_message", "text": "Some partial work."},
-                    {"type": "task_metrics", "tool_calls": 5},
-                    {"type": "workspace_write_tools", "count": 1},
-                ],
-                "candidate_diff": "",
-                "candidate_changed_files": ["workspaces/ws_demo/main.py"],
-            }
-        # Should never get here — fail loudly if we do.
-        raise AssertionError(
-            "Integration submitted iteration 2 even though the stop "
-            "file was on disk before pre-flight check."
-        )
-
-    # Cooperate with the verification step the integration will run
-    # after iteration 1 (we want it to think verification failed so the
-    # remediation path is even considered).
-    monkeypatch.setattr(integ, "_record_baseline", lambda *a, **kw: "")
-    monkeypatch.setattr(
-        integ,
-        "_canonical_drive_root",
-        lambda repo, ws=None: drive_root,
-    )
-    monkeypatch.setattr(integ, "_try_create_instance", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_run_launcher_task_once", fake_run_launcher_task_once)
-    monkeypatch.setattr(
-        integ,
-        "_run_workspace_verification",
-        lambda *a, **kw: {
-            "passed": False,
-            "skipped": False,
-            "summary": "smoke step failed",
-            "results": [{"name": "smoke", "kind": "shell", "status": "failed"}],
-        },
-    )
-    monkeypatch.setattr(integ, "_collect_run_quality_telemetry", lambda **kw: {})
-    monkeypatch.setattr(integ, "_capture_candidate_safe", lambda **kw: None)
-    monkeypatch.setattr(integ, "_record_competency_signals", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_persist_final_gate_report", lambda **kw: "")
-    monkeypatch.setattr(integ, "_collect_changed_files", lambda *a, **kw: [])
-    monkeypatch.setattr(
-        integ,
-        "_filter_workspace_changes",
-        lambda paths, ws: list(paths or []),
-    )
-    monkeypatch.setattr(
-        integ,
-        "_collect_candidate_workspace_changes",
-        lambda *a, **kw: ["workspaces/ws_demo/main.py"],
-    )
-    monkeypatch.setattr(
-        integ,
-        "_persist_verification_failure_context",
-        lambda **kw: {"state_path": ""},
-    )
-
-    result = integ.run_ouroboros_improvement_sync(
-        repo_root=repo_root,
-        task_description="please build the thing",
-        workspace_id=workspace_id,
-        verify=True,
-        require_instance=False,
-        task_id="task_mid",
-        verification_remediation_attempts=8,  # generous budget — must NOT be burned
-    )
-
-    assert result["status"] == "cancelled", (
-        f"Expected cancelled status, got {result.get('status')!r}. "
-        "If this is 'failed_verification' the integration is still "
-        "spinning remediation cycles after a Stop click."
-    )
-    assert "Остановлено пользователем" in result["final_message"]
-    assert len(submit_calls) == 1, (
-        "Iteration 2 must never be submitted once the stop file "
-        f"appears mid-run. Got {len(submit_calls)} submissions."
-    )
-    assert "cancelled_by_user" in (result.get("completion_warnings") or [])
-
-
-def test_run_ouroboros_sync_breaks_on_agent_stop_response(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    """If the stop file is removed between user click and our pre-flight
-    check (race), but the agent already saw the stop and replied with
-    "Stop requested by dashboard…", we must still cancel cleanly on
-    that signal — NOT proceed to verification + remediation."""
-    import umbrella.control_plane.ouroboros_integration as integ
-
-    repo_root = tmp_path / "repo"
-    workspace_id = "ws_race"
-    drive_root = repo_root / "workspaces" / workspace_id / ".memory" / "drive"
-    drive_root.mkdir(parents=True)
-
-    submit_calls: list[dict] = []
-
-    def fake_run_launcher_task_once(*, repo_root, task, timeout_seconds):
-        submit_calls.append(dict(task))
-        return task["id"], {
-            "status": "complete",
-            "task_id": task["id"],
-            "events": [
-                {"type": "send_message", "text": "Stop requested by dashboard: web UI"},
-            ],
-            "candidate_diff": "",
-            "candidate_changed_files": [],
-        }
-
-    monkeypatch.setattr(integ, "_record_baseline", lambda *a, **kw: "")
-    monkeypatch.setattr(
-        integ, "_canonical_drive_root", lambda repo, ws=None: drive_root
-    )
-    monkeypatch.setattr(integ, "_try_create_instance", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_run_launcher_task_once", fake_run_launcher_task_once)
-    monkeypatch.setattr(integ, "_run_workspace_verification", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_collect_run_quality_telemetry", lambda **kw: {})
-    monkeypatch.setattr(integ, "_capture_candidate_safe", lambda **kw: None)
-    monkeypatch.setattr(integ, "_record_competency_signals", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_persist_final_gate_report", lambda **kw: "")
-    monkeypatch.setattr(integ, "_collect_changed_files", lambda *a, **kw: [])
-    monkeypatch.setattr(integ, "_filter_workspace_changes", lambda paths, ws: [])
-
-    result = integ.run_ouroboros_improvement_sync(
-        repo_root=repo_root,
-        task_description="please build the thing",
-        workspace_id=workspace_id,
-        verify=True,
-        require_instance=False,
-        task_id="task_race",
-        verification_remediation_attempts=8,
-    )
-
-    assert result["status"] == "cancelled"
-    # Exactly ONE submission: the agent reported the stop in its first
-    # reply, so we must NOT submit a second remediation iteration.
-    assert len(submit_calls) == 1, (
-        "Agent already surfaced the stop in iteration 1. We must NOT "
-        "queue a remediation iteration after that. "
-        f"Got {len(submit_calls)} submission(s)."
-    )
-    assert "cancelled_by_user" in (result.get("completion_warnings") or [])
-
-
-# ---------------------------------------------------------------------------
-# Stop-signal regression tests (named per the operator's review checklist).
-# These four tests pin the contract called out by the post-incident review
-# of run ``sync_improve_web_4ca9aa5e``: 7 phantom remediation cycles fired
-# AFTER the user clicked Stop, and the resulting task-result row showed
-# "completed" in the dashboard. The four behaviours below must hold so
-# the same regression cannot recur.
-# ---------------------------------------------------------------------------
-
-
-def test_remediation_loop_breaks_when_stop_file_present(monkeypatch, tmp_path) -> None:
-    """User clicks Stop while iteration N of the remediation loop is in
-    flight (the realistic case observed in run ``sync_improve_web_4ca9aa5e``).
-    ``run_ouroboros_improvement_sync`` must observe the new stop file
-    BEFORE submitting iteration N+1 to the launcher and exit with
-    ``status='cancelled'`` after at most ONE submission, never
-    spinning the remediation budget down to zero."""
-    import umbrella.control_plane.ouroboros_integration as integ
-
-    repo_root = tmp_path / "repo"
-    workspace_id = "ws_remed_loop"
-    drive_root = repo_root / "workspaces" / workspace_id / ".memory" / "drive"
-    drive_root.mkdir(parents=True)
-    (drive_root / "state").mkdir(parents=True, exist_ok=True)
-
-    submit_calls: list[dict] = []
-
-    def fake_run_launcher_task_once(*, repo_root, task, timeout_seconds):
-        submit_calls.append(dict(task))
-        # Iteration 1 finishes with a verification failure AND the user
-        # clicks Stop right at this moment (we simulate the dashboard
-        # writing the stop file from inside the launcher fake). The
-        # integration's pre-flight stop check at the top of iteration 2
-        # must observe the new file and abort the whole run.
-        if len(submit_calls) == 1:
-            (drive_root / "state" / "stop_requested.json").write_text(
-                json.dumps(
-                    {
-                        "run_id": "task_remed_loop",
-                        "task_id": "task_remed_loop",
-                        "attempt_task_ids": ["task_remed_loop"],
-                        "reason": "user clicked stop mid-iteration",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return task["id"], {
-                "status": "failed_verification",
-                "task_id": task["id"],
-                "events": [
-                    {"type": "send_message", "text": "Partial work."},
-                    {"type": "task_metrics", "tool_calls": 5},
-                    {"type": "workspace_write_tools", "count": 1},
-                ],
-                "candidate_diff": "",
-                "candidate_changed_files": ["workspaces/ws_remed_loop/main.py"],
-            }
-        raise AssertionError(
-            "Iteration 2 was submitted even though the stop file was "
-            "on disk before pre-flight check — the loop is still "
-            "burning the remediation budget after a Stop click."
-        )
-
-    monkeypatch.setattr(integ, "_record_baseline", lambda *a, **kw: "")
-    monkeypatch.setattr(
-        integ, "_canonical_drive_root", lambda repo, ws=None: drive_root
-    )
-    monkeypatch.setattr(integ, "_try_create_instance", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_run_launcher_task_once", fake_run_launcher_task_once)
-    monkeypatch.setattr(
-        integ,
-        "_run_workspace_verification",
-        lambda *a, **kw: {
-            "passed": False,
-            "skipped": False,
-            "summary": "smoke step failed",
-            "results": [{"name": "smoke", "kind": "shell", "status": "failed"}],
-        },
-    )
-    monkeypatch.setattr(integ, "_collect_run_quality_telemetry", lambda **kw: {})
-    monkeypatch.setattr(integ, "_capture_candidate_safe", lambda **kw: None)
-    monkeypatch.setattr(integ, "_record_competency_signals", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_persist_final_gate_report", lambda **kw: "")
-    monkeypatch.setattr(integ, "_collect_changed_files", lambda *a, **kw: [])
-    monkeypatch.setattr(
-        integ,
-        "_filter_workspace_changes",
-        lambda paths, ws: list(paths or []),
-    )
-    monkeypatch.setattr(
-        integ,
-        "_collect_candidate_workspace_changes",
-        lambda *a, **kw: ["workspaces/ws_remed_loop/main.py"],
-    )
-    monkeypatch.setattr(
-        integ,
-        "_persist_verification_failure_context",
-        lambda **kw: {"state_path": ""},
-    )
-
-    result = integ.run_ouroboros_improvement_sync(
-        repo_root=repo_root,
-        task_description="please build the thing",
-        workspace_id=workspace_id,
-        verify=True,
-        require_instance=False,
-        task_id="task_remed_loop",
-        verification_remediation_attempts=8,
-    )
-
-    assert result["status"] == "cancelled", (
-        f"Got {result.get('status')!r}. The remediation loop must observe "
-        "stop_requested.json between iterations and abort."
-    )
-    assert len(submit_calls) == 1, (
-        "Iteration 2 must never reach the launcher once the stop file "
-        f"appears mid-run. Got {len(submit_calls)} submissions."
-    )
-    assert result.get("verification_remediation_attempts_used", 0) <= 1, (
-        "Cancelled runs must not consume the remediation budget. "
-        f"Used {result.get('verification_remediation_attempts_used')}."
-    )
-
-
-def test_final_status_cancelled_when_agent_returns_stop_text(
-    monkeypatch, tmp_path
-) -> None:
-    """If the launcher task returned the canonical
-    ``"Stop requested by dashboard: …"`` text (which is what the
-    ouroboros loop emits when ``_check_stop_requested`` fires), the
-    integration must end the run with ``status='cancelled'`` and NOT
-    enter a verification remediation cycle."""
-    import umbrella.control_plane.ouroboros_integration as integ
-
-    repo_root = tmp_path / "repo"
-    workspace_id = "ws_stop_text"
-    drive_root = repo_root / "workspaces" / workspace_id / ".memory" / "drive"
-    drive_root.mkdir(parents=True)
-
-    submit_calls: list[dict] = []
-
-    def fake_run_launcher_task_once(*, repo_root, task, timeout_seconds):
-        submit_calls.append(dict(task))
-        return task["id"], {
-            "status": "complete",
-            "task_id": task["id"],
-            "events": [
-                {
-                    "type": "send_message",
-                    "text": "Stop requested by dashboard: stop requested from the web UI",
-                }
-            ],
-            "candidate_diff": "",
-            "candidate_changed_files": [],
-        }
-
-    monkeypatch.setattr(integ, "_record_baseline", lambda *a, **kw: "")
-    monkeypatch.setattr(
-        integ, "_canonical_drive_root", lambda repo, ws=None: drive_root
-    )
-    monkeypatch.setattr(integ, "_try_create_instance", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_run_launcher_task_once", fake_run_launcher_task_once)
-    monkeypatch.setattr(integ, "_run_workspace_verification", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_collect_run_quality_telemetry", lambda **kw: {})
-    monkeypatch.setattr(integ, "_capture_candidate_safe", lambda **kw: None)
-    monkeypatch.setattr(integ, "_record_competency_signals", lambda *a, **kw: None)
-    monkeypatch.setattr(integ, "_persist_final_gate_report", lambda **kw: "")
-    monkeypatch.setattr(integ, "_collect_changed_files", lambda *a, **kw: [])
-    monkeypatch.setattr(integ, "_filter_workspace_changes", lambda paths, ws: [])
-
-    result = integ.run_ouroboros_improvement_sync(
-        repo_root=repo_root,
-        task_description="please build the thing",
-        workspace_id=workspace_id,
-        verify=True,
-        require_instance=False,
-        task_id="task_stop_text",
-        verification_remediation_attempts=8,
-    )
-
-    assert result["status"] == "cancelled"
-    assert len(submit_calls) == 1, (
-        "The agent already surfaced the stop in iteration 1; the loop "
-        "must NOT queue a second remediation iteration. "
-        f"Got {len(submit_calls)} submission(s)."
-    )
-    assert "cancelled_by_user" in (result.get("completion_warnings") or [])
-
-
 def test_task_result_to_run_maps_stop_text_to_cancelled(tmp_path) -> None:
     """Old task-result files written by the launcher carry
     ``status='completed'`` even when the agent's only message was the
@@ -2454,83 +1630,16 @@ def test_task_result_to_run_maps_stop_text_to_cancelled(tmp_path) -> None:
     final_msg_row = app._task_result_to_run(raw_with_final_message, "ws_final_msg")
     assert final_msg_row["status"] == "cancelled"
 
-
-def test_worker_clears_stop_request_files_on_exit(tmp_path, monkeypatch) -> None:
-    """The next user-initiated run on the same workspace must NOT be
-    poisoned by a leftover ``stop_requested.json`` from a previous
-    cancelled run. The worker's ``finally`` block must call
-    ``_clear_stop_requests`` so the path is gone after the worker
-    returns. (Without this, the integration's pre-iteration stop check
-    inside the NEXT run would fire on the first iteration and silently
-    cancel a fresh run with 0 rounds.)"""
-    repo = tmp_path
-    ws_id = "ws_cleanup"
-    drive_state = repo / "workspaces" / ws_id / ".memory" / "drive" / "state"
-    drive_state.mkdir(parents=True)
-    stop_file = drive_state / "stop_requested.json"
-    stop_file.write_text(
-        json.dumps({"run_id": "old_run", "task_id": "old_run", "reason": "leftover"}),
-        encoding="utf-8",
+    raw_failed_stop_requested = {
+        "task_id": "phase_web_cancelled",
+        "status": "failed",
+        "result": "stop_requested by user during phase",
+        "ts": "2026-05-11T00:07:25Z",
+    }
+    failed_stop_row = app._task_result_to_run(
+        raw_failed_stop_requested, "ws_failed_stop"
     )
-
-    launcher_dir = repo / ".umbrella" / "launcher"
-    launcher_dir.mkdir(parents=True)
-    launcher_stop = launcher_dir / "stop_requested.json"
-    launcher_stop.write_text(
-        json.dumps({"run_id": "old_run", "task_id": "old_run", "reason": "leftover"}),
-        encoding="utf-8",
-    )
-
-    app = WebBridgeApp(repo)
-    run_id = "sync_improve_web_cleanup"
-    app._upsert_web_run(
-        run_id,
-        {
-            "id": run_id,
-            "workspace_id": ws_id,
-            "status": "queued",
-            "created_at": "2026-05-11T00:00:00Z",
-            "updated_at": "2026-05-11T00:00:00Z",
-        },
-    )
-
-    def fake_run_sync(**kwargs):
-        return {
-            "status": "cancelled",
-            "task_id": kwargs.get("task_id"),
-            "final_message": "Run cancelled from the web UI.",
-        }
-
-    monkeypatch.setattr(
-        "umbrella.control_plane.ouroboros_integration.run_ouroboros_improvement_sync",
-        fake_run_sync,
-    )
-
-    assert stop_file.exists()
-    assert launcher_stop.exists()
-
-    app._run_ouroboros_worker(
-        run_id=run_id,
-        ws_id=ws_id,
-        task_text="please build the thing",
-        timeout_hours=0.0,
-        max_rounds=10,
-        max_verify_retries=0,
-        selected_model="",
-    )
-
-    assert not stop_file.exists(), (
-        "Worker finally-block must remove the workspace-scoped "
-        "stop_requested.json so the NEXT run on the same workspace is "
-        "not auto-cancelled. File still present at "
-        f"{stop_file}."
-    )
-    assert not launcher_stop.exists(), (
-        "Worker finally-block must also clear the launcher-scoped "
-        "stop_requested.json (legacy fallback path used by some "
-        "tooling). File still present at "
-        f"{launcher_stop}."
-    )
+    assert failed_stop_row["status"] == "cancelled"
 
 
 def test_normalize_run_status_maps_delivery_contract_failures_to_failed() -> None:

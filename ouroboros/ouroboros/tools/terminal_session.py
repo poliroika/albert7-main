@@ -725,6 +725,18 @@ class OneShotBackend(_BackendBase):
         if len(self._scrollback) > 4000:
             self._scrollback = self._scrollback[-2000:]
 
+    @staticmethod
+    def _resolve_windows_executable(argv: list[str]) -> list[str]:
+        if os.name != "nt" or not argv:
+            return argv
+        executable = argv[0]
+        if not executable or any(sep in executable for sep in ("/", "\\")):
+            return argv
+        resolved = shutil.which(executable)
+        if not resolved:
+            return argv
+        return [resolved, *argv[1:]]
+
     def run(
         self, cmd: Sequence[str] | str, *, cwd: str | None, timeout: int
     ) -> RunResult:
@@ -742,7 +754,7 @@ class OneShotBackend(_BackendBase):
                 )
             argv: list[str] | str
             if isinstance(cmd, (list, tuple)):
-                argv = list(cmd)
+                argv = self._resolve_windows_executable(list(cmd))
                 shell = False
             else:
                 argv = str(cmd)

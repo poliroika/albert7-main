@@ -36,6 +36,35 @@ def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def task_artifact_stem(task_id: str | None, *, max_len: int = 120) -> str:
+    """Return a cross-platform filename stem for a task-scoped artifact.
+
+    Task ids are semantic identifiers and may contain characters such as
+    ``:`` in phase-run ids. Keep the original id inside the artifact payloads
+    and use this only for filesystem names.
+    """
+
+    raw = str(task_id or "").strip() or "task"
+    safe = []
+    changed = False
+    for ch in raw:
+        code = ord(ch)
+        if code < 32 or ch in '<>:"/\\|?*':
+            safe.append("_")
+            changed = True
+        else:
+            safe.append(ch)
+    stem = "".join(safe).strip(" .") or "task"
+    if len(stem) > max_len:
+        stem = stem[:max_len].rstrip(" ._") or "task"
+        changed = True
+    if changed or stem != raw:
+        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+        room = max(1, max_len - len(suffix) - 1)
+        stem = f"{stem[:room].rstrip(' ._')}_{suffix}"
+    return stem
+
+
 # ---------------------------------------------------------------------------
 # File I/O
 # ---------------------------------------------------------------------------
@@ -248,6 +277,19 @@ def sanitize_task_for_event(
     threshold: int = 4000,
 ) -> dict[str, Any]:
     """Sanitize task dict for event logging: truncate large text, strip base64 images, persist full text."""
+    def _json_ready(value: Any) -> Any:
+        if isinstance(value, (set, frozenset, tuple)):
+            return [_json_ready(item) for item in value]
+        if isinstance(value, list):
+            return [_json_ready(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): _json_ready(item) for key, item in value.items()}
+        try:
+            json.dumps(value, ensure_ascii=False)
+            return value
+        except (TypeError, ValueError):
+            return {"_repr": repr(value)}
+
     try:
         sanitized = task.copy()
 
@@ -262,7 +304,7 @@ def sanitize_task_for_event(
 
         text = task.get("text")
         if not isinstance(text, str):
-            return sanitized
+            return _json_ready(sanitized)
 
         text_len = len(text)
         text_hash = sha256_text(text)
@@ -289,9 +331,9 @@ def sanitize_task_for_event(
         else:
             sanitized["text_truncated"] = False
 
-        return sanitized
+        return _json_ready(sanitized)
     except Exception:
-        return task
+        return _json_ready(task)
 
 
 _SECRET_KEYS = frozenset(
@@ -333,9 +375,10 @@ def sanitize_tool_args_for_log(
     threshold: int = 3000,
 ) -> dict[str, Any]:
     """Sanitize tool arguments for logging: redact secrets, truncate large fields."""
+    max_depth = 4
 
     def _sanitize_value(key: str, value: Any, depth: int) -> Any:
-        if depth > 3:
+        if depth > max_depth:
             return {"_depth_limit": True}
         if key.lower() in _SECRET_KEYS:
             return "*** REDACTED ***"

@@ -2,12 +2,8 @@
 
 Provides a small subprocess-driven verifier that runs a spec of steps
 (shell commands, HTTP boot probes, import checks) against a workspace
-directory and returns a structured report.  The report is consumed by:
-
-- ``umbrella.control_plane.ouroboros_integration`` as a post-run gate.
-- ``umbrella.app_ouroboros`` as the driver of the verify-then-retry loop.
-- ``umbrella.meta_harness.evaluator`` / ``promotion`` as a runtime signal
-  that blocks promotion of non-working candidates.
+directory and returns a structured report. Consumed by the ``verify``
+phase manifest inside :class:`umbrella.orchestrator.runner.PhaseRunner`.
 """
 
 from umbrella.verification.models import (

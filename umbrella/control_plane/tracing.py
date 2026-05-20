@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from umbrella.artifacts.task_ids import task_artifact_stem
 from umbrella.control_plane.models import (
     DecisionRecord,
     ActionType,
@@ -114,7 +115,7 @@ class TraceManager:
         if not trace:
             raise ValueError(f"No trace found for task {task_id}")
 
-        path = self.trace_dir / f"{task_id}_trace.jsonl"
+        path = self.trace_dir / f"{task_artifact_stem(task_id)}_trace.jsonl"
 
         # Append all decisions as JSONL
         with open(path, "a", encoding="utf-8") as f:
@@ -131,7 +132,7 @@ class TraceManager:
 
     def _load_trace(self, task_id: str) -> DecisionTrace | None:
         """Load trace from disk (internal method)."""
-        path = self.trace_dir / f"{task_id}_trace.jsonl"
+        path = self.trace_dir / f"{task_artifact_stem(task_id)}_trace.jsonl"
 
         if not path.exists():
             return None

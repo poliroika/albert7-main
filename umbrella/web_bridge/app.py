@@ -32,11 +32,39 @@ from umbrella.web_bridge.util import (
     store_path,
 )
 from umbrella.orchestration.task_input import resolve_task_text
+from umbrella.utils.tool_logs import is_effective_write_tool_log_row
 
 try:
     from umbrella.env import load_env
 except Exception:  # pragma: no cover - optional in tiny test fixtures
     load_env = None  # type: ignore[assignment]
+
+
+def _filter_terminal_scrollback_for_run(text: str, run_id: str) -> str:
+    """Return terminal scrollback blocks that belong to ``run_id``."""
+
+    run = str(run_id or "").strip()
+    if not run:
+        return text
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in str(text or "").splitlines():
+        if line.startswith("## ws="):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    matched: list[str] = []
+    for block in blocks:
+        header = block[0]
+        if f"run={run}" in header or f"task={run}:" in header or f"task={run} " in header:
+            matched.extend(block)
+            matched.append("")
+    return "\n".join(matched).strip()
 
 
 class WebBridgeApp:
@@ -173,9 +201,9 @@ class WebBridgeApp:
     def _current_max_rounds(self) -> int:
         self._load_runtime_env()
         value = self._coerce_int(
-            os.environ.get("OUROBOROS_MAX_ROUNDS"), 120, min_value=0
+            os.environ.get("OUROBOROS_MAX_ROUNDS"), 200, min_value=0
         )
-        return 120 if value is None else value
+        return 200 if value is None else value
 
     def _current_max_verify_retries(self) -> int:
         self._load_runtime_env()
@@ -183,55 +211,6 @@ class WebBridgeApp:
             os.environ.get("OUROBOROS_WEB_MAX_VERIFY_RETRIES"), 20, min_value=0
         )
         return 20 if value is None else value
-
-    @staticmethod
-    def _verification_failure_is_repairable_config(result: dict[str, Any]) -> bool:
-        report = result.get("verification_report") if isinstance(result, dict) else None
-        if not isinstance(report, dict):
-            return False
-        if report.get("repairable") or report.get("spec_error"):
-            return True
-        summary = str(report.get("summary") or "").lower()
-        return (
-            "verification spec is invalid" in summary
-            or "no verification steps declared or auto-detected" in summary
-        )
-
-    @staticmethod
-    def _failed_verification_signature(result: dict[str, Any]) -> str:
-        """Identity of the verification failure for retry-loop deduplication.
-
-        Intentionally depends ONLY on the set of failed required check
-        names and the overall status: if the same set of checks fails on
-        consecutive attempts the agent has nothing new to try, even if
-        the number of tool calls / write counts shifted (those metrics
-        are noisy and would prevent the early-exit guard from firing).
-        """
-        report = result.get("verification_report") if isinstance(result, dict) else None
-        sweep = result.get("sweep_report") if isinstance(result, dict) else None
-        failed_required: list[str] = []
-        if isinstance(report, dict):
-            for item in report.get("results") or []:
-                if not isinstance(item, dict) or item.get("optional"):
-                    continue
-                if str(item.get("status") or "") != "passed":
-                    failed_required.append(str(item.get("name") or ""))
-        failed_required.sort()
-        cleanup_targets: list[str] = []
-        if isinstance(sweep, dict):
-            for item in sweep.get("blocking_noise") or []:
-                if isinstance(item, dict) and item.get("path"):
-                    cleanup_targets.append(str(item.get("path")))
-            for item in sweep.get("missing_required") or []:
-                cleanup_targets.append(str(item))
-            cleanup_targets.sort()
-        return "|".join(
-            [
-                str(result.get("status") or ""),
-                ",".join(failed_required),
-                ",".join(cleanup_targets),
-            ]
-        )
 
     @staticmethod
     def _attempt_task_id(run_id: str, attempt: int) -> str:
@@ -292,11 +271,19 @@ class WebBridgeApp:
         value = str(task_id or "")
         if not value:
             return False
-        if value == run_id or value.startswith(f"{run_id}__"):
+        if (
+            value == run_id
+            or value.startswith(f"{run_id}:")
+            or value.startswith(f"{run_id}__")
+        ):
             return True
         for attempt_task_id in attempt_task_ids or set():
             attempt = str(attempt_task_id or "")
-            if attempt and (value == attempt or value.startswith(f"{attempt}__")):
+            if attempt and (
+                value == attempt
+                or value.startswith(f"{attempt}:")
+                or value.startswith(f"{attempt}__")
+            ):
                 return True
         return False
 
@@ -552,7 +539,7 @@ class WebBridgeApp:
     @staticmethod
     def _normalize_run_status(status: str) -> str:
         raw = str(status or "").lower()
-        if raw in {"verified", "complete", "completed", "ok", "success"}:
+        if raw in {"verified", "complete", "completed", "ok", "success", "succeeded"}:
             return "completed"
         if raw in {
             "failed",
@@ -591,13 +578,23 @@ class WebBridgeApp:
         for run_id, worker in list(self._run_threads.items()):
             if worker is None or not worker.is_alive():
                 continue
-            run = self._get_web_run(run_id)
-            if (
-                run
-                and run.get("workspace_id") == ws_id
-                and run.get("status") in {"queued", "running"}
-            ):
+            run = self._get_web_run(run_id) or self.get_run(run_id) or {}
+            if not run or run.get("workspace_id") != ws_id:
+                continue
+            if run.get("status") in {"queued", "running"}:
                 return run
+            # A cancelled/detached Python worker can still drain its current
+            # LLM/tool turn. Treat it as active until the thread exits so a new
+            # run cannot race against late writes from the old one.
+            return {
+                **run,
+                "status": "stopping",
+                "detached_worker_alive": True,
+                "result_preview": (
+                    run.get("result_preview")
+                    or "Previous run is still stopping; wait before starting another run."
+                ),
+            }
         for run in self._web_runs().values():
             if not isinstance(run, dict):
                 continue
@@ -640,6 +637,11 @@ class WebBridgeApp:
         )
 
     def start_workspace_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Start a phase-based run. Every run goes through PhaseRunner.
+
+        ``harness_candidates`` (default 1) controls per-phase parallelism:
+        N candidates run per phase, the watcher/heuristic picks the winner.
+        """
         ws_id = str(payload.get("workspace_id") or "").strip()
         if not ws_id:
             raise ValueError("workspace_id is required")
@@ -656,13 +658,35 @@ class WebBridgeApp:
         if append_message:
             self._append_task_message(ws_id, append_message)
 
-        task_resolution = resolve_task_text(workspace_path)
-        task_text = task_resolution.task_text
-        harness_mode = bool(payload.get("harness_mode"))
-        if harness_mode:
-            run_id = f"harness_web_{uuid.uuid4().hex[:8]}"
+        explicit_task = str(payload.get("task") or payload.get("input") or "").strip()
+        if explicit_task:
+            task_text = explicit_task
+            task_resolution = type("R", (), {
+                "task_text": task_text,
+                "task_source": "api_payload",
+                "task_hash": "",
+                "task_missing": False,
+                "missing_status": None,
+                "error": None,
+            })()
         else:
-            run_id = f"sync_improve_web_{uuid.uuid4().hex[:8]}"
+            task_resolution = resolve_task_text(workspace_path)
+            task_text = task_resolution.task_text
+
+        candidates_per_phase = self._coerce_int(
+            payload.get("harness_candidates"), 1, min_value=1
+        ) or 1
+        if candidates_per_phase > 8:
+            candidates_per_phase = 8
+        is_harness = candidates_per_phase > 1 or bool(payload.get("harness_mode"))
+        if is_harness and candidates_per_phase < 2:
+            candidates_per_phase = 3
+
+        run_id = (
+            f"harness_web_{uuid.uuid4().hex[:8]}"
+            if is_harness
+            else f"phase_web_{uuid.uuid4().hex[:8]}"
+        )
         now_iso = iso_utc(now_ts())
         selected_model = str(payload.get("model") or "").strip()
         model = selected_model or self._current_model_id()
@@ -674,17 +698,12 @@ class WebBridgeApp:
             self._current_max_verify_retries(),
             min_value=0,
         )
-        harness_candidates_raw = payload.get("harness_candidates")
-        harness_candidates = (
-            self._coerce_int(harness_candidates_raw, 3, min_value=2) or 3
-        )
-        if harness_candidates > 8:
-            harness_candidates = 8
+
         run = {
             "id": run_id,
             "workspace_id": ws_id,
             "status": "running",
-            "mode": "harness" if harness_mode else "single",
+            "mode": "harness" if is_harness else "phase_runner",
             "model": model,
             "total_cost": 0.0,
             "total_steps": 0,
@@ -694,38 +713,34 @@ class WebBridgeApp:
             "max_verify_retries": max_verify_retries,
             "thread_id": thread_id or None,
             "attempt": 1,
-            "max_attempts": int(max_verify_retries or 0) + 1,
+            "max_attempts": 1,
             "attempt_task_ids": [run_id],
             "task_text": short_text(task_text, 800),
-            "task_source": task_resolution.task_source,
-            "task_hash": task_resolution.task_hash,
-            "task_missing": task_resolution.task_missing,
+            "task_source": getattr(task_resolution, "task_source", "task_main"),
+            "task_hash": getattr(task_resolution, "task_hash", ""),
+            "task_missing": getattr(task_resolution, "task_missing", False),
             "result_preview": (
-                f"Harness run starting with {harness_candidates} candidates."
-                if harness_mode
-                else "Ouroboros run started from the web UI."
+                f"Phase run started ({candidates_per_phase} candidates per phase)."
+                if is_harness
+                else "Phase run started."
             ),
             "created_at": now_iso,
             "updated_at": now_iso,
             "source": "web_bridge",
+            "candidates_per_phase": candidates_per_phase,
+            "phase_events": [],
         }
-        if harness_mode:
-            run["harness_meta"] = {
-                "candidates": harness_candidates,
-                "candidate_run_ids": [
-                    f"{run_id}__c{i + 1}" for i in range(harness_candidates)
-                ],
-                "models": [model] * harness_candidates,
-            }
         self._upsert_web_run(run_id, run)
-        if task_resolution.task_missing:
+
+        if getattr(task_resolution, "task_missing", False):
             missing_patch = {
-                "status": task_resolution.missing_status or "missing_task_main",
+                "status": getattr(task_resolution, "missing_status", None)
+                or "missing_task_main",
                 "running": False,
                 "finished_at": iso_utc(now_ts()),
                 "updated_at": iso_utc(now_ts()),
-                "result_preview": task_resolution.error,
-                "error": task_resolution.error,
+                "result_preview": getattr(task_resolution, "error", None),
+                "error": getattr(task_resolution, "error", None),
             }
             self._upsert_web_run(run_id, missing_patch)
             if thread_id:
@@ -733,63 +748,189 @@ class WebBridgeApp:
                     thread_id, {**run, **missing_patch}, "TASK_MAIN.md missing"
                 )
             return {**run, **missing_patch}
+
         if thread_id:
             label = (
-                f"Run TASK_MAIN.md (harness x {harness_candidates})"
-                if harness_mode
-                else "Run TASK_MAIN.md"
+                f"Phase run (harness x {candidates_per_phase})"
+                if is_harness
+                else "Phase run"
             )
             self._append_thread_run_messages(thread_id, run, label)
 
-        timeout_hours = payload.get("timeout_hours")
-        try:
-            timeout_hours = float(timeout_hours) if timeout_hours is not None else 24.0
-        except (TypeError, ValueError):
-            timeout_hours = 24.0
-
-        if harness_mode:
-            thread = threading.Thread(
-                target=self._run_harness_worker,
-                args=(
-                    run_id,
-                    ws_id,
-                    task_text,
-                    timeout_hours,
-                    max_rounds,
-                    max_verify_retries,
-                    model,
-                    harness_candidates,
-                ),
-                name=f"UmbrellaWebHarness-{run_id}",
-                daemon=True,
-            )
-            worker_kind = "harness"
-        else:
-            thread = threading.Thread(
-                target=self._run_ouroboros_worker,
-                args=(
-                    run_id,
-                    ws_id,
-                    task_text,
-                    timeout_hours,
-                    max_rounds,
-                    max_verify_retries,
-                    model,
-                ),
-                name=f"UmbrellaWebRun-{run_id}",
-                daemon=True,
-            )
-            worker_kind = "ouroboros"
+        thread = threading.Thread(
+            target=self._run_phase_runner_worker,
+            args=(
+                run_id,
+                ws_id,
+                task_text,
+                model,
+                candidates_per_phase,
+                max_rounds,
+                max_verify_retries,
+            ),
+            name=f"PhaseRunner-{run_id}",
+            daemon=True,
+        )
         with self._run_lock:
             self._run_threads[run_id] = thread
             self._workers[run_id] = {
                 "thread": thread,
-                "kind": worker_kind,
+                "kind": "phase_runner",
                 "started_at": now_ts(),
                 "orchestrator": None,
             }
         thread.start()
         return run
+
+    def _run_phase_runner_worker(
+        self,
+        run_id: str,
+        ws_id: str,
+        task_text: str,
+        model: str,
+        candidates_per_phase: int,
+        max_rounds: int | None = None,
+        max_verify_retries: int | None = None,
+    ) -> None:
+        """Background worker: drives PhaseRunner and mirrors envelopes into the web run record."""
+        from umbrella.orchestrator.runner import PhaseRunner
+        from umbrella.utils.result_envelope import ResultEnvelope
+
+        env_snapshot = self._snapshot_env()
+        self._clear_stop_requests(ws_id)
+        self._load_runtime_env()
+        self._ensure_web_discovery_defaults()
+
+        if model:
+            os.environ["LLM_MODEL"] = model
+            os.environ["OUROBOROS_MODEL"] = model
+        if max_rounds is not None:
+            os.environ["OUROBOROS_MAX_ROUNDS"] = str(max(0, int(max_rounds)))
+        if max_verify_retries is not None:
+            os.environ["OUROBOROS_WEB_MAX_VERIFY_RETRIES"] = str(
+                max(0, int(max_verify_retries))
+            )
+
+        started_at = now_ts()
+        phase_events: list[dict[str, Any]] = []
+        tools_used: set[str] = set()
+        final_status = "succeeded"
+        final_error: str | None = None
+
+        def on_env(env: ResultEnvelope) -> None:
+            payload = env.to_dict()
+            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+            data = payload.get("data") or {}
+            errors = payload.get("errors") or []
+            error_msg = ""
+            if errors and isinstance(errors[0], dict):
+                error_msg = str(errors[0].get("message") or "")
+            evt = data.get("event") or payload.get("phase") or "envelope"
+            phase_events.append(
+                {
+                    "ts": iso_utc(now_ts()),
+                    "phase": meta.get("phase") or payload.get("phase"),
+                    "event": evt,
+                    "outcome": data.get("outcome"),
+                    "took_ms": meta.get("took_ms") or payload.get("took_ms"),
+                    "error": error_msg or payload.get("error"),
+                }
+            )
+            self._upsert_web_run(
+                run_id,
+                {
+                    "status": "running",
+                    "total_steps": len(phase_events),
+                    "tools_used": sorted(tools_used),
+                    "phase_events": phase_events[-20:],
+                    "updated_at": iso_utc(now_ts()),
+                    "last_phase": payload.get("phase"),
+                },
+            )
+
+        def stop_text(value: str | None) -> bool:
+            lines = str(value or "").strip().splitlines()
+            head = lines[0].strip().lower() if lines else ""
+            return (
+                head.startswith("stop requested by dashboard")
+                or head.startswith("stop requested from the web ui")
+                or head.startswith("stop requested by web ui")
+                or head.startswith("stop_requested")
+            )
+
+        try:
+            runner = PhaseRunner(
+                repo_root=self.repo_root,
+                workspace_id=ws_id,
+                candidates_per_phase=candidates_per_phase,
+                on_envelope=on_env,
+            )
+            envelopes = list(runner.run(task_text, run_id=run_id))
+            for envelope in envelopes:
+                payload = envelope.to_dict()
+                if not payload.get("ok", False):
+                    final_status = "failed"
+                    errors = payload.get("errors") or []
+                    if errors and isinstance(errors[0], dict):
+                        final_error = (
+                            str(errors[0].get("message") or "")
+                            or "phase runner reported error"
+                        )
+                    else:
+                        final_error = "phase runner reported error"
+                    if self._stop_was_requested(run_id, ws_id) or stop_text(final_error):
+                        final_status = "cancelled"
+                    break
+        except Exception as exc:
+            log.exception("PhaseRunner worker crashed for run %s", run_id)
+            final_status = "failed"
+            final_error = str(exc)
+        finally:
+            duration_ms = int((now_ts() - started_at) * 1000)
+            log_summary = self._run_log_summary(ws_id, run_id)
+            for tool in log_summary.get("tools_used") or []:
+                tools_used.add(str(tool))
+            if self._stop_was_requested(run_id, ws_id) or stop_text(final_error):
+                final_status = "cancelled"
+                final_error = final_error or "Run cancelled from the web UI."
+            patch: dict[str, Any] = {
+                "status": final_status,
+                "running": False,
+                "total_steps": len(phase_events),
+                "total_duration_ms": duration_ms,
+                "tools_used": sorted(tools_used),
+                "llm_rounds": log_summary.get("llm_rounds", 0),
+                "prompt_tokens": log_summary.get("prompt_tokens", 0),
+                "completion_tokens": log_summary.get("completion_tokens", 0),
+                "models": log_summary.get("models", []),
+                "forbidden_tool_attempts": log_summary.get("forbidden_tool_attempts", 0),
+                "verification_status": log_summary.get("verification_status"),
+                "phase_events": phase_events[-50:],
+                "finished_at": iso_utc(now_ts()),
+                "updated_at": iso_utc(now_ts()),
+                "result_preview": (
+                    final_error
+                    if final_status in {"failed", "cancelled"}
+                    else (
+                        f"Phase run completed ({len(phase_events)} events, "
+                        f"{log_summary.get('llm_rounds', 0)} LLM rounds)."
+                    )
+                ),
+            }
+            if final_error:
+                patch["error"] = final_error
+            final_run = self._upsert_web_run(run_id, patch)
+            thread_id = str(final_run.get("thread_id") or "").strip()
+            if thread_id:
+                try:
+                    self._append_thread_finalize_message(thread_id, run_id, final_run)
+                except Exception:
+                    log.debug("Failed to append final thread run message", exc_info=True)
+            self._restore_env(env_snapshot)
+            self._clear_stop_requests(ws_id)
+            with self._run_lock:
+                self._run_threads.pop(run_id, None)
+                self._workers.pop(run_id, None)
 
     _ENV_KEYS_TO_RESTORE: tuple[str, ...] = (
         "LLM_MODEL",
@@ -802,10 +943,22 @@ class WebBridgeApp:
         "OUROBOROS_DEEP_SEARCH_ENABLED",
         "OUROBOROS_DEEP_SEARCH_PROVIDER",
         "OUROBOROS_DEEP_SEARCH_BUDGET",
+        "OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK",
+        "OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO",
         "OUROBOROS_LEGACY_WEB_SEARCH_DISABLED",
         "OUROBOROS_GITHUB_DISCOVERY_BUDGET",
         "OUROBOROS_HARNESS_MAX_PARALLEL",
         "OUROBOROS_HARNESS_TIMEOUT_HOURS",
+    )
+    _FAST_SEARCH_PROVIDER_ENV: tuple[str, ...] = (
+        "SERPER_API_KEY",
+        "TAVILY_API_KEY",
+        "BRAVE_API_KEY",
+        "BING_SEARCH_API_KEY",
+        "BING_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_CSE_ID",
+        "OPENAI_API_KEY",
     )
 
     def _snapshot_env(self) -> dict[str, str | None]:
@@ -819,884 +972,17 @@ class WebBridgeApp:
             else:
                 os.environ[key] = value
 
-    def _run_ouroboros_worker(
-        self,
-        run_id: str,
-        ws_id: str,
-        task_text: str,
-        timeout_hours: float,
-        max_rounds: int | None,
-        max_verify_retries: int | None,
-        selected_model: str,
-    ) -> None:
-        started = now_ts()
-        env_snapshot = self._snapshot_env()
-        thread_id_for_finalize = str(
-            (self._get_web_run(run_id) or {}).get("thread_id") or ""
-        )
-        result: dict[str, Any] = {
-            "status": "error",
-            "error": "no attempts executed",
-            "task_id": run_id,
-        }
-        attempt_task_ids: list[str] = [run_id]
-        remediation_attempts = int(max_verify_retries or 0)
-        max_attempts = 1
-        try:
-            from umbrella.config import DEFAULT_DASHBOARD_QUALITY_THRESHOLD
-            from umbrella.control_plane.ouroboros_integration import (
-                run_ouroboros_improvement_sync,
-            )
-            from umbrella.integration.ouroboros_bridge import (
-                prepare_active_skills_for_workspace,
-            )
-            from umbrella.orchestration.ouroboros_task import (
-                render_retry_prompt,
-                render_workspace_prompt,
-            )
-
-            self._clear_stop_requests(ws_id)
-            self._load_runtime_env()
-            if selected_model:
-                os.environ["LLM_MODEL"] = selected_model
-                os.environ["OUROBOROS_MODEL"] = selected_model
-            if max_rounds is not None:
-                os.environ["OUROBOROS_MAX_ROUNDS"] = str(int(max_rounds))
-            os.environ["OUROBOROS_TOOL_PREFLIGHT_REPAIR_ROUNDS"] = str(
-                max(6, min(max(1, remediation_attempts), 20))
-            )
-            use_live_llm = bool(
-                os.environ.get("OUROBOROS_LLM_API_KEY")
-                or os.environ.get("LLM_API_KEY")
-                or os.environ.get("OPENAI_API_KEY")
-            )
-            settings = self.get_settings(ws_id) if ws_id else {}
-            quality_threshold = settings.get("quality_threshold")
-            try:
-                quality_threshold = (
-                    float(quality_threshold)
-                    if quality_threshold is not None
-                    else float(DEFAULT_DASHBOARD_QUALITY_THRESHOLD)
-                )
-            except (TypeError, ValueError):
-                quality_threshold = float(DEFAULT_DASHBOARD_QUALITY_THRESHOLD)
-            verification_timeout = self._coerce_int(
-                settings.get("verification_timeout_seconds"),
-                self._coerce_int(
-                    os.environ.get("UMBRELLA_VERIFY_TIMEOUT_SECONDS"), 1800, min_value=0
-                ),
-                min_value=0,
-            )
-            require_instance = bool(settings.get("require_instance", False))
-            verify_enabled = bool(settings.get("verify", True))
-            timeout_seconds = None if timeout_hours <= 0 else timeout_hours * 3600
-            previous_status = ""
-            previous_verification_report: dict[str, Any] | None = None
-            previous_final_message = ""
-            previous_failed_signature = ""
-            repeated_failed_signature_count = 0
-            base_phase_rounds = (
-                self._coerce_int(
-                    os.environ.get("OUROBOROS_PLANNER_PHASE_ROUNDS"), 20, min_value=0
-                )
-                or 20
-            )
-
-            for attempt in range(1, max_attempts + 1):
-                attempt_task_id = self._attempt_task_id(run_id, attempt)
-                if attempt_task_id not in attempt_task_ids:
-                    attempt_task_ids.append(attempt_task_id)
-                if attempt > 1:
-                    os.environ["OUROBOROS_PLANNER_PHASE_ROUNDS"] = str(
-                        max(base_phase_rounds, 24)
-                    )
-                self._upsert_web_run(
-                    run_id,
-                    {
-                        "status": "running",
-                        "attempt": attempt,
-                        "max_attempts": max_attempts,
-                        "verification_remediation_max": remediation_attempts,
-                        "attempt_task_ids": list(attempt_task_ids),
-                        "updated_at": iso_utc(now_ts()),
-                        "result_preview": (
-                            "Ouroboros run is running "
-                            f"(verification remediation budget: {remediation_attempts})."
-                        ),
-                    },
-                )
-                retry_context = render_retry_prompt(
-                    attempt=attempt,
-                    max_attempts=max_attempts,
-                    previous_status=previous_status,
-                    verification_report=previous_verification_report,
-                    previous_final_message=previous_final_message,
-                )
-                try:
-                    prepare_active_skills_for_workspace(
-                        self.repo_root,
-                        ws_id,
-                        task_input=task_text,
-                    )
-                except Exception:
-                    pass
-                prompt = render_workspace_prompt(
-                    repo_root=self.repo_root,
-                    workspace_id=ws_id,
-                    task_text=task_text,
-                    quality_threshold=quality_threshold,
-                    include_prior_knowledge=True,
-                    retry_context=retry_context,
-                )
-                if self._stop_was_requested(run_id, ws_id):
-                    result = {
-                        "status": "cancelled",
-                        "task_id": attempt_task_id,
-                        "final_message": "Run cancelled from the web UI.",
-                    }
-                    break
-                result = run_ouroboros_improvement_sync(
-                    repo_root=self.repo_root,
-                    task_description=prompt,
-                    workspace_id=ws_id,
-                    use_live_llm=use_live_llm,
-                    timeout_seconds=timeout_seconds,
-                    promote=True,
-                    verify=verify_enabled,
-                    verification_timeout_seconds=verification_timeout
-                    if verification_timeout
-                    else None,
-                    require_instance=require_instance,
-                    task_id=attempt_task_id,
-                    verification_remediation_attempts=remediation_attempts,
-                    task_input_metadata={
-                        "task_source": "TASK_MAIN.md",
-                        "task_hash": (self._get_web_run(run_id) or {}).get(
-                            "task_hash", ""
-                        ),
-                        "task_missing": False,
-                    },
-                )
-                status = str(result.get("status") or "unknown")
-                if self._stop_was_requested(run_id, ws_id):
-                    result = {
-                        **result,
-                        "status": "cancelled",
-                        "final_message": (
-                            str(result.get("final_message") or "")
-                            or "Run cancelled from the web UI."
-                        ),
-                    }
-                    status = "cancelled"
-                    break
-                if status == "verified":
-                    break
-                verification_report = result.get("verification_report")
-                verification_failed = (
-                    isinstance(verification_report, dict)
-                    and verification_report.get("passed") is False
-                )
-                has_completion_warnings = bool(result.get("completion_warnings"))
-                if (
-                    status in {"complete", "completed"}
-                    and not verification_failed
-                    and not has_completion_warnings
-                ):
-                    break
-                if status in {"complete", "completed"} and attempt < max_attempts:
-                    previous_status = status
-                    previous_verification_report = result.get("verification_report")
-                    previous_final_message = str(result.get("final_message") or "")
-                    continue
-                if (
-                    status in {"failed_verification", "failed_hygiene"}
-                    and attempt < max_attempts
-                ):
-                    signature = self._failed_verification_signature(result)
-                    if signature and signature == previous_failed_signature:
-                        repeated_failed_signature_count += 1
-                    else:
-                        previous_failed_signature = signature
-                        repeated_failed_signature_count = 1
-                    previous_status = status
-                    previous_verification_report = result.get("verification_report")
-                    previous_final_message = str(result.get("final_message") or "")
-                    if (
-                        repeated_failed_signature_count >= 2
-                        and not self._verification_failure_is_repairable_config(result)
-                    ):
-                        break
-                    continue
-                if status in {"error", "incomplete"} and attempt < max_attempts:
-                    previous_status = status
-                    previous_verification_report = result.get("verification_report")
-                    previous_final_message = str(
-                        result.get("final_message") or result.get("error") or ""
-                    )
-                    continue
-                break
-
-            events = list(result.get("events") or [])
-            latest_round = next(
-                (e for e in reversed(events) if e.get("type") == "llm_round"), {}
-            )
-            finished = now_ts()
-            tools_used = list(result.get("tools_used") or [])
-            if not tools_used:
-                tools_used = self._tools_used_for_run(ws_id, run_id)
-                if tools_used:
-                    result["tools_used"] = tools_used
-            final_run = self._upsert_web_run(
-                run_id,
-                {
-                    "status": self._normalize_run_status(
-                        str(result.get("status") or "")
-                    ),
-                    "model": latest_round.get("model")
-                    or result.get("model")
-                    or self._current_model_id(),
-                    "total_steps": int(
-                        result.get("llm_tool_invocations")
-                        or result.get("events_count")
-                        or len(events)
-                        or 0
-                    ),
-                    "total_duration_ms": int((finished - started) * 1000),
-                    "tools_used": tools_used,
-                    "attempt": int(self._get_web_run(run_id).get("attempt") or 1)
-                    if self._get_web_run(run_id)
-                    else 1,
-                    "max_attempts": max_attempts,
-                    "attempt_task_ids": list(attempt_task_ids),
-                    "max_rounds": max_rounds,
-                    "max_verify_retries": max_verify_retries,
-                    "verification_remediation_attempts_used": result.get(
-                        "verification_remediation_attempts_used"
-                    ),
-                    "verification_remediation_max": result.get(
-                        "verification_remediation_max", remediation_attempts
-                    ),
-                    "verification_failure_context_path": result.get(
-                        "verification_failure_context_path"
-                    ),
-                    "result_preview": short_text(
-                        str(
-                            result.get("final_message") or result.get("error") or result
-                        ),
-                        600,
-                    ),
-                    "full_result": result,
-                    "updated_at": iso_utc(finished),
-                    "finished_at": iso_utc(finished),
-                },
-            )
-            thread_id = str(final_run.get("thread_id") or thread_id_for_finalize)
-            if thread_id:
-                try:
-                    self._append_thread_finalize_message(thread_id, run_id, result)
-                except Exception:
-                    pass
-        except Exception as exc:
-            finished = now_ts()
-            error_text = str(exc) or exc.__class__.__name__
-            error_result = {
-                "status": "error",
-                "error": error_text,
-                "task_id": run_id,
-                "final_message": f"Worker crashed: {error_text}",
-            }
-            self._upsert_web_run(
-                run_id,
-                {
-                    "status": "failed",
-                    "error": error_text,
-                    "result_preview": short_text(error_text, 600),
-                    "total_duration_ms": int((finished - started) * 1000),
-                    "attempt_task_ids": list(attempt_task_ids),
-                    "max_attempts": max_attempts,
-                    "full_result": error_result,
-                    "updated_at": iso_utc(finished),
-                    "finished_at": iso_utc(finished),
-                },
-            )
-            if thread_id_for_finalize:
-                try:
-                    self._append_thread_finalize_message(
-                        thread_id_for_finalize, run_id, error_result
-                    )
-                except Exception:
-                    pass
-        finally:
-            self._restore_env(env_snapshot)
-            self._clear_stop_requests(ws_id)
-            with self._run_lock:
-                self._run_threads.pop(run_id, None)
-                self._workers.pop(run_id, None)
-
-    def _run_harness_worker(
-        self,
-        run_id: str,
-        ws_id: str,
-        task_text: str,
-        timeout_hours: float,
-        max_rounds: int | None,
-        max_verify_retries: int | None,
-        selected_model: str,
-        num_candidates: int,
-    ) -> None:
-        """Worker that runs staged harness tournaments and applies stage winners."""
-        started = now_ts()
-        env_snapshot = self._snapshot_env()
-        thread_id_for_finalize = str(
-            (self._get_web_run(run_id) or {}).get("thread_id") or ""
-        )
-        events_path = (
-            self.workspaces_root / ws_id / ".memory" / "drive" / "logs" / "events.jsonl"
-        )
-        ideas_path = self.workspaces_root / ws_id / ".memory" / "ideas.jsonl"
-        try:
-            events_path.parent.mkdir(parents=True, exist_ok=True)
-            ideas_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-
-        def _record_harness_event(event_dict: dict[str, Any]) -> None:
-            try:
-                with events_path.open("a", encoding="utf-8") as fh:
-                    fh.write(
-                        json.dumps(
-                            {
-                                **event_dict,
-                                "task_id": run_id,
-                                "workspace_id": ws_id,
-                                "kind": "harness",
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            except OSError:
-                pass
-
-        def _record_harness_memory(event_dict: dict[str, Any]) -> None:
-            event_type = str(event_dict.get("type") or "")
-            if event_type not in {
-                "harness_started",
-                "stage_started",
-                "stage_recovered_candidate_selected",
-                "stage_winner_selected",
-                "stage_losers_pruned",
-                "stage_patch_applied",
-                "stage_patch_skipped",
-                "stage_finished",
-                "harness_finished",
-            }:
-                return
-            data = (
-                event_dict.get("data")
-                if isinstance(event_dict.get("data"), dict)
-                else {}
-            )
-            stage_id = str(event_dict.get("stage_id") or data.get("stage_id") or "root")
-            stage_title = str(event_dict.get("stage_title") or data.get("title") or "")
-            stage_kind = str(
-                event_dict.get("stage_kind") or data.get("kind") or "harness"
-            )
-            kind_map = {
-                "harness_started": "harness_plan",
-                "stage_started": "harness_split",
-                "stage_recovered_candidate_selected": "harness_recovery",
-                "stage_winner_selected": "harness_selection",
-                "stage_losers_pruned": "harness_prune",
-                "stage_patch_applied": "harness_promotion",
-                "stage_patch_skipped": "harness_promotion",
-                "stage_finished": "harness_stage_result",
-                "harness_finished": "harness_result",
-            }
-            title_map = {
-                "harness_started": "Harness staged plan",
-                "stage_started": f"Harness split: {stage_title or stage_id}",
-                "stage_recovered_candidate_selected": f"Harness recovered candidate: {stage_title or stage_id}",
-                "stage_winner_selected": f"Harness selected winner: {stage_title or stage_id}",
-                "stage_losers_pruned": f"Harness pruned losers: {stage_title or stage_id}",
-                "stage_patch_applied": f"Harness applied winner: {stage_title or stage_id}",
-                "stage_patch_skipped": f"Harness kept winner without patch: {stage_title or stage_id}",
-                "stage_finished": f"Harness stage finished: {stage_title or stage_id}",
-                "harness_finished": "Harness final result",
-            }
-            row = {
-                "id": f"harness_{run_id}_{event_type}_{stage_id}_{uuid.uuid4().hex[:8]}",
-                "task_id": run_id,
-                "workspace_id": ws_id,
-                "kind": kind_map.get(event_type, "harness_event"),
-                "title": title_map.get(event_type, event_type),
-                "content": short_text(
-                    json.dumps(
-                        {
-                            "event": event_type,
-                            "message": event_dict.get("message"),
-                            "stage": {
-                                "index": event_dict.get("stage_index"),
-                                "id": stage_id,
-                                "title": stage_title,
-                                "kind": stage_kind,
-                            },
-                            "candidate_id": event_dict.get("candidate_id"),
-                            "data": data,
-                        },
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                    1800,
-                ),
-                "palace_path": f"Harness/{run_id}/{stage_id}/{event_type}",
-                "tags": ["harness", event_type, stage_kind],
-                "created_at": event_dict.get("ts") or iso_utc(now_ts()),
-            }
-            try:
-                with ideas_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-            except OSError:
-                pass
-
-        def _collect_candidate_run_ids(
-            meta: dict[str, Any], stages: list[dict[str, Any]]
-        ) -> list[str]:
-            ids: list[str] = [
-                str(item)
-                for item in (meta.get("candidate_run_ids") or [])
-                if str(item or "").strip()
-            ]
-            for stage in stages:
-                for candidate in stage.get("candidates") or []:
-                    if not isinstance(candidate, dict):
-                        continue
-                    run_child = str(candidate.get("run_id") or "").strip()
-                    if run_child and run_child not in ids:
-                        ids.append(run_child)
-            return ids
-
-        def _merge_harness_progress(payload: dict[str, Any]) -> None:
-            event_type = str(payload.get("type") or "")
-            web_run = self._get_web_run(run_id) or {}
-            meta = dict(web_run.get("harness_meta") or {})
-            stages = [
-                dict(stage)
-                for stage in (web_run.get("harness_stages") or meta.get("stages") or [])
-                if isinstance(stage, dict)
-            ]
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-
-            if event_type == "harness_started":
-                stages = [
-                    dict(stage)
-                    for stage in (data.get("stages") or [])
-                    if isinstance(stage, dict)
-                ]
-                for stage in stages:
-                    stage.setdefault("status", "pending")
-                    stage.setdefault("candidates", [])
-                meta.update(
-                    {
-                        "mode": "staged",
-                        "candidates": num_candidates,
-                        "stage_count": data.get("num_stages") or len(stages),
-                        "candidate_run_ids": data.get("candidate_run_ids")
-                        or meta.get("candidate_run_ids")
-                        or [],
-                        "stages": stages,
-                    }
-                )
-            elif event_type.startswith("stage_"):
-                stage_obj = (
-                    data.get("stage") if isinstance(data.get("stage"), dict) else {}
-                )
-                stage_id = str(
-                    payload.get("stage_id") or stage_obj.get("stage_id") or ""
-                )
-                stage_index = self._coerce_int(
-                    payload.get("stage_index"), None, min_value=0
-                )
-                stage_pos = -1
-                for idx, stage in enumerate(stages):
-                    if stage_id and str(stage.get("stage_id") or "") == stage_id:
-                        stage_pos = idx
-                        break
-                    if (
-                        stage_index is not None
-                        and int(stage.get("index") or -1) == stage_index
-                    ):
-                        stage_pos = idx
-                        break
-                if stage_pos < 0:
-                    stage_pos = len(stages)
-                    stages.append(
-                        {
-                            "index": stage_index
-                            if stage_index is not None
-                            else stage_pos,
-                            "stage_id": stage_id or f"s{stage_pos + 1}",
-                            "title": str(
-                                payload.get("stage_title")
-                                or stage_obj.get("title")
-                                or f"Stage {stage_pos + 1}"
-                            ),
-                            "kind": str(
-                                payload.get("stage_kind")
-                                or stage_obj.get("kind")
-                                or "subtask"
-                            ),
-                            "candidates": [],
-                        }
-                    )
-                stage = stages[stage_pos]
-                stage.update(
-                    {
-                        "stage_id": str(
-                            stage.get("stage_id") or stage_id or f"s{stage_pos + 1}"
-                        ),
-                        "title": str(
-                            payload.get("stage_title")
-                            or stage.get("title")
-                            or stage_obj.get("title")
-                            or f"Stage {stage_pos + 1}"
-                        ),
-                        "kind": str(
-                            payload.get("stage_kind")
-                            or stage.get("kind")
-                            or stage_obj.get("kind")
-                            or "subtask"
-                        ),
-                    }
-                )
-                if event_type == "stage_started":
-                    stage["status"] = "running"
-                    stage["candidate_run_ids"] = (
-                        data.get("candidate_run_ids")
-                        or stage.get("candidate_run_ids")
-                        or []
-                    )
-                    if isinstance(data.get("candidates"), list):
-                        stage["candidates"] = [
-                            dict(candidate)
-                            for candidate in data.get("candidates") or []
-                            if isinstance(candidate, dict)
-                        ]
-                elif event_type == "stage_finished":
-                    stage.update(
-                        {
-                            k: v
-                            for k, v in data.items()
-                            if k
-                            in {
-                                "status",
-                                "winner_index",
-                                "winner_id",
-                                "winner_run_id",
-                                "winner_applied",
-                                "pruned_candidate_ids",
-                                "error",
-                                "completed_at",
-                            }
-                        }
-                    )
-                elif event_type == "stage_candidates_scored":
-                    scores = (
-                        data.get("scores")
-                        if isinstance(data.get("scores"), list)
-                        else []
-                    )
-                    stage["scores"] = scores
-                    stage["winner_index"] = data.get("winner_index")
-                    stage["winner_id"] = data.get("winner_id")
-                    candidates = list(stage.get("candidates") or [])
-                    for score in scores:
-                        if not isinstance(score, dict):
-                            continue
-                        key = str(
-                            score.get("candidate_id") or score.get("run_id") or ""
-                        )
-                        found = None
-                        for candidate in candidates:
-                            if (
-                                str(
-                                    candidate.get("candidate_id")
-                                    or candidate.get("run_id")
-                                    or ""
-                                )
-                                == key
-                            ):
-                                found = candidate
-                                break
-                        if found is None:
-                            found = {"candidate_id": key}
-                            candidates.append(found)
-                        found.update(score)
-                    stage["candidates"] = candidates
-                elif event_type == "stage_winner_selected":
-                    winner = (
-                        data.get("winner")
-                        if isinstance(data.get("winner"), dict)
-                        else {}
-                    )
-                    stage["winner_index"] = winner.get("index")
-                    stage["winner_id"] = winner.get("candidate_id")
-                    stage["winner_run_id"] = winner.get("run_id")
-                elif event_type == "stage_recovered_candidate_selected":
-                    winner = (
-                        data.get("winner")
-                        if isinstance(data.get("winner"), dict)
-                        else {}
-                    )
-                    stage["winner_index"] = winner.get("index")
-                    stage["winner_id"] = winner.get("candidate_id")
-                    stage["winner_run_id"] = winner.get("run_id")
-                    stage["recovered"] = True
-                    stage["recovery_reason"] = data.get("reason")
-                    candidates = list(stage.get("candidates") or [])
-                    key = str(winner.get("candidate_id") or winner.get("run_id") or "")
-                    if key:
-                        found = None
-                        for candidate in candidates:
-                            if (
-                                str(
-                                    candidate.get("candidate_id")
-                                    or candidate.get("run_id")
-                                    or ""
-                                )
-                                == key
-                            ):
-                                found = candidate
-                                break
-                        if found is None:
-                            candidates.append(winner)
-                        else:
-                            found.update(winner)
-                        stage["candidates"] = candidates
-                elif event_type in {"stage_patch_applied", "stage_patch_skipped"}:
-                    stage["winner_applied"] = bool(data.get("winner_applied"))
-                elif event_type == "stage_losers_pruned":
-                    stage["pruned_candidate_ids"] = (
-                        data.get("pruned_candidate_ids") or []
-                    )
-
-                if event_type in {
-                    "stage_candidate_started",
-                    "stage_candidate_completed",
-                }:
-                    candidate = (
-                        data.get("candidate")
-                        if isinstance(data.get("candidate"), dict)
-                        else {}
-                    )
-                    if not candidate:
-                        candidate = {
-                            "index": payload.get("candidate_index"),
-                            "candidate_id": payload.get("candidate_id"),
-                            "run_id": data.get("run_id"),
-                            "status": data.get("status")
-                            or (
-                                "running"
-                                if event_type.endswith("started")
-                                else "completed"
-                            ),
-                            "score": data.get("score"),
-                            "duration_ms": data.get("duration_ms"),
-                            "error": data.get("error"),
-                        }
-                    candidates = list(stage.get("candidates") or [])
-                    key = str(
-                        candidate.get("candidate_id")
-                        or candidate.get("run_id")
-                        or payload.get("candidate_id")
-                        or ""
-                    )
-                    found = None
-                    for item in candidates:
-                        if (
-                            str(item.get("candidate_id") or item.get("run_id") or "")
-                            == key
-                        ):
-                            found = item
-                            break
-                    if found is None:
-                        candidates.append(candidate)
-                    else:
-                        found.update(candidate)
-                    stage["candidates"] = candidates
-
-            timeline = list(web_run.get("harness_timeline") or [])
-            timeline.append(
-                {
-                    "type": event_type,
-                    "message": payload.get("message") or event_type,
-                    "ts": payload.get("ts") or iso_utc(now_ts()),
-                    "stage_index": payload.get("stage_index"),
-                    "stage_id": payload.get("stage_id"),
-                    "stage_title": payload.get("stage_title"),
-                    "stage_kind": payload.get("stage_kind"),
-                    "candidate_id": payload.get("candidate_id"),
-                }
-            )
-            timeline = timeline[-240:]
-            meta["stages"] = stages
-            meta["candidate_run_ids"] = _collect_candidate_run_ids(meta, stages)
-            update = {
-                "harness_progress": payload,
-                "harness_stages": stages,
-                "harness_timeline": timeline,
-                "harness_meta": meta,
-                "updated_at": iso_utc(now_ts()),
-            }
-            if event_type == "harness_started":
-                update["result_preview"] = (
-                    f"Harness running: {len(stages)} stages x {num_candidates} candidates"
-                )
-            elif event_type.startswith("stage_"):
-                stage_num = (
-                    self._coerce_int(payload.get("stage_index"), 0, min_value=0) or 0
-                ) + 1
-                update["result_preview"] = short_text(
-                    f"Harness stage {stage_num}: {payload.get('message') or event_type}",
-                    600,
-                )
-            self._upsert_web_run(run_id, update)
-
-        try:
-            from umbrella.harness import HarnessOrchestrator
-
-            self._clear_stop_requests(ws_id)
-            self._load_runtime_env()
-            if selected_model:
-                os.environ["LLM_MODEL"] = selected_model
-                os.environ["OUROBOROS_MODEL"] = selected_model
-            if max_rounds is not None:
-                os.environ["OUROBOROS_MAX_ROUNDS"] = str(int(max_rounds))
-
-            orchestrator: HarnessOrchestrator | None = None
-
-            def _on_event(event) -> None:
-                payload = event.to_dict()
-                _record_harness_event(payload)
-                _record_harness_memory(payload)
-                _merge_harness_progress(payload)
-
-            orchestrator = HarnessOrchestrator(
-                repo_root=self.repo_root,
-                workspace_id=ws_id,
-                task_description=task_text,
-                harness_id=run_id,
-                num_candidates=num_candidates,
-                model_pool=[selected_model] if selected_model else None,
-                max_rounds=int(max_rounds or 0),
-                max_verify_retries=int(max_verify_retries or 0),
-                on_event=_on_event,
-                timeout_seconds=None if timeout_hours <= 0 else timeout_hours * 3600,
-            )
-
-            # Make the live orchestrator visible to ``cancel_run`` so the
-            # web Stop button can flip the cooperative cancel event in
-            # real time (without it the harness only stops on the next
-            # natural boundary, which can be many minutes away).
-            with self._run_lock:
-                worker_entry = self._workers.setdefault(run_id, {})
-                worker_entry["orchestrator"] = orchestrator
-                worker_entry["kind"] = "harness"
-
-            harness_result = orchestrator.run()
-            finished = now_ts()
-            normalized_status = (
-                "completed"
-                if harness_result.status == "completed"
-                else ("cancelled" if harness_result.status == "cancelled" else "failed")
-            )
-            full_result = {
-                "status": normalized_status,
-                "task_id": run_id,
-                "workspace_id": ws_id,
-                "harness_result": harness_result.to_dict(),
-                "final_message": harness_result.final_message,
-            }
-            final_run = self._upsert_web_run(
-                run_id,
-                {
-                    "status": normalized_status,
-                    "model": selected_model or self._current_model_id(),
-                    "total_steps": sum(
-                        int((c.full_result or {}).get("llm_tool_invocations") or 0)
-                        for c in harness_result.candidates
-                    ),
-                    "total_duration_ms": int((finished - started) * 1000),
-                    "result_preview": short_text(harness_result.final_message, 600),
-                    "full_result": full_result,
-                    "harness_meta": {
-                        "mode": "staged",
-                        "candidates": num_candidates,
-                        "stage_count": len(harness_result.stages),
-                        "stages": [stage.to_dict() for stage in harness_result.stages],
-                        "candidate_run_ids": [
-                            c.run_id for c in harness_result.candidates
-                        ],
-                        "winner_index": harness_result.winner_index,
-                        "winner_applied": harness_result.winner_applied,
-                        "scores": [
-                            {
-                                "candidate_id": c.candidate_id,
-                                "run_id": c.run_id,
-                                "stage_id": c.stage_id,
-                                "stage_index": c.stage_index,
-                                "score": c.score,
-                                "status": c.status,
-                                "breakdown": c.score_breakdown,
-                            }
-                            for c in harness_result.candidates
-                        ],
-                    },
-                    "updated_at": iso_utc(finished),
-                    "finished_at": iso_utc(finished),
-                },
-            )
-            thread_id = str(final_run.get("thread_id") or thread_id_for_finalize)
-            if thread_id:
-                try:
-                    self._append_thread_finalize_message(thread_id, run_id, full_result)
-                except Exception:
-                    pass
-        except Exception as exc:
-            finished = now_ts()
-            error_text = str(exc) or exc.__class__.__name__
-            error_result = {
-                "status": "error",
-                "error": error_text,
-                "task_id": run_id,
-                "workspace_id": ws_id,
-                "final_message": f"Harness worker crashed: {error_text}",
-            }
-            self._upsert_web_run(
-                run_id,
-                {
-                    "status": "failed",
-                    "error": error_text,
-                    "result_preview": short_text(error_text, 600),
-                    "total_duration_ms": int((finished - started) * 1000),
-                    "full_result": error_result,
-                    "updated_at": iso_utc(finished),
-                    "finished_at": iso_utc(finished),
-                },
-            )
-            if thread_id_for_finalize:
-                try:
-                    self._append_thread_finalize_message(
-                        thread_id_for_finalize, run_id, error_result
-                    )
-                except Exception:
-                    pass
-        finally:
-            self._restore_env(env_snapshot)
-            self._clear_stop_requests(ws_id)
-            with self._run_lock:
-                self._run_threads.pop(run_id, None)
-                self._workers.pop(run_id, None)
+    def _ensure_web_discovery_defaults(self) -> None:
+        """Let web UI phase runs use the built-in no-key web fallback."""
+        if os.environ.get("OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK"):
+            return
+        if os.environ.get("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO"):
+            return
+        if (os.environ.get("OUROBOROS_DEEP_SEARCH_PROVIDER") or "").strip():
+            return
+        if any((os.environ.get(name) or "").strip() for name in self._FAST_SEARCH_PROVIDER_ENV):
+            return
+        os.environ["OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK"] = "1"
 
     def _stop_was_requested(self, run_id: str, ws_id: str | None) -> bool:
         run = self._get_web_run(run_id) or {}
@@ -1932,6 +1218,76 @@ class WebBridgeApp:
                 tools.append(tool)
         return tools
 
+    def _run_log_summary(self, ws_id: str, run_id: str) -> dict[str, Any]:
+        drive = self.workspaces_root / ws_id / ".memory" / "drive"
+        attempt_task_ids = self._attempt_task_ids_for_run(run_id)
+        round_rows = read_jsonl(drive / "logs" / "round_io.jsonl", limit=12000)
+        event_rows = read_jsonl(drive / "logs" / "events.jsonl", limit=12000)
+        tool_rows = read_jsonl(drive / "logs" / "tools.jsonl", limit=16000)
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        models: list[str] = []
+        llm_rounds = 0
+        for row in round_rows:
+            if not self._task_id_matches_run(row.get("task_id"), run_id, attempt_task_ids):
+                continue
+            llm_rounds += 1
+            usage = row.get("usage") if isinstance(row.get("usage"), dict) else row
+            prompt_tokens += self._coerce_int(usage.get("prompt_tokens"), 0) or 0
+            completion_tokens += self._coerce_int(usage.get("completion_tokens"), 0) or 0
+            model = str(row.get("model") or "").strip()
+            if model and model not in models:
+                models.append(model)
+
+        if llm_rounds == 0:
+            for row in event_rows:
+                if str(row.get("type") or "") != "llm_round":
+                    continue
+                if not self._task_id_matches_run(row.get("task_id"), run_id, attempt_task_ids):
+                    continue
+                llm_rounds += 1
+                prompt_tokens += self._coerce_int(row.get("prompt_tokens"), 0) or 0
+                completion_tokens += self._coerce_int(row.get("completion_tokens"), 0) or 0
+                model = str(row.get("model") or "").strip()
+                if model and model not in models:
+                    models.append(model)
+
+        tools: list[str] = []
+        verification_status: str | None = None
+        for row in tool_rows:
+            if not self._task_id_matches_run(row.get("task_id"), run_id, attempt_task_ids):
+                continue
+            tool = str(row.get("tool") or row.get("tool_name") or "").strip()
+            if tool and tool not in tools:
+                tools.append(tool)
+            if tool == "run_workspace_verify":
+                preview = str(row.get("result_preview") or "")
+                lower = preview.lower()
+                if '"skipped": true' in lower or "skipped" in lower:
+                    verification_status = "skipped"
+                elif '"passed": true' in lower or "passed" in lower:
+                    verification_status = "passed"
+                elif preview:
+                    verification_status = "failed"
+
+        forbidden = 0
+        for row in event_rows:
+            if str(row.get("type") or "") != "tool_forbidden":
+                continue
+            if self._task_id_matches_run(row.get("task_id"), run_id, attempt_task_ids):
+                forbidden += 1
+
+        return {
+            "llm_rounds": llm_rounds,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "models": models,
+            "tools_used": tools,
+            "forbidden_tool_attempts": forbidden,
+            "verification_status": verification_status,
+        }
+
     def _workspace_has_run_artifacts(self, ws_id: str | None, run_id: str) -> bool:
         if not ws_id:
             return False
@@ -1966,54 +1322,14 @@ class WebBridgeApp:
                     return True
         return False
 
-    @staticmethod
-    def _compact_harness_candidate(candidate: Any) -> Any:
-        if not isinstance(candidate, dict):
-            return candidate
-        compact = {
-            k: v
-            for k, v in candidate.items()
-            if k
-            not in {
-                "full_result",
-                "candidate_manifest_path",
-                "candidate_diff",
-                "prompt",
-                "task_description",
-            }
-        }
-        if isinstance(compact.get("error"), str):
-            compact["error"] = short_text(compact["error"], 300)
-        return compact
-
-    @classmethod
-    def _compact_harness_stage(cls, stage: Any) -> Any:
-        if not isinstance(stage, dict):
-            return stage
-        compact = dict(stage)
-        compact["candidates"] = [
-            cls._compact_harness_candidate(candidate)
-            for candidate in compact.get("candidates") or []
-        ]
-        return compact
-
     @classmethod
     def _compact_run_for_list(cls, run: dict[str, Any]) -> dict[str, Any]:
         compact = dict(run)
         compact.pop("full_result", None)
         if isinstance(compact.get("result_preview"), str):
             compact["result_preview"] = short_text(compact["result_preview"], 600)
-        if isinstance(compact.get("harness_meta"), dict):
-            meta = dict(compact["harness_meta"])
-            if isinstance(meta.get("stages"), list):
-                meta["stages"] = [
-                    cls._compact_harness_stage(stage) for stage in meta["stages"]
-                ]
-            compact["harness_meta"] = meta
-        if isinstance(compact.get("harness_stages"), list):
-            compact["harness_stages"] = [
-                cls._compact_harness_stage(stage) for stage in compact["harness_stages"]
-            ]
+        if isinstance(compact.get("phase_events"), list):
+            compact["phase_events"] = compact["phase_events"][-10:]
         return compact
 
     def _infer_workspace_id_for_run(self, run_id: str) -> str | None:
@@ -2601,6 +1917,7 @@ class WebBridgeApp:
                     head.startswith("stop requested by dashboard")
                     or head.startswith("stop requested from the web ui")
                     or head.startswith("stop requested by web ui")
+                    or head.startswith("stop_requested")
                 ):
                     status = "cancelled"
         ts_raw = task.get("ts")
@@ -2909,6 +2226,9 @@ class WebBridgeApp:
                 terminal_text = terminal_path.read_text(
                     encoding="utf-8", errors="replace"
                 )
+                terminal_text = _filter_terminal_scrollback_for_run(
+                    terminal_text, run_id
+                )
                 terminal_mtime = terminal_path.stat().st_mtime
             except OSError:
                 terminal_text = ""
@@ -3061,8 +2381,129 @@ class WebBridgeApp:
         if not run:
             return {"run_id": run_id, "workspace_id": "", "phases": []}
         ws_id = run["workspace_id"]
-        attempt_task_ids = self._attempt_task_ids_for_run(run_id, run)
         drive_root = self.workspaces_root / ws_id / ".memory" / "drive"
+
+        _plan_path = drive_root / "state" / "phase_plan.json"
+        if not _plan_path.exists():
+            for _candidate in self.workspaces_root.glob("*/.memory/drive/state/phase_plan.json"):
+                try:
+                    _d = json.loads(_candidate.read_text(encoding="utf-8"))
+                    if _d.get("run_id") == run_id:
+                        _plan_path = _candidate
+                        break
+                except Exception:
+                    pass
+
+        if _plan_path.exists():
+            try:
+                _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
+                _nodes = _plan.get("nodes") or []
+                _label_map = {
+                    "preflight": "Pre-flight",
+                    "research": "Research",
+                    "research_review": "Research Review",
+                    "plan": "Plan",
+                    "plan_review": "Plan Review",
+                    "execute": "Execute",
+                    "execute_review": "Execute Review",
+                    "final": "Final",
+                    "verify": "Verify",
+                    "reflexion": "Reflexion",
+                }
+                _verify_map = {
+                    "done": "passed",
+                    "failed": "failed",
+                    "skipped": "skipped",
+                }
+                _phases = []
+                for _pn in _nodes:
+                    _pid = str(_pn.get("id") or _pn.get("manifest_id") or "")
+                    _status = str(_pn.get("status") or "pending")
+                    _started = _pn.get("started_at")
+                    _ended = _pn.get("ended_at")
+                    _duration = None
+                    if isinstance(_started, (int, float)) and isinstance(_ended, (int, float)):
+                        _duration = max(0, int((_ended - _started) * 1000))
+                    _phases.append({
+                        "name": _pid,
+                        "label": _label_map.get(_pid, _pid.replace("_", " ").title()),
+                        "duration_ms": _duration,
+                        "rounds": 0,
+                        "tool_calls": 0,
+                        "write_tool_calls": 0,
+                        "preflight_errors": 0,
+                        "verification_status": _verify_map.get(_status),
+                        "status": _status,
+                    })
+                attempt_task_ids = self._attempt_task_ids_for_run(run_id, run)
+                _round_io = read_jsonl(drive_root / "logs" / "round_io.jsonl", limit=8000)
+                _tool_io = read_jsonl(drive_root / "logs" / "tools.jsonl", limit=12000)
+                _event_io = read_jsonl(drive_root / "logs" / "events.jsonl", limit=8000)
+                _write_tools = {
+                    "update_workspace_seed",
+                    "apply_workspace_patch",
+                    "update_workspace_from_instance",
+                    "commit_workspace_changes",
+                    "delete_workspace_file",
+                    "repo_write_commit",
+                }
+
+                def _idx_for_task(task_id: Any) -> int | None:
+                    raw = str(task_id or "")
+                    for idx, phase in enumerate(_phases):
+                        if raw == f"{run_id}:{phase['name']}" or raw.startswith(
+                            f"{run_id}:{phase['name']}:"
+                        ):
+                            return idx
+                    return None
+
+                def _idx_for_ts(ts_val: float | None) -> int | None:
+                    if ts_val is None:
+                        return None
+                    for idx, node in enumerate(_nodes):
+                        start = node.get("started_at")
+                        end = node.get("ended_at")
+                        if isinstance(start, (int, float)) and ts_val >= float(start):
+                            if not isinstance(end, (int, float)) or ts_val <= float(end):
+                                return idx
+                    return None
+
+                for _row in _round_io:
+                    if not self._task_id_matches_run(_row.get("task_id"), run_id, attempt_task_ids):
+                        continue
+                    _idx = _idx_for_task(_row.get("task_id")) or _idx_for_ts(
+                        self._parse_ts_value(_row.get("ts") or _row.get("timestamp"))
+                    )
+                    if _idx is not None and 0 <= _idx < len(_phases):
+                        _phases[_idx]["rounds"] += 1
+                for _row in _tool_io:
+                    if not self._task_id_matches_run(_row.get("task_id"), run_id, attempt_task_ids):
+                        continue
+                    _idx = _idx_for_task(_row.get("task_id")) or _idx_for_ts(
+                        self._parse_ts_value(_row.get("ts") or _row.get("timestamp"))
+                    )
+                    if _idx is not None and 0 <= _idx < len(_phases):
+                        _phases[_idx]["tool_calls"] += 1
+                        if (
+                            str(_row.get("tool") or "") in _write_tools
+                            and is_effective_write_tool_log_row(_row)
+                        ):
+                            _phases[_idx]["write_tool_calls"] += 1
+                for _row in _event_io:
+                    if str(_row.get("type") or "") != "tool_forbidden":
+                        continue
+                    if not self._task_id_matches_run(_row.get("task_id"), run_id, attempt_task_ids):
+                        continue
+                    _idx = _idx_for_task(_row.get("task_id")) or _idx_for_ts(
+                        self._parse_ts_value(_row.get("ts") or _row.get("timestamp"))
+                    )
+                    if _idx is not None and 0 <= _idx < len(_phases):
+                        _phases[_idx]["preflight_errors"] += 1
+                return {"run_id": run_id, "workspace_id": ws_id, "phases": _phases, "source": "phase_plan"}
+            except Exception:
+                pass
+
+        attempt_task_ids = self._attempt_task_ids_for_run(run_id, run)
 
         round_io = read_jsonl(drive_root / "logs" / "round_io.jsonl", limit=8000)
         tool_io = read_jsonl(drive_root / "logs" / "tools.jsonl", limit=12000)
@@ -4691,6 +4132,71 @@ class WebBridgeApp:
 
         nodes = list(nodes_by_id.values())
         nodes.sort(key=lambda node: str(node.get("updated_at") or ""), reverse=True)
+
+        try:
+            import pathlib as _pl
+            import sqlite3 as _sq3
+            from umbrella.memory.palace.facade import MemPalace
+            _repo = _pl.Path(os.environ.get("UMBRELLA_REPO_ROOT", str(self.repo_root)))
+            _palace = MemPalace(_repo, ws_id or "")
+            _palace_nodes = _palace.list_all(n=300)
+
+            _edge_map: dict[str, list[str]] = {}
+            try:
+                _g_path = _palace._stores._graph._conn
+                _rows = _g_path.execute("SELECT src_id, dst_id FROM edges").fetchall()
+                for _s, _d in _rows:
+                    _edge_map.setdefault(_s, []).append(_d)
+                    _edge_map.setdefault(_d, []).append(_s)
+            except Exception:
+                pass
+
+            _STORE_NODE_TYPE = {
+                "palace.charter": "reference",
+                "palace.lesson": "lesson",
+                "palace.idea": "concept",
+                "palace.codeptr": "knowledge",
+                "palace.skill_index": "prompt",
+                "palace.run": "run_result",
+                "palace.phase": "task",
+                "palace.subtask": "subtask_result",
+                "palace.transient": "log",
+            }
+
+            for _n in _palace_nodes:
+                _store = _n.get("store", "palace.idea")
+                _nt = _STORE_NODE_TYPE.get(_store, "concept")
+                _content = str(_n.get("content") or "")
+                _nid = str(_n.get("id") or "")
+                _ts = _n.get("created_at")
+                _created = iso_utc(float(_ts)) if isinstance(_ts, (int, float)) else iso_utc(now_ts())
+                _tags_raw = _n.get("tags") or ""
+                _tags = [t for t in str(_tags_raw).split(",") if t]
+                _conns = list(dict.fromkeys(_edge_map.get(_nid, [])))
+                add_node({
+                    "id": _nid,
+                    "type": _nt,
+                    "node_type": _nt,
+                    "label": _content[:80] or _nid[:40],
+                    "content": _content,
+                    "source": _store,
+                    "scope": _n.get("scope") or _n.get("tier") or "",
+                    "path": _n.get("source_path") or "",
+                    "tags": _tags,
+                    "connections": _conns,
+                    "edges": _conns,
+                    "reference_count": 0,
+                    "priority": 5,
+                    "workspace_id": ws_id,
+                    "verified": bool(_n.get("verified")),
+                    "tier": _n.get("tier") or "",
+                    "phase": _n.get("phase") or "",
+                    "created_at": _created,
+                    "updated_at": _created,
+                })
+        except Exception:
+            pass
+
         return nodes
 
     def get_memory_node(self, node_id: str) -> dict[str, Any] | None:

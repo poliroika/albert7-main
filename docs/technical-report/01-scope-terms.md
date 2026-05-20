@@ -1,46 +1,55 @@
-# Часть 1. Цели отчёта, аудитория, термины
+# Part 1: Goals, Audience, Terms
 
-[← Оглавление](README.md) · [Далее: контекст системы →](02-system-context.md)
+## Purpose
+
+This technical report describes the post-refactoring Umbrella system for engineers who will edit code, debug runs, and extend functionality. It complements the higher-level [architecture](../architecture.md) with code-level detail.
+
+## Audience
+
+- Engineers extending Umbrella, Ouroboros, or workspaces.
+- Operators running and debugging workspace execution.
+- Contributors writing new phase manifests, tools, or skills.
+
+## Glossary
+
+| Term | Definition |
+|------|-----------|
+| **PhaseManifest** | YAML file declaring a phase's tools, skills, prompts, memory access, permissions, exit criteria, and budgets. Validated against `manifest.schema.json`. |
+| **PhasePlan** | Mutable ordered list of `PhaseNode` objects defining the run's progression. Can be modified in-run via `mutate_phase_plan`. |
+| **PhaseNode** | A single phase in the PhasePlan: `id`, `manifest_id`, `status` (pending/running/done/failed/skipped), optional `subtasks`, `overlay`. |
+| **SubtaskCard** | A recipe within the execute phase: goal, allowed tools/skills, success test, codeptr refs, MCP refs. |
+| **PhaseRunner** | `umbrella/orchestrator/runner.py` — walks the PhasePlan, spawns Worker/Watcher per phase, processes signals. |
+| **Worker** | An Ouroboros agent executing a single phase with the manifest's tool filter and prompt overlays. |
+| **Watcher** | An Ouroboros agent running in parallel, idle by default, waking on trigger conditions (stall, repeat error, etc.). |
+| **PermissionEnvelope** | Per-phase access control: `allow/deny(tool, path?, command?)`. Evaluated as pre-hook in `ToolRegistry.execute`. |
+| **MemPalace** | Unified memory facade (`umbrella/memory/palace/facade.py`) with 9 stores (Chroma + SQLite), tier/scope semantics, graph edges. |
+| **MemNode** | A single memory record: `id, store, tier, scope, tags, content, embedding?, workspace_id, run_id, phase, verified, created_at`. |
+| **Tier** | Recall priority: `always_on`, `hot`, `warm`, `cold`, `transient`. Orthogonal to scope. |
+| **Scope** | Lifetime: `cross_run_durable`, `run_scoped`, `phase_scoped`, `subtask_scoped`, `transient`. |
+| **RecallBundle** | Pre-loaded memory context for a phase: always_on nodes, hot nodes, warm vector search results, graph neighbours. |
+| **FinalReport** | Evidence-based report built after `verify(pass)`: claims must cite event/artifact IDs. |
+| **WatcherSignal** | Control signal from Watcher to Runner: `abort_phase`, `restart_phase`, `mutate_phase_plan`, `force_verify`, `inject_lesson`. Written to `drive/state/watcher_signal.json`. |
+| **Reflexion** | Verbal self-feedback mini-phase after failed verify. Promotes to `palace.lesson` only after verified evidence of success. |
+| **Drive** | Ouroboros filesystem workspace at `.umbrella/ouroboros_drive/`: logs, memory, state, task results. |
+| **ResultEnvelope** | Unified JSON response for all CLI and HTTP endpoints: `{ok, data, errors[], meta}`. |
+| **Skill** | A reusable knowledge pack in `umbrella/skills/library/<slug>/SKILL.md` with phase-tagged frontmatter. |
+| **MCP** | Model Context Protocol — external tool servers discovered and loaded per-phase. |
+| **Harness** | Runtime tool `harness_run` that runs N parallel Worker candidates on a subtask and picks the winner. |
+| **Meta-Harness** | Optional experiment/candidate surface under `.umbrella/meta_harness/` (cleanup + bridge summaries). Not the same as the `harness_run` tool; no dedicated `umbrella/meta_harness/` package in this checkout. |
+
+## Out of Scope
+
+- Internal GMAS implementation details (see `gmas/docs/`).
+- Deployment infrastructure beyond local development.
+- LLM provider specifics beyond the API contract.
+
+## Conventions
+
+- File paths are relative to the repository root.
+- Code references use `module.py::symbol` notation.
+- Diagrams use Mermaid syntax.
+- Configuration values show defaults in parentheses.
 
 ---
 
-## 1.1 Зачем нужен этот раздел документации
-
-В репозитории есть набор тематических файлов в [docs/](../README.md). Они хорошо отвечают на вопрос «как мы хотим жить» и «какие сущности существуют». Этот техотчёт отвечает на другой класс вопросов:
-
-- где в **файловой системе** и в **модулях Python** живёт конкретное поведение;
-- какой **порядок вызовов** при запуске из CLI, из Web UI или из непрерывного раннера;
-- какие **файлы на диске** появляются без участия человека и зачем они нужны оператору;
-- где **граница ответственности** между компонентами заканчивается и начинается «магия», которую лучше не трогать без понимания последствий.
-
-Отчёт **не** дублирует пользовательскую документацию GMAS из `gmas/docs/` — там свой фокус на API фреймворка.
-
-## 1.2 Аудитория
-
-1. **Разработчик control-plane** — правки в `umbrella/`, интеграция новых инструментов, доработка bridge.
-2. **Разработчик workspace** — понимание, как instance создаётся, когда срабатывает verification, куда смотреть при падении CI-подобных шагов.
-3. **Оператор** — запуск через терминал или Web UI, интерпретация логов и статусов в `.umbrella/`.
-
-## 1.3 Термины
-
-| Термин | Смысл в Umbrella |
-|--------|------------------|
-| **Workspace** | Прикладной пакет под `workspaces/<id>/`: конфигурация, код агентов GMAS, задачи, тесты. |
-| **Seed** | Стабильный шаблон workspace; политика проекта — не превращать его в свалку разовых экспериментов. |
-| **Task-instance** | Рабочая копия/ветка работы под конкретную задачу; основная поверхность для автоматических правок Ouroboros. |
-| **GMAS** | Мультиагентный фреймворк в `gmas/`; исполнитель графов и инструментов на уровне «движка». |
-| **Umbrella** | Control-plane в `umbrella/`: политика, запуск, retrieval, verification, observability, Web API. |
-| **Ouroboros** | Менеджер долгого цикла в `ouroboros/` + интеграция через `umbrella/control_plane/`; LLM-планирование и вызов Umbrella-tools. |
-| **Verification** | Обязательный пост-проход после итерации: шаги из `workspace.toml` или авто-детект; результат — отчёт, влияющий на retry и promotion. |
-| **Web bridge** | Один HTTP-процесс: статика React + JSON под `/api/*` (`umbrella/web_bridge/`). |
-| **Meta-Harness** | Внешний контур экспериментов над harness/candidate; файловый store под `.umbrella/meta_harness/`. |
-
-## 1.4 Что сознательно не разбирается здесь до строчки
-
-- Внутренняя математика конкретных графов GMAS в каждом workspace (это документация самого workspace).
-- Коммерческие лимиты API провайдеров LLM.
-- Полная история эволюции репозитория (git blame и changelog остаются источником правды по «почему так сделали»).
-
----
-
-Следующая часть связывает термины в один связный рассказ о системе: [02-system-context.md](02-system-context.md).
+Next: [Part 2 — System Context](02-system-context.md)

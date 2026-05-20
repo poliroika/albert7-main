@@ -1,0 +1,61 @@
+id: reflexion
+version: 1
+description: "Reflexion phase: review the full run history, extract lessons, identify failure patterns, and write durable learnings to palace."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/reflexion.system.md
+
+allowed_tools:
+  - load_skill
+  - palace_search
+  - read_drive_log
+  - read_terminal_scrollback
+  - palace_walk
+  - submit_reflection
+  - palace_add
+  - palace_link
+
+forbidden_tools:
+  - apply_workspace_patch
+  - shell
+  - terminal_session
+  - repo_write_commit
+  - claude_code_edit
+  - sandbox_self_edit
+  - run_real_e2e
+  - run_workspace_verify
+
+allowed_skills:
+  - reflexion-author
+  - failure-pattern-analyst
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [execution_error, subtask_verdict, final_review_report, verification_report]}
+  warm_search:
+    - {store: palace.global, n: 8, filter: {type: lesson}}
+  graph:
+    walk_edges: [caused_by, related_to, lesson_from]
+    hops: 2
+  write_rules:
+    lesson: {store: palace.global, tier: warm, scope: cross_run_durable}
+    failure_pattern: {store: palace.global, tier: warm, scope: cross_run_durable}
+
+permissions:
+  rules:
+    - allow_tools: [load_skill, palace_search, read_drive_log, read_terminal_scrollback, palace_walk, submit_reflection, palace_add, palace_link]
+    - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, claude_code_edit, sandbox_self_edit, run_real_e2e, run_workspace_verify]
+
+exit_criteria:
+  required_calls: [submit_reflection]
+  min_palace_writes:
+    - {store: palace.global, n: 1}
+
+mini_review_after: null
+
+budgets:
+  max_tokens: 15000
+  max_seconds: 300

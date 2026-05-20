@@ -23,7 +23,7 @@ def test_sets_moderate_pending_at_86_percent(monkeypatch: pytest.MonkeyPatch) ->
     messages = [{"role": "user", "content": body}]
     ctx = SimpleNamespace(_pending_compaction=None)
     _auto_set_pending_compaction_for_overflow(messages, ctx)
-    assert ctx._pending_compaction == 6
+    assert ctx._pending_compaction == 3
 
 
 def test_respects_existing_pending(monkeypatch: pytest.MonkeyPatch) -> None:

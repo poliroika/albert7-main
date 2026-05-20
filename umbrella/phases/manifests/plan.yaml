@@ -1,0 +1,68 @@
+id: plan
+version: 1
+description: "Planning phase: decompose the task into a phase plan with ordered subtasks, test strategies, and decision policies."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/plan.system.md
+  user_overlay:
+    - umbrella/prompts/phases/plan.user_overlay.md
+
+allowed_tools:
+  - read_file
+  - list_files
+  - propose_phase_plan
+  - propose_subtasks
+  - harness_run
+  - load_skill
+  - palace_search
+  - palace_add
+  - palace_link
+  - list_available_tools
+  - enable_tools
+  - mcp_discover
+  - register_temp_tool
+  - get_gmas_context
+  - search_gmas_knowledge
+  - submit_phase_plan
+
+forbidden_tools:
+  - apply_workspace_patch
+  - shell
+  - terminal_session
+  - repo_write_commit
+  - claude_code_edit
+  - sandbox_self_edit
+
+allowed_skills:
+  - task-decomposition
+  - decision-policy
+  - test-strategy-author
+  - gmas-pattern-author
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [research_finding, research_summary, phase_plan, subtask]}
+  warm_search:
+    - {store: palace.global, n: 6, filter: {type: plan}}
+  write_rules:
+    phase_plan: {store: palace.run, tier: hot, scope: run_scoped}
+    subtask_card: {store: palace.subtask, tier: hot, scope: subtask_scoped}
+
+permissions:
+  rules:
+    - allow_tools: [read_file, list_files, propose_phase_plan, propose_subtasks, harness_run, load_skill, palace_search, palace_add, palace_link, list_available_tools, enable_tools, mcp_discover, register_temp_tool, get_gmas_context, search_gmas_knowledge, submit_phase_plan]
+    - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, claude_code_edit, sandbox_self_edit]
+
+exit_criteria:
+  required_calls: [propose_phase_plan, submit_phase_plan]
+  min_palace_writes:
+    - {store: palace.run, n: 1}
+
+mini_review_after: plan_review
+
+budgets:
+  max_tokens: 25000
+  max_seconds: 480

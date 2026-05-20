@@ -11,8 +11,10 @@ The check is intentionally conservative:
 
 * Skips if no skills are detected for the workspace.
 * Skips for skills that have no compliance contract.
-* Reports ``skill_compliance`` as ``passed`` when at least one
-  ``import gmas`` / ``from gmas`` statement is found in the workspace.
+* Reports ``skill_compliance`` as ``passed`` when at least one application
+  file imports ``gmas``.
+* Adds a runtime import check for the selected verification interpreter so
+  a shadow package named ``gmas`` cannot satisfy compliance accidentally.
 * Returns ``failed`` with a list of inspected files when nothing
   matches.
 
@@ -21,7 +23,10 @@ without bringing in heavy optional deps.
 """
 
 import logging
+import json
 import re
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,6 +86,18 @@ _MOCK_SCAFFOLD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        "compliance-only skill import",
+        re.compile(
+            r"\b(?:import\s+gmas|from\s+gmas|gmas|llm|multi[_-]?agent)\b"
+            r"[\s\S]{0,180}\b(?:satisfy|pass|appease|silence)\b"
+            r"[\s\S]{0,120}\b(?:skill|compliance|import[_-]?check|quality|check|requirement)\b"
+            r"|\b(?:satisfy|pass|appease|silence)\b"
+            r"[\s\S]{0,120}\b(?:skill|compliance|import[_-]?check|quality|check|requirement)\b"
+            r"[\s\S]{0,180}\b(?:gmas|llm|multi[_-]?agent)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "stub content",
         re.compile(
             r"\b(?:create|created|generate|generated|build|built)\s+\w*\s*stub\s+(?:card|cards|content|response)"
@@ -133,6 +150,16 @@ _GMAS_FALLBACK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "llm decision fallback",
+        re.compile(
+            r"\b(?:fallback|fall[-\s]?back)\b[\s\S]{0,300}"
+            r"\b(?:positive|negative)[_\s-]*(?:words?|count|sentiment)\b|"
+            r"\b(?:positive_count|negative_count|positive_words|negative_words)\b"
+            r"[\s\S]{0,500}\b(?:return\s+(?:True|False)|accept|reject|decision)\b",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 _SKIP_DIR_NAMES: frozenset[str] = frozenset(
@@ -180,6 +207,119 @@ _SKILL_CHECKS: dict[str, SkillCheck] = {
         summary_label="GMAS import",
     ),
 }
+
+_GMAS_RUNTIME_IMPORT_SOURCE = r"""
+from pathlib import Path
+import importlib.metadata as metadata
+import sys
+
+import gmas
+from gmas.builder import GraphBuilder
+from gmas.execution import MACPRunner
+
+gmas_file = Path(getattr(gmas, "__file__", "")).resolve()
+expected_source = Path(sys.argv[1]).resolve()
+
+if expected_source.exists():
+    try:
+        gmas_file.relative_to(expected_source)
+    except ValueError:
+        raise SystemExit(
+            f"wrong_gmas_package: imported {gmas_file}, expected local source under {expected_source}"
+        )
+else:
+    dists = set(metadata.packages_distributions().get("gmas", []))
+    if "frontier-ai-gmas" not in dists:
+        raise SystemExit(
+            "wrong_gmas_distribution: import namespace 'gmas' is not provided by frontier-ai-gmas"
+        )
+
+print(f"gmas runtime ok: {gmas_file}")
+print(f"GraphBuilder={GraphBuilder.__module__}.{GraphBuilder.__name__}")
+print(f"MACPRunner={MACPRunner.__module__}.{MACPRunner.__name__}")
+""".strip()
+
+_GMAS_APP_IMPORT_SOURCE = r"""
+from pathlib import Path
+import importlib
+import importlib.util
+import json
+import os
+import sys
+
+workspace = Path(sys.argv[1]).resolve()
+files = json.loads(os.environ.get("UMBRELLA_GMAS_IMPORT_FILES", "[]"))
+sys.path.insert(0, str(workspace))
+src_root = workspace / "src"
+if src_root.exists():
+    sys.path.insert(0, str(src_root))
+
+
+def dotted_module_name(root, raw_parts):
+    if not raw_parts:
+        return None
+    module_parts = raw_parts[:-1] if raw_parts[-1] == "__init__" else raw_parts
+    if not module_parts:
+        return None
+    if len(module_parts) == 1:
+        return module_parts[0]
+    cursor = root
+    package_parts = []
+    for part in module_parts[:-1]:
+        cursor = cursor / part
+        if not (cursor / "__init__.py").exists():
+            return None
+        package_parts.append(part)
+    return ".".join([*package_parts, module_parts[-1]])
+
+
+def module_name_for(rel_path):
+    raw_parts = Path(rel_path).with_suffix("").parts
+    if not raw_parts:
+        return None
+    candidates = []
+    if len(raw_parts) > 1 and raw_parts[0] == "src" and src_root.exists():
+        candidates.append((src_root, raw_parts[1:]))
+    candidates.append((workspace, raw_parts))
+    for root, parts in candidates:
+        module_name = dotted_module_name(root, parts)
+        if module_name:
+            return module_name
+    return None
+
+
+failures = []
+for idx, rel in enumerate(files):
+    path = (workspace / rel).resolve()
+    try:
+        path.relative_to(workspace)
+    except ValueError:
+        failures.append(f"{rel}: path escapes workspace")
+        continue
+    if not path.exists():
+        failures.append(f"{rel}: file is missing")
+        continue
+    try:
+        module_name = module_name_for(rel)
+        if module_name:
+            importlib.import_module(module_name)
+        else:
+            spec = importlib.util.spec_from_file_location(
+                f"_umbrella_gmas_import_check_{idx}", path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"cannot build import spec for {path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+    except BaseException as exc:
+        failures.append(f"{rel}: {type(exc).__name__}: {exc}")
+
+if failures:
+    print("\n".join(failures), file=sys.stderr)
+    raise SystemExit(1)
+
+print("gmas application imports ok: " + ", ".join(files))
+""".strip()
 
 
 def _iter_python_files(workspace_path: Path) -> list[Path]:
@@ -271,6 +411,157 @@ def evaluate_gmas_compliance(workspace_path: Path) -> tuple[bool, str, list[str]
     return False, summary, inspected
 
 
+def _repo_gmas_source_dir(workspace_path: Path) -> Path:
+    """Return the local ``gmas`` source package when this is an Umbrella repo."""
+
+    resolved = workspace_path.resolve()
+    for parent in (resolved, *resolved.parents):
+        candidate = parent / "gmas" / "src" / "gmas"
+        if candidate.exists():
+            return candidate.resolve()
+    return Path()
+
+
+def evaluate_gmas_runtime_import(
+    workspace_path: Path,
+    python_cmd: list[str],
+    env: dict[str, str] | None = None,
+) -> VerificationStepResult:
+    """Verify the selected interpreter imports the real GMAS runtime."""
+
+    step = VerificationStep(
+        kind=VerificationStepKind.IMPORT_CHECK,
+        name="skill_runtime:multi_agent_gmas_importable",
+        optional=False,
+    )
+    started = time.time()
+    expected_source = _repo_gmas_source_dir(workspace_path)
+    cmd = [
+        *python_cmd,
+        "-c",
+        _GMAS_RUNTIME_IMPORT_SOURCE,
+        str(expected_source),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workspace_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return VerificationStepResult(
+            step=step,
+            status=VerificationStatus.ERROR,
+            duration_seconds=time.time() - started,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+            summary="Timed out while importing GMAS runtime with the workspace interpreter.",
+            error="gmas_runtime_import_timeout",
+        )
+    except Exception as exc:  # noqa: BLE001 - defensive verification boundary
+        return VerificationStepResult(
+            step=step,
+            status=VerificationStatus.ERROR,
+            duration_seconds=time.time() - started,
+            summary=f"GMAS runtime import check crashed: {type(exc).__name__}",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    passed = proc.returncode == 0
+    if passed:
+        summary = "Selected workspace interpreter imports frontier-ai-gmas successfully."
+    else:
+        summary = (
+            "Selected workspace interpreter cannot import the required "
+            "`frontier-ai-gmas` runtime (`gmas.builder.GraphBuilder` and "
+            "`gmas.execution.MACPRunner`)."
+        )
+    return VerificationStepResult(
+        step=step,
+        status=VerificationStatus.PASSED if passed else VerificationStatus.FAILED,
+        exit_code=proc.returncode,
+        duration_seconds=time.time() - started,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        summary=summary,
+        error="" if passed else "gmas_runtime_import_failed",
+    )
+
+
+def evaluate_gmas_application_imports(
+    workspace_path: Path,
+    evidence_files: list[str],
+    python_cmd: list[str],
+    env: dict[str, str] | None = None,
+) -> VerificationStepResult:
+    """Import the application modules that claim GMAS usage."""
+
+    step = VerificationStep(
+        kind=VerificationStepKind.IMPORT_CHECK,
+        name="skill_runtime:multi_agent_gmas_app_imports",
+        optional=False,
+    )
+    started = time.time()
+    step_env = dict(env or {})
+    step_env["UMBRELLA_GMAS_IMPORT_FILES"] = json.dumps(evidence_files)
+    cmd = [*python_cmd, "-c", _GMAS_APP_IMPORT_SOURCE, str(workspace_path.resolve())]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workspace_path),
+            env=step_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return VerificationStepResult(
+            step=step,
+            status=VerificationStatus.ERROR,
+            duration_seconds=time.time() - started,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+            summary="Timed out while importing GMAS application modules.",
+            error="gmas_application_import_timeout",
+        )
+    except Exception as exc:  # noqa: BLE001 - defensive verification boundary
+        return VerificationStepResult(
+            step=step,
+            status=VerificationStatus.ERROR,
+            duration_seconds=time.time() - started,
+            summary=f"GMAS application import check crashed: {type(exc).__name__}",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    sample = ", ".join(evidence_files[:5])
+    more = "" if len(evidence_files) <= 5 else f" (+{len(evidence_files) - 5} more)"
+    passed = proc.returncode == 0
+    return VerificationStepResult(
+        step=step,
+        status=VerificationStatus.PASSED if passed else VerificationStatus.FAILED,
+        exit_code=proc.returncode,
+        duration_seconds=time.time() - started,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        summary=(
+            f"GMAS application modules import successfully: {sample}{more}"
+            if passed
+            else "At least one application module that imports GMAS cannot be "
+            f"imported with the workspace interpreter: {sample}{more}"
+        ),
+        error="" if passed else "gmas_application_import_failed",
+    )
+
+
 def evaluate_no_mock_scaffold(workspace_path: Path) -> tuple[bool, str]:
     """Fail when app code still contains obvious mock/stub scaffolding."""
 
@@ -299,7 +590,7 @@ def evaluate_no_mock_scaffold(workspace_path: Path) -> tuple[bool, str]:
 
 
 def evaluate_no_gmas_fallback(workspace_path: Path) -> tuple[bool, str]:
-    """Fail when GMAS-active app code can silently degrade to non-GMAS stubs."""
+    """Fail when GMAS-active app code can silently degrade to stubs or heuristics."""
 
     hits: list[str] = []
     for path in _iter_app_python_files(workspace_path):
@@ -323,13 +614,18 @@ def evaluate_no_gmas_fallback(workspace_path: Path) -> tuple[bool, str]:
     return (
         False,
         "GMAS is active, but application code can silently fall back to "
-        f"non-GMAS stubs: {sample}{more}. Use real `gmas.*` APIs or fail "
-        "loudly with an explicit blocker.",
+        f"non-GMAS stubs or heuristic LLM decisions: {sample}{more}. Use real "
+        "`gmas.*` APIs and structured LLM outputs, or fail loudly with an "
+        "explicit blocker.",
     )
 
 
 def build_skill_compliance_results(
-    workspace_path: Path, detected_domains: set[str]
+    workspace_path: Path,
+    detected_domains: set[str],
+    *,
+    python_cmd: list[str] | None = None,
+    env: dict[str, str] | None = None,
 ) -> list[VerificationStepResult]:
     """Build synthetic verification results for active skill contracts."""
 
@@ -348,6 +644,18 @@ def build_skill_compliance_results(
             error="" if passed else "missing_gmas_import",
         )
     )
+
+    if python_cmd:
+        results.append(evaluate_gmas_runtime_import(workspace_path, python_cmd, env))
+        if passed and evidence_files:
+            results.append(
+                evaluate_gmas_application_imports(
+                    workspace_path,
+                    evidence_files,
+                    python_cmd,
+                    env,
+                )
+            )
 
     no_fallback_passed, no_fallback_summary = evaluate_no_gmas_fallback(workspace_path)
     results.append(

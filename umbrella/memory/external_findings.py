@@ -1,6 +1,8 @@
 """Persistence for findings returned by external discovery tools."""
 
+import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,10 +22,9 @@ def mirror_external_finding_to_memory(
     workspace_id: str = "",
     metadata_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Persist an external discovery result to hierarchical + semantic memory."""
+    """Persist an external discovery result to ideas.jsonl and MemPalace."""
 
     try:
-        from umbrella.memory.hierarchical import HierarchicalMemory
         from umbrella.memory.palace_backend import get_palace_backend
         from umbrella.memory.paths import palace_path_for
 
@@ -43,23 +44,33 @@ def mirror_external_finding_to_memory(
         subpath = (palace_subpath or kind).strip("/")
         hier_path = f"workspaces/{ws}/external/{subpath}"
 
-        hm = HierarchicalMemory(root)
-        record = hm.add(
-            palace_path=hier_path,
-            title=title_norm[:200],
-            content=body_norm,
-            kind=kind,
-            workspace_id=ws,
-            task_id=str(getattr(ctx, "task_id", "") or ""),
-            tags=tag_list,
-            metadata={
-                "source": "external_discovery_tool",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "evidence_kind": "verified_outcome",
-                **(metadata_extra or {}),
-            },
-        )
+        record_id = str(uuid.uuid4())
+        ts = datetime.now(timezone.utc).isoformat()
 
+        # Write to ideas.jsonl (primary JSONL store)
+        idea_record = {
+            "id": record_id,
+            "palace_path": hier_path,
+            "title": title_norm[:200],
+            "content": body_norm,
+            "kind": kind,
+            "workspace_id": ws,
+            "task_id": str(getattr(ctx, "task_id", "") or ""),
+            "tags": tag_list,
+            "evidence_kind": "verified_outcome",
+            "ts": ts,
+            "source": "external_discovery_tool",
+            **(metadata_extra or {}),
+        }
+        try:
+            ideas_path = root / "ideas.jsonl"
+            ideas_path.parent.mkdir(parents=True, exist_ok=True)
+            with ideas_path.open("a", encoding="utf-8") as _fh:
+                _fh.write(json.dumps(idea_record, ensure_ascii=False) + "\n")
+        except Exception:
+            log.debug("mirror_external_finding jsonl write skipped", exc_info=True)
+
+        # Mirror to MemPalace (semantic store)
         palace_result: dict[str, Any] = {}
         try:
             palace_result = get_palace_backend(palace_path_for(repo_root, ws)).add(
@@ -72,7 +83,7 @@ def mirror_external_finding_to_memory(
                 tags=tag_list,
                 task_id=str(getattr(ctx, "task_id", "") or ""),
                 metadata_extra={
-                    "hierarchical_id": record.id,
+                    "idea_id": record_id,
                     "palace_path": hier_path,
                     "evidence_kind": "verified_outcome",
                     **(metadata_extra or {}),
@@ -84,7 +95,7 @@ def mirror_external_finding_to_memory(
         return {
             "mirrored": True,
             "workspace_id": ws,
-            "hierarchical_id": record.id,
+            "idea_id": record_id,
             "palace_path": hier_path,
             "mirrored_to_semantic": bool(palace_result),
         }

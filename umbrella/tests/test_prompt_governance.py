@@ -14,7 +14,6 @@ from umbrella.control_plane import (
     decide_next_action,
     get_prompt_surface,
     identify_prompt_surfaces,
-    prepare_self_improvement,
     propose_prompt_patch,
     record_human_checkpoint_decision,
     record_prompt_version,
@@ -115,58 +114,6 @@ def test_render_prompt_diff_shows_line_changes():
     assert "+++ test_prompt:after" in diff_text
     assert "-line two" in diff_text
     assert "+line two changed" in diff_text
-
-
-def test_resume_after_human_checkpoint_restores_manager_checkpoint():
-    repo_root = _repo_root()
-    context = _decision_context("task_resume")
-    surface = get_prompt_surface(
-        surface_id="ouroboros_context_assembly", repo_root=repo_root
-    )
-    current_text = (repo_root / surface.path).read_text(encoding="utf-8")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        manager_checkpoint = prepare_self_improvement(
-            context,
-            "prompt_stack_rewrite",
-            "Tighten manager context assembly",
-            tmp_path / "manager_checkpoints",
-        )
-        proposal = propose_prompt_patch(
-            surface,
-            repo_root=repo_root,
-            version_store_dir=tmp_path / "versions",
-            task_id=context.task_id,
-            rationale="Reduce routing noise in context assembly",
-            expected_behavioral_effect="Make manager prompts more stable between iterations",
-            evidence=["Context assembly repeatedly included noisy summaries"],
-            proposed_content=current_text + "\n# prompt governance note\n",
-        )
-        request = create_human_checkpoint_request(
-            task_id=context.task_id,
-            proposal=proposal,
-            checkpoint_dir=tmp_path / "human_checkpoints",
-            manager_checkpoint_id=manager_checkpoint.id,
-        )
-        record_human_checkpoint_decision(
-            request.id,
-            checkpoint_dir=tmp_path / "human_checkpoints",
-            approved=True,
-            response="Proceed with the prompt rewrite",
-        )
-
-        resume = resume_after_human_checkpoint(
-            request.id,
-            checkpoint_dir=tmp_path / "human_checkpoints",
-            manager_checkpoint_dir=tmp_path / "manager_checkpoints",
-        )
-
-    assert resume.resumed is True
-    assert resume.next_phase == ManagerPhase.SELF_IMPROVEMENT_APPROVED
-    assert resume.manager_checkpoint_id == manager_checkpoint.id
-    assert resume.human_decision is not None
-    assert resume.human_decision.approved is True
 
 
 def test_prompt_rewrite_is_selected_only_with_prompt_evidence():

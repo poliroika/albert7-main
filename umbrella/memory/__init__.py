@@ -1,11 +1,11 @@
 """
 Umbrella Memory System.
 
-Structured memory for the manager layer:
-- Working memory: current task/iteration state
-- Workspace memory: lessons and patterns per workspace
-- Manager memory: cross-workspace patterns and strategies
-- Competency memory: capability gaps and self-improvement tracking
+Primary store: MemPalace (umbrella.memory.palace) — ChromaDB + SQLite graph/transient.
+Secondary: PalaceBackend (umbrella.memory.palace_backend) — event-log facade over MemPalace.
+JSONL flat files: ideas.jsonl, lessons.jsonl — written directly; indexed by MemPalace on ingest.
+
+Model layer: MemoryType, LessonRecord, CompetencyGapRecord, MemoryQuery, MemoryConfig, etc.
 """
 
 from umbrella.memory.models import (
@@ -33,7 +33,6 @@ from umbrella.memory.models import (
 
 from umbrella.memory.store import MemoryStore
 from umbrella.memory.store import reprioritize_memory as _reprioritize_memory_impl
-from umbrella.memory.hierarchical import HierarchicalMemory, HierarchicalMemoryRecord
 from umbrella.memory.palace_backend import PalaceBackend, get_palace_backend
 from umbrella.memory.paths import (
     get_workspace_store,
@@ -101,8 +100,6 @@ __all__ = [
     # Store
     "MemoryStore",
     "reprioritize_memory",
-    "HierarchicalMemory",
-    "HierarchicalMemoryRecord",
     "PalaceBackend",
     "get_palace_backend",
     "get_workspace_store",

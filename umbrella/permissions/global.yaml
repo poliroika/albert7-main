@@ -1,0 +1,18 @@
+# Global hard-deny rules — override any phase allow.
+# Applied AFTER phase rules in every PermissionEnvelope.
+rules:
+  - deny_path:
+      - "**/.env"
+      - "**/.env.*"
+      - "**/secrets/**"
+      - "**/.git/**"
+  - deny_tool: shell
+    args:
+      cmd_re: ".*(rm\\s+-rf|sudo|curl[^|]*\\|\\s*sh|>.*\\.env|mkfs|dd\\s+if).*"
+  - deny_tool: shell
+    args:
+      cmd_re: ".*git\\s+push\\s+.*--force.*"
+  - deny_path:
+      - "umbrella/**"
+      - "ouroboros/**"
+      - "gmas/**"

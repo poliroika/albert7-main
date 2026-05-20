@@ -557,7 +557,7 @@ def model_breakdown(st: dict[str, Any]) -> dict[str, dict[str, float]]:
 
 def per_task_cost_summary(
     max_tasks: int = 10, tail_bytes: int = 512_000
-) -> List[dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Return cost summary for recent tasks from events.jsonl.
 
     Only reads the last `tail_bytes` of the file to avoid scanning

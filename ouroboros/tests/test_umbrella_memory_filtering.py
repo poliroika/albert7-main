@@ -15,6 +15,7 @@ def test_memory_filter_detects_unverified_tags_and_rooms() -> None:
     assert _is_unverified_memory(
         {"metadata": {"evidence_kind": "observation_from_log"}}
     )
+    assert _is_unverified_memory({"metadata": {"verified": "False"}})
     assert not _is_unverified_memory({"tags": "verified", "room": "verify_runs"})
 
 

@@ -1,24 +1,12 @@
-"""Umbrella harness package: parallel multi-candidate Ouroboros runs.
+"""
+Umbrella harness — DEPRECATED package, kept for import compatibility only.
 
-The harness lets the user spend more compute on one task by spinning up
-several Ouroboros candidate runs in parallel, scoring them, and applying
-the winner.  See :mod:`umbrella.harness.orchestrator` for the entry point.
+The harness model is now phase-level and lives inside :class:`umbrella.orchestrator.runner.PhaseRunner`.
+Pass ``candidates_per_phase=N`` to PhaseRunner (or ``harness_candidates`` in the
+``POST /api/runs`` payload) to enable parallel candidates for each phase. The
+watcher / heuristic picks the winner at the end of each phase.
+
+This module no longer exports any symbols.
 """
 
-from umbrella.harness.orchestrator import (
-    HarnessCandidateResult,
-    HarnessEvent,
-    HarnessOrchestrator,
-    HarnessResult,
-    HarnessStagePlan,
-    HarnessStageResult,
-)
-
-__all__ = [
-    "HarnessCandidateResult",
-    "HarnessEvent",
-    "HarnessOrchestrator",
-    "HarnessResult",
-    "HarnessStagePlan",
-    "HarnessStageResult",
-]
+__all__: list[str] = []

@@ -177,14 +177,44 @@ def _web_search_via_duckduckgo(query: str, max_results: int = 5) -> dict[str, An
     }
 
 
-def _web_search(ctx: ToolContext, query: str, max_results: int = 5) -> str:
+def _web_search(
+    ctx: ToolContext, query: str, max_results: int = 5, intent: str = ""
+) -> str:
     try:
+        allow_slow = (
+            os.environ.get("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO", "")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if not os.environ.get("OPENAI_API_KEY", "").strip() and not allow_slow:
+            return json.dumps(
+                {
+                    "status": "provider_unavailable",
+                    "reason": (
+                        "No provider key for the web_search tool is configured "
+                        "(the OpenAI-backed web-search provider uses "
+                        "OPENAI_API_KEY). This does not mean the workspace LLM "
+                        "runtime is unavailable; use the env_check LLM aliases "
+                        "for project code. Slow DuckDuckGo fallback is disabled "
+                        "by default to avoid long phase stalls. Use "
+                        "deep_search/GitHub/MCP/local memory evidence, or set "
+                        "OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO=1 to allow it."
+                    ),
+                    "query": query,
+                    "intent": str(intent or ""),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
         payload = (
             _web_search_via_openai(query, max_results=max_results)
             if os.environ.get("OPENAI_API_KEY", "").strip()
             else _web_search_via_duckduckgo(query, max_results=max_results)
         )
         payload["query"] = query
+        if intent:
+            payload["intent"] = str(intent)
         return json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"error": repr(e)}, ensure_ascii=False)
@@ -207,6 +237,14 @@ def get_tools() -> list[ToolEntry]:
                     "properties": {
                         "query": {"type": "string"},
                         "max_results": {"type": "integer", "default": 5},
+                        "intent": {
+                            "type": "string",
+                            "description": (
+                                "Optional caller metadata such as planner_research "
+                                "or subtask_evidence; it does not change provider "
+                                "selection."
+                            ),
+                        },
                     },
                     "required": ["query"],
                 },

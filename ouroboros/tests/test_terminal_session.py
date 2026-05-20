@@ -144,6 +144,20 @@ def test_oneshot_backend_runs_basic_command() -> None:
     assert "hello-oneshot" in res.output
 
 
+def test_oneshot_backend_resolves_windows_cmd_shim(monkeypatch) -> None:
+    backend = OneShotBackend()
+    monkeypatch.setattr("ouroboros.tools.terminal_session.os.name", "nt")
+    monkeypatch.setattr(
+        "ouroboros.tools.terminal_session.shutil.which",
+        lambda name: "C:/node/npm.cmd" if name == "npm" else None,
+    )
+
+    assert backend._resolve_windows_executable(["npm", "--version"]) == [
+        "C:/node/npm.cmd",
+        "--version",
+    ]
+
+
 def test_oneshot_view_records_command() -> None:
     sess = TerminalSession(workspace_id="ws-oneshot-view", backend=OneShotBackend())
     sess.run([sys.executable, "-c", "print('viewable')"], timeout=20)

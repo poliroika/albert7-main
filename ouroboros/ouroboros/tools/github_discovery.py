@@ -373,6 +373,7 @@ def _github_project_search(
     query: str = "",
     language: str | None = None,
     max_repos: int = 5,
+    max_results: int | None = None,
 ) -> str:
     try:
         from ouroboros.tools.umbrella_tools import _record_subtask_discovery_tool_call
@@ -399,6 +400,12 @@ def _github_project_search(
     qualifier = query_norm
     if language:
         qualifier = f"{qualifier} language:{language}"
+    if max_results is not None:
+        max_repos = max_results
+    try:
+        max_repos = max(1, min(int(max_repos or 5), 10))
+    except (TypeError, ValueError):
+        max_repos = 5
     repos = _github_search_repositories(qualifier, max_repos=max_repos)
     items: list[dict] = []
     mirrored_count = 0
@@ -704,6 +711,13 @@ def get_tools() -> list[ToolEntry]:
                             "default": 5,
                             "minimum": 1,
                             "maximum": 10,
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "default": 5,
+                            "minimum": 1,
+                            "maximum": 10,
+                            "description": "Alias for max_repos; accepted for consistency with other discovery tools.",
                         },
                     },
                     "required": ["query"],

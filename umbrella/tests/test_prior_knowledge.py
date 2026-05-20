@@ -226,6 +226,9 @@ class TestSkillArtifactInjection:
         assert "GMAS active context" in text
         assert "RoleGraph + MACPRunner" in text
         assert "MUST call" in text and "get_gmas_context" in text
+        assert "Before your first workspace write" in text
+        assert "apply_workspace_patch" in text
+        assert "execute-time retrieval" in text
 
     def test_no_skills_no_banner(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

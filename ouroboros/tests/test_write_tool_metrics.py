@@ -37,6 +37,26 @@ class TestWriteToolMetrics(unittest.TestCase):
                 write_tools,
             )
         )
+        self.assertFalse(
+            _is_effective_write_tool_call(
+                {
+                    "tool": "repo_write_commit",
+                    "result": "GIT_COMMIT_DISABLED_BY_POLICY: local commits are disabled.",
+                    "is_error": False,
+                },
+                write_tools,
+            )
+        )
+        self.assertTrue(
+            _is_effective_write_tool_call(
+                {
+                    "tool": "repo_write_commit",
+                    "result": "OK: wrote workspaces/demo/app.py; local git commit skipped by policy.",
+                    "is_error": False,
+                },
+                write_tools,
+            )
+        )
 
 
 if __name__ == "__main__":

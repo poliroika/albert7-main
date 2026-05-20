@@ -20,6 +20,7 @@ class SkillPack:
     name: str
     status: str
     domains: list[str] = field(default_factory=list)
+    phases: list[str] = field(default_factory=list)
     when_to_use: str = ""
     params: list[dict[str, Any]] = field(default_factory=list)
     body: str = ""
@@ -33,6 +34,7 @@ class SkillPack:
                 self.name,
                 self.when_to_use,
                 " ".join(self.domains),
+                " ".join(self.phases),
                 self.body[:2000],
             ]
         )
@@ -60,6 +62,23 @@ def get_skill_by_slug(skills: list[SkillPack], slug: str) -> SkillPack | None:
         if skill.slug == target:
             return skill
     return None
+
+
+def filter_by_phase(
+    skills: list[SkillPack],
+    phase: str,
+    *,
+    status: str | None = "active",
+) -> list[SkillPack]:
+    """Return skills whose ``phases`` list includes *phase* (or have no phase restriction)."""
+    out: list[SkillPack] = []
+    for skill in skills:
+        if status and skill.status != status:
+            continue
+        if skill.phases and phase not in skill.phases:
+            continue
+        out.append(skill)
+    return out
 
 
 def filter_by_domain(
@@ -137,10 +156,17 @@ def parse_skill_file(path: Path) -> SkillPack | None:
     else:
         domains = []
     params = payload.get("params") if isinstance(payload.get("params"), list) else []
+    raw_phases = payload.get("phases") or []
+    if isinstance(raw_phases, str):
+        phases = [raw_phases.strip().lower()] if raw_phases.strip() else []
+    elif isinstance(raw_phases, list):
+        phases = [str(p).strip().lower() for p in raw_phases if str(p).strip()]
+    else:
+        phases = []
     metadata = {
         key: value
         for key, value in payload.items()
-        if key not in {"name", "status", "domains", "when_to_use", "params"}
+        if key not in {"name", "status", "domains", "phases", "when_to_use", "params"}
     }
     return SkillPack(
         slug=slug,
@@ -148,6 +174,7 @@ def parse_skill_file(path: Path) -> SkillPack | None:
         name=name,
         status=status,
         domains=domains,
+        phases=phases,
         when_to_use=str(payload.get("when_to_use") or "").strip(),
         params=[item for item in params if isinstance(item, dict)],
         body=body.strip(),

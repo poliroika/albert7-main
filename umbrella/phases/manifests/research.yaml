@@ -1,0 +1,69 @@
+id: research
+version: 1
+description: "Deep research phase: discover relevant tools, MCPs, skills, prior art, and architecture patterns needed to solve the workspace task."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/research.system.md
+  user_overlay:
+    - umbrella/prompts/phases/research.user_overlay.md
+
+allowed_tools:
+  - github_project_search
+  - deep_search
+  - web_search
+  - mcp_discover
+  - mcp_install
+  - palace_search
+  - palace_add
+  - palace_link
+  - load_skill
+  - list_available_tools
+  - enable_tools
+  - read_file
+  - list_files
+  - register_temp_tool
+  - get_gmas_context
+  - search_gmas_knowledge
+  - submit_research_summary
+
+forbidden_tools:
+  - apply_workspace_patch
+  - shell
+  - terminal_session
+  - repo_write_commit
+
+allowed_skills:
+  - research-strategy
+  - github-discovery
+  - mcp-discovery
+  - gmas-overview
+  - architecture-author
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [research_finding, mcp_candidate, skill_candidate]}
+  warm_search:
+    - {store: palace.global, n: 8, filter: {type: research}}
+  write_rules:
+    research_finding: {store: palace.run, tier: hot, scope: run_scoped}
+    research_summary: {store: palace.run, tier: hot, scope: run_scoped}
+
+permissions:
+  rules:
+    - allow_tools: [github_project_search, deep_search, web_search, mcp_discover, mcp_install, palace_search, palace_add, palace_link, load_skill, list_available_tools, enable_tools, read_file, list_files, register_temp_tool, get_gmas_context, search_gmas_knowledge, submit_research_summary]
+    - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit]
+
+exit_criteria:
+  required_calls: [submit_research_summary]
+  min_palace_writes:
+    - {store: palace.run, n: 3}
+
+mini_review_after: research_review
+
+budgets:
+  max_tokens: 30000
+  max_seconds: 600
+  max_tool_calls: 80

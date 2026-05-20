@@ -43,24 +43,26 @@ def test_keyword_fallback_matches_project_specific_tokens() -> None:
     }
 
 
-def test_keyword_fallback_matches_generic_llm_phrases() -> None:
-    """The repo's policy is "any LLM-touching task uses gmas".
-
-    The keyword fallback was deliberately broadened so that offline
-    runs still detect ``multi_agent_gmas`` for tasks that obviously
-    require an LLM (in either English or Russian), even when the user
-    never names ``gmas`` explicitly. That's why ``news_cards_ai`` --
-    which says "LLM-обогащение" but no "gmas" -- now fires the skill.
-    """
+def test_keyword_fallback_matches_llm_implementation_phrases() -> None:
+    """Offline fallback fires for real model/agent work, not meta labels."""
     assert classify_with_keywords("Build a multi-agent system") == {
         Domain.MULTI_AGENT_GMAS
     }
     assert classify_with_keywords("Сделай мультиагентную систему") == {
         Domain.MULTI_AGENT_GMAS
     }
-    assert classify_with_keywords("LLM-обогащение карточек новостей") == {
+    assert classify_with_keywords("LLM enrichment for each news card") == {
         Domain.MULTI_AGENT_GMAS
     }
+    assert classify_with_keywords(
+        "Build an LLM-powered civilization game with economy and diplomacy bots"
+    ) == {Domain.MULTI_AGENT_GMAS}
+    assert classify_with_keywords("Call an LLM to summarize incoming tickets") == {
+        Domain.MULTI_AGENT_GMAS
+    }
+    assert classify_with_keywords(
+        "Сделай игру, где экономика и дипломатия ботов строится через ллм"
+    ) == {Domain.MULTI_AGENT_GMAS}
 
 
 def test_keyword_fallback_ignores_pure_non_ai_phrases() -> None:
@@ -68,6 +70,12 @@ def test_keyword_fallback_ignores_pure_non_ai_phrases() -> None:
     assert classify_with_keywords("Build a database schema for users") == set()
     assert (
         classify_with_keywords("Bump httpx from 0.27 to 0.28 and fix imports") == set()
+    )
+    assert (
+        classify_with_keywords(
+            "LLM smoke verification: create smoke_result.txt with static text"
+        )
+        == set()
     )
     assert classify_with_keywords("") == set()
 
@@ -129,6 +137,15 @@ def test_detect_task_domains_unions_llm_and_keyword(
     assert result == {Domain.MULTI_AGENT_GMAS}
 
 
+def test_detect_task_domains_suppresses_llm_false_positive_for_meta_label() -> None:
+    client = _StubClient('{"domains": ["multi_agent_gmas"], "rationale": "mentions LLM"}')
+    result = detect_task_domains(
+        "LLM smoke verification: create smoke_result.txt with static text only",
+        client=client,
+    )
+    assert result == set()
+
+
 def test_detect_task_domains_falls_back_to_keywords_when_llm_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -141,9 +158,9 @@ def test_detect_task_domains_falls_back_to_keywords_when_llm_unavailable(
     assert detect_task_domains("Wire RoleGraph and MACPRunner") == {
         Domain.MULTI_AGENT_GMAS
     }
-    # Generic LLM vocabulary fires too (this is the news_cards_ai case
-    # that previously fell through and made the agent default to raw
-    # ``requests`` / FastAPI).
+    # Concrete LLM implementation vocabulary fires too (this is the
+    # news_cards_ai case that previously fell through and made the agent
+    # default to raw ``requests`` / FastAPI).
     assert detect_task_domains("LLM enrichment for each news card") == {
         Domain.MULTI_AGENT_GMAS
     }

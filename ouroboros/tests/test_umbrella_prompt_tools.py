@@ -6,7 +6,9 @@ from ouroboros.tools.umbrella_tools import (
     update_prompt,
     record_idea,
     save_umbrella_lesson,
+    save_umbrella_memory,
 )
+from ouroboros.tools import umbrella_tools
 
 
 @dataclass
@@ -88,6 +90,46 @@ def test_record_idea_accepts_kind_title_body_and_hierarchy(tmp_path: Path) -> No
     assert "verification_fix" in stored
 
 
+def test_save_umbrella_memory_preserves_nested_workspace_room(tmp_path: Path) -> None:
+    ctx = _workspace_ctx(tmp_path)
+
+    result = save_umbrella_memory(
+        ctx,
+        palace_path="workspaces/demo/plan/subtasks",
+        title="Subtask: build-core",
+        content="Plan subtask card should stay under the nested plan/subtasks room.",
+        kind="subtask_card",
+        workspace_id="demo",
+        tags="subtask_card",
+    )
+
+    payload = json.loads(result)
+    assert payload["saved"] is True
+    assert payload["room"] == "plan/subtasks"
+
+
+def test_save_umbrella_memory_uses_workspace_path_before_backend(
+    tmp_path: Path,
+) -> None:
+    ctx = _workspace_ctx(tmp_path)
+    repo = ctx.host_repo_root
+
+    result = save_umbrella_memory(
+        ctx,
+        palace_path="workspaces/demo/research",
+        title="Research finding",
+        content="Workspace-scoped memory should not land in manager palace.",
+        kind="finding",
+        tags="research",
+    )
+
+    payload = json.loads(result)
+    assert payload["saved"] is True
+    assert payload["wing"] == "wing_demo"
+    assert (repo / "workspaces" / "demo" / ".memory" / "palace").exists()
+    assert not (repo / ".umbrella" / "palace").exists()
+
+
 def _workspace_ctx(tmp_path: Path) -> "_Ctx":
     repo = tmp_path / "repo"
     (repo / "workspaces" / "demo").mkdir(parents=True)
@@ -113,6 +155,26 @@ def test_record_idea_rejects_kind_lesson(tmp_path: Path) -> None:
 
     assert result.startswith("ERROR")
     assert "save_umbrella_lesson" in result
+
+
+def test_stale_phase_palace_memory_is_demoted_from_trusted_results() -> None:
+    old_hit = {
+        "room": "phase_plan",
+        "metadata": {"task_id": "phase_web_old:execute"},
+        "content": "old run claimed completion",
+    }
+    current_hit = {
+        "room": "phase_plan",
+        "metadata": {"task_id": "phase_web_new:execute"},
+        "content": "current run evidence",
+    }
+
+    trusted, unverified = umbrella_tools._split_verified_first(
+        [old_hit, current_hit], current_run_id="phase_web_new"
+    )
+
+    assert trusted == [current_hit]
+    assert unverified == [old_hit]
 
 
 def test_record_idea_defaults_to_hypothesis_and_skips_palace_mirror(
@@ -167,9 +229,9 @@ def test_record_idea_observation_from_log_stays_out_of_semantic_memory(
             mirror_calls.append(kw)
             return {"drawer_id": "drawer-1"}
 
-    monkeypatch.setattr(
-        umbrella_tools, "_palace_backend", lambda repo_root, ws: _FakePalace()
-    )
+    fake_backend = lambda repo_root, ws: _FakePalace()
+    monkeypatch.setattr(umbrella_tools, "_palace_backend", fake_backend)
+    monkeypatch.setitem(record_idea.__globals__, "_palace_backend", fake_backend)
 
     ctx = _workspace_ctx(tmp_path)
 
@@ -206,6 +268,42 @@ def test_save_umbrella_lesson_demoted_without_verify_run_id(tmp_path: Path) -> N
     assert payload["saved"] is True
     assert payload["verified"] is False
     assert payload["downgrade_reason"] == "verify_run_id missing"
+
+
+def test_save_umbrella_lesson_does_not_semantically_verify_demoted_lesson(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[dict] = []
+
+    class _FakeMemPalace:
+        def __init__(self, repo_root, workspace_id):
+            self.repo_root = repo_root
+            self.workspace_id = workspace_id
+
+        def add(self, **kw):
+            calls.append(kw)
+            return "lesson-node"
+
+    monkeypatch.setattr("umbrella.memory.palace.facade.MemPalace", _FakeMemPalace)
+    ctx = _workspace_ctx(tmp_path)
+
+    result = save_umbrella_lesson(
+        ctx,
+        workspace_id="demo",
+        change_summary="Unverified lesson",
+        expected_effect="Should not be trusted",
+        verification_passed=False,
+        critic_verdict="",
+        tags="calibration",
+    )
+
+    payload = json.loads(result)
+    assert payload["verified"] is False
+    assert calls
+    assert calls[-1]["store"] == "palace.lesson"
+    assert calls[-1]["verified"] is False
+    assert "unverified_lesson" in calls[-1]["tags"]
+    assert "verified" not in calls[-1]["tags"]
 
 
 def test_save_umbrella_lesson_demoted_when_failed_step_count_positive(
@@ -263,9 +361,9 @@ def test_record_idea_verified_outcome_mirrors_to_semantic(
             mirror_calls.append(kw)
             return {"drawer_id": "drawer-1"}
 
-    monkeypatch.setattr(
-        umbrella_tools, "_palace_backend", lambda repo_root, ws: _FakePalace()
-    )
+    fake_backend = lambda repo_root, ws: _FakePalace()
+    monkeypatch.setattr(umbrella_tools, "_palace_backend", fake_backend)
+    monkeypatch.setitem(record_idea.__globals__, "_palace_backend", fake_backend)
 
     ctx = _workspace_ctx(tmp_path)
 

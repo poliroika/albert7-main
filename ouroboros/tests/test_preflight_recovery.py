@@ -49,6 +49,18 @@ class TestExtractPseudoXmlArgs:
         assert name == "update_workspace_seed"
         assert args == {"workspace_id": "news_cards_ai", "file_path": "src/main.py"}
 
+    def test_tool_call_name_inside_args_overrides_clean_outer_name(self) -> None:
+        raw_args = (
+            "<tool_call>palace_add"
+            "<arg_key>title</arg_key><arg_value>finding</arg_value>"
+            "<arg_key>content</arg_key><arg_value>details</arg_value>"
+        )
+
+        name, args = extract_pseudo_xml_args("submit_research_summary", raw_args)
+
+        assert name == "palace_add"
+        assert args == {"title": "finding", "content": "details"}
+
     def test_xml_split_across_name_and_args(self) -> None:
         polluted_name = (
             "update_workspace_seed</arg_value>foo</arg_key><arg_value>1</arg_value>"
@@ -74,6 +86,64 @@ class TestExtractPseudoXmlArgs:
         name, args = extract_pseudo_xml_args(None, None)
         assert name == ""
         assert args == {}
+
+    def test_loop_recovers_xml_args_when_tool_name_is_already_clean(
+        self, tmp_path: Path
+    ) -> None:
+        from ouroboros.loop import _recover_pseudo_xml_tool_name
+
+        tc = {
+            "function": {
+                "name": "apply_workspace_patch",
+                "arguments": (
+                    "<arg_key>workspace_id</arg_key><arg_value>mini_game</arg_value>"
+                    "<arg_key>patch</arg_key><arg_value>*** Begin Patch\n"
+                    "*** Add File: README.md\n+hello\n*** End Patch</arg_value>"
+                ),
+            }
+        }
+
+        name = _recover_pseudo_xml_tool_name(
+            tc,
+            drive_logs=tmp_path,
+            task_id="run-1:execute",
+            phase_label="execute",
+        )
+
+        assert name == "apply_workspace_patch"
+        assert json.loads(tc["function"]["arguments"]) == {
+            "workspace_id": "mini_game",
+            "patch": "*** Begin Patch\n*** Add File: README.md\n+hello\n*** End Patch",
+        }
+
+    def test_loop_rewrites_to_xml_tool_name_when_args_contain_tool_call(
+        self, tmp_path: Path
+    ) -> None:
+        from ouroboros.loop import _recover_pseudo_xml_tool_name
+
+        tc = {
+            "function": {
+                "name": "submit_research_summary",
+                "arguments": (
+                    "<tool_call>palace_add"
+                    "<arg_key>title</arg_key><arg_value>finding</arg_value>"
+                    "<arg_key>content</arg_key><arg_value>details</arg_value>"
+                ),
+            }
+        }
+
+        name = _recover_pseudo_xml_tool_name(
+            tc,
+            drive_logs=tmp_path,
+            task_id="run-1:research",
+            phase_label="research",
+        )
+
+        assert name == "palace_add"
+        assert json.loads(tc["function"]["arguments"]) == {
+            "title": "finding",
+            "content": "details",
+        }
 
 
 class TestRecentSuccessfulArgs:

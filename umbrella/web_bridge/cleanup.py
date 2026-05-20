@@ -27,6 +27,8 @@ from typing import Any
 
 from collections.abc import Callable, Iterable
 
+from umbrella.artifacts.task_ids import task_artifact_stem
+
 __all__ = [
     "CleanupReport",
     "wipe_run_artifacts",
@@ -285,9 +287,10 @@ def wipe_run_artifacts(
     if workspace_memory is not None and workspace_memory.exists():
         task_results_dir = workspace_memory / "drive" / "task_results"
         for task_id in task_ids:
+            task_stem = task_artifact_stem(task_id)
             for path in (
-                task_results_dir / f"{task_id}.json",
-                task_results_dir / f"{task_id}.verification.md",
+                task_results_dir / f"{task_stem}.json",
+                task_results_dir / f"{task_stem}.verification.md",
             ):
                 if path.exists():
                     _safe_remove(path, report, kind="task_result")
@@ -374,12 +377,13 @@ def wipe_run_artifacts(
             )
 
         for task_id in task_ids:
+            task_stem = task_artifact_stem(task_id)
             for path in (
-                umbrella_root / "ouroboros_drive" / "task_results" / f"{task_id}.json",
+                umbrella_root / "ouroboros_drive" / "task_results" / f"{task_stem}.json",
                 umbrella_root
                 / "ouroboros_drive"
                 / "task_results"
-                / f"{task_id}.verification.md",
+                / f"{task_stem}.verification.md",
                 umbrella_root / "ouroboros_drive" / "task_plans" / f"{task_id}.json",
             ):
                 if path.exists():

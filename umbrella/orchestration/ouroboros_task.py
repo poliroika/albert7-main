@@ -238,14 +238,17 @@ def _render_skill_banner(
     chunks.append(
         "**This workspace is classified as a multi-agent system task. "
         "The host repo's `gmas/` library is the intended foundation. "
-        "Before your first `update_workspace_seed`, you MUST call "
-        "`get_gmas_context` with a specific query (graph construction, "
-        "RoleGraph + AgentProfile, MACPRunner usage, agent tools, "
-        "streaming, memory) and build the implementation on real "
-        "`gmas.*` APIs. Do not invent `gmas` APIs from memory and "
-        "do not fall back to a plain FastAPI/httpx solution unless "
-        "you have first proved with a recorded blocker that GMAS "
-        "cannot deliver this task.**"
+        "Before your first workspace write (`apply_workspace_patch`, "
+        "`update_workspace_seed`, `repo_write_commit`, seed update, or "
+        "other repo/workspace write), you MUST call `get_gmas_context` "
+        "or `search_gmas_knowledge` with a specific implementation query "
+        "(graph construction, RoleGraph + AgentProfile, MACPRunner usage, "
+        "agent tools, streaming, memory) and build the implementation on "
+        "real `gmas.*` APIs. The pre-fetched context below is background, "
+        "not a replacement for that execute-time retrieval. Do not invent "
+        "`gmas` APIs from memory and do not fall back to a plain FastAPI/httpx "
+        "solution unless you have first proved with a recorded blocker that "
+        "GMAS cannot deliver this task.**"
     )
     chunks.append("")
     raw_gmas = _read_skill_artifact(
@@ -449,7 +452,9 @@ def _render_cold_start_discovery_banner() -> str:
         "`save_umbrella_lesson` so the next run in this workspace recalls "
         "it from memory instead of repeating the lookup. If the task "
         "looks multi-agent in nature, also call `get_gmas_context` "
-        "before the first `update_workspace_seed` write."
+        "or `search_gmas_knowledge` before the first workspace write "
+        "(`apply_workspace_patch`, `update_workspace_seed`, seed update, "
+        "or repo write)."
     )
 
 
@@ -575,22 +580,7 @@ def render_workspace_prompt(
 
     environment_snapshot = ""
     if include_environment_snapshot:
-        try:
-            from umbrella.meta_harness.bootstrap import (
-                render_environment_snapshot_section,
-            )
-
-            workspace_path = repo_root / "workspaces" / workspace_id
-            environment_snapshot = render_environment_snapshot_section(
-                repo_root,
-                workspace_path if workspace_path.exists() else None,
-            )
-            environment_snapshot = _compact_environment_snapshot(environment_snapshot)
-        except Exception:
-            log.debug(
-                "Environment snapshot generation failed (non-fatal)", exc_info=True
-            )
-            environment_snapshot = "_Environment snapshot unavailable._"
+        environment_snapshot = "_Environment snapshot unavailable (meta-harness removed)._"
 
     prior_knowledge = ""
     if include_prior_knowledge:

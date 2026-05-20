@@ -13,7 +13,10 @@ from umbrella.workspace_registry import WorkspaceRegistry
 from umbrella.retrieval.service import RetrievalService
 from umbrella.memory.store import MemoryStore
 from umbrella.memory.models import MemoryConfig
-from umbrella.control_plane.engine import ControlPlaneEngine
+try:
+    from umbrella.control_plane.engine import ControlPlaneEngine
+except ImportError:
+    ControlPlaneEngine = None  # type: ignore
 from umbrella.control_plane.models import ManagerTask
 from umbrella.telemetry.store import TelemetryStore
 from umbrella.telemetry.metrics import MetricsRegistry

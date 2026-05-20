@@ -1,0 +1,77 @@
+id: subtask_template
+version: 1
+description: "Template phase for individual subtask execution: inherits execute toolset with tighter scope per subtask card."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/execute.system.md
+  user_overlay:
+    - umbrella/prompts/phases/execute.subtask_overlay.md
+
+allowed_tools:
+  - apply_workspace_patch
+  - delete_workspace_file
+  - sandbox_self_edit
+  - shell
+  - terminal_session
+  - read_file
+  - load_skill
+  - list_files
+  - repo_read
+  - repo_list
+  - run_workspace_verify
+  - run_unit_tests
+  - palace_search
+  - palace_add
+  - palace_link
+  - mark_subtask_complete
+  - harness_run
+  - enable_tools
+  - mcp_install
+  - mcp_discover
+  - web_search
+  - deep_search
+  - request_watcher_review
+  - get_gmas_context
+  - search_gmas_knowledge
+
+forbidden_tools:
+  - mutate_phase_plan
+  - add_phase
+  - wipe_workspace
+  - reset_palace
+
+allowed_skills:
+  - patch-discipline
+  - terminal-debugging
+  - error-self-repair
+  - mcp-bridge-author
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [phase_plan]}
+    - {store: palace.subtask, tags: [subtask_card, execution_error, phase_retry]}
+  warm_search:
+    - {store: palace.global, n: 4}
+  write_rules:
+    subtask_artifact: {store: palace.subtask, tier: hot, scope: subtask_scoped}
+
+permissions:
+  rules:
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, sandbox_self_edit, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_unit_tests, palace_search, palace_add, palace_link, mark_subtask_complete, harness_run, enable_tools, mcp_install, mcp_discover, web_search, deep_search, request_watcher_review, get_gmas_context, search_gmas_knowledge]
+    - deny_tools: [mutate_phase_plan, add_phase, wipe_workspace, reset_palace]
+    - deny_path: ["**/.env*", "**/secrets/**"]
+
+exit_criteria:
+  required_calls: [mark_subtask_complete]
+
+mini_review_after: subtask_review
+
+temp_tools_allowed: true
+
+budgets:
+  max_tokens: 20000
+  max_seconds: 900
+  max_tool_calls: 150

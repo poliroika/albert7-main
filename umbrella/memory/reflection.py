@@ -111,6 +111,25 @@ def run_reflection_phase(
             "evidence_sha": _evidence_sha(verification_report, changes_made or []),
         },
     )
+    try:
+        from umbrella.memory.palace.facade import MemPalace
+
+        _palace = MemPalace(repo_root, workspace_id)
+        _lesson_content = (
+            f"{lesson.change_summary} | expected:{lesson.expected_effect}"
+            f" | observed:{lesson.observed_effect}"
+        )
+        _palace.add(
+            store="palace.lesson",
+            content=_lesson_content,
+            tier="warm",
+            scope="cross_run_durable",
+            tags=["lesson", "verified", "reflection"],
+            verified=True,
+            phase="verify",
+        )
+    except Exception:
+        log.debug("Reflection palace.lesson mirror failed", exc_info=True)
 
     skill_slug = ""
     candidate_skill = (
@@ -204,6 +223,21 @@ def _record_avoid_lesson(
                 "evidence_sha": _evidence_sha(verification_report, changes_made),
             },
         )
+        try:
+            from umbrella.memory.palace.facade import MemPalace
+
+            _palace = MemPalace(repo_root, workspace_id)
+            _palace.add(
+                store="palace.lesson",
+                content=f"AVOID unverified run | {str(summary)[:400]}",
+                tier="warm",
+                scope="cross_run_durable",
+                tags=["lesson", "avoid", "unverified_lesson", "reflection"],
+                verified=False,
+                phase="verify",
+            )
+        except Exception:
+            log.debug("Reflection avoid-lesson palace mirror failed", exc_info=True)
     except Exception:
         log.debug("Failed to record AVOID lesson for unverified run", exc_info=True)
 

@@ -5,12 +5,15 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from ouroboros.memory_hooks import (
+    _extract_task_brief,
+    _guess_initial_workspace,
+    _short_args_repr,
+)
 from ouroboros.loop import (
     _RepeatedReadGuardState,
     _execute_single_tool,
-    _extract_task_brief,
     _format_llm_unavailable_message,
-    _guess_initial_workspace,
     _looks_like_pseudo_tool_call_text,
     _looks_like_tool_failure,
     _maybe_inject_no_write_tool_nudge,
@@ -22,7 +25,6 @@ from ouroboros.loop import (
     _rewrite_forbidden_tool_call_if_safe,
     _select_forced_progress_tool,
     _should_abort_no_write_tool_churn,
-    _short_args_repr,
     _subtask_allows_read_only_progress,
     _successful_terminating_tools,
     _summarize_recent_actions,
@@ -67,6 +69,23 @@ class TestLoopSelfCheck(unittest.TestCase):
         self.assertIn("round 50/∞", content)
         self.assertIn("Rounds remaining: ∞", content)
         self.assertNotIn("Rounds remaining: -", content)
+
+    def test_self_check_does_not_suggest_unavailable_compaction_tool(self):
+        messages = []
+
+        _maybe_inject_self_check(
+            round_idx=50,
+            max_rounds=120,
+            messages=messages,
+            accumulated_usage={},
+            emit_progress=lambda _msg: None,
+            available_tool_names={"read_file", "apply_workspace_patch"},
+        )
+
+        self.assertEqual(len(messages), 1)
+        content = messages[0]["content"]
+        self.assertNotIn("call `compact_context`", content)
+        self.assertIn("do not call unavailable context tools", content)
 
     def test_auth_error_message_does_not_suggest_mock_or_rephrasing(self):
         text = _format_llm_unavailable_message(
@@ -357,12 +376,20 @@ class TestCompletionToolAcceptance(unittest.TestCase):
 
 
 class TestProgressToolSelection(unittest.TestCase):
-    def test_forced_progress_prefers_verify_when_available(self):
+    def test_forced_progress_prefers_write_tool_over_verify(self):
+        self.assertEqual(
+            _select_forced_progress_tool(
+                frozenset({"apply_workspace_patch", "run_workspace_verify"})
+            ),
+            "apply_workspace_patch",
+        )
+
+    def test_forced_progress_falls_back_to_legacy_write_tool(self):
         self.assertEqual(
             _select_forced_progress_tool(
                 frozenset({"update_workspace_seed", "run_workspace_verify"})
             ),
-            "run_workspace_verify",
+            "update_workspace_seed",
         )
 
 

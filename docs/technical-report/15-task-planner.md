@@ -1,247 +1,126 @@
-# Часть 15. Adaptive Task Planner
+# Part 15: Planning — PhasePlan vs Adaptive Task Planner
 
-[← Оглавление](README.md) · [← Часть 14](14-testing-and-docs.md)
-
----
-
-## 15.1 Зачем он появился
-
-До введения плановщика `run_llm_loop` работал в едином линейном потоке: LLM получал полный текст задачи и работал с ним до тех пор, пока не выдавал финальный ответ. Для небольших задач это работало. Для многошаговых — нет:
-
-- Контекст рос неограниченно; модель теряла фокус.
-- Частичный прогресс не фиксировался: при перезапуске всё начиналось с нуля.
-- Невозможно было отследить, на каком именно шаге агент завис или выбрал неправильную стратегию.
-
-**Плановщик** (`ouroboros/ouroboros/task_planner.py`) решает эти проблемы, добавляя структуру **без привязки к домену** — он одинаково работает для ML-задач, web-приложений, data-пайплайнов и любых других.
+[← Table of contents](README.md) · [← Part 14](14-testing-and-docs.md)
 
 ---
 
-## 15.2 Три принципа плановщика
+## 15.1 Two planning layers
+
+After the refactor, **planning** spans two complementary layers:
+
+| Layer | Owner | Artifact | Purpose |
+|-------|--------|----------|---------|
+| **Macro (phases)** | Umbrella `PhaseRunner` | `PhasePlan` in `drive/state/phase_plan.json` | Ordered phases: preflight, research, plan, execute, final_review, verify, reflexion. Each phase has a YAML **PhaseManifest** (tools, skills, memory, permissions, exit criteria). |
+| **Micro (subtasks inside the loop)** | Ouroboros `task_planner.py` | JSON under `drive/task_plans/` | Optional adaptive decomposition: `propose_task_plan`, per-subtask focus, `revise_remaining_plan`, completion gates. |
+
+The phase machine decides **which kind of work** happens when (research vs execute vs verify). The adaptive task planner, when enabled, structures **how** the Worker walks a long task **inside** those phases—especially execute—without baking domain heuristics into Umbrella.
 
 ```mermaid
-flowchart TD
-    A[Получена задача] --> B{PLANNER_MODE?}
-    B -->|off| LINEAR[Линейный loop\nбез плана]
-    B -->|auto| C{Длина > 220 симв?}
-    B -->|always| D[Planner round]
-    C -->|нет| LINEAR
-    C -->|да| D
-    D --> E[propose_task_plan\nLLM строит JSON-план]
-    E --> F[Сохранение в\ndrive/task_plans/]
-    F --> G[Subtask 1/N]
-    G --> H[mark_subtask_complete?]
-    H -->|нет| G
-    H -->|да| I[review_phase:\nrevise_remaining_plan?]
-    I -->|нет изменений| J{Следующий subtask}
-    I -->|план пересмотрен| J
-    J -->|остались| G
-    J -->|план завершён| K[✅ Задача выполнена]
+flowchart TB
+    subgraph UmbrellaMacro["Umbrella: PhasePlan"]
+        P1[preflight]
+        P2[research]
+        P3[plan]
+        P4[execute]
+        P5[verify]
+        P1 --> P2 --> P3 --> P4 --> P5
+    end
+
+    subgraph OuroMicro["Ouroboros: task_planner (optional)"]
+        T1[propose_task_plan]
+        T2[Subtask 1..N]
+        T3[mark_subtask_complete]
+        T4[revise_remaining_plan]
+        T1 --> T2 --> T3
+        T3 --> T4
+        T4 --> T2
+    end
+
+    P4 -. "may use" .-> OuroMicro
 ```
 
-### Принцип 1: Декомпозиция (upfront decomposition)
-
-При старте итерации — выделенный «planner-раунд»: LLM вызывает `propose_task_plan` и возвращает структурированный список подзадач.
-
-Каждая подзадача содержит:
-
-```json
-{
-  "id": "subtask_1",
-  "title": "Создать GMAS граф агентов",
-  "description": "Настроить 4-агентный граф: thesis_parser → card_generator → slide_assembler → qa_agent",
-  "success_check": "Graph создан, MACPRunner импортируется без ошибок",
-  "tags": ["implementation"]
-}
-```
-
-Доступные теги для подзадач:
-
-| Тег | Смысл |
-|-----|-------|
-| `implementation` | Создание кода |
-| `domain_unknown` | Технология незнакома агенту — требуется discovery |
-| `discovery` | Поиск/исследование |
-| `verification` | Проверка результатов |
-| `refactor` | Рефакторинг |
-
-### Принцип 2: Фокусированное исполнение
-
-Оркестратор проходит план по одной подзадаче. Перед каждой фазой в системное сообщение инжектируется:
-
-```
-[SUBTASK 2/5: Создать GMAS граф агентов]
-Цель: Настроить 4-агентный граф...
-Критерий успеха: Graph создан, MACPRunner импортируется без ошибок
-```
-
-Фаза заканчивается вызовом `mark_subtask_complete`. Этот вызов проходит через **completion gates** — систему проверок (см. раздел 15.4).
-
-### Принцип 3: Адаптивный реплан
-
-После каждой подзадачи — короткая review-фаза. LLM может:
-
-- Оставить оставшийся план без изменений (типичный случай).
-- Вызвать `revise_remaining_plan` с новым хвостом, если выяснилось, что следующие шаги неактуальны.
-
-Число ревизий ограничено (`OUROBOROS_PLANNER_MAX_REVISIONS`, по умолчанию 3) — чтобы исключить бесконечный реплан.
+**Phase-plan mutations** (macro) use tools in `ouroboros/ouroboros/tools/phase_control.py`: `mutate_phase_plan`, `add_phase`, `loop_back_to`, `edit_subtask_card`, etc. They update `phase_plan.json` and bump `PhasePlan.version` with an audit trail.
 
 ---
 
-## 15.3 Конфигурация
+## 15.2 Adaptive Task Planner (`ouroboros/ouroboros/task_planner.py`)
 
-=== "Переменные окружения"
-    | Переменная | Допустимые значения | По умолчанию | Описание |
-    |-----------|---------------------|-------------|----------|
-    | `OUROBOROS_PLANNER_MODE` | `auto` / `always` / `off` | `auto` | Режим включения плановщика |
-    | `OUROBOROS_PLANNER_MAX_STEPS` | целое 1–20 | `7` | Максимальное число подзадач |
-    | `OUROBOROS_REQUIRE_PLANNER_DISCOVERY` | `1` / `0` | `1` | Блокировать план без discovery-вызовов |
-    | `OUROBOROS_PLANNER_MAX_REVISIONS` | целое ≥ 0 | `3` | Максимум ревизий плана |
+The module docstring summarizes three capabilities:
 
-=== "Режимы AUTO_MIN_TASK_CHARS"
-    В режиме `auto` задачи короче `AUTO_MIN_TASK_CHARS_DEFAULT` (220 символов) считаются разговорными и обходят плановщик. Порог переопределяется через env:
+1. **Upfront decomposition** — a planner round asks the model to call `propose_task_plan` and persist a structured list of subtasks to `drive/task_plans/<slug>.<hash>.json`.
+2. **Sequential execution** — the loop injects a `[SUBTASK i/N]` focus block; the phase advances when `mark_subtask_complete` is called.
+3. **Adaptive replan** — after each subtask, a short review allows `revise_remaining_plan` with a capped revision count.
 
-    ```bash
-    OUROBOROS_AUTO_MIN_TASK_CHARS=400
-    ```
+The **plan file is canonical** for resume within that planner run: the orchestrator reads the JSON plan from disk, not secondary recall stores, when continuing execution.
 
-=== "Отключение для CI"
-    Для быстрых задач (дым-тесты, чат) рекомендуется:
+### Environment variables
 
-    ```bash
-    OUROBOROS_PLANNER_MODE=off
-    ```
+| Variable | Values | Default | Meaning |
+|----------|--------|---------|---------|
+| `OUROBOROS_PLANNER_MODE` | `auto` / `always` / `off` | `auto` | Enable planner |
+| `OUROBOROS_PLANNER_MAX_STEPS` | 1–20 | `7` | Max subtasks |
+| `OUROBOROS_REQUIRE_PLANNER_DISCOVERY` | `1` / `0` | `1` | Require discovery before leaving planner phase |
+| `OUROBOROS_PLANNER_MAX_REVISIONS` | ≥ 0 | `3` | Max `revise_remaining_plan` calls |
+
+In `auto` mode, tasks shorter than **220 characters** (override with `OUROBOROS_AUTO_MIN_TASK_CHARS`) skip the planner and use a linear loop. For CI smoke tests, set `OUROBOROS_PLANNER_MODE=off`.
 
 ---
 
-## 15.4 Completion Gates
+## 15.3 Completion gates (`ouroboros/ouroboros/tools/control.py`)
 
-Completion gates — система проверок в `ouroboros/ouroboros/tools/control.py`, которая предотвращает преждевременное закрытие фаз при отсутствии реальных доказательств работы.
+Completion gates prevent premature closure when evidence is missing. They are tested heavily in `ouroboros/tests/test_completion_gates.py`.
 
-### Gate 1: Delivery Contract
+### Delivery contract
 
-При вызове `propose_task_plan` проверяется наличие `delivery_contract` — объекта с описанием финального пользовательского результата:
+`propose_task_plan` may include a `delivery_contract` object (expected outcome, proof command, artifact path). An empty contract yields a **warning** injected into the next round rather than a hard failure.
 
-```json
-{
-  "delivery_contract": {
-    "outcome": "Готовый .pptx файл с 5 слайдами",
-    "proof_command": "python -c \"from src.news_cards.pipeline import run_full_pipeline; print('OK')\"",
-    "artifact": "output/news_cards.pptx"
-  }
-}
-```
+### Discovery gate (`domain_unknown`)
 
-!!! warning "Отсутствие delivery_contract"
-    Отсутствие или пустой объект вызывает предупреждение в следующем раунде, но не блокирует исполнение. Цель — напомнить агенту сформулировать критерий «готовности».
+Subtasks tagged `domain_unknown` cannot call `mark_subtask_complete` until at least one discovery tool ran in that subtask (web, GitHub, MCP discovery families—see tests for the exact allowlist).
 
-### Gate 2: Discovery Gate (для domain_unknown)
+### Planner discovery gate
 
-Подзадачи с тегом `domain_unknown` **не могут** завершиться без предшествующего вызова хотя бы одного discovery-инструмента:
+When `OUROBOROS_REQUIRE_PLANNER_DISCOVERY=1`, leaving the initial planner phase requires at least one discovery-style call.
 
-```mermaid
-flowchart LR
-    A[mark_subtask_complete] --> B{subtask.tags\ncontains domain_unknown?}
-    B -->|нет| OK[✅ Завершение разрешено]
-    B -->|да| C{current_subtask_discovery_calls > 0?}
-    C -->|да| OK
-    C -->|нет| BLOCK["⛔ Blocked:\n'Subtask tagged domain_unknown requires\nat least one discovery tool call'"]
-```
+### Behavior evidence (soft)
 
-Discovery-инструменты, засчитываемые гейтом:
+After `mark_subtask_complete`, the loop checks transcript/tool history for weak signals of real execution (tests run, files created, exit 0, HTTP 200, etc.). Absence yields a **recommendation**, not a block.
 
-| Группа | Инструменты |
-|--------|-------------|
-| `web` | `deep_search`, `web_fetch` |
-| `github` | `github_project_search`, `github_extract_snippets` |
-| `mcp` | `mcp_discover`, `mcp_install` |
+### Verify-evidence gate
 
-### Gate 3: Planner Discovery Gate
-
-При завершении planner-фазы (до выполнения подзадач) также проверяется: была ли выполнена хоть одна discovery-операция? Управляется через `OUROBOROS_REQUIRE_PLANNER_DISCOVERY=1` (по умолчанию включено).
-
-### Gate 4: Behavior Evidence Gate
-
-После `mark_subtask_complete` система проверяет наличие в тексте итерации признаков реального исполнения (не просто импорта). Паттерны:
-
-```python
-_BEHAVIOR_EVIDENCE_RE = re.compile(
-    r"(?i)\b(run_workspace_verify|pytest|test[s]? passed|"
-    r"created .*\.(?:pptx|pdf|png|jpg|csv|json|html|docx)|"
-    r"exit(?:_code)?\s*[=:]\s*0|exit\s+0|http\s+200|cli)\b"
-)
-```
-
-!!! info "Мягкая проверка"
-    Это **предупреждение**, а не hard-block. Если поведенческих признаков нет, в следующий раунд инжектируется сигнал с рекомендацией запустить что-то измеримое.
+Guards marking work done without verification-style evidence when the flow expects it (see tests and `control.py` for exact conditions).
 
 ---
 
-## 15.5 Файловое состояние плана
+## 15.4 Relationship to `SubtaskCard` (execute phase)
 
-```
-workspaces/<id>/.memory/drive/task_plans/
-    <task_slug>.<task_hash>.json
-    <task_slug>.<task_hash>.before_remediation_<attempt>.<timestamp>.json
-```
+The **plan** phase (Umbrella manifest) produces `SubtaskCard` entries inside the execute container: each card carries its own allowed tools/skills and a `success_test`. That is the **macro** contract for execution.
 
-Структура файла плана:
+The **adaptive task planner** can still refine or supplement sequencing **within** execute (or legacy paths) when planner mode is on—think of it as an optional inner loop that keeps the LLM focused and supports replanning without editing YAML manifests every time.
 
-```json
-{
-  "task_id": "sync_improve_web_a40b85c6",
-  "created_at": "2026-05-12T03:14:22Z",
-  "status": "in_progress",
-  "delivery_contract": { ... },
-  "subtasks": [
-    {
-      "id": "subtask_1",
-      "title": "...",
-      "description": "...",
-      "success_check": "...",
-      "tags": ["implementation"],
-      "status": "completed",
-      "completed_at": "2026-05-12T03:21:05Z"
-    },
-    {
-      "id": "subtask_2",
-      "status": "in_progress",
-      ...
-    }
-  ],
-  "revision_count": 1
-}
-```
+Avoid conflating the two: editing `phase_plan.json` changes Umbrella phases; editing `drive/task_plans/*.json` changes the inner subtask list for the planner.
 
 ---
 
-## 15.6 Связь с Memory
+## 15.5 Memory mirrors
 
-По завершении каждой подзадачи `HierarchicalMemory` создаёт recall-запись, позволяя:
-
-- Находить прогресс из прошлых прогонов по схожим задачам.
-- Обогащать контекст следующей итерации знанием «что уже сделано».
-
-!!! note "Принцип приоритета"
-    Оркестратор для **возобновления** всегда читает файл плана, а не память. Память — вспомогательный поиск, не авторитетный источник состояния.
+Finished subtasks are mirrored into long-lived memory for retrieval on future runs. The modern stack uses **MemPalace** (`umbrella/memory/palace/`) and hooks under `umbrella/memory/` / `ouroboros/ouroboros/memory_hooks.py`. Older docstrings in `task_planner.py` may still mention legacy types; prefer MemPalace terminology in new code and docs.
 
 ---
 
-## 15.7 Проверка работы плановщика
-
-Тесты completion gates (без запуска полного loop):
+## 15.6 How to test the planner quickly
 
 ```bash
-uv run pytest ouroboros/tests/test_completion_gates.py -v
+uv run pytest -q ouroboros/tests/test_completion_gates.py
 ```
 
-Что покрывают тесты (Tier 1.3 + Tier 3.1 + Tier 3.2):
+For an integrated check with planner forced on:
 
-- `test_check_discovery_gate_*` — gate для `domain_unknown` subtasks.
-- `test_planner_discovery_gate_*` — gate для planner-фазы.
-- `test_behavior_evidence_warning_*` — паттерны behavior evidence.
-- `test_validate_delivery_contract_*` — валидация delivery_contract.
-- `test_check_verify_evidence_gate_*` — verify-evidence gate.
+```bash
+set OUROBOROS_PLANNER_MODE=always   # PowerShell: $env:OUROBOROS_PLANNER_MODE="always"
+uv run pytest -q ouroboros/tests/
+```
 
 ---
 
-[↑ В начало раздела](README.md)
+[↑ Back to technical report](README.md)

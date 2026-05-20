@@ -1,263 +1,288 @@
-# Архитектура Umbrella
+# Architecture
 
-## Обзор
+Umbrella is built on three layers with a phase-driven control plane that orchestrates long-running improvement cycles through deterministic phase manifests.
 
-Umbrella построен на трёхслойной архитектуре, где каждый слой имеет чёткую зону ответственности
-и уровень изменяемости. Связующую роль между слоями выполняет модуль `umbrella/` — control-plane,
-который реализует политику, реестр, рантайм, retrieval и memory.
+## Three-Layer Model
 
 ```mermaid
 graph TB
-    subgraph layer3 [Ouroboros - менеджер]
-        OuroCore["ouroboros/"]
-        OuroPrompts["Системный промпт, Bible, память"]
+    subgraph orchestratorLayer [Umbrella - Phase-Driven Control Plane]
+        PhaseRunner["PhaseRunner<br/>umbrella/orchestrator/runner.py"]
+        Manifests["Phase Manifests<br/>umbrella/phases/manifests/*.yaml"]
+        Envelope["PermissionEnvelope<br/>umbrella/permissions/"]
+        Palace["MemPalace<br/>umbrella/memory/palace/"]
     end
 
-    subgraph umbrellaLayer [Umbrella - control-plane]
-        Policies["policies/"]
-        Registry["workspace_registry/"]
-        Runtime["workspace_runtime/"]
-        Retrieval["retrieval/"]
-        Artifacts["artifacts/"]
-        Integration["integration/"]
-        Memory["memory/"]
+    subgraph agentLayer [Ouroboros - Deep Agent]
+        Worker["Worker Ouroboros<br/>per-phase execution"]
+        Watcher["Watcher Ouroboros<br/>monitoring + control"]
     end
 
-    subgraph layer2 [Workspaces - прикладные системы]
+    subgraph workspaceLayer [Workspaces - Application Systems]
         SeedWS["Seed workspaces"]
         Instances["Task instances"]
     end
 
-    subgraph layer1 [GMAS - фреймворк]
-        GMASCore["Графы, раннеры, инструменты, память"]
+    subgraph frameworkLayer [GMAS - Framework]
+        GMASCore["Graphs, runners, tools, memory"]
     end
 
-    OuroCore -->|"делегирует задачи"| Integration
-    Integration -->|"запускает"| Runtime
-    Runtime -->|"создаёт instance"| Instances
-    Instances -->|"работает на"| GMASCore
-    SeedWS -->|"шаблон для"| Instances
-    Registry -->|"обнаруживает"| SeedWS
-    Policies -->|"ограничивает"| Runtime
-    Retrieval -->|"индексирует"| GMASCore
-    Artifacts -->|"собирает логи"| Instances
-    Memory -->|"накапливает lessons и gaps"| OuroCore
-    Memory -->|"контекст для следующих итераций"| Runtime
+    PhaseRunner --> Worker
+    PhaseRunner --> Watcher
+    Worker --> Instances
+    Instances --> GMASCore
+    SeedWS -->|"template for"| Instances
+    Manifests --> Envelope
+    Envelope -. "gate" .-> Worker
+    Worker --> Palace
+    Watcher --> Palace
+    Watcher -- "control signals" --> PhaseRunner
 ```
 
-## Слой 1: GMAS (фреймворк)
+| Layer | Responsibility |
+|-------|---------------|
+| **GMAS** (`gmas/`) | Stable, read-only multi-agent framework. Provides execution runtime, tools, memory, callbacks. |
+| **Workspaces** (`workspaces/`) | Application systems built on GMAS. Seeds are human-created templates; task-instances are mutable copies for specific tasks. |
+| **Umbrella** (`umbrella/`) | Control plane: phase machine, memory, permissions, retrieval, web bridge. Owns the PhaseRunner, MemPalace, and PermissionEnvelope. |
+| **Ouroboros** (`ouroboros/`) | Deep LLM agent. Spawned per-phase by the PhaseRunner as Worker or Watcher. Consumes phase manifests. |
 
-GMAS — это неизменяемый vendor-like движок мультиагентных графов. Он предоставляет:
+## Phase-Driven Run Lifecycle
 
-- Execution runtime (раннеры, топологии, шедулер).
-- Базовые инструменты (web search, file search, MCP client, computer use).
-- Память и сообщения между агентами.
-- Бюджет, callback-систему, стриминг.
+Every run follows a **PhasePlan** — a mutable ordered list of phases. Each phase is described by a YAML manifest that declares:
 
-Политика: `gmas/` **read-only**. Автоматические патчи запрещены. Если возможностей GMAS
-не хватает, решение ищется через обёртки и конфигурацию вне `gmas/`, а не через прямое
-изменение фреймворка.
-
-Документация GMAS живёт в `gmas/docs/` и `gmas/DOCUMENTATION.md`.
-
-## Слой 2: Workspaces (прикладные системы)
-
-Workspace — это прикладная система, заточенная под класс задач: граф агентов, промпты, роли,
-инструменты, модели, evals, эксперименты и артефакты. Именно workspace даёт полезный результат
-пользователю.
-
-Workspaces делятся на два уровня:
-
-- **Seed** — стабильный шаблон, созданный человеком. Не патчится «в лоб».
-- **Task-instance** — мутабельная копия seed под конкретную задачу. Основная зона итеративного
-  улучшения.
-
-Итоговый артефакт должен быть standalone: workspace может работать и без Ouroboros.
-
-Подробнее: [workspaces.md](workspaces.md).
-
-## Слой 3: Ouroboros (менеджер)
-
-Ouroboros — это менеджер и оператор контуров улучшения. Он:
-
-- Выбирает подходящий workspace.
-- Запускает его, читает логи и артефакты.
-- Строит гипотезу улучшения и модифицирует workspace.
-- Запускает повторно и оценивает результат.
-- Только если workspace-итерации исчерпаны, переходит к самомодификации.
-
-Ouroboros не является основным исполнителем задачи. Исполнение рождается в workspace на GMAS.
-
-Подробнее: [ouroboros.md](ouroboros.md).
-
-## Umbrella: связующий control-plane
-
-Umbrella — это набор подсистем, которые связывают три слоя:
-
-| Подсистема | Модуль | Роль |
-|------------|--------|------|
-| Политика | `umbrella/policies/` | Границы: что read-only, что workspace-first, когда эскалация |
-| Реестр | `umbrella/workspace_registry/` | Обнаружение seed/instance, метаданные, lineage |
-| Рантайм | `umbrella/workspace_runtime/` | Создание instance, запуск через адаптеры, snapshot |
-| Retrieval | `umbrella/retrieval/` | BM25 + символьный поиск по GMAS, docs index, workspace usage |
-| Артефакты | `umbrella/artifacts/` | Индексация запусков, логи, сравнение результатов |
-| Интеграция | `umbrella/integration/` | Мост к Ouroboros: launcher, drive, bridge |
-| Memory | `umbrella/memory/` | Lessons, competency ledger, palace backend, prompt-ready context |
-
-Подробнее: [umbrella-layer.md](umbrella-layer.md).
-
-## Verification loop (runtime-гейт)
-
-Между самозавершением Ouroboros и применением изменений теперь стоит
-обязательный этап **runtime verification** — набор шагов, объявленных в
-`workspace.toml` (секция `[verification]`), либо автоматически выведенных
-(`test_smoke.py`, `web_server.py` HTTP-health, `main.py` import-check).
-Шаги исполняются реальным subprocess'ом в рабочей директории workspace.
+- Which **tools** and **skills** are allowed/forbidden
+- Which **prompt files** to load
+- Which **memory stores** to read/write
+- **Exit criteria** (required tool calls, minimum palace writes)
+- **Budgets** (tokens, seconds, tool calls)
+- Whether a **mini-review** phase follows
 
 ```mermaid
-graph TB
-    Task[TASK_MAIN.md] --> Iter["Ouroboros attempt N"]
-    Iter --> Verify["VerificationRunner:<br/>pytest + HTTP boot + import"]
-    Verify -->|pass| Promote[status=verified<br/>promote to seed]
-    Verify -->|fail, N &lt; max| Retry["render_retry_prompt:<br/>inject failure report"]
-    Retry --> Iter
-    Verify -->|fail, N = max| FailExit[status=failed_verification<br/>exit != 0]
-    Verify -.->|runtime gate| Harness["Meta-Harness evaluator +<br/>decide_candidate_promotion"]
+flowchart LR
+    Preflight[preflight] --> Research[research]
+    Research --> RR["research_review"]
+    RR --> Plan[plan]
+    Plan --> PR["plan_review"]
+    PR --> Execute[execute]
+    Execute --> SR["subtask_review"]
+    SR --> Execute
+    Execute --> FR["final_review"]
+    FR --> Verify[verify]
+    Verify -->|pass| Report[FinalReport]
+    Verify -->|fail| Reflexion[reflexion]
+    Reflexion --> Execute
+    FR -->|"loop_back"| Research
 ```
 
-Ключевые точки интеграции:
+### Phase Descriptions
 
-- `umbrella.verification` — runner, spec_loader, auto-detect
-  ([umbrella/verification/](../umbrella/verification)).
-- `umbrella.control_plane.ouroboros_integration.run_ouroboros_improvement_sync`
-  вызывает verification после каждой итерации и возвращает
-  `status ∈ {verified, failed_verification, incomplete, error}`;
-  `promote=True` эффектен только при `verified`.
-- `umbrella/app_ouroboros.py` и `run_ouroboros_self_improve.py` реализуют
-  verify-then-retry (до `--max-verify-retries+1` попыток) и подмешивают
-  `Previous Verification Failure` в retry-prompt.
-- `umbrella/meta_harness/evaluator.py` включает `runtime_verification`
-  компонент в weighted score (0.15).
-- `umbrella/meta_harness/promotion.py::decide_candidate_promotion` отклоняет
-  кандидата, если любой required verification step упал.
+| Phase | Purpose | Tool Access |
+|-------|---------|-------------|
+| **preflight** | Environment check: env vars, MCP health, palace availability, secrets | Read-only + `mcp_install` |
+| **research** | Understand the task, find similar projects/patterns, draft architecture | Read-only filesystem + palace + web search + MCP |
+| **research_review** | Quick verification of research output | Read-only + palace_link |
+| **plan** | Build PhasePlan and subtask cards with tool/skill/test recipes | Read-only + palace + `harness_run` |
+| **plan_review** | Verify plan completeness | Read-only + palace |
+| **execute** | Execute each subtask card until tests pass | Full edit (within workspace only) + shell + verify |
+| **subtask_review** | Review after each subtask | Read-only + palace + control tools |
+| **final_review** | Check result against original goal | Read-only + real e2e tests + `loop_back_to` |
+| **verify** | Final verification + promote durable knowledge | Read-only + verify + `promote_to_durable` |
+| **reflexion** | Verbal self-feedback after failed verify (evidence-backed) | Read-only + palace write |
 
-## Внешний контур: Meta-Harness
+### Phase Manifest Example
 
-Поверх обычного цикла Ouroboros → workspace → GMAS добавлен **Meta-Harness** — слой
-экспериментов над «harness» (промпты, интеграция, политика, память, инструменты Ouroboros),
-с явным хранением кандидатов и оценкой на **search set** до promotion.
+```yaml
+id: research
+version: 1
+prompt_files:
+  system:
+    - umbrella/prompts/phases/research.system.md
+  user_overlay:
+    - umbrella/prompts/phases/research.user_overlay.md
+allowed_tools:
+  - github_project_search
+  - deep_search
+  - palace_search
+  - palace_add
+  - read_file
+forbidden_tools: [apply_workspace_patch, shell, repo_write_commit]
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  warm_search:
+    - {store: palace.lesson, n: 6}
+exit_criteria:
+  required_calls: [submit_research_summary]
+  min_palace_writes:
+    - {store: palace.idea, n: 3}
+mini_review_after: research_review
+```
 
-- Код: `umbrella/meta_harness/` (store, capture, evaluator, promotion, search_sets, CLI).
-- Данные: `.umbrella/meta_harness/experiments/<experiment_id>/...` — манифесты, снимки,
-  execution/evaluation, диффы.
-- Запуск: `run_meta_harness.py` или `uv run python -m umbrella.meta_harness`.
-- Связь с непрерывным улучшением: `run_ouroboros_self_improve.py`
-  может принимать решение о promotion **после** оценки кандидата, если в результате итерации
-  есть `candidate_id`.
+All manifests are validated against `umbrella/phases/schema/manifest.schema.json` at load time and in CI (`test_phase_manifests_valid.py`).
 
-Идейный план и мотивация: [meta-harness-improvement-plan.md](meta-harness-improvement-plan.md).
+## Dual-Agent Pattern: Worker + Watcher
 
-## Поток решения задачи
+Each run spawns **two** Ouroboros agents in parallel:
+
+### Worker
+
+- Executes the current phase with the full tool set from the manifest.
+- Receives `phase_manifest`, `tool_filter`, and `recall_bundle` in `task["context_overlays"]`.
+- Can mutate the PhasePlan via `mutate_phase_plan`, `add_phase`, `loop_back_to`, `edit_subtask_card`.
+- All tool calls pass through the PermissionEnvelope pre-hook.
+
+### Watcher
+
+- **Idle by default** — does not invoke LLM unless a trigger fires.
+- Read-only access: `palace_search`, `read_drive_log`, `read_terminal_scrollback`.
+- Control tools: `request_abort_phase`, `request_restart_phase`, `request_mutate_phase_plan`, `force_verify`, `inject_lesson`.
+- Communicates via `drive/state/watcher_signal.json` (atomic rename-on-write).
+
+**Watcher triggers** (deterministic heuristics in `umbrella/orchestrator/watcher_triggers.py`):
+
+| Trigger | Condition |
+|---------|-----------|
+| `stall` | No progress for `OUROBOROS_WATCHER_STALL_SEC` (default 180s) |
+| `shell_nonzero` | Shell returned non-zero and Worker did not react |
+| `repeat_error` | Same error signature in M consecutive rounds |
+| `verify_failed` | `submit_verification(fail)` called |
+| `phase_overrun` | Phase exceeded token or time budget |
+| `worker_panic` | Worker process crashed |
+| `explicit_call` | Worker called `request_watcher_review(reason)` |
+
+## PermissionEnvelope
+
+Every tool call passes through a single gateway:
+
+```
+PermissionEnvelope(phase_id, tool_name, paths?, commands?) -> allow | deny(reason)
+```
+
+- Phase manifest contains a `permissions:` block with explicit allow/deny rules.
+- Global hard denials in `umbrella/permissions/global.yaml` (deny on `**/.env*`, `**/secrets/**`, `git push --force`, etc.) override any phase rule.
+- Pre-hook in `ToolRegistry.execute` blocks denied calls with `TOOL_DENIED_BY_ENVELOPE`.
+- **Watcher** has a hardcoded read-only envelope (in Python, not YAML) that prevents any write operations.
+- Agent can request `request_envelope_extension(reason)` which requires Watcher or human confirmation.
+
+## MemPalace: Unified Memory
+
+Memory is split along two axes: **physical stores** (by domain) and **durability scopes** (when nodes expire).
+
+### Stores
+
+| Store | Backend | Purpose |
+|-------|---------|---------|
+| `palace.charter` | Chroma | Project goal, architecture, active envelope. Always loaded. |
+| `palace.lesson` | Chroma | Durable verified lessons. Semantic search. |
+| `palace.idea` | Chroma | Hypotheses, findings. `verified=false` suppressed in plan/execute recall. |
+| `palace.codeptr` | Chroma | External code pointers (GitHub URLs + summaries). |
+| `palace.skill_index` | Chroma | Mirror of skills library for semantic `load_skill` search. |
+| `palace.run` | Chroma | Current run: PhasePlan, findings, subtask results, watcher incidents. |
+| `palace.phase` | Chroma | Phase scratchpad. Cleared on phase transition. |
+| `palace.subtask` | Chroma | Subtask scratchpad. Cleared on `mark_subtask_complete`. |
+| `palace.transient` | SQLite | Events, tool I/O, terminal scrollback. TTL 24h. |
+| `palace.graph` | SQLite | Edge table: `src_id, dst_id, edge_type, weight, phase, created_at`. |
+
+### Durability Scopes
+
+| Scope | Lives in | Cleared when |
+|-------|---------|-------------|
+| `cross_run_durable` | charter, lesson, idea(verified), codeptr, skill_index | Never (only manual cold-tier archival) |
+| `run_scoped` | palace.run | On run completion: verified nodes promoted, rest archived |
+| `phase_scoped` | palace.phase | On transition to next phase |
+| `subtask_scoped` | palace.subtask | On `mark_subtask_complete` |
+| `transient` | palace.transient (SQLite) | TTL (default 24h) + hard cap |
+
+The `tier` field (always_on / hot / warm / cold) is orthogonal to scope: tier controls **recall priority**, scope controls **lifetime**.
+
+### Graph Edges
+
+Edge types linking memory nodes: `derived_from`, `cites`, `tests`, `implements`, `supersedes`, `references_file`, `triggered_by_error`, `flagged_by`, `blocks`.
+
+## Evidence-First FinalReport
+
+After `verify(pass)`, the runner builds a structured `FinalReport` where every claim in the human summary must cite a specific `event_id` or `artifact_id`.
+
+```json
+{
+  "run_id": "...",
+  "workspace_id": "...",
+  "status": "pass | fail | partial",
+  "human_summary_md": "...",
+  "claims_index": {"claim_1": ["event_42", "artifact_7"]},
+  "evidence": {
+    "changed_files": [...],
+    "commands_run": [...],
+    "verification_reports": [...],
+    "watcher_incidents": [...],
+    "memory_promotions": [...]
+  },
+  "phase_timeline": [...]
+}
+```
+
+A validator rejects reports with unverified claims. On validation failure, the final phase repeats once; after a second failure, `status=partial`.
+
+## Task Flow
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Ouroboros
-    participant Umbrella as Umbrella Control Plane
-    participant WS as Workspace Instance
-    participant GMAS
+    participant CLI as CLI / Web Bridge
+    participant Runner as PhaseRunner
+    participant Worker as Worker Ouroboros
+    participant Watcher as Watcher Ouroboros
+    participant Palace as MemPalace
 
-    User->>Ouroboros: Задача
-    Ouroboros->>Umbrella: Структурированный brief
-    Umbrella->>Umbrella: Выбор seed workspace
-    Umbrella->>WS: create_task_instance из seed
-    Umbrella->>GMAS: Запуск графа агентов
-    GMAS-->>WS: Артефакты, логи, memory
-    Umbrella->>Ouroboros: Результаты, eval-метрики
-    Ouroboros->>WS: Гипотеза улучшения (патч графа, промптов)
-    Umbrella->>GMAS: Повторный запуск
-    GMAS-->>WS: Улучшенные артефакты
-    Umbrella-->>User: Финальный артефакт
+    User->>CLI: Task description
+    CLI->>Runner: run_phases(workspace, task)
+    Runner->>Runner: Load PhasePlan + manifests
+    loop For each phase
+        Runner->>Palace: recall(phase_id) -> RecallBundle
+        Runner->>Worker: spawn with phase_manifest + recall
+        Runner->>Watcher: start monitoring
+        Worker->>Palace: read/write per manifest rules
+        Watcher-->>Runner: control signals (if triggered)
+        Worker-->>Runner: phase result
+        Runner->>Palace: expire_scope(phase_scoped)
+    end
+    Runner->>Runner: build_final_report()
+    Runner-->>CLI: FinalReport (JSON)
+    CLI-->>User: Result
 ```
 
-Полный цикл:
+## In-Run Self-Modification
 
-1. Принять задачу, привести к структурированному brief.
-2. Определить класс задачи.
-3. Выбрать seed workspace.
-4. Создать task-instance.
-5. Поднять контекст по GMAS, по workspace, по прошлым кейсам.
-6. Запустить workspace.
-7. Прочитать логи, eval-результаты и артефакты.
-8. Построить гипотезу улучшения.
-9. Изменить workspace.
-10. Повторить цикл запуска и оценки.
-11. Вернуть артефакт и сохранить уроки.
-12. Если цикл упёрся в ограничения менеджера — вторичный self-improvement контур.
+During a run, the Worker can modify its own execution path (but never the manager code):
 
-## Память как сквозной слой
+- `mutate_phase_plan(patch)` — add/remove/reorder remaining phases
+- `add_phase(after, manifest)` — insert an extra phase
+- `loop_back_to(phase)` — return to a previous phase
+- `edit_subtask_card(subtask_id, patch)` — change goal/tests/tools
+- `swap_skill_in_phase(phase_id, add, remove)` — change active skills
+- `register_temp_tool(name, src, schema)` — create a temporary tool (scope = phase)
 
-Хотя memory физически находится внутри `umbrella/`, по смыслу это сквозной слой всей системы.
-Он связывает прошлые запуски, текущий выбор стратегии и решение о том, где именно менять систему.
+**Forbidden in normal runs** (requires separate `self_improvement_run` mode with relaxed envelope):
+- Editing `umbrella/`, `ouroboros/`, `gmas/`, root configs
+- Changing `umbrella/permissions/global.yaml`
+- Changing manifest schemas
 
-Memory в Umbrella хранит:
+## Verified Reflexion
 
-- lessons по workspace-итерациям;
-- manager-level lessons, применимые к нескольким workspace;
-- competency signals и gaps;
-- palace/hierarchical knowledge с тематической таксономией;
-- компактные summary bundles для prompt injection.
+When `verify` fails, a **reflexion** mini-phase generates a verbal self-feedback node in `palace.run` with `verified=false`. This reflection is promoted to `palace.lesson` (cross-run durable) **only** when:
 
-Именно memory помогает ответить на ключевой вопрос архитектуры:
-это проблема текущего workspace, проблема выбора стратегии или уже проблема самого менеджера.
+1. The reflection was in hot-context of a subsequent attempt
+2. That attempt passed `verify(pass)`
+3. A `palace.run` edge `applied_reflection -> <reflection_id>` exists
 
-Подробнее: [umbrella-layer.md](umbrella-layer.md).
+Without these conditions, the reflection stays in `palace.idea` with `verified=false` (suppressed in default recall) or dies with the run.
 
-## Ключевые нововведения
+## Key Design Principles
 
-Если смотреть идейно, `Umbrella` предлагает не просто ещё одного coding-агента, а другую
-операционную модель построения AI-систем:
-
-1. **Workspace-first вместо self-first**.
-   Прикладная компетенция и основные изменения должны кристаллизоваться в `workspaces`, а не в коде менеджера.
-
-2. **Seed / instance / promotion lifecycle**.
-   Есть явный жизненный цикл: человек создаёт seed, менеджер материализует instance под задачу, затем полезные изменения могут возвращаться обратно в seed.
-
-3. **Менеджер отделён от продукта**.
-   `Ouroboros` и `umbrella` отвечают за выбор, оценку, память и orchestration, но итоговый полезный артефакт должен жить отдельно от них.
-
-4. **Формализованный self-improvement**.
-   Самоулучшение не является default-реакцией. Оно включается по сигналам, gaps и policy-триггерам.
-
-5. **Control-plane с памятью и retrieval**.
-   Решения принимаются не только по текущему контексту, но и по накопленным lessons, semantic memory и retrieval по `GMAS`.
-
-6. **Framework discipline**.
-   `GMAS` выступает как стабильный execution substrate, а не как поверхность для спонтанного автопатчинга.
-
-7. **Meta-Harness как внешняя проверка улучшений**.
-   Изменения harness-level не обязаны считаться успешными только потому, что итерация завершилась;
-   по возможности они проходят оценку на заранее заданном наборе задач и решение о promotion
-   отделено от «просто сделал правки».
-
-## Политика границ
-
-Правила закреплены в `umbrella/policies/default_policy.yaml` и в коде `umbrella/policies/engine.py`.
-
-| Путь | Политика | Эскалация |
-|------|----------|-----------|
-| `gmas/**` | Read-only | Требуется одобрение человека |
-| `ouroboros/**` | Mutable при self-improvement | Уведомление человека |
-| `workspaces/<seed>/` | Seed: только через promotion | Требуется evidence + min score 0.7 |
-| `workspaces/.../instances/**` | Свободно изменяем | Нет |
-| `umbrella/**` | Свободно изменяем | Нет |
-
-Ключевые API решений:
-
-- `classify_path(path)` — категория поверхности (framework, manager, workspace_instance, ...).
-- `can_edit_path(path, actor, action)` — разрешение на запись.
-- `should_prefer_workspace_patch(context)` — предпочтение workspace-патча.
-- `can_trigger_self_improvement(context)` — допустим ли self-improvement.
-
-Подробнее: `umbrella/policies/README.md`.
+1. **Workspace-first**: improve the application, not the manager.
+2. **Manifest-driven**: phases are data, not hardcoded logic.
+3. **Permission-gated**: every tool call passes through the envelope.
+4. **Evidence-based**: reports require citations; reflexions require verification.
+5. **Framework discipline**: GMAS is read-only; work within its API.
+6. **Idle Watcher**: monitoring is cheap; LLM calls only on triggers.
+7. **Memory as control plane**: past runs inform future decisions, not just archive.

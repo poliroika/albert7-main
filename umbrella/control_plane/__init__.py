@@ -44,11 +44,17 @@ from umbrella.control_plane.models import (
     ExecutionOutcome,
 )
 
-from umbrella.control_plane.state import (
-    ManagerStateMachine,
-    StateTransition,
-    transition_to,
-)
+try:
+    from umbrella.control_plane.state import (
+        ManagerStateMachine,
+        StateTransition,
+        transition_to,
+    )
+except ImportError:
+    # state.py removed — ManagerStateMachine replaced by umbrella/phases/ PhaseNode
+    ManagerStateMachine = None  # type: ignore
+    StateTransition = None  # type: ignore
+    transition_to = None  # type: ignore
 
 from umbrella.control_plane.decision_policy import (
     decide_next_action,
@@ -58,14 +64,6 @@ from umbrella.control_plane.decision_policy import (
     classify_task,
     select_seed_workspace,
     build_decision_context,
-)
-
-from umbrella.control_plane.self_improvement import (
-    SelfImprovementGate,
-    check_self_improvement_eligibility,
-    prepare_self_improvement,
-    execute_self_improvement,
-    resume_from_checkpoint,
 )
 
 from umbrella.control_plane.prompt_policy import (
@@ -110,10 +108,15 @@ from umbrella.control_plane.tracing import (
     explain_decision,
 )
 
-from umbrella.control_plane.engine import (
-    ControlPlaneEngine,
-    create_engine,
-)
+try:
+    from umbrella.control_plane.engine import (
+        ControlPlaneEngine,
+        create_engine,
+    )
+except ImportError:
+    # engine.py removed — replaced by umbrella/orchestrator/runner.py
+    ControlPlaneEngine = None  # type: ignore
+    create_engine = None  # type: ignore
 
 __all__ = [
     # Models
@@ -154,12 +157,6 @@ __all__ = [
     "classify_task",
     "select_seed_workspace",
     "build_decision_context",
-    # Self-Improvement
-    "SelfImprovementGate",
-    "check_self_improvement_eligibility",
-    "prepare_self_improvement",
-    "execute_self_improvement",
-    "resume_from_checkpoint",
     # Prompt Governance
     "identify_prompt_surfaces",
     "get_prompt_surface",

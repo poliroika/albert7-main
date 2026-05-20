@@ -137,7 +137,12 @@ def sync_umbrella_context_to_drive(
     drive_root = drive_root.resolve()
     ensure_drive_layout(drive_root)
     seed_workspace_prompts(repo_root, workspace_id)
-    palace_path = repo_root / ".umbrella" / "palace"
+    try:
+        from umbrella.memory.paths import palace_path_for
+
+        palace_path = palace_path_for(repo_root, workspace_id or "")
+    except Exception:
+        palace_path = repo_root / ".umbrella" / "palace"
 
     try:
         _write_state_snapshot(
@@ -337,7 +342,12 @@ def _format_palace_memory(
     workspace_id: str | None,
     task_input: str | None,
 ) -> list[str]:
-    palace_path = repo_root / ".umbrella" / "palace"
+    try:
+        from umbrella.memory.paths import palace_path_for
+
+        palace_path = palace_path_for(repo_root, workspace_id or "")
+    except Exception:
+        palace_path = repo_root / ".umbrella" / "palace"
     if not palace_path.exists():
         return ["- No palace memories yet."]
 
@@ -345,12 +355,18 @@ def _format_palace_memory(
         from umbrella.memory.palace_backend import get_palace_backend
 
         palace = get_palace_backend(palace_path)
-        query = task_input or workspace_id or ""
+        try:
+            query = task_input or workspace_id or ""
 
-        if query.strip():
-            hits = palace.search(query, workspace_id=workspace_id or "", n_results=8)
-        else:
-            hits = palace.recent(workspace_id=workspace_id or "", limit=8)
+            if query.strip():
+                hits = palace.search(query, workspace_id=workspace_id or "", n_results=8)
+            else:
+                hits = palace.recent(workspace_id=workspace_id or "", limit=8)
+        finally:
+            try:
+                palace.close()
+            except Exception:
+                pass
 
         if not hits:
             return ["- No palace memories yet."]
@@ -372,13 +388,19 @@ def _format_palace_memory(
 
             clear_palace_backend_cache(palace_path)
             palace = get_palace_backend(palace_path)
-            query = task_input or workspace_id or ""
-            if query.strip():
-                hits = palace.search(
-                    query, workspace_id=workspace_id or "", n_results=8
-                )
-            else:
-                hits = palace.recent(workspace_id=workspace_id or "", limit=8)
+            try:
+                query = task_input or workspace_id or ""
+                if query.strip():
+                    hits = palace.search(
+                        query, workspace_id=workspace_id or "", n_results=8
+                    )
+                else:
+                    hits = palace.recent(workspace_id=workspace_id or "", limit=8)
+            finally:
+                try:
+                    palace.close()
+                except Exception:
+                    pass
             if not hits:
                 return ["- No palace memories yet."]
             lines = []
@@ -397,68 +419,8 @@ def _format_palace_memory(
 
 
 def _build_meta_harness_summary(*, repo_root: Path) -> str:
-    """Build a compact Meta-Harness experience summary for the knowledge bridge."""
-    try:
-        from umbrella.meta_harness.store import get_default_store
-
-        store = get_default_store(repo_root)
-        exp = store.get_latest_experiment()
-        if exp is None:
-            return ""
-
-        lines = [
-            "# Meta-Harness Experience",
-            "",
-            f"Generated: {_utc_now_iso()}",
-            f"Experiment: {exp.id} (status: {exp.status})",
-            f"Workspace: {exp.workspace_id}",
-            f"Iterations: {exp.iterations_completed}",
-            f"Best score: {exp.best_score:.3f}"
-            if exp.best_score
-            else "Best score: n/a",
-            "",
-        ]
-
-        pairs = store.top_candidates(exp.id, n=5, sort_by="score")
-        if pairs:
-            lines.append("## Top Candidates")
-            for cand, ev in pairs:
-                score = f"{ev.avg_score:.3f}" if ev else "n/a"
-                lines.append(
-                    f"- {cand.candidate_id}: score={score} status={cand.run_status} "
-                    f"writes={cand.write_calls} cost=${cand.cost_usd:.4f}"
-                )
-
-        failures = store.get_failures(exp.id)
-        if failures:
-            lines.extend(["", "## Recent Failures (do not repeat)"])
-            for cand, ev in failures[:5]:
-                error_hint = cand.error[:150] if cand.error else "no error detail"
-                lines.append(f"- {cand.candidate_id}: {error_hint}")
-
-        # Active hypotheses from latest candidate diagnosis
-        if pairs:
-            latest_dir = store.find_candidate_dir(pairs[0][0].candidate_id)
-            if latest_dir:
-                hypothesis_path = latest_dir / "hypothesis.md"
-                if hypothesis_path.exists():
-                    hypothesis = hypothesis_path.read_text(encoding="utf-8")[:500]
-                    lines.extend(["", "## Active Hypothesis", "", hypothesis])
-
-        lines.extend(
-            [
-                "",
-                "## Navigation",
-                f"- Candidate dirs: .umbrella/meta_harness/experiments/{exp.id}/candidates/",
-                "- Use `search_meta_harness_experience` tool for queryable access",
-                "- Use `inspect_candidate_trace` tool for raw traces",
-            ]
-        )
-
-        return "\n".join(lines).strip()
-    except Exception:
-        log.debug("Meta-harness summary build failed", exc_info=True)
-        return ""
+    """Meta-harness was removed in the PhaseRunner refactor; return empty."""
+    return ""
 
 
 def _build_retrieval_summary(
@@ -565,11 +527,10 @@ def _workspace_skill_signal(
 ) -> tuple[str, set[Domain], list[str]]:
     """Return deterministic workspace-local hints for skill detection.
 
-    Explicit workspace policy still wins, but normal task-domain
-    detection is now allowed to activate ``multi_agent_gmas`` whenever a
-    task touches an LLM. In this repo LLM-backed agents should be built
-    on the in-repo GMAS framework, even when the workspace seed forgot
-    to opt in.
+    Workspace policy contributes durable hints, but the current task can
+    override a stale opt-out when it explicitly requires LLM/model/agent
+    work. In this repo LLM-backed agents should be built on the in-repo
+    GMAS framework, even when the workspace seed forgot to opt in.
     """
     if not workspace_id:
         return "", set(), []
@@ -707,6 +668,7 @@ def _record_workspace_skill_decision(
     enabled: bool,
     reason: str,
     source: str,
+    override_existing: bool = False,
 ) -> bool:
     """Persist Umbrella's skill decision into ``workspace.toml``.
 
@@ -738,7 +700,7 @@ def _record_workspace_skill_decision(
 
     skills = parsed.get("skills") if isinstance(parsed, dict) else None
     existing_value = skills.get(domain.value) if isinstance(skills, dict) else None
-    if existing_value is (not enabled):
+    if existing_value is (not enabled) and not override_existing:
         return False
 
     updated = original
@@ -766,6 +728,8 @@ def _record_workspace_skill_decision(
 _SKILL_ARTIFACT_FILES: dict[Domain, str] = {
     Domain.MULTI_AGENT_GMAS: "gmas_active_context.md",
 }
+
+_SKILL_CACHE_SCHEMA_VERSION = 3
 
 
 def _skill_cache_path(drive_root: Path) -> Path:
@@ -837,7 +801,7 @@ def _resolve_domains(
         isinstance(cached, dict)
         and cached.get("text_hash") == text_hash
         and cached.get("workspace_id") == (workspace_id or "")
-        and cached.get("schema_version") == 2
+        and cached.get("schema_version") == _SKILL_CACHE_SCHEMA_VERSION
     ):
         raw_domains = cached.get("domains") or []
         domains: set[Domain] = set()
@@ -853,7 +817,7 @@ def _resolve_domains(
         drive_root,
         {
             "entry": {
-                "schema_version": 2,
+                "schema_version": _SKILL_CACHE_SCHEMA_VERSION,
                 "text_hash": text_hash,
                 "workspace_id": workspace_id or "",
                 "domains": sorted(d.value for d in domains),
@@ -998,16 +962,32 @@ def _sync_active_skill_packs(
     # GMAS is automatic for LLM/agent tasks. The classifier already
     # distinguishes pure plumbing from LLM-backed work; when it fires we
     # keep the domain so the prompt and knowledge bridge load GMAS
-    # context before the first write. An explicit workspace.toml false is
-    # still respected as a narrow escape hatch.
+    # context before the first write. A stale workspace.toml false must
+    # not silently override a current task that explicitly asks for
+    # LLM/model/agent behavior.
     auto_detected_gmas = Domain.MULTI_AGENT_GMAS in domains
     if explicit_gmas_policy is True:
         domains.add(Domain.MULTI_AGENT_GMAS)
     elif explicit_gmas_policy is False and auto_detected_gmas:
-        domains.discard(Domain.MULTI_AGENT_GMAS)
-        signal_reasons.append(
-            "auto-detected multi_agent_gmas suppressed by explicit workspace.toml opt-out"
+        wrote_policy = _record_workspace_skill_decision(
+            repo_root,
+            workspace_id,
+            domain=Domain.MULTI_AGENT_GMAS,
+            enabled=True,
+            reason=(
+                "Current TASK_MAIN.md explicitly requires LLM/model/agent work; "
+                "overriding a stale workspace opt-out so LLM-backed code uses GMAS."
+            ),
+            source="TASK_MAIN.md",
+            override_existing=True,
         )
+        signal_reasons.append(
+            "current LLM task overrides prior workspace.toml multi_agent_gmas=false"
+        )
+        if wrote_policy:
+            signal_reasons.append(
+                "workspace.toml auto-updated: skills.multi_agent_gmas = true"
+            )
     elif Domain.MULTI_AGENT_GMAS in domains:
         wrote_policy = _record_workspace_skill_decision(
             repo_root,
@@ -1030,7 +1010,7 @@ def _sync_active_skill_packs(
             drive_root,
             {
                 "entry": {
-                    "schema_version": 2,
+                    "schema_version": _SKILL_CACHE_SCHEMA_VERSION,
                     "text_hash": _hash_task_text(composite),
                     "workspace_id": workspace_id or "",
                     "domains": sorted(d.value for d in domains),
@@ -1044,7 +1024,7 @@ def _sync_active_skill_packs(
             drive_root,
             {
                 "entry": {
-                    "schema_version": 2,
+                    "schema_version": _SKILL_CACHE_SCHEMA_VERSION,
                     "text_hash": _hash_task_text(composite),
                     "workspace_id": workspace_id or "",
                     "domains": sorted(d.value for d in domains),
@@ -1135,6 +1115,7 @@ def prepare_active_skills_for_workspace(
     *,
     user_message: str | None = None,
     task_input: str | None = None,
+    phase_id: str | None = None,
 ) -> set[Domain]:
     """Run skill detection eagerly so ``active_skills.json`` and the
     matching ``gmas_active_context.md`` artifact exist *before* the
@@ -1190,6 +1171,21 @@ def prepare_active_skills_for_workspace(
             out.add(Domain(value))
         except ValueError:
             continue
+
+    if phase_id:
+        from umbrella.skills.registry import discover_skills, filter_by_phase, skill_library_root
+        all_skills = discover_skills(skill_library_root(repo_root))
+        skills = filter_by_phase(all_skills, phase_id, status=None)
+        phase_domains: set[Domain] = set()
+        for sk in skills:
+            for d in sk.domains:
+                try:
+                    phase_domains.add(Domain(d))
+                except ValueError:
+                    continue
+        if phase_domains:
+            out = out.intersection(phase_domains)
+
     return out
 
 

@@ -25,29 +25,27 @@ Before final `send_message`, rerun the same verification commands with `run_work
 
 The `[verification]` section in `workspace.toml` MUST include at least one shell step that actually runs the project (e.g. `python main.py`, `npm start`, `uv run python -m mypkg.cli`). The harness will NOT silently add one for you — if you ship a spec with only `import_check` / `file_exists` the promotion gate blocks the run as "shallow verification spec" and the operator gets a warning instead of a green tick.
 
-### Credentials & API keys (find them yourself)
+### Credentials & API keys / LLM runtime env (find them yourself)
 
-The verification subprocess does NOT auto-load the workspace `.env`. If your smoke step needs an API key, you have to wire it up explicitly. Use this order, stop at the first that works:
+Credentials & API keys are your responsibility to discover, declare, and wire into the project without hardcoded provider assumptions. The verification subprocess inherits the host process env, but the verification subprocess does NOT auto-load the workspace `.env`. If your smoke/e2e step needs an LLM, use the current Umbrella/Ouroboros runtime contract instead of hardcoding a provider:
 
-1. **Ask the host environment.** Call `run_workspace_command argv=["python","-c","import os;print('OPENAI_API_KEY' in os.environ)"]` to check whether the key is already in process env. If yes, your code can read it via `os.environ.get("OPENAI_API_KEY")` at runtime — verification subprocesses inherit the host env, so you do not need to repeat the value in `[[verification.steps]] env`. Just confirm the key is there before relying on it.
+1. **Ask the inherited env.** Check aliases, not just one variable:
 
-   If you need to override or add a value (e.g. force a specific model endpoint), use the explicit form:
-
-   ```toml
-   [[verification.steps]]
-   kind = "shell"
-   name = "smoke_run:main.py"
-   command = ["python", "main.py"]
-   env.OPENAI_API_KEY = "<paste-the-actual-value-here>"
+   ```python
+   api_key = os.getenv("LLM_API_KEY") or os.getenv("OUROBOROS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+   base_url = os.getenv("LLM_BASE_URL") or os.getenv("OUROBOROS_LLM_BASE_URL")
+   model = os.getenv("LLM_MODEL") or os.getenv("OUROBOROS_MODEL")
    ```
 
-   Note: TOML literal values only — there is NO `${{VAR}}` interpolation here. Either paste the literal (only safe for non-secret config) or rely on host-env passthrough.
+   `OPENAI_API_KEY` is only one possible provider key and is also used by some web-search providers. Do not require it for a generated project unless the project intentionally chooses OpenAI as the provider. For a standalone generated project, document the generic `LLM_*` aliases as the public contract; keep `OUROBOROS_*` aliases as optional inherited compatibility when Umbrella launches the workspace.
 
-2. **Ask the operator** via `request_user_input(prompt="...", request_id="api_key_<provider>")` if no key is in env and the task genuinely needs a paid call. Once you have the answer, write it into `workspaces/<id>/.env` for documentation, AND export it into the host process env or paste it into `[[verification.steps]] env` so the smoke step actually uses it.
+2. **Wire aliases into project code/tests.** Create a small runtime resolver if the project uses LLMs. Tests and e2e checks should use that resolver so they can run against the same model env that launched Umbrella. A test that requires only `LLM_API_KEY`, only `OPENAI_API_KEY`, or a hardcoded localhost/default model is too narrow.
 
-3. **Fall back to a stub mode** if the user declined or the task can be exercised without real network calls. Add a `--dry-run` / `--offline` flag to your CLI and use that in the smoke step. Document the trade-off in `README.md` and in your final message. Dry-run/offline mode is not enough by itself for generation, parsing, presentation, web, or agent tasks: add tests or inspection steps that prove the generated content changes with the real input and is not placeholder output.
+3. **Ask the operator** via `request_user_input(prompt="...", request_id="api_key_<provider>")` only if no accepted key/model aliases are inherited and the task genuinely cannot proceed without a paid/external call. Once answered, document it in `workspaces/<id>/.env.example` or `.env` as appropriate and ensure verification actually sees the value.
 
-Always read your own code to confirm the env var name your project uses (`OPENAI_API_KEY` vs `OPENAI_KEY` vs custom). A smoke step that "passes" only because the program silently fell back to a hard-coded sample response is a bug — the `mock_scaffold_scan` policy will flag it on the next sweep.
+4. **No fake LLM proof.** For generation, parsing, presentation, web, or agent tasks, dry-run/offline/mock mode is not sufficient as the production/e2e proof. If real LLM env is unavailable, fail or skip explicitly with a clear "real LLM env required" message, or pause/request configuration. Never silently switch to hard-coded sample responses, random choices, cached decisions, or stub agents.
+
+Always read your own code to confirm the env resolver your project uses. A smoke step that "passes" only because the program silently fell back to a hard-coded sample response is a bug — the `mock_scaffold_scan` policy will flag it on the next sweep.
 
 ## Self-review (you will be asked to do this)
 

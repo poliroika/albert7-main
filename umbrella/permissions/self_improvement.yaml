@@ -1,0 +1,21 @@
+# Relaxed envelope for self-improvement runs (system code edits).
+# Only used by umbrella/orchestrator/self_improvement_runner.py.
+rules:
+  - allow_tools:
+      - apply_workspace_patch
+      - repo_write_commit
+      - claude_code_edit
+      - shell
+      - terminal_session
+      - read_file
+      - list_files
+      - palace_search
+      - palace_add
+      - run_unit_tests
+  - allow_path_prefix:
+      - "umbrella/**"
+      - "ouroboros/**"
+  - deny_path:
+      - "**/.env*"
+      - "**/secrets/**"
+      - "**/credentials*"

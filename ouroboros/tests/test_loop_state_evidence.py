@@ -283,6 +283,41 @@ def test_verify_run_id_from_payload_is_preferred_over_round_derived():
     assert state.last_verify_failed_count == 0
 
 
+def test_run_real_e2e_updates_dedicated_e2e_state():
+    state = _LoopState(round_idx=18)
+    payload = {
+        "passed": True,
+        "pass_rate": 1.0,
+        "skipped": False,
+        "results": [
+            {
+                "name": "http_boot:app",
+                "kind": "http_boot",
+                "status": "passed",
+                "optional": False,
+            }
+        ],
+        "summary": "E2E PASS",
+        "verify_run_id": "verify-e2e-1",
+        "failed_step_count": 0,
+    }
+    state.llm_trace = {
+        "assistant_notes": [],
+        "tool_calls": [_trace_entry("run_real_e2e", json.dumps(payload))],
+    }
+
+    _update_state_from_tool_calls(
+        state,
+        [{"function": {"name": "run_real_e2e"}}],
+        phase_label="final_review",
+    )
+
+    assert state.last_verify_passed is True
+    assert state.last_e2e_passed is True
+    assert state.last_e2e_run_id == "verify-e2e-1"
+    assert state.last_e2e_phase_label == "final_review"
+
+
 def test_explicit_failed_step_count_is_honoured():
     state = _LoopState(round_idx=4)
     payload = {

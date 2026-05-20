@@ -888,10 +888,15 @@ def _load_task_from_checkpoint(
     """
     try:
         import json
+        from umbrella.artifacts.task_ids import task_artifact_stem
         from umbrella.control_plane.models import ManagerTask
 
         # Try to load from control state directory
-        checkpoint_path = services.control_state_dir / "checkpoints" / f"{task_id}.json"
+        checkpoint_path = (
+            services.control_state_dir
+            / "checkpoints"
+            / f"{task_artifact_stem(task_id)}.json"
+        )
 
         if not checkpoint_path.exists():
             log.warning(f"No checkpoint found at {checkpoint_path}")
@@ -925,11 +930,12 @@ def _save_task_checkpoint(
     """
     try:
         import json
+        from umbrella.artifacts.task_ids import task_artifact_stem
 
         checkpoint_dir = services.control_state_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        checkpoint_path = checkpoint_dir / f"{task.id}.json"
+        checkpoint_path = checkpoint_dir / f"{task_artifact_stem(task.id)}.json"
 
         with open(checkpoint_path, "w", encoding="utf-8") as f:
             json.dump(

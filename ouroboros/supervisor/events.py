@@ -136,11 +136,12 @@ def _handle_task_done(evt: dict[str, Any], ctx: Any) -> None:
     # Store task result for subtask retrieval
     try:
         from pathlib import Path
+        from ouroboros.utils import task_artifact_stem
 
         results_dir = Path(ctx.DRIVE_ROOT) / "task_results"
         results_dir.mkdir(parents=True, exist_ok=True)
         # Only write if agent didn't already write (check if file exists)
-        result_file = results_dir / f"{task_id}.json"
+        result_file = results_dir / f"{task_artifact_stem(task_id)}.json"
         if not result_file.exists():
             result_data = {
                 "task_id": task_id,
@@ -149,7 +150,7 @@ def _handle_task_done(evt: dict[str, Any], ctx: Any) -> None:
                 "cost_usd": float(evt.get("cost_usd", 0)),
                 "ts": evt.get("ts", ""),
             }
-            tmp_file = results_dir / f"{task_id}.json.tmp"
+            tmp_file = results_dir / f"{task_artifact_stem(task_id)}.json.tmp"
             tmp_file.write_text(json.dumps(result_data, ensure_ascii=False))
             os.rename(tmp_file, result_file)
     except Exception as e:

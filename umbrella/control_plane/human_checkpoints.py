@@ -20,7 +20,13 @@ from umbrella.control_plane.models import (
     PromptPatchProposal,
     generate_human_checkpoint_id,
 )
-from umbrella.control_plane.self_improvement import resume_from_checkpoint
+def resume_from_checkpoint(checkpoint_id: str, checkpoint_dir: Path) -> None:
+    """No-op placeholder: legacy self-improvement governance removed in PhaseRunner refactor.
+
+    System self-improvement now flows through ``umbrella.orchestrator.self_improvement_runner``
+    with the relaxed PermissionEnvelope from ``umbrella/permissions/self_improvement.yaml``.
+    """
+    return None
 
 
 def _request_path(checkpoint_dir: Path, checkpoint_id: str) -> Path:

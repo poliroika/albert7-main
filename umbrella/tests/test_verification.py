@@ -720,6 +720,120 @@ class TestSpecLoader:
         assert http_steps[0].command == [sys.executable, "src/app/main.py"]
         assert http_steps[0].health_url == "http://127.0.0.1:8080/health"
 
+    def test_autodetect_fastapi_behavior_uses_real_post_route(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "main.py").write_text(
+            textwrap.dedent(
+                """
+                from fastapi import FastAPI
+                from pydantic import BaseModel
+                import uvicorn
+
+                app = FastAPI()
+
+                class CreateGameRequest(BaseModel):
+                    human_name: str
+                    bot_personalities: list[str] = []
+
+                @app.get("/")
+                async def root():
+                    return {"status": "ok"}
+
+                @app.post("/api/game/create")
+                async def create_game(request: CreateGameRequest):
+                    return {"player": request.human_name}
+
+                if __name__ == "__main__":
+                    uvicorn.run(app, host="0.0.0.0", port=8080)
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+        steps = autodetect_steps(tmp_path)
+
+        behavioral = [
+            s for s in steps if s.kind == VerificationStepKind.BEHAVIORAL_HTTP
+        ]
+        assert len(behavioral) == 1
+        assert behavioral[0].name == "behavioral_http:/api/game/create"
+        assert behavioral[0].request_url == "http://127.0.0.1:8080/api/game/create"
+        assert behavioral[0].request_payloads[0]["human_name"].startswith("alpha")
+        assert behavioral[0].request_payloads[1]["human_name"].startswith("beta")
+
+    def test_autodetect_prefers_domain_route_over_generic_generate(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "main.py").write_text(
+            textwrap.dedent(
+                """
+                from typing import Any
+                from fastapi import FastAPI
+                from pydantic import BaseModel
+                import uvicorn
+
+                app = FastAPI()
+
+                class CreateGameRequest(BaseModel):
+                    human_name: str
+
+                @app.get("/")
+                async def root():
+                    return {"status": "ok"}
+
+                @app.post("/generate")
+                async def generate_text(request: dict[str, Any]):
+                    return {"input": request.get("input")}
+
+                @app.post("/api/game/create")
+                async def create_game(request: CreateGameRequest):
+                    return {"player": request.human_name}
+
+                if __name__ == "__main__":
+                    uvicorn.run(app, host="0.0.0.0", port=8080)
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+        steps = autodetect_steps(tmp_path)
+
+        behavioral = [
+            s for s in steps if s.kind == VerificationStepKind.BEHAVIORAL_HTTP
+        ]
+        assert len(behavioral) == 1
+        assert behavioral[0].name == "behavioral_http:/api/game/create"
+
+    def test_autodetect_fastapi_does_not_force_generate_route(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "main.py").write_text(
+            textwrap.dedent(
+                """
+                from fastapi import FastAPI
+                import uvicorn
+
+                app = FastAPI()
+
+                @app.get("/")
+                async def root():
+                    return {"status": "ok"}
+
+                if __name__ == "__main__":
+                    uvicorn.run(app, host="0.0.0.0", port=8080)
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+        steps = autodetect_steps(tmp_path)
+
+        assert any(s.kind == VerificationStepKind.HTTP_BOOT for s in steps)
+        assert not any(
+            s.kind == VerificationStepKind.BEHAVIORAL_HTTP for s in steps
+        )
+
     def test_autodetect_skips_pptx_diff_when_only_template_pptx(
         self, tmp_path: Path
     ) -> None:
@@ -975,6 +1089,54 @@ class TestBehavioralDepth:
         report = run_verification(tmp_path, [step])
 
         assert not report.passed, report.render_summary()
+
+    def test_behavioral_http_failure_includes_requests_and_error_body(
+        self, tmp_path: Path
+    ) -> None:
+        port = _pick_free_port()
+        server_script = tmp_path / "validation_server.py"
+        server_script.write_text(
+            textwrap.dedent(
+                f"""
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+
+                class H(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(b'ok')
+                    def do_POST(self):
+                        self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                        self.send_response(422)
+                        self.send_header('Content-Type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(b'{{"detail":"game_id is required"}}')
+                    def log_message(self, *a, **kw):
+                        return
+
+                HTTPServer(('127.0.0.1', {port}), H).serve_forever()
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+        step = VerificationStep(
+            kind=VerificationStepKind.BEHAVIORAL_HTTP,
+            name="behavioral",
+            command=[sys.executable, "validation_server.py"],
+            health_url=f"http://127.0.0.1:{port}/health",
+            request_url=f"http://127.0.0.1:{port}/generate",
+            request_payloads=[{"text": "alpha"}, {"text": "beta"}],
+            startup_timeout_seconds=10,
+        )
+
+        report = run_verification(tmp_path, [step])
+        result = report.results[0]
+
+        assert not report.passed
+        assert "statuses=[422, 422]" in result.summary
+        assert "--- request A ---" in result.stdout
+        assert '"text": "alpha"' in result.stdout
+        assert '"detail":"game_id is required"' in result.stdout
 
     def test_changed_source_mock_scaffold_fails_verification(
         self, tmp_path: Path

@@ -1,0 +1,55 @@
+id: verify
+version: 1
+description: "Verification phase: run the full workspace verification suite, confirm all acceptance criteria pass, and promote durable artifacts."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/verify.system.md
+
+allowed_tools:
+  - load_skill
+  - run_workspace_verify
+  - run_real_e2e
+  - palace_search
+  - submit_verification
+  - request_human_checkpoint
+  - loop_back_to
+  - promote_to_durable
+
+forbidden_tools:
+  - apply_workspace_patch
+  - shell
+  - terminal_session
+  - repo_write_commit
+  - palace_add
+  - claude_code_edit
+  - sandbox_self_edit
+
+allowed_skills:
+  - verification-protocol
+  - human-checkpoint-author
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [final_review_report, execution_artifact]}
+  warm_search: []
+  write_rules:
+    verification_report: {store: palace.durable, tier: always_on, scope: cross_run_durable, verified: true}
+
+permissions:
+  rules:
+    - allow_tools: [load_skill, run_workspace_verify, run_real_e2e, palace_search, submit_verification, request_human_checkpoint, loop_back_to, promote_to_durable]
+    - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
+
+exit_criteria:
+  required_calls: [submit_verification]
+  required_palace_writes:
+    - {store: palace.durable, tag: verification_report, n: 1}
+
+mini_review_after: null
+
+budgets:
+  max_tokens: 15000
+  max_seconds: 600

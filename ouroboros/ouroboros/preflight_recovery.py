@@ -54,6 +54,10 @@ _ARG_PAIR_LENIENT_RE = re.compile(
 _PSEUDO_XML_NOISE_RE = re.compile(
     r"</?(?:arg_key|arg_value|tool_call|function_call)>", re.IGNORECASE
 )
+_PSEUDO_TOOL_NAME_RE = re.compile(
+    r"<(?:tool_call|function_call)>\s*([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
 
 
 def _coerce_arg_value(raw: str) -> Any:
@@ -118,7 +122,12 @@ def extract_pseudo_xml_args(
     ):
         sources.append(raw_args_text)
 
+    explicit_tool_name = ""
     for src in sources:
+        if not explicit_tool_name:
+            tool_match = _PSEUDO_TOOL_NAME_RE.search(src)
+            if tool_match:
+                explicit_tool_name = (tool_match.group(1) or "").strip()
         # Try the canonical shape first so we don't double-match the
         # same pair through the lenient pattern.
         canonical_spans: set[tuple[int, int]] = set()
@@ -140,11 +149,14 @@ def extract_pseudo_xml_args(
             value = _coerce_arg_value(match.group(2) or "")
             args.setdefault(key, value)
 
-    # Strip everything from the first ``<`` or ``(`` onward — that's
-    # where the pseudo-XML / call-form pollution starts.
-    if "<" in name or "(" in name:
-        name = re.split(r"[<(]", name, maxsplit=1)[0].strip()
-    name = _PSEUDO_XML_NOISE_RE.sub("", name).strip()
+    if explicit_tool_name:
+        name = explicit_tool_name
+    else:
+        # Strip everything from the first ``<`` or ``(`` onward — that's
+        # where the pseudo-XML / call-form pollution starts.
+        if "<" in name or "(" in name:
+            name = re.split(r"[<(]", name, maxsplit=1)[0].strip()
+        name = _PSEUDO_XML_NOISE_RE.sub("", name).strip()
 
     return name, args
 

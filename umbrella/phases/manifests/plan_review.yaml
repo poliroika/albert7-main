@@ -1,0 +1,52 @@
+id: plan_review
+version: 1
+description: "Mini-review gate after planning: verify phase plan completeness, subtask quality, and test strategy before execution."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/plan_review.system.md
+
+allowed_tools:
+  - read_file
+  - load_skill
+  - palace_search
+  - get_gmas_context
+  - search_gmas_knowledge
+  - submit_micro_review
+  - loop_back_to
+
+forbidden_tools:
+  - apply_workspace_patch
+  - shell
+  - terminal_session
+  - repo_write_commit
+  - palace_add
+  - claude_code_edit
+  - sandbox_self_edit
+
+allowed_skills:
+  - review-checklist
+  - decision-policy
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [phase_plan, subtask_card]}
+  warm_search: []
+  write_rules:
+    plan_review_verdict: {store: palace.run, tier: hot, scope: phase_scoped}
+
+permissions:
+  rules:
+    - allow_tools: [read_file, load_skill, palace_search, get_gmas_context, search_gmas_knowledge, submit_micro_review, loop_back_to]
+    - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
+
+exit_criteria:
+  required_calls: [submit_micro_review]
+
+mini_review_after: null
+
+budgets:
+  max_tokens: 10000
+  max_seconds: 180

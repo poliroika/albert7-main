@@ -1,0 +1,80 @@
+id: execute
+version: 1
+description: "Execution phase: implement subtasks by applying patches, running tests, using terminals, and iterating until all subtasks pass."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/execute.system.md
+
+allowed_tools:
+  - apply_workspace_patch
+  - delete_workspace_file
+  - sandbox_self_edit
+  - shell
+  - terminal_session
+  - read_file
+  - load_skill
+  - list_files
+  - repo_read
+  - repo_list
+  - run_workspace_verify
+  - run_unit_tests
+  - palace_search
+  - palace_add
+  - palace_link
+  - mutate_phase_plan
+  - add_phase
+  - loop_back_to
+  - request_extra_subtask
+  - mark_subtask_complete
+  - harness_run
+  - enable_tools
+  - mcp_install
+  - mcp_discover
+  - register_temp_tool
+  - web_search
+  - deep_search
+  - request_watcher_review
+  - get_gmas_context
+  - search_gmas_knowledge
+
+forbidden_tools:
+  - wipe_workspace
+  - reset_palace
+
+allowed_skills:
+  - patch-discipline
+  - terminal-debugging
+  - error-self-repair
+  - mcp-bridge-author
+  - harness-strategy
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [phase_plan, execution_error, patch_applied]}
+    - {store: palace.subtask, tags: [subtask_card, phase_plan_mutation, phase_retry, execution_failure]}
+  warm_search:
+    - {store: palace.global, n: 6}
+  write_rules:
+    execution_artifact: {store: palace.run, tier: hot, scope: run_scoped}
+    error_record: {store: palace.subtask, tier: hot, scope: subtask_scoped}
+
+permissions:
+  rules:
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, sandbox_self_edit, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_unit_tests, palace_search, palace_add, palace_link, mutate_phase_plan, add_phase, loop_back_to, request_extra_subtask, mark_subtask_complete, harness_run, enable_tools, mcp_install, mcp_discover, register_temp_tool, web_search, deep_search, request_watcher_review, get_gmas_context, search_gmas_knowledge]
+    - deny_tools: [wipe_workspace, reset_palace]
+    - deny_path: ["**/.env*", "**/secrets/**"]
+
+exit_criteria:
+  required_calls: [mark_subtask_complete]
+
+mini_review_after: subtask_review
+
+temp_tools_allowed: true
+
+budgets:
+  max_tokens: 60000
+  max_seconds: 3600
+  max_tool_calls: 500

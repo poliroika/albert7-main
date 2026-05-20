@@ -35,6 +35,43 @@ def _find_subseq_rstrip(haystack: list[str], needle: list[str]) -> int:
     )
 
 
+def _is_blank(line: str) -> bool:
+    return not line.strip()
+
+
+def _find_subseq_blank_flexible(
+    haystack: list[str], needle: list[str]
+) -> tuple[int, int] | None:
+    """Match hunks when the file only has extra blank context lines."""
+    if not needle:
+        return (0, 0)
+    hay = [line.rstrip() for line in haystack]
+    ned = [line.rstrip() for line in needle]
+    for start in range(0, len(hay)):
+        hi = start
+        ni = 0
+        while ni < len(ned):
+            if hi >= len(hay):
+                break
+            wanted = ned[ni]
+            if _is_blank(wanted):
+                if not _is_blank(hay[hi]):
+                    break
+                while hi < len(hay) and _is_blank(hay[hi]):
+                    hi += 1
+                ni += 1
+                continue
+            while hi < len(hay) and _is_blank(hay[hi]):
+                hi += 1
+            if hi >= len(hay) or hay[hi] != wanted:
+                break
+            hi += 1
+            ni += 1
+        if ni == len(ned):
+            return (start, hi)
+    return None
+
+
 def _is_action_boundary(line: str) -> bool:
     return line.startswith("*** ") and any(
         line.startswith(prefix)
@@ -149,12 +186,19 @@ def apply_update_to_text(old_text: str, hunks: list[list[str]], path: str = "") 
                 old_seq.append(context)
                 new_seq.append(context)
         idx = _find_subseq(source, old_seq)
-        if idx < 0:
+        if idx >= 0:
+            end = idx + len(old_seq)
+        else:
             idx = _find_subseq_rstrip(source, old_seq)
+            end = idx + len(old_seq)
+        if idx < 0:
+            flexible = _find_subseq_blank_flexible(source, old_seq)
+            if flexible is not None:
+                idx, end = flexible
         if idx < 0:
             label = f" in {path}" if path else ""
             raise ValueError(f"failed to match patch hunk{label}")
-        source = source[:idx] + new_seq + source[idx + len(old_seq) :]
+        source = source[:idx] + new_seq + source[end:]
     new_text = "\n".join(source)
     if had_trailing_newline or source:
         new_text += "\n"

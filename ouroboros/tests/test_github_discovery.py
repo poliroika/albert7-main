@@ -122,6 +122,28 @@ def test_github_project_search_uses_workspace_drive_not_repo_dir_memory(
     )
 
 
+def test_github_project_search_accepts_max_results_alias(tmp_path: Path) -> None:
+    gd.reset_budget("task_gh_alias")
+    ctx = _ctx(tmp_path, "task_gh_alias")
+    requested: list[int] = []
+
+    def fake_search(query: str, *, max_repos: int):
+        requested.append(max_repos)
+        return []
+
+    with patch.object(gd, "_github_search_repositories", side_effect=fake_search):
+        payload = json.loads(
+            gd._github_project_search(
+                ctx,
+                query="civilization strategy game AI bot python",
+                max_results=3,
+            )
+        )
+
+    assert payload["status"] == "ok"
+    assert requested == [3]
+
+
 def test_github_extract_snippets_blocks_non_permissive_body(tmp_path: Path) -> None:
     gd.reset_budget("task_gh_lic")
     ctx = _ctx(tmp_path, "task_gh_lic")

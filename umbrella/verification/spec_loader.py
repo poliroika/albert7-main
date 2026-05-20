@@ -1,5 +1,6 @@
 """Load verification specs from ``workspace.toml`` or auto-detect them."""
 
+import ast
 import logging
 import re
 import shlex
@@ -779,6 +780,174 @@ def _autodetect_http_step(workspace_path: Path) -> VerificationStep | None:
     return None
 
 
+def _route_path_from_decorator(node: ast.AST, methods: set[str]) -> str:
+    if not isinstance(node, ast.Call):
+        return ""
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return ""
+    if func.attr.lower() not in methods:
+        return ""
+    if not node.args:
+        return ""
+    first = node.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return first.value
+    return ""
+
+
+def _annotation_name(node: ast.AST | None) -> str:
+    if node is None:
+        return ""
+    try:
+        return ast.unparse(node)
+    except Exception:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+    return ""
+
+
+def _basemodel_classes(tree: ast.AST) -> dict[str, list[tuple[str, str]]]:
+    models: dict[str, list[tuple[str, str]]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        base_names = {_annotation_name(base).split(".")[-1] for base in node.bases}
+        if "BaseModel" not in base_names:
+            continue
+        fields: list[tuple[str, str]] = []
+        for item in node.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                fields.append((item.target.id, _annotation_name(item.annotation)))
+        if fields:
+            models[node.name] = fields
+    return models
+
+
+def _payload_value(field_name: str, annotation: str, variant: str) -> Any:
+    ann = annotation.lower()
+    field = field_name.lower()
+    text = f"{variant} verification input"
+    if "list" in ann or ann.startswith("list[") or ann.startswith("typing.list"):
+        if "str" in ann or any(k in field for k in ("name", "tag", "personality")):
+            return [text]
+        return []
+    if "dict" in ann or "mapping" in ann:
+        return {"input": text}
+    if "bool" in ann:
+        return variant == "alpha"
+    if "float" in ann:
+        return 1.25 if variant == "alpha" else 2.5
+    if "int" in ann:
+        return 1 if variant == "alpha" else 2
+    return text
+
+
+def _payloads_for_model(
+    fields: list[tuple[str, str]]
+) -> list[dict[str, Any]] | None:
+    if not fields:
+        return None
+    alpha = {
+        name: _payload_value(name, annotation, "alpha")
+        for name, annotation in fields
+    }
+    beta = {
+        name: _payload_value(name, annotation, "beta")
+        for name, annotation in fields
+    }
+    if alpha == beta:
+        return None
+    return [alpha, beta]
+
+
+def _payloads_for_endpoint_args(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    models: dict[str, list[tuple[str, str]]],
+) -> tuple[list[dict[str, Any]], int] | None:
+    for arg in func.args.args:
+        if arg.arg in {"self", "request"} and arg.annotation is None:
+            continue
+        annotation = _annotation_name(arg.annotation)
+        model_name = annotation.split(".")[-1]
+        if model_name in models:
+            payloads = _payloads_for_model(models[model_name])
+            return (payloads, 0) if payloads is not None else None
+        if any(token in annotation.lower() for token in ("dict", "mapping", "any")):
+            return [
+                {"input": "alpha verification input"},
+                {"input": "beta verification input"},
+            ], 20
+    return None
+
+
+def _behavioral_route_priority(path: str) -> tuple[int, str]:
+    lowered = path.lower()
+    if lowered in {"/generate", "/api/generate"}:
+        return (0, lowered)
+    for idx, marker in enumerate(
+        ("/create", "/chat", "/message", "/ask", "/complete", "/action", "/turn")
+    ):
+        if marker in lowered:
+            return (idx + 1, lowered)
+    return (50, lowered)
+
+
+def _autodetect_fastapi_behavioral_step(
+    entry_path: Path, http_step: VerificationStep
+) -> VerificationStep | None:
+    """Choose a real POST route for behavioral HTTP probing.
+
+    Older autodetect unconditionally required ``POST /generate`` for every
+    web app. That is correct for text-generation services, but harmful for
+    games, dashboards, CRMs, and other domain APIs: the agent then starts
+    adding verifier-only endpoints. Prefer an existing no-path-param FastAPI
+    route and derive payloads from its Pydantic request model.
+    """
+
+    try:
+        tree = ast.parse(entry_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    models = _basemodel_classes(tree)
+    candidates: list[tuple[tuple[int, int, str], str, list[dict[str, Any]]]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        route = ""
+        for decorator in node.decorator_list:
+            route = _route_path_from_decorator(decorator, {"post"})
+            if route:
+                break
+        if not route or "{" in route or "}" in route:
+            continue
+        lowered = route.lower()
+        if any(skip in lowered for skip in ("/health", "/metrics", "/docs")):
+            continue
+        payload_info = _payloads_for_endpoint_args(node, models)
+        if payload_info is None:
+            continue
+        payloads, payload_rank = payload_info
+        route_rank, route_name = _behavioral_route_priority(route)
+        candidates.append(((payload_rank, route_rank, route_name), route, payloads))
+    if not candidates:
+        return None
+    _priority, route, payloads = sorted(candidates, key=lambda item: item[0])[0]
+    base = http_step.health_url.rsplit("/", 1)[0]
+    return VerificationStep(
+        kind=VerificationStepKind.BEHAVIORAL_HTTP,
+        name=f"behavioral_http:{route}",
+        command=list(http_step.command),
+        health_url=http_step.health_url,
+        startup_timeout_seconds=http_step.startup_timeout_seconds,
+        request_url=f"{base}{route}",
+        request_payloads=payloads,
+        optional=False,
+    )
+
+
 def _autodetect_smoke_shell_step(workspace_path: Path) -> VerificationStep | None:
     """Return a SHELL step that actually *runs* the workspace's entrypoint.
 
@@ -910,22 +1079,13 @@ def autodetect_steps(workspace_path: Path) -> list[VerificationStep]:
         )
 
     if http_step is not None:
-        base = http_step.health_url.rsplit("/", 1)[0]
-        steps.append(
-            VerificationStep(
-                kind=VerificationStepKind.BEHAVIORAL_HTTP,
-                name="behavioral_http:/generate",
-                command=list(http_step.command),
-                health_url=http_step.health_url,
-                startup_timeout_seconds=http_step.startup_timeout_seconds,
-                request_url=f"{base}/generate",
-                request_payloads=[
-                    {"topic": "alpha verification input"},
-                    {"topic": "beta verification input"},
-                ],
-                optional=False,
-            )
+        entry_rel = http_step.name.split(":", 1)[-1]
+        behavioral = _autodetect_fastapi_behavioral_step(
+            workspace_path / entry_rel,
+            http_step,
         )
+        if behavioral is not None:
+            steps.append(behavioral)
 
     # Require at least one non-template .pptx (generated artifact). Template-only
     # trees should not fail pptx_diff before any codegen has run.

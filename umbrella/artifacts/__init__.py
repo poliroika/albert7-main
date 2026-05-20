@@ -31,6 +31,7 @@ from umbrella.artifacts.run_index import (
     get_run_by_id,
     index_workspace_runs,
 )
+from umbrella.artifacts.task_ids import task_artifact_stem
 
 __all__ = [
     "ArtifactCategory",
@@ -57,4 +58,5 @@ __all__ = [
     "read_result_summary",
     "summarize_run_logs",
     "tail_log",
+    "task_artifact_stem",
 ]

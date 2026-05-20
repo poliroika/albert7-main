@@ -25,7 +25,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from umbrella.memory.paths import hierarchical_root_for_palace
 
 log = logging.getLogger(__name__)
 
@@ -218,29 +217,6 @@ class PalaceBackend:
         )
 
         log.debug("Palace add: %s/%s/%s [%s]", wing, hall, room_name, drawer_id[:16])
-
-        # Mirror selected event types into hierarchical JSONL (ideas tree) for navigation without Chroma.
-        et_key = (event_type or "").strip().lower().rstrip("s")
-        if et_key in {"idea", "insight", "decision", "lesson", "observation"}:
-            try:
-                from umbrella.memory.hierarchical import HierarchicalMemory
-
-                hm_root = hierarchical_root_for_palace(self._palace_path)
-                hm = HierarchicalMemory(hm_root)
-                palace_path = f"ideas/{room_name}" if room_name else f"ideas/{et_key}"
-                hm.add(
-                    palace_path=palace_path,
-                    title=title,
-                    content=content,
-                    kind=kind,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    tags=tags or [],
-                    source_path=source_path or f"umbrella/{event_type}",
-                    metadata={"event_type": event_type, "hall": hall, "wing": wing},
-                )
-            except Exception as exc:
-                log.debug("Hierarchical memory mirror skipped: %s", exc)
 
         return {"id": drawer_id, "wing": wing, "hall": hall, "room": room_name}
 

@@ -288,7 +288,10 @@ def run_verification(
         detected_domains = _apply_domain_overrides(detected_domains, workspace_path)
     if detected_domains:
         for compliance_result in build_skill_compliance_results(
-            workspace_path, detected_domains
+            workspace_path,
+            detected_domains,
+            python_cmd=chosen_python,
+            env=base_env,
         ):
             results.append(compliance_result)
 
@@ -1132,8 +1135,12 @@ def _post_json(
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        return resp.status, resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return exc.code, body or f"HTTPError {exc.code}: {exc.reason}"
 
 
 def _run_behavioral_http_step(
@@ -1244,8 +1251,12 @@ def _run_behavioral_http_step(
                 f"different_outputs={len(bodies) >= 2 and bodies[0] != bodies[1]}; "
                 f"semantic_input_match={semantic_ok}"
             ),
-            stdout="\n--- response A ---\n"
+            stdout="\n--- request A ---\n"
+            + json.dumps(payloads[0], ensure_ascii=False, indent=2)
+            + "\n--- response A ---\n"
             + (bodies[0] if bodies else "")
+            + "\n--- request B ---\n"
+            + json.dumps(payloads[1], ensure_ascii=False, indent=2)
             + "\n--- response B ---\n"
             + (bodies[1] if len(bodies) > 1 else ""),
             stderr="".join(stderr_buf),

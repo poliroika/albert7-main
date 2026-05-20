@@ -1,348 +1,253 @@
-# Umbrella (control-plane)
+# Umbrella (Control Plane)
 
-Umbrella — это набор подсистем, связывающих GMAS, workspaces и Ouroboros. Он реализует политику
-границ, реестр workspace, рантайм запусков, retrieval по GMAS, observability и развитую memory-систему
-для lessons, competency tracking и семантического накопления знаний.
+Umbrella is the phase-driven control plane that binds together GMAS, workspaces, and Ouroboros. After the refactoring, it owns the phase machine (`umbrella/phases/`), the orchestrator (`umbrella/orchestrator/`), the unified memory facade (`umbrella/memory/palace/`), and the permission system (`umbrella/permissions/`).
 
-## UmbrellaServices
+## Subsystems
 
-Центральная точка входа — класс `UmbrellaServices` в `umbrella/integration/services.py`.
-Он инициализирует все подсистемы в правильном порядке зависимостей:
+### Phases (`umbrella/phases/`)
+
+The phase machine defines how a run progresses. Each phase is a YAML manifest validated against a JSON schema.
+
+| Module | Purpose |
+|--------|---------|
+| `base.py` | Data classes: `PhaseManifest`, `PhasePlan`, `PhaseNode`, `SubtaskCard` |
+| `loader.py` | YAML -> `PhaseManifest` dataclass |
+| `registry.py` | Discover manifests + validate against schema |
+| `schema/manifest.schema.json` | JSON Schema for manifest validation |
+| `manifests/*.yaml` | 11 phase manifests (preflight, research, plan, execute, verify, reflexion, etc.) |
+
+**11 manifests:**
+
+| Manifest | Phase |
+|-----------|-------|
+| `preflight.yaml` | Environment health check |
+| `research.yaml` | Task understanding, architecture draft |
+| `research_review.yaml` | Review research output |
+| `plan.yaml` | Build PhasePlan + subtask cards |
+| `plan_review.yaml` | Review plan completeness |
+| `execute.yaml` | Container for subtask execution |
+| `subtask_template.yaml` | Template for individual subtasks |
+| `subtask_review.yaml` | Review after each subtask |
+| `final_review.yaml` | Goal alignment check |
+| `verify.yaml` | Final verification + memory promotion |
+| `reflexion.yaml` | Verbal self-feedback on failure |
+
+### Orchestrator (`umbrella/orchestrator/`)
+
+The orchestrator drives a run from start to finish: loading the PhasePlan, spawning Worker/Watcher per phase, processing control signals, and building the FinalReport.
+
+| Module | Purpose |
+|--------|---------|
+| `runner.py` | `PhaseRunner`: walks PhasePlan, spawns Worker + Watcher, main loop |
+| `worker.py` | Spawns Worker-Ouroboros per phase via `OuroborosLauncher` |
+| `watcher.py` | Watcher pump-loop: poll triggers, send control signals |
+| `watcher_triggers.py` | Deterministic trigger heuristics (stall, repeat error, budget overrun) |
+| `phase_plan.py` | `PhasePlan` model: mutable ordered list of phases with audit trail |
+| `final_report.py` | Evidence-based FinalReport builder and validator |
+| `verify_loop.py` | Verification retry loop |
+| `promotion.py` | Memory node promotion (run-scoped -> cross-run durable) |
+| `self_improvement_runner.py` | Separate runner for system self-improvement mode (relaxed envelope) |
+
+### MemPalace (`umbrella/memory/palace/`)
+
+Unified memory facade with multiple Chroma stores, SQLite transient + graph, and tier/scope semantics.
+
+| Module | Purpose |
+|--------|---------|
+| `facade.py` | `MemPalace`: add, search, recall, link, walk, promote, expire_scope |
+| `stores.py` | Multiple Chroma collections (charter, lesson, idea, codeptr, skill_index, run, phase, subtask) |
+| `tiers.py` | Enum: always_on, hot, warm, cold, transient |
+| `graph.py` | SQLite edge table (src_id, dst_id, edge_type, weight, phase, created_at) |
+| `recall.py` | Tier-aware recall: always_on -> hot -> vector search -> 1-hop graph walk |
+| `transient.py` | SQLite transient store: events, tool I/O, terminal scrollback (TTL 24h) |
+| `migrators.py` | One-time migration: lessons.jsonl, ideas.jsonl, gaps.jsonl -> palace stores |
+
+**API surface:**
 
 ```python
-from umbrella.integration.services import UmbrellaServices
-from pathlib import Path
-
-services = UmbrellaServices(
-    repo_root=Path("."),
-    use_live_llm=True,
-    llm_model="anthropic/claude-sonnet-4-20250514",
-    llm_api_key="sk-...",
-)
-
-cp = services.get_control_plane()   # ControlPlaneEngine
-reg = services.get_registry()       # WorkspaceRegistry
-ret = services.get_retrieval()      # RetrievalService
+palace.add(store, content, tier, scope, tags, phase, links)
+palace.search(query, stores, tiers, scopes, hop, n)
+palace.recall(phase_id, n, include_graph)  # auto-applies phase recall policy
+palace.link(src_id, dst_id, edge_type, weight)
+palace.walk(node_id, edge_types, hops, direction)
+palace.promote(node_id, target_store, verified)
+palace.expire_scope(scope_kind, key)
+palace.health()
 ```
 
-Порядок инициализации: telemetry -> memory -> retrieval -> registry -> control plane.
+### Permissions (`umbrella/permissions/`)
 
-## Подсистемы
+Per-phase access control for all tool calls.
 
-### Политика (`umbrella/policies/`)
+| Module | Purpose |
+|--------|---------|
+| `envelope.py` | `PermissionEnvelope`: allow/deny based on phase manifest rules |
+| `global.yaml` | Global hard denials (overrides any phase rule) |
+| `watcher_envelope.py` | Hardcoded read-only envelope for Watcher (Python, not YAML) |
+| `self_improvement.yaml` | Relaxed envelope for self-improvement run mode |
+| `loader.py` | Loads and compiles permission rules from YAML |
 
-Машиночитаемые правила границ репозитория. Определяют, что можно менять, кому и когда.
+Permission evaluation: phase rules (top-to-bottom, first match wins) then global denials (can override allows). The Watcher envelope is in Python to prevent accidental YAML edits from granting write access.
 
-Ключевые файлы:
+### Workspace Registry (`umbrella/workspace_registry/`)
 
-- `default_policy.yaml` — значения по умолчанию.
-- `engine.py` — `PolicyEngine` с API решений.
+Discovery and catalog of workspaces.
 
-Основные функции:
+| Module | Purpose |
+|--------|---------|
+| `registry.py` | `WorkspaceRegistry`: discover, register, select |
+| `discovery.py` | File-based discovery of `workspace.toml` |
+| `models.py` | `WorkspaceRef`, `SeedWorkspaceProfile`, `TaskInstanceProfile`, `WorkspaceLineageRecord` |
+| `task_main.py` | Load and parse `TASK_MAIN.md` |
 
-| Функция | Роль |
-|---------|------|
-| `classify_path(path)` | Категория поверхности (framework, manager, workspace_instance, ...) |
-| `can_edit_path(path)` | Можно ли писать по пути |
-| `should_prefer_workspace_patch(ctx)` | Предпочтение workspace-патча перед self-improvement |
-| `can_trigger_self_improvement(ctx)` | Допустим ли self-improvement |
-| `requires_human_escalation(ctx)` | Нужно ли участие человека |
+### Workspace Runtime (`umbrella/workspace_runtime/`)
 
-Подробнее: `umbrella/policies/README.md`.
+Instance creation, execution, and inspection.
 
-### Реестр workspace (`umbrella/workspace_registry/`)
-
-Каталог всех workspace с обнаружением и выбором.
-
-| Модуль | Назначение |
-|--------|------------|
-| `registry.py` | `WorkspaceRegistry` — discover, register, select |
-| `discovery.py` | Файловое обнаружение `workspace.toml` |
-| `models.py` | Типы: `WorkspaceRef`, `SeedWorkspaceProfile`, `TaskInstanceProfile`, `WorkspaceLineageRecord` |
-| `task_main.py` | Загрузка и парсинг `TASK_MAIN.md` |
-
-Обнаружение: рекурсивный обход `workspaces/**/workspace.toml` с игнорированием
-служебных каталогов (`runs`, `snapshots`, `__pycache__`, ...).
-
-### Рантайм workspace (`umbrella/workspace_runtime/`)
-
-Создание instance, запуск и инспекция workspace.
-
-| Модуль | Назначение |
-|--------|------------|
-| `runner.py` | Единый раннер: `prepare_workspace()`, `run_workspace()`, `inspect_workspace()` |
+| Module | Purpose |
+|--------|---------|
+| `runner.py` | Unified runner: `prepare_workspace()`, `run_workspace()`, `inspect_workspace()` |
 | `instances.py` | `create_task_instance()`, `snapshot_instance()`, `archive_instance()` |
-| `adapters/` | Адаптеры под конкретные seed: `AgentResearchAdapter`, `WorldPredictionAdapter`, `GenericWorkspaceAdapter` |
-
-Раннер подбирает адаптер по `workspace_id` seed:
-
-```python
-_ADAPTER_BY_SEED_ID = {
-    "agent_research": AgentResearchAdapter,
-    "evaluation": EvaluationAdapter,
-    "world_prediction": WorldPredictionAdapter,
-}
-```
-
-Для workspace без специального адаптера используется `GenericWorkspaceAdapter`.
-
-### Артефакты и observability (`umbrella/artifacts/`)
-
-Индексация запусков workspace, чтение логов и сравнение результатов.
-
-| Модуль | Назначение |
-|--------|------------|
-| `run_index.py` | `index_workspace_runs()` — индексация всех запусков |
-| `log_access.py` | `read_result_summary()`, `read_events_jsonl()` |
-| `models.py` | `RunManifest`, `WorkspaceRunIndex`, `RunStatus` |
-
-Менеджер использует индекс для сравнения запусков и отслеживания прогресса.
+| `adapters/` | Per-seed adapters for workspace-specific logic |
+| `checkpoints.py` | Run checkpoint management |
 
 ### Retrieval (`umbrella/retrieval/`)
 
-Поисковая система по коду и документации GMAS.
+Search over GMAS code, docs, and symbols.
+
+| Module | Purpose |
+|--------|---------|
+| `service.py` | `RetrievalService`: orchestrates all search methods |
+| `gmas_context.py` | `build_gmas_context()`: context for Ouroboros |
+| `lexical.py` | BM25 index |
+| `symbols.py` | Symbol index (classes, functions, modules) |
+| `docs_index.py` | Documentation index from `mkdocs.yml` |
+| `code_index.py` | Code-aware symbol index |
+| `workspace_usage.py` | GMAS usage patterns in workspaces |
+| `cards.py` | Retrieval card generation |
+| `gmas_chunk_cache.py` | Cached GMAS code chunks |
+| `gmas_summarizer.py` | GMAS documentation summarization |
+| `sources.py` | Source file discovery |
 
-| Модуль | Назначение |
-|--------|------------|
-| `service.py` | `RetrievalService` — оркестрация всех методов поиска |
-| `gmas_context.py` | `build_gmas_context()` — контекст для Ouroboros |
-| `lexical.py` | BM25-индекс |
-| `symbols.py` | Символьный индекс (классы, функции, модули) |
-| `docs_index.py` | Индекс документации (`mkdocs.yml` навигация) |
-| `code_index.py` | Code-aware символьный индекс |
-| `workspace_usage.py` | Паттерны использования GMAS в workspace |
-| `cards.py` | Генерация retrieval cards |
+### Artifacts and Observability (`umbrella/artifacts/`)
 
-Подробнее: [gmas.md](gmas.md#retrieval-по-gmas).
-
-### Интеграция с Ouroboros (`umbrella/integration/`)
+Run indexing and log access.
 
-Мост между Umbrella и Ouroboros.
+| Module | Purpose |
+|--------|---------|
+| `run_index.py` | `index_workspace_runs()`: index all runs |
+| `log_summary.py` | Log summary generation |
+| `models.py` | `RunManifest`, `WorkspaceRunIndex`, `RunStatus` |
+
+### Verification (`umbrella/verification/`)
+
+Workspace verification runner that executes test commands after Ouroboros completes.
+
+| Module | Purpose |
+|--------|---------|
+| `final_sweep.py` | Final sweep verification |
+| `test_quality.py` | Test quality checks |
+| `workspace_path_policy.py` | Path policy for verification |
+
+### Policies (`umbrella/policies/`)
+
+Boundary rules for the repository.
+
+| File | Purpose |
+|------|---------|
+| `engine.py` | `PolicyEngine` with decision API: `classify_path`, `can_edit_path`, `should_prefer_workspace_patch` |
+| `README.md` | Policy documentation |
+
+### Integration (`umbrella/integration/`)
+
+Bridge between Umbrella and Ouroboros.
+
+| Module | Purpose |
+|--------|---------|
+| `services.py` | `UmbrellaServices`: central service locator |
+| `ouroboros_bridge.py` | Sync Umbrella context to Ouroboros drive |
+| `ouroboros_launcher.py` | Launch and manage Ouroboros process |
+
+### Control Plane (`umbrella/control_plane/`)
+
+Manager-level decision modules (post-refactor, the `ControlPlaneEngine` monolith was removed).
+
+| Module | Purpose |
+|--------|---------|
+| `critic.py` | Critic review tool for review phases |
+| `decision_policy.py` | Decision policy skill for plan phase |
+| `remediation_planner.py` | Remediation planning for failed verification |
+| `sandbox_self_edit.py` | Temporary code edits with git rollback |
+| `task_bridge.py` | Task bridging utilities |
+| `terminal_check.py` | Terminal health checks |
+| `workspace_code_update.py` | Workspace code update operations |
+| `workspace_patching.py` | Workspace patching utilities |
+| `escalation.py` | Human escalation management |
+| `human_checkpoints.py` | Human checkpoint flow |
+| `prompt_diff.py` | Prompt diff utilities |
+| `prompt_versioning.py` | Prompt version management |
+| `prompt_policy.py` | Prompt policy rules |
+| `code_analyzer.py` | Code analysis utilities |
+| `code_improver.py` | Code improvement suggestions |
+| `tracing.py` | Execution tracing |
+
+### Web Bridge (`umbrella/web_bridge/`)
+
+HTTP server: serves React static build + JSON API at `/api/*`.
+
+| Module | Purpose |
+|--------|---------|
+| `server.py` | Server entrypoint (`uv run bridge`) |
+| `handler.py` | Route handler registration |
+| `app.py` | Main application (Flask/FastAPI routes) |
+| `chat_launcher.py` | Chat session launcher |
+| `util.py` | Utility functions |
+| `cleanup.py` | Cleanup routines |
+| `api/report_api.py` | Report-specific API routes |
+
+Start: `uv run bridge` (port 8765). Before starting, build the frontend: `cd web && yarn install && yarn build`.
+
+### Skills (`umbrella/skills/`)
+
+Skill packs with phase-tagged frontmatter in `SKILL.md`.
+
+| Directory | Purpose |
+|-----------|---------|
+| `library/` | Skill pack directories, each with `SKILL.md` |
+| `registry.py` | `SkillPack` discovery and phase filtering |
 
-| Модуль | Назначение |
-|--------|------------|
-| `services.py` | `UmbrellaServices` — центральный сервис-локатор |
-| `ouroboros_bridge.py` | Синхронизация Umbrella-контекста в Ouroboros drive |
-| `ouroboros_launcher.py` | Запуск и управление процессом Ouroboros |
+Skills are filtered per-phase via `phases:` field in `SKILL.md` frontmatter.
 
-`ouroboros_bridge.py` отвечает за:
+### MCP (`umbrella/mcp/`)
 
-- Создание layout в `.umbrella/ouroboros_drive/` (logs, memory, state, task_results).
-- Синхронизацию workspace-контекста, lessons и задач из Umbrella memory в drive.
-- Обеспечение Ouroboros актуальными знаниями о состоянии workspace.
+MCP (Model Context Protocol) integration.
 
-Текущий основной entrypoint Ouroboros-first запуска живёт в `umbrella/app_ouroboros.py`:
-он читает `TASK_MAIN.md`, формирует mission prompt и затем вызывает
-`run_ouroboros_improvement_sync()`. Операторский UI поднимается отдельно:
-`uv run bridge` или `uv run python -m umbrella.web_bridge` (см. `umbrella/web_bridge/`; перед запуском — `yarn build` в `web/`).
+| Module | Purpose |
+|--------|---------|
+| `tools_bridge.py` | Bridge between MCP tools and Ouroboros tool registry |
 
-### Control plane (`umbrella/control_plane/`)
-
-Менеджерский движок, принимающий решения о выборе workspace, создании instance,
-запуске и оценке результатов.
+MCP tool entries are filtered per-phase by the manifest's `allowed_tools`.
 
-Ключевой класс: `ControlPlaneEngine` в `umbrella/control_plane/engine.py`.
+### Other Modules
 
-Интеграция с Ouroboros: `umbrella/control_plane/ouroboros_integration.py` —
-функции `create_ouroboros_self_improvement_task()` и `run_ouroboros_improvement_sync()`
-для постановки задач Ouroboros и синхронного запуска итерации улучшения. Модуль также
-связывает запуск с **кандидатами Meta-Harness** (идентификаторы, снимки состояния репозитория),
-чтобы итерации можно было воспроизводимо оценивать и сравнивать.
+| Module | Purpose |
+|--------|---------|
+| `umbrella/telemetry/` | Telemetry and metrics storage |
+| `umbrella/evals/` | Evaluation utilities |
+| `umbrella/utils/` | Shared utilities |
+| `umbrella/config.py` | Configuration loading |
+| `umbrella/env.py` | Environment variable loading (`.env`) |
+| `umbrella/llm_budget.py` | LLM budget tracking |
+| `umbrella/run_observer.py` | Run observation utilities |
+| `umbrella/umbrella_api.py` | Umbrella-level API utilities |
 
-Для временных правок кода менеджера в рамках задачи используется **sandbox self-edit**
-(`umbrella/control_plane/sandbox_self_edit.py`): снимок git до правок и откат после завершения
-задачи, чтобы не оставлять «грязный» репозиторий после экспериментального self-patch.
+## Configuration
 
-### Meta-Harness (`umbrella/meta_harness/`)
+Runtime configuration is spread across:
 
-Внешний слой оптимизации harness: каждая попытка оформляется как кандидат с манифестом,
-снимками (промпт, политика, исходники, входная память), артефактами execution/evaluation
-и решением о promotion.
+- `umbrella/policies/default_policy.yaml` — boundary rules, runtime defaults
+- `.env` at repository root — API keys, model names, endpoint URLs
+- Phase manifests (`umbrella/phases/manifests/*.yaml`) — per-phase settings
+- `umbrella/permissions/global.yaml` — global permission denials
 
-| Модуль | Назначение |
-|--------|------------|
-| `store.py` | Файловый store под `.umbrella/meta_harness/` |
-| `capture.py` | Захват состояния harness для кандидата |
-| `evaluator.py` | Оценка кандидата на search set |
-| `promotion.py` | Решение о promotion и применение патча |
-| `search_sets.py` | Сбор и загрузка search set (в т.ч. из workspace и memory) |
-| `cli.py` | CLI; также `python -m umbrella.meta_harness` |
-
-Точка входа верхнего уровня: `run_meta_harness.py`. Подробный
-план и обоснование: [meta-harness-improvement-plan.md](meta-harness-improvement-plan.md).
-
-### Memory (`umbrella/memory/`)
-
-Memory в Umbrella — это не просто журнал заметок, а отдельный слой принятия решений.
-Он нужен, чтобы менеджер:
-
-- помнил успешные и неуспешные паттерны по workspace;
-- отличал проблему конкретного workspace от проблемы самого менеджера;
-- накапливал сигналы capability gaps;
-- умел собирать компактный prompt-ready context для следующих итераций;
-- мог хранить как структурированную локальную память, так и более богатую palace-таксономию.
-
-#### Что именно хранится
-
-Модель памяти разбита на несколько типов (`umbrella/memory/models.py`):
-
-| Тип | Роль |
-|-----|------|
-| `WorkingMemoryRecord` | Краткоживущая память текущей итерации: brief, hypothesis, last run, patch plan |
-| `WorkspaceMemoryRecord` | Память конкретного workspace: lessons, invariants, limitations, successful/failure patterns |
-| `ManagerMemoryRecord` | Кросс-workspace память менеджера: стратегии, признаки manager-vs-workspace проблем, retrieval patterns |
-| `CompetencyMemoryRecord` | Память о capability areas менеджера и их эволюции |
-| `WorkspaceLessonRecord` | Уроки по конкретным workspace-итерациям, включая `files_changed` и `was_promoted` |
-| `ManagerLessonRecord` | Уроки уровня менеджера, включая `affected_capability_area` и результат self-improvement |
-| `CapabilitySignal` | Сигналы силы/слабости в capability area (`retrieval`, `gmas_knowledge`, `planning`, ...) |
-| `CompetencyGapRecord` | Открытые и закрытые capability gaps с severity, evidence и suggested actions |
-
-#### MemoryStore: структурированная локальная память
-
-`MemoryStore` (`umbrella/memory/store.py`) — основной file-backed store. Он:
-
-- хранит lessons, gaps и signals в JSONL под `.umbrella/memory/`;
-- держит in-memory индексы для быстрых запросов;
-- поддерживает фильтрацию по `task_id`, `workspace_id`, `lesson_type`, `tags`, age и priority;
-- умеет делать reprioritization с decay-моделью;
-- закрывает или откладывает stale gaps;
-- умеет compact/rewrite storage.
-
-Физические файлы по умолчанию:
-
-| Файл | Содержимое |
-|------|------------|
-| `.umbrella/memory/lessons.jsonl` | Workspace и manager lessons |
-| `.umbrella/memory/gaps.jsonl` | Competency gaps |
-| `.umbrella/memory/signals.jsonl` | Capability signals |
-
-Это даёт локальный, простой и инспектируемый слой памяти без обязательной внешней инфраструктуры.
-
-#### Competency ledger: когда система понимает, что проблема в ней самой
-
-Отдельный важный кусок — `umbrella/memory/competency.py`.
-Он превращает отдельные негативные наблюдения в capability ledger:
-
-- `record_competency_signal(...)` записывает сигнал силы/слабости;
-- при накоплении негативных сигналов `_check_and_update_gap(...)` может открыть gap автоматически;
-- severity выводится из силы и повторяемости сигналов;
-- gap помечается как manager-level или workspace-level;
-- `should_trigger_self_improvement(...)` решает, пора ли запускать self-improvement.
-
-Категории сигналов:
-
-- `no_progress_iterations`
-- `retrieval_misses`
-- `repeated_failure_mode`
-- `human_feedback`
-- `high_cost_no_gain`
-- `missing_capability`
-
-Это как раз тот механизм, который делает self-improvement не «на глаз», а более формализованным.
-
-#### Context builder: память как вход в prompt, а не только как архив
-
-`umbrella/memory/context_builder.py` собирает память в компактные контекстные пакеты:
-
-- `build_manager_context_bundle(...)` — bundle для manager decision-making;
-- `build_workspace_context_bundle(...)` — bundle для workspace-level операций;
-- `ingest_workspace_run(...)` — переводит завершённый run в memory summary и lessons;
-- `update_working_memory(...)` — обновляет краткоживущую память текущей итерации.
-
-Именно здесь память превращается из набора записей в то, что реально попадает в LLM-контекст.
-
-#### Contrastive retrieval: успехи и провалы рядом
-
-`umbrella/memory/contrastive.py` дополняет «топ-k похожих уроков» парами **confirmers /
-challengers** — что сработало и что нет в сходном контексте, чтобы менеджер видел обе стороны,
-а не только релевантные успехи.
-
-#### MemPalace backend: семантическая память с таксономией wing/hall/room/drawer
-
-`umbrella/memory/palace_backend.py` — одна из самых интересных частей memory-слоя.
-Он проецирует память Umbrella на MemPalace-модель:
-
-- `workspace_id -> wing_{workspace_id}`
-- `system -> wing_umbrella_system`
-- `event_type -> hall_*`
-- `room` — свободная тематическая комната внутри wing
-- `drawer` — конкретная запись памяти
-
-Карта hall по типам событий:
-
-| Event type | Hall |
-|------------|------|
-| `command`, `test`, `error`, `bug`, `warning` | `hall_events` |
-| `change`, `code`, `decision`, `seed`, `commit` | `hall_facts` |
-| `lesson`, `idea`, `observation`, `insight`, `completion` | `hall_discoveries` |
-| `preference`, `config` | `hall_preferences` |
-| `advice`, `recommendation` | `hall_advice` |
-
-Что умеет backend:
-
-- `add(...)` — положить запись в palace с `wing/hall/room` классификацией;
-- `search(...)` — semantic search по palace, с фильтрацией по workspace/room;
-- `list_wings()` и `list_rooms()` — агрегаты по структуре памяти;
-- `get_taxonomy()` — дерево `{wing: {room: count}}`;
-- `recent()` — последние записи;
-- `stats()` — сводка по дворцу памяти.
-
-Важно, что это уже не просто JSONL-журнал: это семантически индексируемая память с понятной
-пространственной моделью хранения знаний.
-
-#### HierarchicalMemory: лёгкая palace-подобная альтернатива без жёсткой зависимости
-
-Кроме `PalaceBackend`, в коде есть `HierarchicalMemory` (`umbrella/memory/hierarchical.py`).
-Это append-only JSONL-представление palace-иерархии, где записи имеют `palace_path`
-вроде `workspaces/agent_research/errors` или `ideas/gmas`.
-
-Его роль:
-
-- дать лёгкую локальную иерархическую память без обязательного ChromaDB/MCP;
-- сохранить palace-логику даже в более простом runtime;
-- обеспечить простое lexical retrieval по `palace_path`, title, content и tags.
-
-То есть memory-слой в Umbrella уже устроен двухконтурно:
-
-- простой структурированный store для lessons/gaps/signals;
-- более богатая palace/hierarchical модель для семантического и тематического накопления знаний.
-
-#### Почему это важно архитектурно
-
-Память в Umbrella напрямую участвует в управлении, а не только в архивировании:
-
-- влияет на выбор следующего шага;
-- влияет на решение `workspace patch` vs `self-improvement`;
-- хранит evidence для promotion в seed;
-- формирует prompt-контекст для следующих запусков;
-- даёт Web UI и Ouroboros доступ к накопленной картине мира.
-
-Это одно из главных отличий проекта от более простого «агент просто правит код» подхода:
-здесь память — часть control-plane, а не побочный лог.
-
-### Web bridge (`umbrella/web_bridge/`)
-
-Один HTTP-процесс: собранный React из `web/build` (или `web/dist`) и JSON API под `/api/*`.
-Запуск: `uv run bridge` или `uv run python -m umbrella.web_bridge` (порт по умолчанию 8765). Перед этим — `yarn install` и `yarn build` в `web/` (см. [docs/README.md](README.md#запуск-web-bridge)).
-
-Примеры эндпоинтов:
-
-- `GET /api/health`, `GET /api/workspaces`, `GET /api/runs`, `GET /api/logs`, `GET /api/memory`
-- `GET /api/dashboard/stats?workspace_id=...`
-- чат: threads, messages, POST сообщения (см. `umbrella/web_bridge/handler.py`)
-
-Старый встроенный HTML/JS dashboard (`umbrella/dashboard/`) удалён.
-
-## Конфигурация
-
-Рантайм-конфигурация задаётся в секции `runtime` файла `umbrella/policies/default_policy.yaml`:
-
-| Параметр | Значение | Назначение |
-|----------|---------|------------|
-| `max_budget_usd` | `null` | Бюджет (null = без лимита) |
-| `quality_completion_threshold` | `0.85` | Минимальный eval score для завершения |
-| `self_improve_after_stalled_iterations` | `2` | Когда включать self-improvement |
-| `human_review_stages` | `[outline_approved, final_draft]` | Стадии, требующие review |
-| `instance_cleanup_enabled` | `true` | Очистка старых runs/snapshots |
-
-Значения можно переопределять через CLI-флаги или `load_runtime_config(overrides={...})`.
+See [technical-report/11-configuration.md](technical-report/11-configuration.md) for the full list of environment variables.

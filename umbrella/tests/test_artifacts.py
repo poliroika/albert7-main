@@ -271,6 +271,7 @@ class TestManifests:
 
         result_summary = {
             "run_id": "test_run",
+            "status": "completed",
             "final_agent_id": "delivery_agent",
             "execution_order": ["agent1", "agent2"],
             "total_tokens": 1000,

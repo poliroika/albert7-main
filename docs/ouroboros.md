@@ -1,236 +1,155 @@
 # Ouroboros
 
-Ouroboros — это менеджер и оператор контуров улучшения в Umbrella. Он не является основным
-исполнителем задачи: исполнение рождается в workspace на GMAS. Ouroboros выбирает workspace,
-запускает его, анализирует результаты и строит гипотезы улучшения.
+Ouroboros is the **deep LLM agent** that executes individual phases within an Umbrella run. It is spawned by the `PhaseRunner` as either a **Worker** (executing a phase) or a **Watcher** (monitoring for problems). It does not orchestrate phases itself — that is Umbrella's responsibility.
+
+## Role in the System
+
+Ouroboros consumes a **phase manifest** from Umbrella, which defines what tools it can use, what prompts to load, and what memory it can access. The manifest is passed through `task["context_overlays"]` and enforced by the `PermissionEnvelope` pre-hook.
+
+Key principle: Ouroboros is a **per-phase executor**, not a run orchestrator. It receives instructions, executes them, and reports back. The PhaseRunner decides what comes next.
+
+## Core Modules
+
+| Module | Purpose |
+|--------|---------|
+| `ouroboros/ouroboros/loop.py` | Main LLM tool loop (~5800 lines). Manages rounds, tool calls, context building, phase enforcement. |
+| `ouroboros/ouroboros/agent.py` | Thin orchestrator. Delegates to loop, tools, LLM, memory, context, review. |
+| `ouroboros/ouroboros/context.py` | Context builder: `build_llm_messages`, message compaction, prompt overlays. |
+| `ouroboros/ouroboros/llm.py` | LLM client: chat calls, pricing, model resolution. |
+| `ouroboros/ouroboros/memory.py` | Scratchpad / identity memory. |
+| `ouroboros/ouroboros/memory_hooks.py` | Memory hook system for events. |
+| `ouroboros/ouroboros/utils.py` | Shared utilities: `utc_now_iso`, `append_jsonl`, `get_git_info`, etc. |
+| `ouroboros/ouroboros/task_planner.py` | Adaptive task planning and decomposition. |
+| `ouroboros/ouroboros/discipline.py` | `VerifyGate`, `WRITE_TOOL_NAMES` constants. |
+| `ouroboros/ouroboros/deadline.py` | Runtime deadline enforcement. |
+| `ouroboros/ouroboros/preflight_recovery.py` | Preflight error tracking and repair suggestions. |
+| `ouroboros/ouroboros/review.py` | Code collection and metrics. |
+
+## Tool Registry
+
+Ouroboros has 22 tool modules in `ouroboros/ouroboros/tools/`:
+
+### Core Tools
+
+| Tool | Module | Purpose |
+|------|--------|---------|
+| `registry.py` | `ToolRegistry` | Plugin architecture: auto-discovers tool modules, manages tool entries, PermissionEnvelope pre-hook |
+| `core.py` | Core tools | Basic file operations, workspace inspection |
+| `shell.py` | Shell execution | Run shell commands with working directory control |
+| `git.py` | Git operations | Status, diff, commit, branch management |
+| `github.py` | GitHub tools | Repository and issue operations |
+| `github_discovery.py` | GitHub discovery | Find similar projects and patterns |
+| `browser.py` | Browser automation | Web page interaction |
+| `search.py` | Web search | Search the web |
+| `vision.py` | Vision/image | Image analysis |
+| `knowledge.py` | Knowledge retrieval | Read knowledge bases |
+| `deep_search.py` | Deep search | Comprehensive search with findings stored in MemPalace |
+| `health.py` | Health check | System health diagnostics |
+| `terminal_session.py` | Terminal session | Interactive terminal management |
+| `background_jobs.py` | Background jobs | Async job management |
+| `compact_context.py` | Context compaction | Reduce context size |
+
+### Umbrella Integration Tools
+
+| Tool | Module | Purpose |
+|------|--------|---------|
+| `umbrella_tools.py` | Umbrella integration | GMAS retrieval, workspace read/run, memory operations, promotion, sandbox self-edit |
+| `palace_tools.py` | MemPalace tools | `get_umbrella_memory`, `list_memory_tree`, `save_umbrella_memory`, `record_idea`, `save_umbrella_lesson` (handlers still delegate to `umbrella_tools.py`) |
+| `skills_tools.py` | Skills | Load and discover skill packs |
+| `mcp_servers.py` | MCP servers | Start/stop MCP servers |
+| `mcp_discovery.py` | MCP discovery | Find available MCP tools |
+| `tool_discovery.py` | Meta-tools | `list_available_tools`, `enable_tools` |
+| `evolution_stats.py` | Evolution statistics | Track self-improvement metrics |
+| `completion_gates.py` | Completion gates | Phase/subtask completion checks |
+
+### Phase Control Tools (new)
+
+| Tool | Module | Purpose |
+|------|--------|---------|
+| `phase_control.py` | In-run self-modification | `mutate_phase_plan`, `add_phase`, `loop_back_to`, `submit_research_summary`, `submit_micro_review`, `submit_phase_plan`, `submit_final_review`, `submit_verification`, `submit_reflection`, `submit_preflight_report`, `edit_subtask_card`, `mark_subtask_complete`, `request_watcher_review`, `harness_run` |
+
+### Review Tools
+
+| Tool | Module | Purpose |
+|------|--------|---------|
+| `review.py` | Review tools | Experimental code review tools (gated by `OUROBOROS_ENABLE_EXPERIMENTAL_REVIEW_TOOLS`) |
+| `control.py` | Supervisor control | Supervisor-level control operations |
+
+## Phase Manifest Consumption
+
+The phase manifest flows from the PhaseRunner to Ouroboros as follows:
+
+1. **PhaseRunner** reads the YAML manifest, compiles the PermissionEnvelope, and builds a `recall_bundle` from MemPalace.
+2. **Worker spawn** (`umbrella/orchestrator/worker.py`) creates a task with `context_overlays` containing:
+   - `phase_manifest`: the full manifest payload
+   - `phase_node`: current phase state
+   - `recall_bundle`: pre-loaded memory context
+   - `permissions`: compiled permission rules
+   - `tool_filter`: `{allow: [...], deny: [...]}`
+   - `budgets`: token/second/tool-call limits
+3. **Agent** (`agent.py`) reads `task["context_overlays"]["phase_manifest"]` — if present, phase-driven mode; otherwise legacy fallback.
+4. **Loop** (`loop.py`) uses `tool_filter.allow/deny` instead of hardcoded tool name lists. Every tool call checks: `if allowed_tool_names is None or fn_name in allowed_tool_names`.
+5. **Context builder** (`context.py`) includes `recall_bundle` as a new section and `permissions` for self-awareness (agent sees its own envelope in the prompt).
+
+**Forbidden tool handling:**
+- A `_format_forbidden_tool_error` message is returned to the LLM
+- Strike counting tracks repeated violations (`forbidden_strike_counts`)
+- After enough strikes, the call may be auto-delegated or the phase may be flagged
+
+## Supervisor
+
+The supervisor (`ouroboros/supervisor/`) manages Ouroboros processes, event dispatch, and external communication.
+
+| Module | Purpose |
+|--------|---------|
+| `telegram.py` | Telegram client: message sending, markdown-to-HTML conversion, budget tracking |
+| `events.py` | Event dispatcher: 15 event types from `EVENT_Q` to handler functions |
+| `queue.py` | Task queue: priority, timeouts, persistence, scheduling |
+| `workers.py` | Worker lifecycle: multiprocessing, health checks, direct chat handling |
+| `state.py` | Persistent state on Drive: load, save, atomic writes, file locks, budget management |
+| `git_ops.py` | Git operations: clone, checkout, reset, rescue snapshots, dependency sync |
 
-## Роль в системе
+Event types: `llm_usage`, `task_heartbeat`, `typing_start`, `send_message`, `task_done`, `task_metrics`, `review_request`, `restart_request`, `promote_to_stable`, `schedule_task`, `cancel_task`, `send_photo`, `toggle_evolution`, `toggle_consciousness`, `owner_message_injected`.
 
-В целевой архитектуре Ouroboros мыслит так:
+## Removed Modules
 
-1. У меня есть команда из workspaces.
-2. Каждый workspace решает свой класс задач на GMAS.
-3. Я выбираю подходящий workspace, запускаю его, смотрю, где он слаб.
-4. Я усиливаю workspace, пока он не начнёт решать задачу сам.
-5. Если для этого мне самому не хватает памяти, поиска или инструментов, я временно
-   улучшаю себя.
-6. После self-improvement я возвращаюсь к работе с workspace, а не подменяю его собой.
+The following modules were removed during the refactoring:
 
-Ключевой принцип: **workspace-first**. Self-improvement допустим только как средство
-снова лучше улучшать workspaces.
+- `ouroboros/ouroboros/consciousness.py` — replaced by the Watcher agent in `umbrella/orchestrator/watcher.py`
+- `ouroboros/ouroboros/workspaces/polymarket_sim_empty/` — sample workspace removed
+- `_PERIODIC_RECALL_DEFAULT_PHASES` in `loop.py` — replaced by manifest-driven memory policy
+- Hardcoded `_PLANNER_DISCOVERY_TOOL_NAMES`, `_SUBTASK_TOOL_NAMES`, `_REVIEW_TOOL_NAMES` — replaced by `tool_filter` from manifests
 
-## Два контура улучшения
+## What Changed from the Pre-Refactor Ouroboros
 
-### Контур A: улучшение workspaces (основной)
+| Aspect | Before | After |
+|--------|--------|-------|
+| Tool access | Hardcoded tool name lists per phase | Manifest-driven `tool_filter` (allow/deny) |
+| Memory recall | `_PERIODIC_RECALL_DEFAULT_PHASES` | MemPalace `recall_bundle` per phase manifest |
+| Self-modification | Mixed into loop | Dedicated `phase_control.py` tools |
+| Monitoring | `BackgroundConsciousness` (in-process) | External Watcher agent (parallel process) |
+| Workspace storage | `ouroboros/ouroboros/workspaces/` | Removed (workspaces live in `workspaces/`) |
+| Context building | Hardcoded prompt sections | Phase manifest `prompt_files` + overlays |
+| Permission enforcement | None | PermissionEnvelope pre-hook in `ToolRegistry.execute` |
 
-Это основной рабочий цикл. Ouroboros:
+## Integration with Umbrella
 
-- Создаёт task-instance на основе seed workspace.
-- Модифицирует графы, промпты, политики, эксперименты и модели внутри instance.
-- Запускает и перезапускает workspace.
-- Анализирует логи и eval-результаты.
-- Сравнивает версии.
-- Накапливает прикладную компетенцию.
+Ouroboros connects to Umbrella through:
 
-Каждая итерация теперь **гейтится runtime verification**. После того как
-Ouroboros заявил о завершении, Umbrella автоматически запускает шаги из
-секции `[verification]` в `workspace.toml` (или авто-детект: `pytest
-test_smoke.py` + HTTP-health на `web_server.py`). Если хоть один шаг
-провален:
+- **Ouroboros drive** (`.umbrella/ouroboros_drive/`): filesystem bridge for task context, memory, and state. Managed by `umbrella/integration/ouroboros_bridge.py`.
+- **PhaseRunner** (`umbrella/orchestrator/runner.py`): spawns Worker/Watcher, passes manifests, processes control signals.
+- **Phase control channel** (`drive/state/`): JSON files for `phase_plan.json`, `watcher_signal.json`, subtask state. `phase_control.py` tools read/write here.
+- **MemPalace** (`umbrella/memory/palace/`): Worker and Watcher both access the unified memory facade.
 
-1. Итоговый статус итерации становится `failed_verification`, а не
-   `complete`.
-2. В prompt следующей попытки подмешивается секция *Previous Verification
-   Failure* с точным отчётом по каждому failed step.
-3. Promotion кандидата в seed заблокирован до тех пор, пока не будет
-   `verified`.
+## CLI Entrypoints
 
-Количеством попыток управляют флаги `--max-verify-retries` (по умолчанию **20**
-у `umbrella/app_ouroboros.py` и `run_ouroboros_self_improve.py`; в Web UI дефолт
-для старта рана задаётся в bridge и может переопределяться `OUROBOROS_WEB_MAX_VERIFY_RETRIES`);
-флаг `--no-verify` возвращает старое поведение (promote по self-report).
+| Script | Purpose |
+|--------|---------|
+| `umbrella/app_ouroboros.py` | Single-run CLI entrypoint |
+| `umbrella/web_bridge/server.py` | Operator UI + JSON API |
 
-### Контур B: self-improvement (вторичный)
+There is no longer a standalone `run_ouroboros_self_improve.py` or `run_meta_harness.py` — these entrypoints were consolidated into the phase-driven runner.
 
-Включается только по сигналу дефицита собственной способности. Триггеры
-(из `default_policy.yaml`):
+## Key Design Principle
 
-| Триггер | Порог |
-|---------|-------|
-| Повторяющиеся неудачи workspace-итераций | `min_repeated_failures: 3` |
-| Стагнация без прогресса | `min_stalled_iterations: 5` |
-| Низкий confidence retrieval по GMAS | `retrieval_confidence_threshold: 0.3` |
-
-Self-improvement отвечает за:
-
-- Улучшение системного промпта и BIBLE.
-- Перестройку retrieval и контекстной сборки.
-- Улучшение памяти и правил компрессии.
-- Добавление инструментов менеджера.
-
-Self-improvement **нельзя** запускать только потому, что проще переписать себя,
-чем аккуратно улучшить workspace.
-
-## Интеграция с Umbrella
-
-Ouroboros интегрирован с Umbrella через три модуля:
-
-### ouroboros_bridge.py
-
-`umbrella/integration/ouroboros_bridge.py` синхронизирует контекст Umbrella в Ouroboros drive —
-файловую систему, из которой Ouroboros читает задачи и знания.
-
-Drive layout (создаётся под `.umbrella/ouroboros_drive/`):
-
-```
-.umbrella/ouroboros_drive/
-    logs/           # события и логи
-    memory/
-        knowledge/  # lessons из Umbrella memory
-    state/
-        state.json  # текущее состояние (бюджет, drift)
-    task_results/   # результаты выполненных задач
-```
-
-Bridge синхронизирует:
-
-- Workspace-контекст (какой workspace активен, его TASK_MAIN).
-- Lessons из Umbrella memory store.
-- Budget state и метрики.
-
-### ouroboros_integration.py
-
-`umbrella/control_plane/ouroboros_integration.py` предоставляет функции делегирования:
-
-- `create_ouroboros_self_improvement_task()` — сформировать задачу для асинхронного
-  контура self-improvement через launcher.
-
-- `run_ouroboros_improvement_sync()` — запустить синхронную итерацию улучшения
-  и дождаться результата.
-
-### ouroboros_launcher.py
-
-`umbrella/integration/ouroboros_launcher.py` управляет процессом Ouroboros: запуск,
-отправка задач, ожидание результатов. Поддерживает сессии **sandbox self-edit**
-(временные правки `umbrella/` и `ouroboros/` с откатом после задачи — см.
-`umbrella/control_plane/sandbox_self_edit.py`).
-
-#### Восстановление осиротевших sandbox-стэшей
-
-Sandbox self-edit использует `git stash push --include-untracked` для
-бэкапа текущего состояния репозитория перед выполнением задачи. Если
-`exit_sandbox` ловит конфликт при `git stash pop` (например, Ouroboros
-нагенерировал файлы, пересекающиеся со стэшем), stash остаётся в списке,
-а сессия помечается `rollback_ok: false` с описанием ошибки в
-`.umbrella/sandbox_sessions/<id>.json`.
-
-При следующем старте `enter_sandbox` (включая запуск
-`umbrella/app_ouroboros.py`) автоматически вызывается
-`recover_orphan_sandbox_stashes(repo_root)`, которая:
-
-- находит в `git stash list` все записи с префиксом `umbrella-sandbox-`;
-- если worktree чистый — применяет их через `git stash apply` (не `pop`),
-  чтобы пользователь не терял данные, и пишет WARNING в лог;
-- если worktree грязный — оставляет stash на месте с WARNING и рекомендует
-  запустить `git stash list` + `git stash apply <idx>` вручную.
-
-Stash никогда не дропается автоматически — удалять его из списка должен
-пользователь после проверки содержимого: `git stash drop stash@{N}`.
-
-## Инструменты Umbrella в Ouroboros
-
-Реализация: `ouroboros/ouroboros/tools/umbrella_tools.py`. Менеджер получает доступ к
-Umbrella-слою: GMAS retrieval и контекст, чтение/запуск workspace, метрики и логи,
-запись в память и уроки, promotion между seed и instance. Дополнительно:
-
-- `search_meta_harness_experience` — поиск по прошлым кандидатам и экспериментам.
-- `inspect_candidate_trace` — просмотр trace выбранного кандидата Meta-Harness.
-- `sandbox_self_edit` — оформленный вход во временные правки с откатом.
-
-## Связь с Web UI
-
-Операторский интерфейс: `uv run bridge` ([umbrella/web_bridge/](../umbrella/web_bridge/)); перед запуском — сборка UI в `web/` (см. [docs/README.md](README.md#запуск-web-bridge)) —
-один процесс отдаёт собранный React из `web/build` и JSON API под префиксом `/api/*`
-(workspaces, threads, runs, logs, memory, dashboard stats и т.д.). Перед запуском выполните `yarn build` в каталоге `web/`.
-
-Старый встроенный HTML/JS dashboard (`umbrella/dashboard`) удалён; детали control plane по-прежнему в [umbrella-layer.md](umbrella-layer.md).
-
-## Отличие от «исполнителя задачи»
-
-В предыдущей модели Ouroboros решал задачу через прямую самомодификацию: он переписывал
-собственный код, промпты и инструменты, создавая ad-hoc решение внутри себя.
-
-В Umbrella Ouroboros — **руководитель**, а не исполнитель:
-
-| Аспект | Старая модель | Umbrella |
-|--------|---------------|---------|
-| Где рождается решение | Внутри Ouroboros | Внутри workspace на GMAS |
-| Основная зона изменений | `ouroboros/` | `workspaces/.../instances/` |
-| Self-improvement | Первый ответ на задачу | Вторичный контур, по триггерам |
-| Итоговый артефакт | Зависит от Ouroboros | Standalone workspace |
-
-Итоговый workspace должен работать автономно, без рантайм-зависимости от Ouroboros.
-Ouroboros нужен для построения, улучшения и эволюции, но конечный полезный артефакт
-живёт в самом workspace.
-
-## Главное отличие от Claude Code и чистого Ouroboros
-
-### По сравнению с Claude Code
-
-`Claude Code` — это сильный инструмент интерактивного редактирования, но не готовая теория того,
-как должна эволюционировать прикладная AI-система в долгом цикле.
-
-Идейные нововведения `Umbrella` по сравнению с таким режимом:
-
-- **выделение product surface**: прикладной результат должен жить в `workspace`, а не оставаться побочным эффектом coding-session;
-- **эволюция через seed/instance/promotion**: у системы есть формализованный путь от шаблона к эксперименту и обратно;
-- **policy-aware развитие**: границы `gmas`, `ouroboros`, seed-workspaces и instances не держатся только в голове разработчика, а вынесены в policy engine;
-- **memory as control-plane**: lessons, competency gaps и palace memory влияют на следующие решения;
-- **artifact-first thinking**: успех определяется не только тем, что агент «смог поправить код», а тем, что появился автономный улучшенный workspace.
-
-Поэтому `Umbrella` сильнее там, где нужен не разовый coding-assist, а накопительная система улучшения.
-
-### По сравнению с чистым Ouroboros
-
-Чистый `ouroboros` в этом монорепозитории остаётся отдельным агентом с собственным runtime,
-prompt stack и инструментами, включая делегирование code edits через Claude Code CLI.
-
-`Umbrella` меняет его роль:
-
-- `Ouroboros` перестаёт быть главным местом, где «рождается» прикладное решение.
-- Основная mutable-поверхность смещается из `ouroboros/` в `workspaces/.../instances/`.
-- Self-improvement остаётся, но включается как вторичный контур по policy-триггерам.
-- Появляется слой `umbrella/`, который добавляет registry, retrieval, memory, run index и policy.
-
-Главные идейные сдвиги:
-
-- **от self-first к workspace-first**: сначала улучшаем рабочую систему, а не менеджера;
-- **от агента к портфелю workspaces**: менеджер работает не с одной собственной кодовой базой, а с набором специализированных исполнительных систем;
-- **от неявной эволюции к формализованной**: есть seed profiles, lineage, promotion rules и evaluation evidence;
-- **от интуитивного self-improvement к триггерному**: capability gaps и negative signals формализуют момент, когда стоит менять менеджера;
-- **от “агент сделал задачу” к “собран reusable artifact”**: ценность переносится в автономный workspace.
-
-Главная идея: не делать ещё одну самоизменяющуюся версию агента под задачу, а получать
-отдельный полезный workspace, который потом можно запускать, сравнивать, архивировать и развивать независимо от менеджера.
-
-## Операторские скрипты
-
-Для запуска Ouroboros в режиме непрерывного улучшения используются скрипты из корня
-репозитория:
-
-- `umbrella/app_ouroboros.py` — актуальный single-run entrypoint в Ouroboros-first модели.
-- `run_ouroboros_self_improve.py` — полный цикл: чтение TASK_MAIN, рендеринг промпта,
-  итерации, auto-promotion в seed. Если итерация возвращает `candidate_id` Meta-Harness,
-  promotion может быть **ограничен** результатом оценки на search set (см. модуль
-  `umbrella/meta_harness/promotion.py`).
-- `run_meta_harness.py` — внешний цикл Meta-Harness: предложение изменений harness,
-  оценка кандидата, решение о promotion (см. [meta-harness-improvement-plan.md](meta-harness-improvement-plan.md)).
-
-Примеры:
-
-```powershell
-uv run python run_meta_harness.py --workspace agent_research --iterations 5
-uv run python run_meta_harness.py --experiment latest --resume
-```
-
-Подробнее: [creating-workspaces.md](creating-workspaces.md#способ-3-операторские-скрипты).
+Ouroboros is a **head** that executes instructions, not an **orchestrator** that decides what to do next. The PhaseRunner decides the sequence of phases. Ouroboros' job is to execute each phase well, using the tools and memory it has been granted, and to report results honestly.

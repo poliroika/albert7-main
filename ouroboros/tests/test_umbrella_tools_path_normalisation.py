@@ -5,9 +5,13 @@ to tools that expect a workspace-relative path. Without normalisation we
 end up creating ``workspaces/<id>/workspaces/<id>/foo/bar`` on disk.
 """
 
+import json
 from pathlib import Path
 
 from ouroboros.tools.umbrella_tools import (
+    apply_workspace_patch,
+    delete_workspace_file,
+    _gmas_context_before_write_block,
     _maybe_rewrite_workspace_command,
     _strip_workspace_prefix,
     list_workspace_files,
@@ -48,6 +52,19 @@ def test_strip_workspace_prefix_handles_double_prefix() -> None:
     )
 
 
+def test_strip_workspace_prefix_handles_workspace_root_path() -> None:
+    assert _strip_workspace_prefix("demo_ws", "workspaces/demo_ws") == ""
+    assert _strip_workspace_prefix("demo_ws", "demo_ws") == ""
+
+
+def test_strip_workspace_prefix_removes_bare_workspace_prefix() -> None:
+    assert _strip_workspace_prefix("demo_ws", "demo_ws/TASK_MAIN.md") == "TASK_MAIN.md"
+    assert (
+        _strip_workspace_prefix("demo_ws", "demo_ws/src/app.py")
+        == "src/app.py"
+    )
+
+
 def test_strip_workspace_prefix_keeps_already_relative_path() -> None:
     assert _strip_workspace_prefix("demo_ws", "main.py") == "main.py"
     assert (
@@ -65,11 +82,185 @@ def test_strip_workspace_prefix_handles_leading_slash_and_backslash() -> None:
     )
 
 
+def test_strip_workspace_prefix_handles_dot_workspaces_typo() -> None:
+    assert (
+        _strip_workspace_prefix(
+            "demo_ws",
+            ".workspaces/demo_ws/.memory/drive/memory/knowledge/index.md",
+        )
+        == ".memory/drive/memory/knowledge/index.md"
+    )
+
+
+def test_strip_workspace_prefix_is_case_insensitive_for_prefix_only() -> None:
+    assert (
+        _strip_workspace_prefix("demo_ws", "WORKSPACES/demo_ws/TASK_MAIN.md")
+        == "TASK_MAIN.md"
+    )
+    assert (
+        _strip_workspace_prefix("demo_ws", "Demo_WS/src/app.py")
+        == "src/app.py"
+    )
+
+
 def test_strip_workspace_prefix_ignores_other_workspace_id() -> None:
     assert (
         _strip_workspace_prefix("demo_ws", "workspaces/other_ws/main.py")
         == "workspaces/other_ws/main.py"
     )
+
+
+def test_delete_workspace_file_blocks_source_repair_delete(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    target = workspace / "backend" / "models" / "game_state.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("class GameState:\n    pass\n", encoding="utf-8")
+    ctx = _FakeCtx(tmp_path, tmp_path / ".umbrella" / "drive")
+
+    payload = json.loads(
+        delete_workspace_file(
+            ctx,
+            workspace_id="demo_ws",
+            file_path="backend/models/game_state.py",
+            reason="Corrupted/truncated file needs to be recreated cleanly",
+        )
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "source_repair_delete_blocked"
+    assert "sanctioned full-file write" not in payload["next_step"]
+    assert "apply_workspace_patch" in payload["next_step"]
+    assert target.exists()
+
+
+def test_delete_workspace_file_blocks_source_fix_delete_reason(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    target = workspace / "src" / "demo" / "__init__.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("from .missing import Missing\n", encoding="utf-8")
+    ctx = _FakeCtx(tmp_path, tmp_path / ".umbrella" / "drive")
+
+    payload = json.loads(
+        delete_workspace_file(
+            ctx,
+            workspace_id="demo_ws",
+            file_path="src/demo/__init__.py",
+            reason="Fix import by recreating clean file",
+        )
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "source_repair_delete_blocked"
+    assert target.exists()
+
+
+def test_delete_workspace_file_blocks_captured_test_replacement_reason(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    target = workspace / "tests" / "test_game_engine.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def test_contract():\n    assert True\n", encoding="utf-8")
+    ctx = _FakeCtx(tmp_path, tmp_path / ".umbrella" / "drive")
+
+    payload = json.loads(
+        delete_workspace_file(
+            ctx,
+            workspace_id="demo_ws",
+            file_path="tests/test_game_engine.py",
+            reason="Replacing with tests that match actual implementation",
+        )
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "source_repair_delete_blocked"
+    assert "apply_workspace_patch" in payload["next_step"]
+    assert target.exists()
+
+
+def test_delete_workspace_file_blocks_managed_source_delete_without_repair_words(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    target = workspace / "src" / "demo" / "engine.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("class Engine:\n    pass\n", encoding="utf-8")
+    ctx = _FakeCtx(tmp_path, tmp_path / ".umbrella" / "drive")
+
+    payload = json.loads(
+        delete_workspace_file(
+            ctx,
+            workspace_id="demo_ws",
+            file_path="src/demo/engine.py",
+            reason="obsolete after refactor",
+        )
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "source_repair_delete_blocked"
+    assert target.exists()
+
+
+def test_delete_workspace_file_allows_cleanup_probe_delete(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    target = workspace / "check_markers.py"
+    target.write_text("print('probe')\n", encoding="utf-8")
+    ctx = _FakeCtx(tmp_path, tmp_path / ".umbrella" / "drive")
+
+    payload = json.loads(
+        delete_workspace_file(
+            ctx,
+            workspace_id="demo_ws",
+            file_path="check_markers.py",
+            reason="ad-hoc probe script left over from verification",
+        )
+    )
+
+    assert payload["status"] == "deleted"
+    assert not target.exists()
+
+
+def test_gmas_gate_ignores_blocked_write_attempt_round(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    (workspace / "workspace.toml").write_text(
+        "[skills]\nmulti_agent_gmas = true\n",
+        encoding="utf-8",
+    )
+    drive_root = tmp_path / ".umbrella" / "drive"
+    (drive_root / "logs").mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+    ctx.task_id = "run-1:execute"
+    ctx.loop_state_view = {"last_write_round": 3}
+    (drive_root / "logs" / "tools.jsonl").write_text(
+        (
+            '{"task_id":"run-1:execute","tool":"apply_workspace_patch",'
+            '"result_preview":"{\\"status\\": \\"blocked\\", '
+            '\\"reason\\": \\"gmas_context_before_first_write\\"}"}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    block = _gmas_context_before_write_block(ctx, "demo_ws", workspace)
+
+    assert block is not None
+    assert block["reason"] == "gmas_context_before_first_write"
+
+
+def test_gmas_gate_accepts_explicit_context_tool_call(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    (workspace / "workspace.toml").write_text(
+        "[skills]\nmulti_agent_gmas = true\n",
+        encoding="utf-8",
+    )
+    drive_root = tmp_path / ".umbrella" / "drive"
+    (drive_root / "logs").mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+    ctx.task_id = "run-1:execute"
+    ctx.loop_state_view = {}
+    (drive_root / "logs" / "tools.jsonl").write_text(
+        '{"task_id":"run-1:execute","tool":"get_gmas_context","result_preview":"{}"}\n',
+        encoding="utf-8",
+    )
+
+    assert _gmas_context_before_write_block(ctx, "demo_ws", workspace) is None
 
 
 def test_update_workspace_seed_does_not_double_nest_path(tmp_path: Path) -> None:
@@ -109,6 +300,24 @@ def test_update_workspace_seed_blocks_root_diagnostic_scripts(tmp_path: Path) ->
 
     assert "workspace_layout_policy" in result
     assert not (workspace / "check_docx.py").exists()
+
+
+def test_update_workspace_seed_blocks_root_pytest_modules(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = update_workspace_seed(
+        ctx,
+        workspace_id="demo_ws",
+        file_path="test_generate.py",
+        new_content="def test_generate():\n    assert True\n",
+        create_backup=False,
+    )
+
+    assert "workspace_layout_policy" in result
+    assert not (workspace / "test_generate.py").exists()
 
 
 def test_update_workspace_seed_blocks_diagnostic_scripts_under_src_scripts(
@@ -215,6 +424,146 @@ def test_update_workspace_seed_blocks_pytest_files_under_src(tmp_path: Path) -> 
     assert not (workspace / "src" / "test_app.py").exists()
 
 
+def test_update_workspace_seed_blocks_greenfield_python_package_outside_src(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    (workspace / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = update_workspace_seed(
+        ctx,
+        workspace_id="demo_ws",
+        file_path="game_engine/hex_grid.py",
+        new_content="class HexGrid:\n    pass\n",
+        create_backup=False,
+    )
+
+    assert "greenfield_python_src_layout_policy" in result
+    assert not (workspace / "game_engine" / "hex_grid.py").exists()
+
+
+def test_apply_workspace_patch_blocks_greenfield_python_package_outside_src(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    (workspace / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = apply_workspace_patch(
+        ctx,
+        workspace_id="demo_ws",
+        patch=(
+            "*** Begin Patch\n"
+            "*** Add File: agents/civ_agents.py\n"
+            "+class CivilizationAgents:\n"
+            "+    pass\n"
+            "*** End Patch\n"
+        ),
+    )
+
+    assert "greenfield_python_src_layout_policy" in result
+    assert not (workspace / "agents" / "civ_agents.py").exists()
+
+
+def test_apply_workspace_patch_blocks_bare_src_python_module(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    (workspace / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = apply_workspace_patch(
+        ctx,
+        workspace_id="demo_ws",
+        patch=(
+            "*** Begin Patch\n"
+            "*** Add File: src/game_engine.py\n"
+            "+class GameEngine:\n"
+            "+    pass\n"
+            "*** End Patch\n"
+        ),
+    )
+
+    assert "greenfield_python_src_layout_policy" in result
+    assert "src/<package>" in result
+    assert not (workspace / "src" / "game_engine.py").exists()
+
+
+def test_apply_workspace_patch_blocks_parallel_src_python_roots(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    (workspace / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = apply_workspace_patch(
+        ctx,
+        workspace_id="demo_ws",
+        patch=(
+            "*** Begin Patch\n"
+            "*** Add File: src/api/app.py\n"
+            "+class ApiApp:\n"
+            "+    pass\n"
+            "*** Add File: src/agents/runner.py\n"
+            "+class AgentRunner:\n"
+            "+    pass\n"
+            "*** End Patch\n"
+        ),
+    )
+
+    assert "greenfield_python_src_layout_policy" in result
+    assert "one canonical package root" in result
+    assert not (workspace / "src" / "api" / "app.py").exists()
+    assert not (workspace / "src" / "agents" / "runner.py").exists()
+
+
+def test_update_workspace_seed_allows_existing_non_src_package_repair(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    (workspace / "game_engine").mkdir()
+    (workspace / "game_engine" / "__init__.py").write_text("", encoding="utf-8")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = update_workspace_seed(
+        ctx,
+        workspace_id="demo_ws",
+        file_path="game_engine/hex_grid.py",
+        new_content="class HexGrid:\n    pass\n",
+        create_backup=False,
+    )
+
+    assert "Updated" in result, result
+    assert (workspace / "game_engine" / "hex_grid.py").exists()
+
+
+def test_update_workspace_seed_allows_greenfield_src_package(tmp_path: Path) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = update_workspace_seed(
+        ctx,
+        workspace_id="demo_ws",
+        file_path="src/civilization_game/game_engine/hex_grid.py",
+        new_content="class HexGrid:\n    pass\n",
+        create_backup=False,
+    )
+
+    assert "Updated" in result, result
+    assert (
+        workspace / "src" / "civilization_game" / "game_engine" / "hex_grid.py"
+    ).exists()
+
+
 def test_read_workspace_file_strips_repo_prefix(tmp_path: Path) -> None:
     workspace = _make_workspace(tmp_path, "demo_ws")
     (workspace / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -277,3 +626,79 @@ def test_update_workspace_seed_unwraps_nested_new_content_dict(tmp_path: Path) -
 
     assert "Updated" in result, result
     assert (workspace / "mod.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_apply_workspace_patch_blocks_top_level_use_before_definition(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = apply_workspace_patch(
+        ctx,
+        workspace_id="demo_ws",
+        patch="""*** Begin Patch
+*** Add File: main.py
+from fastapi import FastAPI
+
+app = FastAPI(lifespan=lifespan)
+
+async def lifespan(app):
+    yield
+*** End Patch""",
+    )
+
+    assert "python_top_level_name_order" in result
+    assert not (workspace / "main.py").exists()
+
+
+def test_apply_workspace_patch_blocks_missing_local_package_import(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = apply_workspace_patch(
+        ctx,
+        workspace_id="demo_ws",
+        patch="""*** Begin Patch
+*** Add File: backend/bots/__init__.py
+from backend.bots.bot_decision_engine import BotDecisionEngine
+
+__all__ = ["BotDecisionEngine"]
+*** End Patch""",
+    )
+
+    assert "python_missing_local_import" in result
+    assert not (workspace / "backend" / "bots" / "__init__.py").exists()
+
+
+def test_apply_workspace_patch_allows_local_import_created_in_same_patch(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path, "demo_ws")
+    drive_root = tmp_path / ".umbrella" / "drive"
+    drive_root.mkdir(parents=True)
+    ctx = _FakeCtx(tmp_path, drive_root)
+
+    result = apply_workspace_patch(
+        ctx,
+        workspace_id="demo_ws",
+        patch="""*** Begin Patch
+*** Add File: backend/bots/bot_decision_engine.py
+class BotDecisionEngine:
+    pass
+*** Add File: backend/bots/__init__.py
+from backend.bots.bot_decision_engine import BotDecisionEngine
+
+__all__ = ["BotDecisionEngine"]
+*** End Patch""",
+    )
+
+    assert "applied" in result, result
+    assert (workspace / "backend" / "bots" / "bot_decision_engine.py").exists()
+    assert (workspace / "backend" / "bots" / "__init__.py").exists()

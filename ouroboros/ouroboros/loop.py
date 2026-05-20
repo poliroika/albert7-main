@@ -20,7 +20,12 @@ from collections.abc import Callable
 
 import logging
 
-from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
+from ouroboros.llm import (
+    LLMClient,
+    normalize_reasoning_effort,
+    add_usage,
+    llm_error_looks_like_html_tunnel_page,
+)
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import compact_tool_history, compact_tool_history_llm
 from ouroboros.deadline import (
@@ -168,6 +173,19 @@ _JSON_TYPE_TO_PYTHON: dict[str, tuple[type, ...]] = {
 }
 
 
+def _schema_type_options(spec: dict[str, Any]) -> list[str]:
+    raw = spec.get("type")
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [str(item) for item in raw if isinstance(item, str)]
+    return []
+
+
+def _schema_type_label(types: list[str]) -> str:
+    return " or ".join(types)
+
+
 def _infer_workspace_id_from_tools_context(tools: ToolRegistry) -> str:
     """Best-effort workspace id inference from active drive root."""
     try:
@@ -301,6 +319,34 @@ def _append_round_io(
         )
     except Exception:
         log.debug("Failed to append round IO trace", exc_info=True)
+
+
+def _register_transient_event_pointer(
+    drive_root: pathlib.Path | None,
+    event: dict[str, Any],
+    task_id: str,
+) -> None:
+    """Best-effort: register a pointer in palace.transient sqlite for Watcher visibility."""
+    if not drive_root:
+        return
+    try:
+        palace_root = drive_root.parent / "palace" if "drive" in str(drive_root) else drive_root.parent.parent / ".memory" / "palace"
+        transient_db = palace_root / "transient.sqlite"
+        if not transient_db.parent.exists():
+            return
+        import sqlite3, uuid, time as _time
+        source_path = str(drive_root / "logs" / "events.jsonl")
+        summary = f"[{event.get('phase', '')}] round={event.get('round', '')} model={event.get('model', '')} cost={event.get('cost_usd', '')}"
+        workspace_id = str(drive_root).split("workspaces/")[-1].split("/")[0] if "workspaces" in str(drive_root) else ""
+        conn = sqlite3.connect(str(transient_db), check_same_thread=False, timeout=1.0)
+        conn.execute(
+            "INSERT OR IGNORE INTO transient_nodes(id,workspace_id,run_id,phase,source_path,summary,created_at) VALUES(?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), workspace_id, task_id, event.get("phase", ""), source_path, summary[:500], _time.time()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def _check_stop_requested(
@@ -805,6 +851,32 @@ def _successful_terminating_tools(
     return successes, rejected
 
 
+def _accepted_terminating_tools_from_trace(
+    trace_tool_calls: list[dict[str, Any]],
+    terminating_tools: frozenset,
+) -> set[str]:
+    accepted: set[str] = set()
+    if not terminating_tools:
+        return accepted
+    for item in trace_tool_calls or []:
+        tool_name = str(item.get("tool") or "").strip()
+        if tool_name not in terminating_tools:
+            continue
+        if _completion_tool_result_is_success(_trace_result_text(item)):
+            accepted.add(tool_name)
+    return accepted
+
+
+def _missing_terminating_tools_from_trace(
+    trace_tool_calls: list[dict[str, Any]],
+    terminating_tools: frozenset,
+) -> set[str]:
+    return set(terminating_tools) - _accepted_terminating_tools_from_trace(
+        trace_tool_calls,
+        terminating_tools,
+    )
+
+
 def _format_rejected_termination_nudge(rejected: dict[str, str]) -> str:
     rendered = []
     for name, result in sorted(rejected.items()):
@@ -1045,7 +1117,9 @@ def _recover_pseudo_xml_tool_name(
         fn_name,
         raw_arguments_before,
     )
-    if not clean_fn_name or clean_fn_name == fn_name:
+    if not clean_fn_name:
+        return fn_name
+    if clean_fn_name == fn_name and not salvaged_args:
         return fn_name
 
     try:
@@ -1072,6 +1146,7 @@ def _recover_pseudo_xml_tool_name(
             "task_id": task_id,
             "tool": clean_fn_name,
             "phase": phase_label,
+            "name_changed": clean_fn_name != fn_name,
             "salvaged_keys": sorted(salvaged_args.keys()),
         },
     )
@@ -1515,14 +1590,20 @@ def _tool_call_preflight_error(
         spec = properties.get(key)
         if not isinstance(spec, dict):
             continue
-        expected_type = str(spec.get("type") or "").strip()
-        if not expected_type:
+        expected_types = _schema_type_options(spec)
+        if not expected_types:
             continue
-        py_types = _JSON_TYPE_TO_PYTHON.get(expected_type)
-        if not py_types:
+        py_type_groups = [
+            _JSON_TYPE_TO_PYTHON[type_name]
+            for type_name in expected_types
+            if type_name in _JSON_TYPE_TO_PYTHON
+        ]
+        if not py_type_groups:
             continue
+        py_types = tuple({py_type for group in py_type_groups for py_type in group})
         if not isinstance(value, py_types):
-            return f"field `{key}` expects {expected_type}, got {type(value).__name__}"
+            expected_label = _schema_type_label(expected_types)
+            return f"field `{key}` expects {expected_label}, got {type(value).__name__}"
     return ""
 
 
@@ -1542,7 +1623,8 @@ def _tool_schema_hint(fn_name: str, tools: ToolRegistry) -> str:
     example: dict[str, Any] = {}
     for key in required:
         spec = properties.get(key) if isinstance(properties.get(key), dict) else {}
-        typ = str(spec.get("type") or "string")
+        type_options = _schema_type_options(spec)
+        typ = type_options[0] if type_options else "string"
         if typ == "array":
             example[key] = []
         elif typ == "object":
@@ -1657,6 +1739,40 @@ def _make_timeout_result(
         "args_for_log": args_for_log,
         "is_code_tool": is_code_tool,
     }
+
+
+def _tool_result_is_stop_requested(exec_result: dict[str, Any]) -> bool:
+    result = str(exec_result.get("result") or "").casefold()
+    return "stop_requested" in result or "stop requested" in result
+
+
+def _recent_tool_results_have_stop_requested(
+    llm_trace: dict[str, Any], tool_count: int
+) -> bool:
+    if tool_count <= 0:
+        return False
+    trace_tool_calls = llm_trace.get("tool_calls") or []
+    if not isinstance(trace_tool_calls, list) or not trace_tool_calls:
+        return False
+    for item in trace_tool_calls[-tool_count:]:
+        if isinstance(item, dict) and _tool_result_is_stop_requested(item):
+            return True
+    return False
+
+
+def _synthetic_stop_skipped_tool_result(tc: dict[str, Any]) -> dict[str, Any]:
+    fn_name = str(tc.get("function", {}).get("name") or "")
+    return _tool_execution_result(
+        tool_call_id=str(tc.get("id") or ""),
+        fn_name=fn_name,
+        result=(
+            "STOP_REQUESTED: skipped remaining tool call in this batch after "
+            "dashboard cancel was observed."
+        ),
+        is_error=True,
+        args_for_log={},
+        is_code_tool=False,
+    )
 
 
 def _execute_with_timeout(
@@ -1781,8 +1897,9 @@ def _handle_tool_calls(
     )
 
     if not can_parallel:
-        results = [
-            _execute_with_timeout(
+        results = []
+        for idx, tc in enumerate(tool_calls):
+            result = _execute_with_timeout(
                 tools,
                 tc,
                 drive_logs,
@@ -1792,8 +1909,13 @@ def _handle_tool_calls(
                 allowed_tool_names=allowed_tool_names,
                 phase_label=phase_label,
             )
-            for tc in tool_calls
-        ]
+            results.append(result)
+            if _tool_result_is_stop_requested(result):
+                results.extend(
+                    _synthetic_stop_skipped_tool_result(remaining)
+                    for remaining in tool_calls[idx + 1 :]
+                )
+                break
     else:
         max_workers = min(len(tool_calls), 8)
         executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -1948,7 +2070,7 @@ def _tool_schemas_for_names(
     ]
     if not selected:
         log.warning("Requested tool schema(s) missing: %s", ",".join(sorted(names)))
-    return selected or tool_schemas
+    return selected
 
 
 _PLANNER_DISCOVERY_TOOL_NAMES = {
@@ -2015,9 +2137,6 @@ _REMEDIATION_TOOL_NAMES = _SUBTASK_TOOL_NAMES | {
 _REVIEW_TOOL_NAMES = {
     "revise_remaining_plan",
 }
-
-
-_PERIODIC_RECALL_DEFAULT_PHASES: frozenset[str] = frozenset({"planner", "remediation"})
 
 
 def _periodic_recall_enabled_for_phase(phase_label: str) -> bool:
@@ -2169,6 +2288,7 @@ def _maybe_inject_self_check(
     messages: list[dict[str, Any]],
     accumulated_usage: dict[str, Any],
     emit_progress: Callable[[str], None],
+    available_tool_names: set[str] | None = None,
 ) -> None:
     """Inject a soft self-check reminder every REMINDER_INTERVAL rounds.
 
@@ -2195,6 +2315,16 @@ def _maybe_inject_self_check(
     # "Rounds remaining: -<round_idx>" calculation.
     max_label = "∞" if max_rounds <= 0 else str(max_rounds)
     remaining_label = "∞" if max_rounds <= 0 else str(max_rounds - round_idx)
+    if available_tool_names is None or "compact_context" in available_tool_names:
+        context_action = (
+            "   → If yes, call `compact_context` to summarize them selectively.\n"
+        )
+    else:
+        context_action = (
+            "   → If yes, do not call unavailable context tools; rely on the "
+            "authoritative artifacts/current files and avoid rereading stale "
+            "large outputs.\n"
+        )
     reminder = (
         f"[CHECKPOINT {checkpoint_num} — round {round_idx}/{max_label}]\n"
         f"📊 Context: ~{ctx_tokens} tokens | Cost so far: ${task_cost:.2f} | "
@@ -2203,7 +2333,7 @@ def _maybe_inject_self_check(
         f"1. Am I making real progress, or repeating the same actions?\n"
         f"2. Is my current strategy working? Should I try something different?\n"
         f"3. Is my context bloated with old tool results I no longer need?\n"
-        f"   → If yes, call `compact_context` to summarize them selectively.\n"
+        f"{context_action}"
         f"4. Have I been stuck on the same sub-problem for many rounds?\n"
         f"   → If yes, consider: simplify the approach, skip the sub-problem, or finish with what I have.\n"
         f"   If you finish with a partial result, first record the concrete blocker and evidence.\n"
@@ -2239,7 +2369,153 @@ def _format_llm_unavailable_message(
     )
 
 
-def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
+def _schema_tool_names(tool_schemas: list[dict[str, Any]]) -> set[str]:
+    return {
+        str((schema.get("function") or {}).get("name") or "")
+        for schema in tool_schemas
+        if str((schema.get("function") or {}).get("name") or "")
+    }
+
+
+def _append_schema_by_name(tools_registry, tool_schemas, name: str) -> bool:
+    if name in _schema_tool_names(tool_schemas):
+        return True
+    schema = tools_registry.get_schema_by_name(name)
+    if not schema:
+        return False
+    tool_schemas.append(schema)
+    return True
+
+
+def _phase_tool_filter_sets(
+    task_type: str,
+    tool_filter: dict[str, Any] | None,
+) -> tuple[set[str] | None, set[str]]:
+    if not tool_filter:
+        return None, set()
+    allowed_raw = tool_filter.get("allow") or []
+    denied_raw = tool_filter.get("deny") or []
+    required_raw = tool_filter.get("required") or []
+    allowed = {str(name).strip() for name in allowed_raw if str(name).strip()}
+    denied = {str(name).strip() for name in denied_raw if str(name).strip()}
+    required = {str(name).strip() for name in required_raw if str(name).strip()}
+    allowed |= required
+    return (allowed or None), denied
+
+
+def _phase_required_tool_set(tool_filter: dict[str, Any] | None) -> set[str]:
+    if not tool_filter:
+        return set()
+    required_raw = tool_filter.get("required") or []
+    return {str(name).strip() for name in required_raw if str(name).strip()}
+
+
+def _phase_completion_prerequisites(
+    tool_filter: dict[str, Any] | None,
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(tool_filter, dict):
+        return ()
+    raw = tool_filter.get("completion_prerequisites") or {}
+    if not isinstance(raw, dict):
+        return ()
+    normalized: list[dict[str, Any]] = []
+    required_tools = raw.get("required_tools") or []
+    if isinstance(required_tools, list):
+        for tool in required_tools:
+            tool_name = str(tool).strip()
+            if not tool_name:
+                continue
+            normalized.append(
+                {
+                    "kind": "tool_call",
+                    "tool": tool_name,
+                    "n": 1,
+                    "tools": [tool_name],
+                }
+            )
+    rules = raw.get("palace_writes") or []
+    if not isinstance(rules, list):
+        return tuple(normalized)
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        try:
+            needed = max(1, int(rule.get("n") or 1))
+        except (TypeError, ValueError):
+            needed = 1
+        tools = [
+            str(tool).strip()
+            for tool in (rule.get("tools") or [])
+            if str(tool).strip()
+        ]
+        normalized.append(
+            {
+                "kind": "palace_write",
+                "store": str(rule.get("store") or "").strip(),
+                "tag": str(rule.get("tag") or "").strip(),
+                "n": needed,
+                "tools": tools,
+            }
+        )
+    return tuple(normalized)
+
+
+def _preload_phase_tool_schemas(
+    tools_registry,
+    tool_schemas: list[dict[str, Any]],
+    *,
+    allowed: set[str] | None,
+    denied: set[str],
+    drive_logs: pathlib.Path,
+    task_id: str,
+) -> None:
+    if not allowed:
+        return
+    missing: list[str] = []
+    for name in sorted(allowed - denied):
+        if not _append_schema_by_name(tools_registry, tool_schemas, name):
+            missing.append(name)
+    if missing:
+        append_jsonl(
+            drive_logs / "events.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "phase_tool_contract_missing",
+                "task_id": task_id,
+                "missing_tools": missing,
+            },
+        )
+
+
+def _apply_tool_filter_in_place(
+    tool_schemas: list[dict[str, Any]],
+    *,
+    allowed: set[str] | None,
+    denied: set[str],
+) -> None:
+    if allowed is None and not denied:
+        return
+    filtered = []
+    for schema in tool_schemas:
+        name = str((schema.get("function") or {}).get("name") or "")
+        if not name:
+            continue
+        if allowed is not None and name not in allowed:
+            continue
+        if name in denied:
+            continue
+        filtered.append(schema)
+    tool_schemas[:] = filtered
+
+
+def _setup_dynamic_tools(
+    tools_registry,
+    tool_schemas,
+    messages,
+    *,
+    phase_allowed_tools: set[str] | None = None,
+    phase_denied_tools: set[str] | None = None,
+):
     """
     Wire tool-discovery handlers onto an existing tool_schemas list.
 
@@ -2251,13 +2527,29 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
     Returns (tool_schemas, enabled_extra_set).
     """
     enabled_extra: set = set()
+    phase_denied_tools = set(phase_denied_tools or set())
+
+    def _phase_can_enable(name: str) -> bool:
+        if phase_allowed_tools is not None and name not in phase_allowed_tools:
+            return False
+        return name not in phase_denied_tools
 
     def _handle_list_tools(ctx=None, **kwargs):
-        non_core = tools_registry.list_non_core_tools()
+        non_core = [
+            t
+            for t in tools_registry.list_non_core_tools()
+            if _phase_can_enable(str(t.get("name") or ""))
+        ]
         if not non_core:
+            if phase_allowed_tools is not None:
+                return (
+                    "No additional tools are available under the current phase "
+                    "contract. Use the tools already listed for this phase."
+                )
             return "All tools are already in your active set."
         lines = [
-            f"**{len(non_core)} additional tools available** (use `enable_tools` to activate):\n"
+            f"**{len(non_core)} additional phase-available tools** "
+            "(use `enable_tools` to activate):\n"
         ]
         for t in non_core:
             lines.append(f"- **{t['name']}**: {t['description'][:120]}")
@@ -2265,8 +2557,14 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
 
     def _handle_enable_tools(ctx=None, tools: str = "", **kwargs):
         names = [n.strip() for n in tools.split(",") if n.strip()]
-        enabled, not_found = [], []
+        enabled, not_found, not_allowed = [], [], []
         for name in names:
+            if phase_allowed_tools is not None and name not in phase_allowed_tools:
+                not_allowed.append(name)
+                continue
+            if name in phase_denied_tools:
+                not_allowed.append(name)
+                continue
             schema = tools_registry.get_schema_by_name(name)
             if schema and name not in enabled_extra:
                 tool_schemas.append(schema)
@@ -2281,19 +2579,27 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
             parts.append(f"✅ Enabled: {', '.join(enabled)}")
         if not_found:
             parts.append(f"❌ Not found: {', '.join(not_found)}")
+        if not_allowed:
+            parts.append(f"ERROR: Not allowed in this phase: {', '.join(not_allowed)}")
         return "\n".join(parts) if parts else "No tools specified."
 
     tools_registry.override_handler("list_available_tools", _handle_list_tools)
     tools_registry.override_handler("enable_tools", _handle_enable_tools)
 
-    non_core_count = len(tools_registry.list_non_core_tools())
+    non_core_count = len(
+        [
+            t
+            for t in tools_registry.list_non_core_tools()
+            if _phase_can_enable(str(t.get("name") or ""))
+        ]
+    )
     if non_core_count > 0:
         messages.append(
             {
                 "role": "system",
                 "content": (
                     f"Note: {len(tool_schemas)} tools are pre-loaded in your active set. "
-                    f"Another {non_core_count} specialised tools exist but are not "
+                    f"Another {non_core_count} phase-available specialised tools exist but are not "
                     f"loaded by default — call `list_available_tools` to inspect them "
                     f"and `enable_tools` to activate any you need (their schemas will "
                     f"be added to subsequent rounds). Reach for them whenever the "
@@ -2386,6 +2692,16 @@ class _LoopState:
     last_verify_passed: bool = False
     last_verify_failed_count: int = 0
     last_verify_summary: str = ""
+    # End-to-end evidence tracked separately from generic verification.
+    # ``run_real_e2e`` may share the underlying runner, but final review must
+    # prove that this phase actually ran the e2e contract instead of leaning on
+    # stale import/build checks from an earlier verify phase.
+    last_e2e_run_id: str = ""
+    last_e2e_round: int = -1
+    last_e2e_passed: bool = False
+    last_e2e_failed_count: int = 0
+    last_e2e_summary: str = ""
+    last_e2e_phase_label: str = ""
     last_write_round: int = -1
     # Discovery tracking (Tier 3.1): how many discovery / recall tool calls
     # the agent made in the *current* subtask. Reset when a new subtask
@@ -2442,16 +2758,50 @@ def _try_fallback_llm(
         )
         return None, final
 
-    fallback_list_raw = os.environ.get(
-        "OUROBOROS_MODEL_FALLBACK_LIST",
-        "google/gemini-2.5-pro-preview,openai/o3,anthropic/claude-sonnet-4.6",
-    )
+    fallback_list_raw = os.environ.get("OUROBOROS_MODEL_FALLBACK_LIST", "")
     candidates = [m.strip() for m in fallback_list_raw.split(",") if m.strip()]
-    fallback_model = next((c for c in candidates if c != state.active_model), None)
+    skipped: list[dict[str, str]] = []
+    fallback_model = None
+    for candidate in candidates:
+        skip_reason = _fallback_model_skip_reason(
+            candidate,
+            active_model=state.active_model,
+        )
+        if skip_reason:
+            skipped.append({"model": candidate, "reason": skip_reason})
+            continue
+        fallback_model = candidate
+        break
     if fallback_model is None:
+        if skipped:
+            append_jsonl(
+                drive_logs / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "llm_fallback_skipped",
+                    "task_id": task_id,
+                    "round": state.round_idx,
+                    "active_model": state.active_model,
+                    "skipped": skipped,
+                },
+            )
+        skipped_text = (
+            " Skipped incompatible configured fallback(s): "
+            + "; ".join(
+                f"{item['model']} ({item['reason']})" for item in skipped[:5]
+            )
+            + "."
+            if skipped
+            else ""
+        )
         final = (
             f"⚠️ Failed to get a response from model {state.active_model} after {max_retries} attempts. "
-            f"All fallback models match the active one. Try rephrasing your request.",
+            "No compatible fallback model is configured. Set "
+            "OUROBOROS_MODEL_FALLBACK_LIST to provider-supported model ids for "
+            "the configured base URL if this runtime should switch models "
+            "after repeated empty/failed responses; otherwise retry the same "
+            "run when the configured provider is healthy."
+            + skipped_text,
             state.accumulated_usage,
             state.llm_trace,
         )
@@ -2488,11 +2838,55 @@ def _try_fallback_llm(
     return msg, ("", state.accumulated_usage, state.llm_trace)
 
 
+def _truthy_env(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fallback_model_skip_reason(candidate: str, *, active_model: str) -> str:
+    candidate = str(candidate or "").strip()
+    active = str(active_model or "").strip()
+    if not candidate:
+        return "empty model id"
+    if candidate == active:
+        return "same as active model"
+    if _truthy_env(os.environ.get("OUROBOROS_ALLOW_CROSS_PROVIDER_FALLBACKS")):
+        return ""
+
+    base_url = (
+        os.environ.get("OUROBOROS_LLM_BASE_URL")
+        or os.environ.get("LLM_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or ""
+    ).lower()
+    candidate_provider = candidate.split("/", 1)[0] if "/" in candidate else ""
+    active_provider = active.split("/", 1)[0] if "/" in active else ""
+    if not candidate_provider:
+        return ""
+    if active_provider and candidate_provider == active_provider:
+        return ""
+    if "openrouter" in base_url:
+        return ""
+    return (
+        "provider-qualified model id does not match the configured runtime "
+        "base URL; set OUROBOROS_ALLOW_CROSS_PROVIDER_FALLBACKS=1 only when "
+        "the provider endpoint accepts cross-provider model ids"
+    )
+
+
 _NO_WRITE_NUDGE_LIMIT = 2
 _NO_WRITE_TOOL_NUDGE_AFTER_ROUNDS = 8
 _NO_WRITE_TOOL_NUDGE_INTERVAL = 4
 _NO_WRITE_TOOL_NUDGE_LIMIT = 2
 _NO_WRITE_TOOL_ABORT_AFTER_NUDGES = 2
+_REQUIRED_TERMINATION_NUDGE_AFTER_ROUNDS = 4
+
+
+def _allowed_workspace_write_tools(
+    allowed_tool_names: frozenset | set[str] | None,
+) -> list[str]:
+    if allowed_tool_names is None:
+        return sorted(WRITE_TOOL_NAMES)
+    return sorted(str(name) for name in (set(allowed_tool_names) & WRITE_TOOL_NAMES))
 # Tier 1.2: how many times we re-prompt in a text-only phase before
 # giving up when the assistant insists on emitting pseudo tool-call text.
 # Two is enough — by then either the model fixes itself or no amount of
@@ -2709,10 +3103,17 @@ def _publish_state_view_to_tool_ctx(
                 return
         view["round_idx"] = state.round_idx
         view["phase_label"] = phase_label
+        view["active_workspace_id"] = state.active_workspace_id
         view["last_verify_run_id"] = state.last_verify_run_id
         view["last_verify_round"] = state.last_verify_round
         view["last_verify_passed"] = state.last_verify_passed
         view["last_verify_failed_count"] = state.last_verify_failed_count
+        view["last_e2e_run_id"] = state.last_e2e_run_id
+        view["last_e2e_round"] = state.last_e2e_round
+        view["last_e2e_passed"] = state.last_e2e_passed
+        view["last_e2e_failed_count"] = state.last_e2e_failed_count
+        view["last_e2e_summary"] = state.last_e2e_summary
+        view["last_e2e_phase_label"] = state.last_e2e_phase_label
         view["last_write_round"] = state.last_write_round
         view["current_subtask_id"] = state.current_subtask_id
         view["current_subtask_discovery_calls"] = state.current_subtask_discovery_calls
@@ -2769,7 +3170,10 @@ def _reset_subtask_tool_state(tools: ToolRegistry) -> None:
 
 
 def _update_state_from_tool_calls(
-    state: "_LoopState", tool_calls: list[dict[str, Any]]
+    state: "_LoopState",
+    tool_calls: list[dict[str, Any]],
+    *,
+    phase_label: str = "",
 ) -> None:
     """Update verify / write / discovery counters in ``state`` from a batch
     of tool calls executed in the current round.
@@ -2850,15 +3254,17 @@ def _update_state_from_tool_calls(
             state.last_memory_recall_empty = total == 0
             break
 
-    # Parse ``run_workspace_verify`` outcomes from the trace tail. We look
-    # at the last ``len(tool_calls)`` entries; the executor appends in
-    # call order, so this slice covers exactly this round.
+    # Parse verification/e2e outcomes from the trace tail. We look at the
+    # last ``len(tool_calls)`` entries; the executor appends in call order,
+    # so this slice covers exactly this round.
     trace_tool_calls = state.llm_trace.get("tool_calls") or []
     if not trace_tool_calls:
         return
     tail = trace_tool_calls[-len(tool_calls) :]
     for item in tail:
-        if str(item.get("tool") or "") != "run_workspace_verify":
+        tool_name = str(item.get("tool") or "")
+        is_e2e = tool_name == "run_real_e2e"
+        if tool_name not in {"run_workspace_verify", "run_real_e2e"}:
             continue
         result_text = _trace_result_text(item)
         if (
@@ -2884,6 +3290,13 @@ def _update_state_from_tool_calls(
             state.last_verify_summary = str(
                 payload.get("reason") or "verification skipped"
             )
+            if is_e2e:
+                state.last_e2e_run_id = ""
+                state.last_e2e_round = state.round_idx
+                state.last_e2e_passed = False
+                state.last_e2e_failed_count = 0
+                state.last_e2e_summary = state.last_verify_summary
+                state.last_e2e_phase_label = str(phase_label or "")
             continue
         state.last_verify_round = state.round_idx
         state.last_verify_passed = bool(payload.get("passed"))
@@ -2916,6 +3329,13 @@ def _update_state_from_tool_calls(
             state.last_verify_run_id = payload_run_id.strip()
         else:
             state.last_verify_run_id = f"round-{state.round_idx}"
+        if is_e2e:
+            state.last_e2e_run_id = state.last_verify_run_id
+            state.last_e2e_round = state.round_idx
+            state.last_e2e_passed = state.last_verify_passed
+            state.last_e2e_failed_count = state.last_verify_failed_count
+            state.last_e2e_summary = state.last_verify_summary
+            state.last_e2e_phase_label = str(phase_label or "")
 
 
 def _resolve_positive_int_env(name: str, default: int) -> int:
@@ -2939,6 +3359,8 @@ def _resolve_tool_round_max_tokens(base_max_tokens: int, has_tools: bool) -> int
 
 def _classify_llm_error(error: Exception) -> str:
     text = repr(error).lower()
+    if llm_error_looks_like_html_tunnel_page(text):
+        return "server_transient"
     if any(
         marker in text
         for marker in (
@@ -2964,17 +3386,29 @@ def _tool_preflight_repair_round_cap() -> int:
 def _select_forced_progress_tool(
     allowed_tool_names: set[str] | None,
 ) -> str | None:
-    """Pick a concrete write/verify tool for no-write recovery."""
+    """Pick a concrete write tool for no-write recovery.
+
+    This guard is entered specifically because a delivery phase has spent
+    several tool rounds without any workspace write. Forcing another verify at
+    that point can only re-observe the same broken state; the next useful
+    action must be an actual write-capable tool that can change the workspace.
+    """
+    allowed_write_tools = _allowed_workspace_write_tools(allowed_tool_names)
+    if not allowed_write_tools:
+        return None
     priority = (
-        "run_workspace_verify",
+        "apply_workspace_patch",
+        "repo_write_commit",
+        "sandbox_self_edit",
         "update_workspace_seed",
         "update_workspace_from_instance",
         "commit_workspace_changes",
+        "repo_commit_push",
     )
     for name in priority:
-        if allowed_tool_names is None or name in allowed_tool_names:
+        if name in allowed_write_tools:
             return name
-    return None
+    return allowed_write_tools[0]
 
 
 def _reject_tool_calls_under_no_write_enforcement(
@@ -3078,6 +3512,7 @@ def _maybe_inject_no_write_nudge(
 def _maybe_inject_no_write_tool_nudge(
     *,
     require: bool,
+    allowed_tool_names: frozenset | set[str] | None = None,
     phase_write_tool_calls: int,
     nudges_so_far: int,
     last_nudge_round: int,
@@ -3097,6 +3532,9 @@ def _maybe_inject_no_write_tool_nudge(
     at a concrete artifact-producing action without removing tool access.
     """
     if not require or not tool_calls:
+        return nudges_so_far, last_nudge_round
+    allowed_write_tools = _allowed_workspace_write_tools(allowed_tool_names)
+    if not allowed_write_tools:
         return nudges_so_far, last_nudge_round
     if phase_write_tool_calls > 0:
         return nudges_so_far, last_nudge_round
@@ -3130,6 +3568,7 @@ def _maybe_inject_no_write_tool_nudge(
     invoked_preview = ", ".join(invoked[:6]) or "<unknown tool>"
     if len(invoked) > 6:
         invoked_preview += ", ..."
+    write_tool_hint = ", ".join(f"`{name}`" for name in allowed_write_tools)
 
     log.warning(
         "[LOOP] Phase '%s' has %d tool rounds and 0 workspace writes; "
@@ -3150,8 +3589,8 @@ def _maybe_inject_no_write_tool_nudge(
                 f"round invoked: {invoked_preview}.\n"
                 f"Stop broad inspection of `workspaces/{workspace_id or '<workspace>'}/`. "
                 "On your next turn, choose one concrete progress action:\n"
-                "  - call `update_workspace_seed` (or another workspace write "
-                "tool) with actual project files,\n"
+                f"  - call one of the workspace write tools allowed in this "
+                f"phase ({write_tool_hint}) with actual project files,\n"
                 "  - call `run_workspace_command` only if it creates or "
                 "modifies files as part of a deterministic generation step, "
                 "then verify those files immediately,\n"
@@ -3165,6 +3604,488 @@ def _maybe_inject_no_write_tool_nudge(
         }
     )
     return nudges_so_far + 1, round_idx
+
+
+def _normalise_tool_command_text(value: Any) -> str:
+    if isinstance(value, dict):
+        raw = value.get("command") or value.get("argv") or value.get("cmd") or ""
+    else:
+        raw = value
+    if isinstance(raw, (list, tuple)):
+        raw = " ".join(str(part) for part in raw)
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").lower())
+
+
+def _success_test_command_fragments(success_text: str) -> list[str]:
+    text = str(success_text or "").strip()
+    if not text:
+        return []
+    fragments = [text]
+    py_c = re.search(r"(?i)(?:^|\s)-c\s+(.+)$", text)
+    if py_c:
+        fragments.append(py_c.group(1).strip().strip("`'\""))
+    return [
+        re.sub(r"[^a-z0-9]+", "", fragment.lower())
+        for fragment in fragments
+        if len(re.sub(r"[^a-z0-9]+", "", fragment.lower())) >= 20
+    ]
+
+
+def _tool_trace_entry_succeeded(item: dict[str, Any]) -> bool:
+    if item.get("is_error") is True:
+        return False
+    text = _trace_result_text(item)
+    if _pytest_output_is_skip_only(text):
+        return False
+    lowered = text.lower()
+    return (
+        text.lstrip().startswith("OK:")
+        or '"exit_code": 0' in text
+        or "'exit_code': 0" in text
+        or '"passed": true' in lowered
+        or "'passed': true" in lowered
+        or '"status": "ok"' in lowered
+        or "'status': 'ok'" in lowered
+    )
+
+
+_PYTEST_SKIP_ONLY_RE = re.compile(
+    r"(?im)^=+\s*(?P<skipped>\d+)\s+skipped"
+    r"(?:,\s*\d+\s+warnings?)?\s+in\s+[\d.]+s\s*=+\s*$"
+)
+_PYTEST_PASS_RE = re.compile(r"(?i)\b\d+\s+passed\b")
+_PYTEST_FAILURE_RE = re.compile(r"(?i)\b\d+\s+(?:failed|errors?|xfailed)\b")
+
+
+def _pytest_output_is_skip_only(output: str) -> bool:
+    text = str(output or "")
+    if not text:
+        return False
+    if _PYTEST_PASS_RE.search(text) or _PYTEST_FAILURE_RE.search(text):
+        return False
+    match = _PYTEST_SKIP_ONLY_RE.search(text)
+    return bool(match and int(match.group("skipped") or 0) > 0)
+
+
+def _current_execute_success_test_text(drive_root: pathlib.Path | None) -> str:
+    subtask = _current_execute_subtask(drive_root)
+    if not isinstance(subtask, dict):
+        return ""
+    raw = subtask.get("success_test")
+    if isinstance(raw, dict):
+        for key in ("value", "command", "cmd", "pytest_id", "verification", "text"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
+def _current_execute_subtask_id(drive_root: pathlib.Path | None) -> str:
+    subtask = _current_execute_subtask(drive_root)
+    if not isinstance(subtask, dict):
+        return ""
+    return str(subtask.get("id") or "").strip()
+
+
+def _current_execute_subtask(drive_root: pathlib.Path | None) -> dict[str, Any] | None:
+    if drive_root is None:
+        return None
+    try:
+        plan = json.loads((pathlib.Path(drive_root) / "state" / "phase_plan.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    nodes = plan.get("nodes") if isinstance(plan, dict) else None
+    if not isinstance(nodes, list):
+        return None
+    execute = next(
+        (node for node in nodes if isinstance(node, dict) and node.get("id") == "execute"),
+        None,
+    )
+    subtasks = execute.get("subtasks") if isinstance(execute, dict) else None
+    if not isinstance(subtasks, list):
+        return None
+    first = next(
+        (
+            item
+            for item in subtasks
+            if isinstance(item, dict) and str(item.get("status") or "").lower() != "done"
+        ),
+        None,
+    )
+    return first if isinstance(first, dict) else None
+
+
+def _execute_success_test_observed(
+    *,
+    success_text: str,
+    trace_tool_calls: list[dict[str, Any]],
+) -> bool:
+    text = str(success_text or "").strip()
+    if not text:
+        return False
+    fragments = _success_test_command_fragments(text)
+    lowered = text.lower()
+    explicit_tools = {
+        tool
+        for tool in (
+            "run_workspace_verify",
+            "run_unit_tests",
+            "harness_run",
+            "shell",
+        )
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(tool)}(?![A-Za-z0-9_])", lowered)
+    }
+    for item in trace_tool_calls or []:
+        if not _tool_trace_entry_succeeded(item):
+            continue
+        tool_name = str(item.get("tool") or "")
+        if tool_name in explicit_tools and tool_name != "shell":
+            return True
+        if tool_name == "shell":
+            command_text = _normalise_tool_command_text(item.get("args"))
+            if any(fragment and fragment in command_text for fragment in fragments):
+                return True
+    return False
+
+
+def _may_force_mark_subtask_complete(
+    *,
+    drive_root: pathlib.Path | None,
+    trace_tool_calls: list[dict[str, Any]],
+    phase_write_tool_calls: int,
+) -> bool:
+    if phase_write_tool_calls <= 0:
+        return False
+    success_text = _current_execute_success_test_text(drive_root)
+    return _execute_success_test_observed(
+        success_text=success_text,
+        trace_tool_calls=trace_tool_calls,
+    )
+
+
+def _trace_json_payload(item: dict[str, Any]) -> dict[str, Any]:
+    text = _trace_result_text(item).strip()
+    if not text.startswith("{"):
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _trace_tool_tags(item: dict[str, Any]) -> set[str]:
+    args = item.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    raw = args.get("tags") or args.get("tag") or ""
+    values: list[str] = []
+    if isinstance(raw, str):
+        values.extend(part.strip() for part in raw.replace(";", ",").split(","))
+        values.extend(part.strip() for part in raw.split())
+    elif isinstance(raw, (list, tuple, set)):
+        values.extend(str(part).strip() for part in raw)
+    return {value for value in values if value}
+
+
+def _trace_entry_satisfies_palace_prerequisite(
+    item: dict[str, Any],
+    *,
+    tool_names: set[str],
+    store: str,
+    tag: str,
+) -> tuple[bool, str]:
+    tool_name = str(item.get("tool") or "").strip()
+    if tool_names and tool_name not in tool_names:
+        return False, ""
+    if item.get("is_error") is True:
+        return False, ""
+    if tag:
+        tags = _trace_tool_tags(item)
+        if tags and tag not in tags:
+            return False, ""
+    text = _trace_result_text(item).lstrip()
+    if text.startswith(("ERROR:", "WARNING:", "TOOL_ERROR", "TOOL_DENIED")):
+        return False, ""
+    payload = _trace_json_payload(item)
+    if payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"blocked", "error", "failed", "missing", "not_found"}:
+            return False, ""
+        if tool_name == "palace_add" and payload.get("saved") is not True:
+            return False, ""
+        if store and str(payload.get("store") or "").strip() not in {"", store}:
+            return False, ""
+        if (
+            store == "palace.durable"
+            and tool_name == "promote_to_durable"
+            and str(payload.get("durable_store") or "").strip() != "palace.durable"
+        ):
+            return False, ""
+        memory_id = str(
+            payload.get("id")
+            or payload.get("memory_id")
+            or payload.get("artifact_id")
+            or payload.get("durable_node_id")
+            or ""
+        ).strip()
+        if memory_id:
+            return True, memory_id
+        if status in {"applied", "updated", "ok"} or payload.get("saved") is True:
+            return True, f"{tool_name}:{len(text)}"
+        return False, ""
+    if _completion_tool_result_is_success(text):
+        return True, f"{tool_name}:{len(text)}"
+    return False, ""
+
+
+def _trace_entry_satisfies_tool_prerequisite(
+    item: dict[str, Any],
+    *,
+    tool_name: str,
+) -> bool:
+    expected = str(tool_name or "").strip()
+    if not expected or str(item.get("tool") or "").strip() != expected:
+        return False
+    text = str(
+        item.get("result")
+        or item.get("result_preview")
+        or item.get("content")
+        or ""
+    ).strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if (
+        "tool_arg_error" in lowered
+        or lowered.startswith("error:")
+        or lowered.startswith("warning:")
+    ):
+        return False
+    payload = _trace_json_payload(item)
+    if payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"blocked", "error", "failed", "missing", "not_found"}:
+            return False
+        if payload.get("ok") is False or payload.get("passed") is False:
+            return False
+    return True
+
+
+def _phase_completion_prerequisite_status(
+    *,
+    completion_prerequisites: tuple[dict[str, Any], ...],
+    trace_tool_calls: list[dict[str, Any]],
+    candidate_tool: str,
+) -> tuple[dict[str, Any] | None, int, int, str]:
+    for rule in completion_prerequisites or ():
+        try:
+            needed = max(1, int(rule.get("n") or 1))
+        except (TypeError, ValueError):
+            needed = 1
+        if str(rule.get("kind") or "") == "tool_call":
+            tool = str(rule.get("tool") or "").strip()
+            count = sum(
+                1
+                for item in trace_tool_calls or []
+                if _trace_entry_satisfies_tool_prerequisite(item, tool_name=tool)
+            )
+            if count >= needed:
+                continue
+            if candidate_tool and candidate_tool == tool:
+                continue
+            return rule, count, needed, tool
+        tools = {
+            str(tool).strip()
+            for tool in (rule.get("tools") or [])
+            if str(tool).strip()
+        }
+        store = str(rule.get("store") or "").strip()
+        tag = str(rule.get("tag") or "").strip()
+        seen: set[str] = set()
+        for item in trace_tool_calls or []:
+            ok, memory_id = _trace_entry_satisfies_palace_prerequisite(
+                item,
+                tool_names=tools,
+                store=store,
+                tag=tag,
+            )
+            if ok:
+                seen.add(memory_id or f"{item.get('tool')}:{len(seen)}")
+        count = len(seen)
+        if count >= needed:
+            continue
+        if candidate_tool and candidate_tool in tools:
+            continue
+        preferred = next(iter(sorted(tools)), "")
+        return rule, count, needed, preferred
+    return None, 0, 0, ""
+
+
+def _append_phase_prerequisite_pending_message(
+    *,
+    messages: list[dict[str, Any]],
+    missing_rule: dict[str, Any],
+    prereq_count: int,
+    prereq_needed: int,
+    completion_tool: str,
+    preferred_tool: str,
+) -> str:
+    if str(missing_rule.get("kind") or "") == "tool_call":
+        tool_hint = preferred_tool or str(missing_rule.get("tool") or "").strip()
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "[REQUIRED_TOOL_CALLS_PENDING]\n"
+                    f"Do not call `{completion_tool}` yet. This phase still needs "
+                    f"`{tool_hint}` accepted {prereq_count}/{prereq_needed} "
+                    "time(s). Run the missing required check first, then "
+                    "call the phase-completion tool after all prior checks "
+                    "are satisfied."
+                ),
+            }
+        )
+        return tool_hint
+    store = str(missing_rule.get("store") or "palace").strip()
+    tag = str(missing_rule.get("tag") or "").strip()
+    tool_hint = preferred_tool or "the required memory-write tool"
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "[REQUIRED_MEMORY_WRITES_PENDING]\n"
+                f"Do not call `{completion_tool}` yet. This phase still needs "
+                f"`{tool_hint}` accepted {prereq_count}/{prereq_needed} "
+                f"time(s) for `{store}`"
+                + (f" with tag `{tag}`" if tag else "")
+                + ". Add concrete phase memory first, then call the "
+                "phase-completion tool after the prerequisite is satisfied."
+            ),
+        }
+    )
+    return preferred_tool
+
+
+def _maybe_force_required_phase_completion(
+    *,
+    terminating_tools: frozenset,
+    tool_calls: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    rounds_in_phase: int,
+    forced_progress_tool_choice: str | None,
+    accepted_terminating_tools: set[str] | frozenset[str] | None = None,
+    drive_root: pathlib.Path | None = None,
+    trace_tool_calls: list[dict[str, Any]] | None = None,
+    phase_write_tool_calls: int = 0,
+    completion_prerequisites: tuple[dict[str, Any], ...] = (),
+) -> str | None:
+    """After enough non-completion tool rounds, force the phase completion call.
+
+    Phase-run contracts already say "call this tool to complete the phase", but
+    live models sometimes keep browsing optional discovery tools until the
+    runner fails the phase. This keeps tools available while making the
+    required control-plane signal the next native tool call. For execute,
+    ``mark_subtask_complete`` is forceable only after a workspace write and
+    the active subtask's declared success test has already passed.
+    """
+    if not terminating_tools or rounds_in_phase < _REQUIRED_TERMINATION_NUDGE_AFTER_ROUNDS:
+        return forced_progress_tool_choice
+    invoked = {
+        str(tc.get("function", {}).get("name") or "").strip()
+        for tc in tool_calls
+        if str(tc.get("function", {}).get("name") or "").strip()
+    }
+    if invoked & set(terminating_tools):
+        missing_rule, prereq_count, prereq_needed, preferred_tool = (
+            _phase_completion_prerequisite_status(
+                completion_prerequisites=completion_prerequisites,
+                trace_tool_calls=list(trace_tool_calls or []),
+                candidate_tool="",
+            )
+        )
+        if missing_rule is not None:
+            completion_tool = next(iter(sorted(invoked & set(terminating_tools))), "")
+            tool_hint = _append_phase_prerequisite_pending_message(
+                messages=messages,
+                missing_rule=missing_rule,
+                prereq_count=prereq_count,
+                prereq_needed=prereq_needed,
+                completion_tool=completion_tool,
+                preferred_tool=preferred_tool,
+            )
+            return tool_hint or forced_progress_tool_choice
+        return forced_progress_tool_choice
+    accepted = set(accepted_terminating_tools or set())
+    allow_mark_subtask = (
+        "mark_subtask_complete" in terminating_tools
+        and _may_force_mark_subtask_complete(
+            drive_root=drive_root,
+            trace_tool_calls=list(trace_tool_calls or []),
+            phase_write_tool_calls=phase_write_tool_calls,
+        )
+    )
+    candidates = sorted(
+        name
+        for name in terminating_tools
+        if name
+        and name not in accepted
+        and (name != "mark_subtask_complete" or allow_mark_subtask)
+    )
+    if not candidates:
+        return forced_progress_tool_choice
+    chosen = candidates[0]
+    missing_rule, prereq_count, prereq_needed, preferred_tool = (
+        _phase_completion_prerequisite_status(
+            completion_prerequisites=completion_prerequisites,
+            trace_tool_calls=list(trace_tool_calls or []),
+            candidate_tool=chosen,
+        )
+    )
+    if missing_rule is not None:
+        tool_hint = _append_phase_prerequisite_pending_message(
+            messages=messages,
+            missing_rule=missing_rule,
+            prereq_count=prereq_count,
+            prereq_needed=prereq_needed,
+            completion_tool=chosen,
+            preferred_tool=preferred_tool,
+        )
+        return tool_hint or forced_progress_tool_choice
+    if forced_progress_tool_choice == chosen:
+        return forced_progress_tool_choice
+    current_subtask_id = (
+        _current_execute_subtask_id(drive_root)
+        if chosen == "mark_subtask_complete"
+        else ""
+    )
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "[REQUIRED_PHASE_COMPLETION_PENDING]\n"
+                f"You have spent {rounds_in_phase} rounds in this phase without "
+                f"calling the required phase-completion tool. Your next tool call "
+                f"is forced to `{chosen}`. Summarize the evidence you already have; "
+                "do not inspect unrelated tools or workspaces first."
+                + (
+                    "\nThe active execute subtask's declared success test has already passed. "
+                    + (
+                        "Call `mark_subtask_complete("
+                        f"subtask_id=\"{current_subtask_id}\", summary=..., evidence=[...])` now; "
+                        "put non-blocking extra checks in evidence/notes."
+                        if current_subtask_id
+                        else "Call `mark_subtask_complete` now; put non-blocking extra checks in evidence/notes."
+                    )
+                    if chosen == "mark_subtask_complete"
+                    else ""
+                )
+            ),
+        }
+    )
+    return chosen
 
 
 def _should_abort_no_write_tool_churn(
@@ -3386,11 +4307,16 @@ def _handle_no_tool_response_in_phase(
     messages.append({"role": "assistant", "content": content or ""})
     forced_progress_tool_choice = None
     if terminating_tools:
-        required = ", ".join(f"`{name}`" for name in sorted(terminating_tools))
+        missing_tools = _missing_terminating_tools_from_trace(
+            list(state.llm_trace.get("tool_calls") or []),
+            terminating_tools,
+        )
+        required_tools = missing_tools or set(terminating_tools)
+        required = ", ".join(f"`{name}`" for name in sorted(required_tools))
         log.warning(
             "[LOOP] Phase '%s' received text without required tool(s): %s",
             phase_label,
-            ", ".join(sorted(terminating_tools)),
+            ", ".join(sorted(required_tools)),
         )
         if pseudo_tool_text:
             log.warning(
@@ -3421,7 +4347,7 @@ def _handle_no_tool_response_in_phase(
                 ),
             }
         )
-        forced_progress_tool_choice = sorted(terminating_tools)[0]
+        forced_progress_tool_choice = sorted(required_tools)[0]
     return None, no_write_text_nudges, pseudo_text_nudges, forced_progress_tool_choice
 
 
@@ -3566,6 +4492,7 @@ def _process_tool_call_round_after_execution(
     memory_hooks: Any,
     terminating_tools: frozenset,
     drive_root: pathlib.Path | None,
+    completion_prerequisites: tuple[dict[str, Any], ...],
 ) -> tuple[
     tuple[tuple[str, dict[str, Any], dict[str, Any]] | None, str] | str | None,
     int,
@@ -3609,6 +4536,31 @@ def _process_tool_call_round_after_execution(
         allowed_tool_names=allowed_tool_names,
         phase_label=phase_label,
     )
+    if _recent_tool_results_have_stop_requested(state.llm_trace, len(tool_calls)):
+        stop_result = _check_stop_requested(
+            drive_root,
+            task_id,
+            state.accumulated_usage,
+            state.llm_trace,
+        )
+        if stop_result is not None:
+            return (
+                (stop_result, "final"),
+                phase_write_tool_calls,
+                no_write_tool_nudges,
+                last_no_write_tool_nudge_round,
+                forced_progress_tool_choice,
+                preflight_repair_rounds,
+            )
+        stop_message = "Stop requested by dashboard: tool reported stop_requested"
+        return (
+            ((stop_message, state.accumulated_usage, state.llm_trace), "final"),
+            phase_write_tool_calls,
+            no_write_tool_nudges,
+            last_no_write_tool_nudge_round,
+            forced_progress_tool_choice,
+            preflight_repair_rounds,
+        )
     preflight_tools = _preflight_failed_tool_names(
         tool_calls=tool_calls,
         trace_tool_calls=list(state.llm_trace.get("tool_calls") or []),
@@ -3645,7 +4597,7 @@ def _process_tool_call_round_after_execution(
         )
 
     phase_write_tool_calls += _count_workspace_write_tool_calls(tool_calls)
-    _update_state_from_tool_calls(state, tool_calls)
+    _update_state_from_tool_calls(state, tool_calls, phase_label=phase_label)
     impasse_message = _maybe_trip_completion_impasse(
         state=completion_impasse_guard,
         tool_calls=tool_calls,
@@ -3707,6 +4659,21 @@ def _process_tool_call_round_after_execution(
                 forbidden_strike_counts.pop(fn, None)
     _maybe_inject_repeated_read_guard(tool_calls, messages, repeated_read_guard)
     _maybe_inject_repeated_failure_guard(tool_calls, messages, repeated_failure_guard)
+    forced_progress_tool_choice = _maybe_force_required_phase_completion(
+        terminating_tools=terminating_tools,
+        tool_calls=tool_calls,
+        messages=messages,
+        rounds_in_phase=rounds_in_phase,
+        forced_progress_tool_choice=forced_progress_tool_choice,
+        accepted_terminating_tools=_accepted_terminating_tools_from_trace(
+            list(state.llm_trace.get("tool_calls") or []),
+            terminating_tools,
+        ),
+        drive_root=drive_root,
+        trace_tool_calls=list(state.llm_trace.get("tool_calls") or []),
+        phase_write_tool_calls=phase_write_tool_calls,
+        completion_prerequisites=completion_prerequisites,
+    )
 
     state.active_workspace_id = memory_hooks.observe_tool_calls(
         tool_calls=tool_calls,
@@ -3717,11 +4684,13 @@ def _process_tool_call_round_after_execution(
         verify_gate=verify_gate,
         repo_root=repo_root,
         current_workspace_id=state.active_workspace_id,
+        task_id=task_id,
     )
     previous_no_write_tool_nudges = no_write_tool_nudges
     no_write_tool_nudges, last_no_write_tool_nudge_round = (
         _maybe_inject_no_write_tool_nudge(
             require=require_writes_before_text_exit,
+            allowed_tool_names=allowed_tool_names,
             phase_write_tool_calls=phase_write_tool_calls,
             nudges_so_far=no_write_tool_nudges,
             last_nudge_round=last_no_write_tool_nudge_round,
@@ -3736,7 +4705,6 @@ def _process_tool_call_round_after_execution(
     no_write_tool_nudge_injected = no_write_tool_nudges > previous_no_write_tool_nudges
     if any(
         str(tc.get("function", {}).get("name") or "") in WRITE_TOOL_NAMES
-        or str(tc.get("function", {}).get("name") or "") == "run_workspace_verify"
         for tc in tool_calls
     ):
         forced_progress_tool_choice = None
@@ -3808,6 +4776,47 @@ def _call_llm_for_phase_round(
     dict[str, Any] | None, tuple[str, dict[str, Any], dict[str, Any]] | None
 ]:
     effective_tool_choice: Any = state.active_tool_choice
+    available_tool_names = _allowed_tool_names_from_schemas(tool_schemas)
+    if force_tool_choice and force_tool_choice not in available_tool_names:
+        append_jsonl(
+            drive_logs / "events.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "tool_choice_unavailable",
+                "task_id": task_id,
+                "phase": phase_label,
+                "tool": force_tool_choice,
+                "available": sorted(available_tool_names),
+            },
+        )
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "[TOOL_CHOICE_UNAVAILABLE]\n"
+                    f"The runtime wanted to force `{force_tool_choice}`, but that "
+                    "tool is not in the active schema for this phase. Continue with "
+                    "one of the active tools instead."
+                ),
+            }
+        )
+        force_tool_choice = None
+    if (
+        forced_progress_tool_choice
+        and forced_progress_tool_choice not in available_tool_names
+    ):
+        append_jsonl(
+            drive_logs / "events.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "tool_choice_unavailable",
+                "task_id": task_id,
+                "phase": phase_label,
+                "tool": forced_progress_tool_choice,
+                "available": sorted(available_tool_names),
+            },
+        )
+        forced_progress_tool_choice = None
     if force_tool_choice and tool_schemas:
         effective_tool_choice = {
             "type": "function",
@@ -3885,6 +4894,7 @@ def _handle_phase_tail_after_tool_round(
     task_type: str,
     drive_root: pathlib.Path | None,
     rounds_in_phase: int,
+    completion_prerequisites: tuple[dict[str, Any], ...],
 ) -> tuple[tuple[str, dict[str, Any], dict[str, Any]] | None, str] | None:
     if terminating_tools:
         invoked = {tc.get("function", {}).get("name", "") for tc in tool_calls}
@@ -3895,12 +4905,53 @@ def _handle_phase_tail_after_tool_round(
                 terminating_tools=terminating_tools,
             )
             if accepted:
-                log.info(
-                    "[LOOP] <<< Phase '%s' exited: accepted terminating tool(s) %s",
-                    phase_label,
-                    ",".join(sorted(accepted)),
+                missing_rule, prereq_count, prereq_needed, preferred_tool = (
+                    _phase_completion_prerequisite_status(
+                        completion_prerequisites=completion_prerequisites,
+                        trace_tool_calls=list(state.llm_trace.get("tool_calls") or []),
+                        candidate_tool="",
+                    )
                 )
-                return None, "terminated"
+                if missing_rule is not None:
+                    completion_tool = next(
+                        iter(sorted(invoked & set(terminating_tools))),
+                        next(iter(sorted(terminating_tools)), ""),
+                    )
+                    _append_phase_prerequisite_pending_message(
+                        messages=messages,
+                        missing_rule=missing_rule,
+                        prereq_count=prereq_count,
+                        prereq_needed=prereq_needed,
+                        completion_tool=completion_tool,
+                        preferred_tool=preferred_tool,
+                    )
+                    return "continue", "continue"
+                accepted_total = _accepted_terminating_tools_from_trace(
+                    list(state.llm_trace.get("tool_calls") or []),
+                    terminating_tools,
+                )
+                missing = set(terminating_tools) - accepted_total
+                if not missing:
+                    log.info(
+                        "[LOOP] <<< Phase '%s' exited: accepted terminating tool(s) %s",
+                        phase_label,
+                        ",".join(sorted(accepted_total)),
+                    )
+                    return None, "terminated"
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "[COMPLETION_TOOL_PARTIAL]\n"
+                            "Accepted phase-completion tool(s): "
+                            + ", ".join(f"`{name}`" for name in sorted(accepted_total))
+                            + ". Still required before this phase can exit: "
+                            + ", ".join(f"`{name}`" for name in sorted(missing))
+                            + ". Call the missing completion tool(s) now."
+                        ),
+                    }
+                )
+                return "continue", "continue"
             if rejected:
                 log.warning(
                     "[LOOP] Phase '%s' stays active: rejected terminating tool(s) %s",
@@ -4026,6 +5077,7 @@ def _prepare_llm_phase_round(
     emit_progress: Callable[[str], None],
     max_global_rounds: int,
     memory_hooks: Any,
+    available_tool_names: set[str] | None = None,
 ) -> None:
     _maybe_inject_self_check(
         state.round_idx,
@@ -4033,6 +5085,7 @@ def _prepare_llm_phase_round(
         messages,
         state.accumulated_usage,
         emit_progress,
+        available_tool_names=available_tool_names,
     )
     if _periodic_recall_enabled_for_phase(phase_label):
         state.last_periodic_recall_round = memory_hooks.maybe_inject_periodic_recall(
@@ -4043,6 +5096,7 @@ def _prepare_llm_phase_round(
             repo_root=repo_root,
             messages=messages,
             phase=phase_label,
+            task_id=task_id,
         )
     if verify_gate.should_remind(state.round_idx):
         messages.append(verify_gate.build_reminder(state.round_idx))
@@ -4159,6 +5213,7 @@ def _process_phase_tool_round(
     memory_hooks: Any,
     terminating_tools: frozenset,
     drive_root: pathlib.Path | None,
+    completion_prerequisites: tuple[dict[str, Any], ...],
 ) -> tuple[
     tuple[tuple[str, dict[str, Any], dict[str, Any]] | None, str] | str | None,
     int,
@@ -4195,6 +5250,7 @@ def _process_phase_tool_round(
         memory_hooks=memory_hooks,
         terminating_tools=terminating_tools,
         drive_root=drive_root,
+        completion_prerequisites=completion_prerequisites,
     )
 
 
@@ -4228,6 +5284,7 @@ def _run_llm_phase(
     require_writes_before_text_exit: bool = False,
     force_tool_choice: str | None = None,
     memory_hooks: Any = None,
+    completion_prerequisites: tuple[dict[str, Any], ...] = (),
 ) -> tuple[tuple[str, dict[str, Any], dict[str, Any]] | None, str]:
     """Drive one LLM phase until a terminating condition fires."""
     repeated_read_guard, repeated_failure_guard = (
@@ -4244,7 +5301,6 @@ def _run_llm_phase(
     no_write_text_nudges = no_write_tool_nudges = last_no_write_tool_nudge_round = 0
     phase_write_tool_calls = 0
     forced_progress_tool_choice: str | None = None
-    allowed_tool_names = _allowed_tool_names_from_schemas(tool_schemas)
     forbidden_strike_counts: dict[str, int] = {}
     plan_now_nudge_emitted = planner_discovery_nudge_emitted = (
         planner_external_nudge_emitted
@@ -4252,6 +5308,7 @@ def _run_llm_phase(
     preflight_repair_rounds = pseudo_text_nudges = 0
 
     while True:
+        allowed_tool_names = _allowed_tool_names_from_schemas(tool_schemas)
         rounds_in_phase, start_result = _start_llm_phase_round(
             state=state,
             phase_start_round=phase_start_round,
@@ -4287,6 +5344,7 @@ def _run_llm_phase(
             emit_progress=emit_progress,
             max_global_rounds=max_global_rounds,
             memory_hooks=memory_hooks,
+            available_tool_names=allowed_tool_names,
         )
 
         (
@@ -4409,6 +5467,7 @@ def _run_llm_phase(
             memory_hooks=memory_hooks,
             terminating_tools=terminating_tools,
             drive_root=drive_root,
+            completion_prerequisites=completion_prerequisites,
         )
         if tool_round_result is not None:
             if tool_round_result == "continue":
@@ -4430,6 +5489,7 @@ def _run_llm_phase(
             task_type=task_type,
             drive_root=drive_root,
             rounds_in_phase=rounds_in_phase,
+            completion_prerequisites=completion_prerequisites,
         )
         if tail_result is not None:
             if tail_result == ("continue", "continue"):
@@ -4865,6 +5925,7 @@ def run_llm_loop(
     prebuilt_plan_id: str = "",
     memory_hooks: Any = None,
     self_review_attempt: int = 0,
+    tool_filter: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Core LLM-with-tools loop.
 
@@ -4915,9 +5976,33 @@ def run_llm_loop(
             max_retries=max_retries,
         )
 
+    phase_allowed_tools, phase_denied_tools = _phase_tool_filter_sets(
+        task_type, tool_filter
+    )
+    phase_required_tools = _phase_required_tool_set(tool_filter)
+    phase_completion_prerequisites = _phase_completion_prerequisites(tool_filter)
     tool_schemas = tools.schemas(core_only=True)
+    _preload_phase_tool_schemas(
+        tools,
+        tool_schemas,
+        allowed=phase_allowed_tools,
+        denied=phase_denied_tools,
+        drive_logs=drive_logs,
+        task_id=task_id,
+    )
     tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(
-        tools, tool_schemas, messages
+        tools,
+        tool_schemas,
+        messages,
+        phase_allowed_tools=phase_allowed_tools,
+        phase_denied_tools=phase_denied_tools,
+    )
+    # Phase-manifest tool filter: allow/deny from Umbrella phase runner.
+    # Keep the list object live so enable_tools mutates the same schema set.
+    _apply_tool_filter_in_place(
+        tool_schemas,
+        allowed=phase_allowed_tools,
+        denied=phase_denied_tools,
     )
 
     tools._ctx.event_queue = event_queue
@@ -4939,11 +6024,27 @@ def run_llm_loop(
     task_main_text = _extract_task_brief(messages)
     mode = _planner.planner_mode()
     in_external_remediation = bool(remediation_attempt and remediation_attempt > 0)
-    use_planner = _planner.should_run_planner(
-        mode=mode,
-        task_main_text=task_main_text,
-        has_existing_plan=existing_plan is not None,
-    )
+    phase_run_owns_phase_contract = task_type == "phase_run"
+    if phase_run_owns_phase_contract:
+        if existing_plan is not None:
+            append_jsonl(
+                drive_logs / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "phase_run_internal_plan_ignored",
+                    "task_id": task_id,
+                    "phase": "init",
+                    "plan_id": str(getattr(existing_plan, "task_id", "") or ""),
+                },
+            )
+        existing_plan = None
+        use_planner = False
+    else:
+        use_planner = _planner.should_run_planner(
+            mode=mode,
+            task_main_text=task_main_text,
+            has_existing_plan=existing_plan is not None,
+        )
 
     # Expose the digest to the planner tool handler so propose_task_plan
     # can persist it without re-extracting from the message log.
@@ -5045,6 +6146,8 @@ def run_llm_loop(
                 base_messages=base_messages,
                 in_external_remediation=in_external_remediation,
                 external_remediation_attempt=int(remediation_attempt or 0),
+                phase_tool_names=phase_allowed_tools,
+                phase_required_tool_names=phase_required_tools,
                 memory_hooks=memory_hooks,
             )
 
@@ -5052,6 +6155,12 @@ def run_llm_loop(
         # workspace-write tool call before allowing a text-only exit, so the
         # model can no longer silently surrender on a task that produced
         # zero deliverables.
+        linear_required_tools = frozenset(phase_required_tools)
+        linear_requires_write_progress = True
+        if phase_run_owns_phase_contract:
+            linear_requires_write_progress = bool(
+                _allowed_workspace_write_tools(phase_allowed_tools)
+            )
         final, exit_reason = _run_llm_phase(
             state=state,
             messages=messages,
@@ -5075,11 +6184,12 @@ def run_llm_loop(
             max_global_rounds=max_global_rounds,
             max_rounds_label=max_rounds_label,
             phase_label="linear",
-            terminating_tools=frozenset(),
+            terminating_tools=linear_required_tools,
             max_phase_rounds=0,
-            terminate_on_text=True,
-            require_writes_before_text_exit=True,
+            terminate_on_text=not bool(linear_required_tools),
+            require_writes_before_text_exit=linear_requires_write_progress,
             memory_hooks=memory_hooks,
+            completion_prerequisites=phase_completion_prerequisites,
         )
         if final is not None:
             return final
@@ -5194,10 +6304,13 @@ def _subtask_phase_tool_schemas(
     *,
     tool_schemas: list[dict[str, Any]],
     in_external_remediation: bool,
+    phase_tool_names: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     subtask_tool_name_set = (
         _REMEDIATION_TOOL_NAMES if in_external_remediation else _SUBTASK_TOOL_NAMES
     )
+    if phase_tool_names:
+        subtask_tool_name_set = set(subtask_tool_name_set) | set(phase_tool_names)
     return (
         _tool_schemas_for_names(tool_schemas, subtask_tool_name_set),
         _tool_schemas_for_names(tool_schemas, _REMEDIATION_TOOL_NAMES),
@@ -5240,13 +6353,17 @@ def _drive_subtask_loop(
     base_messages: list[dict[str, Any]] | None = None,
     in_external_remediation: bool = False,
     external_remediation_attempt: int = 0,
+    phase_tool_names: set[str] | None = None,
+    phase_required_tool_names: set[str] | None = None,
     memory_hooks: Any = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     from ouroboros import task_planner as _planner
 
     subtask_tool_schemas, remediation_tool_schemas, review_tool_schemas = (
         _subtask_phase_tool_schemas(
-            tool_schemas=tool_schemas, in_external_remediation=in_external_remediation
+            tool_schemas=tool_schemas,
+            in_external_remediation=in_external_remediation,
+            phase_tool_names=phase_tool_names,
         )
     )
     isolate_phases = bool(base_messages) and _phase_isolation_enabled()
@@ -5467,12 +6584,28 @@ def _drive_subtask_loop(
             return final
         plan = plan_store.load(task_id)
 
+    final_required_tools = frozenset(
+        (phase_required_tool_names or set()) - {"mark_subtask_complete"}
+    )
     if plan is not None:
-        final_messages = _phase_messages(
-            _final_aggregation_block(plan, state, _planner)
-        )
+        final_block = _final_aggregation_block(plan, state, _planner)
+        if final_required_tools:
+            final_block["content"] = (
+                str(final_block.get("content") or "")
+                + "\n\n[UMBRELLA_PHASE_COMPLETION]\n"
+                + "Before this phase can exit, call the required phase-completion "
+                + "tool(s): "
+                + ", ".join(f"`{name}`" for name in sorted(final_required_tools))
+                + ". Do not answer with prose only."
+            )
+        final_messages = _phase_messages(final_block)
     else:
         final_messages = messages
+    final_tool_schemas = (
+        _tool_schemas_for_names(tool_schemas, final_required_tools)
+        if final_required_tools
+        else []
+    )
     final, exit_reason = _run_llm_phase(
         state=state,
         messages=final_messages,
@@ -5487,7 +6620,7 @@ def _drive_subtask_loop(
         event_queue=event_queue,
         drive_root=drive_root,
         deadline_monotonic=deadline_monotonic,
-        tool_schemas=[],
+        tool_schemas=final_tool_schemas,
         stateful_executor=stateful_executor,
         repo_root=repo_root,
         verify_gate=verify_gate,
@@ -5496,12 +6629,12 @@ def _drive_subtask_loop(
         max_global_rounds=max_global_rounds,
         max_rounds_label=max_rounds_label,
         phase_label="final_aggregation",
-        terminating_tools=frozenset(),
+        terminating_tools=final_required_tools,
         # Tier 1.2: bumped from 2 -> 3 to give the pseudo-text-nudge a
         # round to recover after a single botched attempt without
         # blowing budget on stubborn models.
         max_phase_rounds=3,
-        terminate_on_text=True,
+        terminate_on_text=not bool(final_required_tools),
         memory_hooks=memory_hooks,
     )
     if final is not None:

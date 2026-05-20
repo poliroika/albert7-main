@@ -144,7 +144,11 @@ GMAS (`multi_agent_gmas`) is the required implementation path for
 LLM-backed workspace agents in this repo. Umbrella auto-detects tasks that
 touch an LLM, prompts, summarization, classification, generation,
 embeddings, RAG, autonomous workflows, planners, or tool-using agents
-and loads GMAS context before the first write. Use
+and loads GMAS context before the first write of an active subtask that
+actually implements LLM/agent/GMAS/bot behavior. Setup, dependency,
+README, env, or frontend/backend scaffold subtasks may mention GMAS without
+needing the hard pre-write gate; retrieve GMAS before writing the agent/LLM
+implementation itself. Use
 `configure_workspace_skills(..., enabled=false, reason="...")` only for
 an explicit, audited opt-out when the task truly has no LLM/model
 surface.

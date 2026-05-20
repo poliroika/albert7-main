@@ -234,9 +234,23 @@ class WebBridgeHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/memory":
-            self._send_json(
-                app.list_memory_nodes(q.get("workspace_id"), q.get("run_id"))
-            )
+            result = app.list_memory_nodes(q.get("workspace_id"), q.get("run_id"))
+            if q.get("include_palace") == "1":
+                try:
+                    import os
+                    import pathlib
+                    from umbrella.memory.palace.facade import MemPalace
+                    repo_root = pathlib.Path(os.environ.get("UMBRELLA_REPO_ROOT", "."))
+                    palace = MemPalace(repo_root, q.get("workspace_id") or "")
+                    palace_nodes = palace.search("", n=100)
+                    if isinstance(result, dict) and "nodes" in result:
+                        result["palace_nodes"] = palace_nodes
+                        result["palace_count"] = len(palace_nodes)
+                    elif isinstance(result, list):
+                        result = {"nodes": result, "palace_nodes": palace_nodes}
+                except Exception:
+                    pass
+            self._send_json(result)
             return
         m = re.fullmatch(r"/api/memory/([^/]+)", path)
         if m:
@@ -277,6 +291,22 @@ class WebBridgeHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/mcp/servers":
             self._send_json(app.list_mcp_servers())
+            return
+
+        m = re.fullmatch(r"/api/runs/([^/]+)/phases", path)
+        if m:
+            self._send_json(self._get_phase_plan(m.group(1)))
+            return
+
+        m = re.fullmatch(r"/api/runs/([^/]+)/report", path)
+        if m:
+            self._send_json(self._get_run_report(m.group(1), q.get("workspace_id", "")))
+            return
+
+        if path == "/api/palace":
+            self._send_json(
+                self._list_palace_nodes(q.get("workspace_id"), q.get("query", ""), q.get("store"))
+            )
             return
 
         self._serve_static(path)
@@ -407,6 +437,48 @@ class WebBridgeHandler(BaseHTTPRequestHandler):
             self._send_json(result, status=status)
             return
         raise FileNotFoundError(path)
+
+    def _get_phase_plan(self, run_id: str) -> dict:
+        import json
+        import os
+        import pathlib
+        repo_root = pathlib.Path(os.environ.get("UMBRELLA_REPO_ROOT", "."))
+        drive_candidates = list(repo_root.glob("workspaces/*/.memory/drive/state/phase_plan.json"))
+        for candidate in drive_candidates:
+            try:
+                data = json.loads(candidate.read_text())
+                if data.get("run_id") == run_id or not run_id:
+                    return {"ok": True, "data": data}
+            except Exception:
+                pass
+        return {"ok": False, "error": "no phase plan found", "run_id": run_id}
+
+    def _get_run_report(self, run_id: str, workspace_id: str) -> dict:
+        import os
+        import pathlib
+        from umbrella.web_bridge.api.report_api import get_run_report
+        repo_root = pathlib.Path(os.environ.get("UMBRELLA_REPO_ROOT", "."))
+        if workspace_id:
+            drive_root = repo_root / "workspaces" / workspace_id / ".memory" / "drive"
+        else:
+            drive_root = repo_root / ".umbrella"
+        return get_run_report(run_id, workspace_id, drive_root=drive_root)
+
+    def _list_palace_nodes(self, workspace_id: str | None, query: str, store: str | None) -> dict:
+        try:
+            import os
+            import pathlib
+            from umbrella.memory.palace.facade import MemPalace
+            repo_root = pathlib.Path(os.environ.get("UMBRELLA_REPO_ROOT", "."))
+            palace = MemPalace(repo_root, workspace_id or "")
+            nodes = palace.search(
+                query or "memory",
+                stores=[store] if store else None,
+                n=50,
+            )
+            return {"ok": True, "data": {"nodes": nodes, "total": len(nodes), "workspace_id": workspace_id}}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def _serve_static(self, request_path: str) -> None:
         asset_like = request_path.startswith("/static/") or bool(

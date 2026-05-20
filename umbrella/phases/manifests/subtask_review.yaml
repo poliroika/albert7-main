@@ -1,0 +1,50 @@
+id: subtask_review
+version: 1
+description: "Mini-review gate after each subtask: assess completion quality, decide whether to proceed, revise, or request extra work."
+
+prompt_files:
+  system:
+    - umbrella/prompts/phases/subtask_review.system.md
+
+allowed_tools:
+  - load_skill
+  - palace_search
+  - submit_micro_review
+  - add_phase
+  - loop_back_to
+  - request_extra_subtask
+  - revise_remaining_plan
+
+forbidden_tools:
+  - apply_workspace_patch
+  - shell
+  - terminal_session
+  - repo_write_commit
+  - palace_add
+  - claude_code_edit
+  - sandbox_self_edit
+
+allowed_skills:
+  - review-checklist
+
+memory:
+  always_on:
+    - {store: palace.charter, tier: always_on}
+  hot:
+    - {store: palace.run, tags: [subtask_card, subtask_artifact, execution_error]}
+  warm_search: []
+  write_rules:
+    subtask_verdict: {store: palace.run, tier: hot, scope: subtask_scoped}
+
+permissions:
+  rules:
+    - allow_tools: [load_skill, palace_search, submit_micro_review, add_phase, loop_back_to, request_extra_subtask, revise_remaining_plan]
+    - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
+
+exit_criteria:
+  required_calls: [submit_micro_review]
+
+mini_review_after: null
+
+budgets:
+  max_tokens: 10000

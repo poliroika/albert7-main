@@ -27,6 +27,7 @@ from ouroboros.utils import (
     truncate_for_log,
     get_git_info,
     sanitize_task_for_event,
+    task_artifact_stem,
 )
 from ouroboros.llm import LLMClient
 from ouroboros.tools import ToolRegistry
@@ -55,9 +56,15 @@ def _is_effective_write_tool_call(
         return False
 
     result = str(tc.get("result") or "").lstrip()
+    if result.startswith("OK:"):
+        return True
     if "GIT_NO_CHANGES" in result[:120]:
         return False
-    if result.startswith(("ERROR:", "GIT_ERROR", "WARNING:")):
+    if "GIT_COMMIT_DISABLED_BY_POLICY" in result[:500]:
+        return False
+    if result.startswith(("ERROR:", "GIT_ERROR", "FILE_WRITE_ERROR", "WARNING:")):
+        return False
+    if any(marker in result[:300] for marker in ("TOOL_DENIED", "TOOL_ERROR", "PATH_ERROR")):
         return False
     return True
 
@@ -416,6 +423,8 @@ class OuroborosAgent:
             if isinstance(raw_overrides, dict)
             else {}
         )
+        raw_overlays = task.get("context_overlays")
+        context_overlays = dict(raw_overlays) if isinstance(raw_overlays, dict) else {}
 
         # Set tool context for this task
         ctx = ToolContext(
@@ -426,6 +435,7 @@ class OuroborosAgent:
             pending_events=self._pending_events,
             current_chat_id=self._current_chat_id,
             current_task_type=self._current_task_type,
+            context_overlays=context_overlays,
             workspace_root_overrides=workspace_root_overrides,
             emit_progress_fn=self._emit_progress,
             event_queue=self._event_queue,
@@ -553,6 +563,7 @@ class OuroborosAgent:
                     prebuilt_plan_id=str(task.get("prebuilt_plan_id") or ""),
                     memory_hooks=self.memory_hooks,
                     self_review_attempt=self_review_attempt,
+                    tool_filter=task.get("tool_filter"),
                 )
             except Exception as e:
                 tb = traceback.format_exc()
@@ -731,8 +742,9 @@ class OuroborosAgent:
                 "model": active_model or None,
                 "ts": utc_now_iso(),
             }
-            result_file = results_dir / f"{task.get('id')}.json"
-            tmp_file = results_dir / f"{task.get('id')}.json.tmp"
+            result_stem = task_artifact_stem(str(task.get("id") or ""))
+            result_file = results_dir / f"{result_stem}.json"
+            tmp_file = results_dir / f"{result_stem}.json.tmp"
             tmp_file.write_text(
                 json.dumps(result_data, ensure_ascii=False, indent=2),
                 encoding="utf-8",

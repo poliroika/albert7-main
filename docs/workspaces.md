@@ -1,78 +1,61 @@
 # Workspaces
 
-Workspace — это основная единица производства в Umbrella: прикладная система, заточенная под
-определённый класс задач. Каждый workspace содержит граф агентов, промпты, модели, evals и
-артефакты, работающие поверх GMAS.
+A workspace is the primary unit of production in Umbrella: an application system built to solve a specific class of tasks. Each workspace contains agent graphs, prompts, models, evals, and artifacts, all running on GMAS.
 
-## Seed и task-instance
+## Seed and Task-Instance
 
-Система разделяет workspaces на два уровня, чтобы стабильные шаблоны не засорялись
-экспериментальными патчами конкретных задач.
+The system separates workspaces into two levels to keep stable templates clean from experimental patches of specific tasks.
 
-### Seed workspace
+### Seed Workspace
 
-Стабильный шаблон, созданный человеком. Живёт в `workspaces/<workspace_id>/`.
+A stable template created by a human. Lives in `workspaces/<workspace_id>/`.
 
-Характеристики:
+Characteristics:
 
-- Версионируется в git.
-- Не патчится автоматически — изменения проходят через promotion (минимальный eval score 0.7).
-- Определяет базовый граф, промпты, роли, инструменты и политики для класса задач.
-- Содержит `TASK_MAIN.md` с общей миссией seed.
+- Version-controlled in git.
+- Not auto-patched — changes go through promotion (minimum eval score 0.7).
+- Defines the base graph, prompts, roles, tools, and policies for the task class.
+- Contains `TASK_MAIN.md` with the seed's general mission.
 
-Зарегистрированные seed workspaces перечислены в `workspaces/registry.toml`:
+Registered seeds are listed in `workspaces/registry.toml`:
 
 ```toml
 version = "0.1.0"
-seeds = ["agent_research", "world_prediction"]
+seeds = ["multi_agent_debate_graph"]
 instances = []
 ```
 
-### Task-instance
+### Task-Instance
 
-Мутабельная копия seed под конкретную задачу. Создаётся автоматически через
-`create_task_instance()` (модуль `umbrella/workspace_runtime/instances.py`).
+A mutable copy of a seed for a specific task. Created automatically via `create_task_instance()` in `umbrella/workspace_runtime/instances.py`.
 
-Путь instance: `workspaces/<seed_id>/instances/<instance_id>_<timestamp>/`.
+Instance path: `workspaces/<seed_id>/instances/<instance_id>_<timestamp>/`.
 
-При создании instance происходит:
+On creation:
 
-1. Копирование файлов seed (за исключением `runs/`, `snapshots/`, `reports/`, `memory/`,
-   `logs/`, `instances/`, `__pycache__/`, `.git/`).
-2. Создание служебных каталогов: `runs/`, `snapshots/`, `reports/`, `memory/`, `logs/`.
-3. Перезапись идентичности workspace (новый `workspace_id`, привязка к `task_id`).
-4. Инициализация `TASK_MAIN.md` из task brief.
-5. Запись lineage-метаданных.
+1. Copy seed files (excluding `runs/`, `snapshots/`, `reports/`, `memory/`, `logs/`, `instances/`, `__pycache__/`, `.git/`).
+2. Create runtime directories: `runs/`, `snapshots/`, `reports/`, `memory/`, `logs/`.
+3. Overwrite workspace identity (new `workspace_id`, linked to `task_id`).
+4. Initialize `TASK_MAIN.md` from the task brief.
+5. Record lineage metadata.
 
-Instance — основная зона итеративного улучшения. Ouroboros свободно модифицирует графы,
-промпты, evals и эксперименты внутри instance, оценивает результат и повторяет цикл.
+The task-instance is the primary surface for iterative improvement. The Worker-Ouroboros freely modifies graphs, prompts, evals, and experiments within the instance, evaluates the result, and repeats the cycle.
 
-По завершении задачи полезные патчи могут быть promoted обратно в seed через review.
+Upon task completion, useful patches may be **promoted** back to the seed through review.
 
-## Обязательные файлы workspace
+## Required Workspace Files
 
 ### workspace.toml
 
-Контракт workspace: описание структуры, ссылки на файлы, список мутабельных путей.
+The workspace contract: structure description, file references, mutable paths list.
 
-Пример (`workspaces/agent_research/workspace.toml`):
+Example:
 
 ```toml
-workspace_id = "agent_research"
-name = "Agent Research"
-description = "A gMAS-first article writing workspace..."
+workspace_id = "my_workspace"
+name = "My Workspace"
+description = "Description of what this workspace does"
 task_main_file = "TASK_MAIN.md"
-graph_file = "graph/topology.toml"
-agents_dir = "agents"
-prompts_dir = "prompts"
-tools_allowlist_file = "tools/allowlist.toml"
-models_file = "models/models.toml"
-policies_file = "policies.toml"
-evals_dir = "evals"
-experiments_dir = "experiments"
-runs_dir = "runs"
-snapshots_dir = "snapshots"
-reports_dir = "reports"
 
 mutable_paths = [
     "graph", "agents", "prompts", "tools", "models",
@@ -83,117 +66,123 @@ mutable_paths = [
 owner = "manual"
 engine = "gmas"
 engine_mutable = false
-notes = "Standalone workspace. No ouroboros dependency."
 ```
 
-Ключевые поля:
+Key fields:
 
-| Поле | Назначение |
-|------|------------|
-| `workspace_id` | Уникальный идентификатор workspace |
-| `task_main_file` | Путь к `TASK_MAIN.md` |
-| `graph_file` | Файл топологии графа GMAS |
-| `mutable_paths` | Каталоги, разрешённые для автоматических изменений |
-| `metadata.engine` | Фреймворк (`gmas`) |
-| `metadata.engine_mutable` | Можно ли менять движок (всегда `false`) |
+| Field | Purpose |
+|-------|---------|
+| `workspace_id` | Unique identifier |
+| `task_main_file` | Path to `TASK_MAIN.md` |
+| `mutable_paths` | Directories allowed for automatic changes |
+| `metadata.engine` | Framework (`gmas`) |
+| `metadata.engine_mutable` | Can the engine be edited? (always `false`) |
 
 ### TASK_MAIN.md
 
-Главный задачный контракт workspace. Хранит цель, deliverables, критерии успеха и ограничения.
+The primary task contract. Stores the goal, deliverables, success criteria, and constraints.
 
-Для seed — это общая миссия шаблона. Для instance — конкретная прикладная задача.
+For seeds: the general mission of the template. For instances: the specific task.
 
-Менеджер и рантайм опираются на `TASK_MAIN.md` как на основной task brief. Пример
-из `workspaces/agent_research/TASK_MAIN.md`:
+Example:
 
 ```markdown
 ## Objective
-Develop a multi-agent workspace that can take a user's topic or query,
-perform the necessary research, plan the article structure, write a draft,
-revise weak sections, and deliver a convincing final article.
+What the workspace should do.
 
 ## Success Criteria
-- The workspace can complete the full article-writing loop
-- The final article is coherent, structured, and useful
-- Weak drafts are improved through review and revision
+- Criterion 1
+- Criterion 2
+
+## Constraints
+- Constraint 1
 ```
 
-### seed_profile.toml
+The PhaseRunner, Worker, and Watcher all reference `TASK_MAIN.md` as the source of truth for what the workspace is trying to accomplish.
 
-Профиль seed workspace с метаданными для автоматического выбора: capabilities, task classes,
-selection hints.
+### seed_profile.toml (optional)
+
+Metadata for automatic workspace selection: capabilities, task classes, selection hints.
 
 ```toml
-name = "Agent Research"
-maturity = "stable"
-primary_task_classes = ["article_writing", "article_research"]
-human_dependency_level = "medium"
+name = "My Workspace"
+maturity = "experimental"
+primary_task_classes = ["my_task_class"]
 
 [[capabilities]]
-name = "article_writing"
-description = "Write technical articles from research through final delivery"
-weight = 1.5
+name = "my_capability"
+description = "What this workspace can do"
+weight = 1.0
 
 [selection_hints]
-task_classes = ["article_writing", "article_research"]
-keywords = ["article", "research", "writing", "paper"]
-preferred_for_domains = ["technology", "software_engineering", "science"]
+keywords = ["keyword1", "keyword2"]
 ```
 
-## Обнаружение workspace
+## Workspace Discovery
 
-Модуль `umbrella/workspace_registry/discovery.py` сканирует файловую систему в поисках
-`workspace.toml`:
+`umbrella/workspace_registry/discovery.py` scans the filesystem for `workspace.toml`:
 
-1. Рекурсивный обход `workspaces/**/workspace.toml`.
-2. Игнорирование служебных каталогов: `runs`, `snapshots`, `reports`, `memory`, `logs`,
-   `__pycache__`, `.git`, `archived`.
-3. Загрузка конфигурации в `WorkspaceRef`.
-4. Для seed — дополнительная загрузка `seed_profile.toml` в `SeedWorkspaceProfile`.
+1. Recursive traversal of `workspaces/**/workspace.toml`.
+2. Ignores runtime directories: `runs`, `snapshots`, `reports`, `memory`, `logs`, `__pycache__`, `.git`, `archived`.
+3. Loads configuration into `WorkspaceRef`.
+4. For seeds: loads additional `seed_profile.toml` into `SeedWorkspaceProfile`.
 
-Всё это оркестрируется через `WorkspaceRegistry` (`umbrella/workspace_registry/registry.py`),
-который предоставляет API: `discover()`, `register_workspace()`, `get_workspace()`,
-`get_seed_profile()`, `match()` и `select_best()`.
+Everything is orchestrated through `WorkspaceRegistry` (`umbrella/workspace_registry/registry.py`):
 
-Отдельный нюанс текущей реализации: policy engine в `umbrella/policies/engine.py` пока
-жёстко выделяет `workspaces/agent_research` как canonical seed при классификации edit surface.
-Архитектурно модель уже шире (`workspaces/registry.toml` содержит несколько seed), но
-часть policy-логики всё ещё ориентирована на канонический seed.
+- `discover()` — find all workspaces
+- `register_workspace()` — register a workspace
+- `get_workspace()` — get by ID
+- `get_seed_profile()` — get seed metadata
+- `match()` — find workspaces matching a task
+- `select_best()` — pick the best workspace for a task
 
 ## Lineage
 
-Каждый instance хранит запись о происхождении:
+Each instance stores its origin record:
 
-- Из какого seed создан.
-- Под какую задачу (`task_id`).
-- Какие итерации и патчи были сделаны.
-- Какие патчи оказались полезными и были promoted в seed.
+- Which seed it was created from.
+- Which task (`task_id`).
+- What iterations and patches were applied.
+- Which patches were useful and promoted to seed.
 
-Модель lineage определена в `umbrella/workspace_registry/models.py` (`WorkspaceLineageRecord`).
+The lineage model is defined in `umbrella/workspace_registry/models.py` (`WorkspaceLineageRecord`).
 
-## Структура каталогов workspace
+## Workspace and Phase Execution
+
+In the phase-driven model, a workspace run proceeds as follows:
+
+1. The PhaseRunner loads the workspace's `TASK_MAIN.md` and creates a `PhasePlan`.
+2. The **preflight** phase checks environment readiness.
+3. The **research** phase studies the task and drafts architecture.
+4. The **plan** phase builds subtask cards.
+5. The **execute** phase runs subtasks, writing code within the workspace instance.
+6. The **verify** phase runs workspace verification (tests, e2e).
+7. The **FinalReport** captures all changes and evidence.
+
+During execution, the Worker writes only within the workspace instance directory (enforced by `PermissionEnvelope` with path policies). The root repository, `umbrella/`, `ouroboros/`, and `gmas/` are all denied.
+
+## Directory Structure
 
 ```
-workspaces/agent_research/
-    workspace.toml          # контракт workspace
-    TASK_MAIN.md            # задачный контракт
-    seed_profile.toml       # профиль seed для реестра
+workspaces/<workspace_id>/
+    workspace.toml          # workspace contract
+    TASK_MAIN.md            # task contract
+    seed_profile.toml       # seed profile (optional)
     graph/
-        topology.toml       # граф агентов GMAS
-    agents/                 # конфиги агентов (.toml)
-    prompts/                # промпты агентов (.md)
+        topology.toml       # GMAS agent graph topology
+    agents/                 # agent configs (.toml)
+    prompts/                # agent prompts (.md)
     tools/
-        allowlist.toml      # разрешённые инструменты
+        allowlist.toml      # allowed tools
     models/
-        models.toml         # конфигурация LLM-моделей
-    policies.toml           # локальные политики workspace
+        models.toml         # LLM model configuration
+    policies.toml           # workspace-local policies
     evals/                  # eval harness
-    experiments/            # эксперименты и скрипты запуска
-    runs/                   # результаты запусков (runtime)
-    snapshots/              # снимки состояния (runtime)
-    reports/                # сгенерированные отчёты (runtime)
+    experiments/            # experiments and launch scripts
+    runs/                   # run results (runtime)
+    snapshots/              # state snapshots (runtime)
+    reports/                # generated reports (runtime)
     instances/              # task-instances (runtime)
 ```
 
-Каталоги `runs/`, `snapshots/`, `reports/`, `memory/`, `logs/` и `instances/`
-заполняются в рантайме и не входят в seed-шаблон.
+`runs/`, `snapshots/`, `reports/`, `memory/`, `logs/`, and `instances/` are populated at runtime and are not part of the seed template.

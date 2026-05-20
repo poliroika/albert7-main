@@ -10,11 +10,13 @@ from umbrella.integration.ouroboros_bridge import (
     workspace_drive_root,
 )
 from umbrella.integration.ouroboros_launcher import OuroborosLauncher
+from umbrella.memory.palace_backend import clear_palace_backend_cache, get_palace_backend
 from umbrella.memory.models import (
     MemoryConfig,
     WorkspaceLessonRecord,
     generate_lesson_id,
 )
+from umbrella.memory.paths import palace_path_for
 from umbrella.memory.store import MemoryStore
 
 
@@ -74,6 +76,45 @@ def test_sync_umbrella_context_to_drive_writes_state_and_memory_bridge() -> None
         assert "retrieval-first patches converge faster" in knowledge_index.lower()
 
 
+def test_sync_umbrella_context_to_drive_reads_workspace_palace_memory(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path
+    (repo_root / "ouroboros").mkdir(parents=True, exist_ok=True)
+    workspace_id = "civilization"
+    palace_dir = palace_path_for(repo_root, workspace_id)
+    backend = get_palace_backend(palace_dir)
+    try:
+        backend.add(
+            workspace_id=workspace_id,
+            event_type="research",
+            room="research",
+            title="Captured GMAS finding",
+            content="Use MACPRunner from workspace palace, not manager palace.",
+            kind="research_finding",
+            tags=["research_finding", "gmas"],
+        )
+    finally:
+        backend.close()
+        clear_palace_backend_cache(palace_dir)
+
+    drive_root = workspace_drive_root(repo_root, workspace_id)
+    sync_umbrella_context_to_drive(
+        repo_root,
+        drive_root,
+        workspace_id=workspace_id,
+        task_input="Build a GMAS civilization game",
+        task_id="task_bridge",
+    )
+
+    knowledge_index = (drive_root / "memory" / "knowledge" / "_index.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Umbrella Memory Bridge" in knowledge_index
+    assert "Captured GMAS finding" in knowledge_index
+    assert "Use MACPRunner from workspace palace" in knowledge_index
+
+
 def test_workspace_drive_root_is_scoped_to_workspace() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_root = Path(tmpdir)
@@ -85,7 +126,7 @@ def test_workspace_drive_root_is_scoped_to_workspace() -> None:
         )
 
 
-def test_launcher_uses_real_ouroboros_repo_with_host_root(monkeypatch) -> None:
+def test_launcher_uses_host_repo_as_agent_repo_with_host_root(monkeypatch) -> None:
     captured: dict[str, str] = {}
 
     class _FakeAgent:
@@ -99,6 +140,7 @@ def test_launcher_uses_real_ouroboros_repo_with_host_root(monkeypatch) -> None:
         drive_root: str,
         host_repo_root: str | None = None,
         event_queue=None,
+        **kwargs,
     ):
         captured["repo_dir"] = repo_dir
         captured["drive_root"] = drive_root
@@ -115,7 +157,7 @@ def test_launcher_uses_real_ouroboros_repo_with_host_root(monkeypatch) -> None:
         result = launcher._process_task({"id": "task_real_repo", "input": "inspect"})
 
     assert result["status"] == "complete"
-    assert captured["repo_dir"] == str(resolve_ouroboros_repo_root(repo_root))
+    assert captured["repo_dir"] == str(repo_root)
     assert captured["host_repo_root"] == str(repo_root)
 
 

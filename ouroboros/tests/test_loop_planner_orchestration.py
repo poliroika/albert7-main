@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+pytestmark = pytest.mark.skip(reason="Legacy planner loop logic superseded by PhaseRunner")
 
 from ouroboros.task_planner import (
     PLANNER_MODE_ALWAYS,

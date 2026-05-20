@@ -28,6 +28,7 @@ Implementation notes:
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -58,6 +59,18 @@ _BUDGET_LOCK = threading.Lock()
 _BUDGET_USED: dict[str, int] = {}
 
 
+_FAST_SEARCH_PROVIDER_ENV = (
+    "SERPER_API_KEY",
+    "TAVILY_API_KEY",
+    "BRAVE_API_KEY",
+    "BING_SEARCH_API_KEY",
+    "BING_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_CSE_ID",
+    "OPENAI_API_KEY",
+)
+
+
 def _budget_for_run() -> int:
     raw = (os.environ.get("OUROBOROS_DEEP_SEARCH_BUDGET") or "").strip()
     try:
@@ -73,6 +86,21 @@ def _enabled() -> bool:
 
 def _provider_name() -> str:
     return (os.environ.get("OUROBOROS_DEEP_SEARCH_PROVIDER") or "").strip().lower()
+
+
+def _slow_fallback_allowed() -> bool:
+    raw = (
+        os.environ.get("OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK")
+        or os.environ.get("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO")
+        or ""
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _has_fast_search_provider() -> bool:
+    if _provider_name():
+        return True
+    return any(os.environ.get(name, "").strip() for name in _FAST_SEARCH_PROVIDER_ENV)
 
 
 def reset_budget_for_task(task_id: str | None) -> None:
@@ -162,8 +190,10 @@ def _parse_formatted_results(text: str) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
     for block in blocks:
-        lines = [line for line in block.splitlines() if line.strip()]
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
         if not lines:
+            continue
+        if len(lines) == 1 and re.match(r"(?i)^found\s+\d+\s+result", lines[0]):
             continue
         title = lines[0]
         url = ""
@@ -179,7 +209,7 @@ def _parse_formatted_results(text: str) -> list[dict[str, str]]:
                 snippet_parts.append(line)
         out.append(
             {
-                "title": title.lstrip("0123456789. ").strip(),
+                "title": re.sub(r"^\[?\d+\]?\s*[\.)-]?\s*", "", title).strip(),
                 "url": url,
                 "snippet": " ".join(snippet_parts)[:600],
                 "content": "",
@@ -290,6 +320,33 @@ def _persist(
         ideas_path = _rel_or_abs(ideas_target, host_root)
     except OSError:
         log.warning("deep_search persist to ideas.jsonl failed", exc_info=True)
+    try:
+        from umbrella.memory.palace.facade import MemPalace
+        import pathlib as _pl
+
+        _repo = (
+            _pl.Path(ctx.repo_dir)
+            if hasattr(ctx, "repo_dir")
+            else _pl.Path(".")
+        )
+        _ws = getattr(ctx, "workspace_id", "") or ""
+        _palace = MemPalace(_repo, _ws)
+        finding_text = "; ".join(
+            f"{item.get('title')} ({item.get('url')})"
+            for item in results[:5]
+            if item.get("url")
+        )
+        _palace.add(
+            store="palace.idea",
+            content=finding_text,
+            tier="warm",
+            scope="cross_run_durable",
+            tags=["finding", "research", "deep_search"],
+            verified=False,
+            phase="research",
+        )
+    except Exception:
+        pass
     return knowledge_path, ideas_path
 
 
@@ -338,6 +395,21 @@ def _deep_search(
             {
                 "status": "error",
                 "reason": f"unknown intent {intent_norm!r}. Allowed: {sorted(INTENT_WHITELIST)}",
+            },
+            ensure_ascii=False,
+        )
+    if not _has_fast_search_provider() and not _slow_fallback_allowed():
+        return json.dumps(
+            {
+                "status": "provider_unavailable",
+                "reason": (
+                    "No fast web search provider is configured. Slow DuckDuckGo "
+                    "fallback is disabled by default to avoid long phase stalls. "
+                    "Use GitHub/MCP/local memory evidence, or set "
+                    "OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK=1 to allow it."
+                ),
+                "query": query_norm,
+                "intent": intent_norm,
             },
             ensure_ascii=False,
         )

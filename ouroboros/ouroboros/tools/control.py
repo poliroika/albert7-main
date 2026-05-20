@@ -413,7 +413,6 @@ def _propose_prompt_patch(
         save_prompt_patch_proposal,
     )
     from umbrella.control_plane.human_checkpoints import create_human_checkpoint_request
-    from umbrella.control_plane.self_improvement import prepare_self_improvement
 
     governance_root = _prompt_governance_root(ctx)
     versions_dir = governance_root / "versions"
@@ -444,13 +443,6 @@ def _propose_prompt_patch(
     )
     save_prompt_patch_proposal(proposal, proposals_dir)
 
-    manager_checkpoint = prepare_self_improvement(
-        _build_prompt_decision_context(ctx),
-        "prompt_stack_rewrite",
-        expected_behavioral_effect,
-        manager_checkpoints_dir,
-    )
-
     payload = {
         "proposal_id": proposal.id,
         "surface_id": proposal.surface.id,
@@ -459,7 +451,7 @@ def _propose_prompt_patch(
         "requires_human_checkpoint": proposal.requires_human_checkpoint,
         "base_version_id": proposal.base_version_id,
         "candidate_version_id": proposal.candidate_version_id,
-        "manager_checkpoint_id": manager_checkpoint.id,
+        "manager_checkpoint_id": "",
         "rollback_reference": proposal.rollback_reference,
         "diff_text": proposal.diff_text,
     }
@@ -469,7 +461,7 @@ def _propose_prompt_patch(
             task_id=str(ctx.task_id or "prompt_patch"),
             proposal=proposal,
             checkpoint_dir=human_checkpoints_dir,
-            manager_checkpoint_id=manager_checkpoint.id,
+            manager_checkpoint_id="",
             description=f"Approve prompt rewrite for {proposal.surface.label}",
         )
         payload["human_checkpoint_id"] = request.id
@@ -529,8 +521,10 @@ def _resolve_prompt_checkpoint(
 
 def _get_task_result(ctx: ToolContext, task_id: str) -> str:
     """Read the result of a completed subtask."""
+    from ouroboros.utils import task_artifact_stem
+
     results_dir = Path(ctx.drive_root) / "task_results"
-    result_file = results_dir / f"{task_id}.json"
+    result_file = results_dir / f"{task_artifact_stem(task_id)}.json"
     if not result_file.exists():
         return f"Task {task_id}: not found or not yet completed"
     data = json.loads(result_file.read_text())
@@ -542,8 +536,10 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
 
 def _wait_for_task(ctx: ToolContext, task_id: str) -> str:
     """Check if a subtask has completed. Call repeatedly to poll."""
+    from ouroboros.utils import task_artifact_stem
+
     results_dir = Path(ctx.drive_root) / "task_results"
-    result_file = results_dir / f"{task_id}.json"
+    result_file = results_dir / f"{task_artifact_stem(task_id)}.json"
     if result_file.exists():
         return _get_task_result(ctx, task_id)
     return f"Task {task_id}: still running. Call again later to check."

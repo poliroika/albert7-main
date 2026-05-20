@@ -106,11 +106,16 @@ def test_bridge_writes_gmas_artifact_when_llm_detects_multi_agent(
         assert 'detected_by = "umbrella.skill_detector"' in workspace_toml
 
 
-def test_bridge_suppresses_auto_gmas_when_workspace_explicitly_opts_out(
+def test_bridge_current_llm_task_overrides_stale_gmas_opt_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An explicit false in ``workspace.toml`` is the narrow escape hatch
-    for pure non-LLM work or audited exceptions."""
+    """The current task wins over a stale workspace opt-out.
+
+    Workspaces can accumulate old ``multi_agent_gmas = false`` settings
+    from earlier attempts. A new task that explicitly asks for LLM/model
+    behavior should not silently degrade into rule-based code because of
+    that stale setting.
+    """
     monkeypatch.setattr(
         "umbrella.control_plane.code_analyzer.get_llm_client",
         lambda: _make_llm_stub(["multi_agent_gmas"]),
@@ -145,16 +150,17 @@ def test_bridge_suppresses_auto_gmas_when_workspace_explicitly_opts_out(
         )
 
         knowledge_dir = drive_root / "memory" / "knowledge"
-        assert not (knowledge_dir / "gmas_active_context.md").exists()
+        assert (knowledge_dir / "gmas_active_context.md").exists()
         cache = json.loads(
             (drive_root / "state" / "active_skills.json").read_text(encoding="utf-8")
         )
-        assert cache["entry"]["domains"] == []
+        assert cache["entry"]["domains"] == ["multi_agent_gmas"]
         workspace_toml = (
             repo_root / "workspaces" / "JKX" / "workspace.toml"
         ).read_text(encoding="utf-8")
-        assert "multi_agent_gmas = false" in workspace_toml
-        assert "[skill_decisions.multi_agent_gmas]" not in workspace_toml
+        assert "multi_agent_gmas = true" in workspace_toml
+        assert "[skill_decisions.multi_agent_gmas]" in workspace_toml
+        assert "overriding a stale workspace opt-out" in workspace_toml
 
 
 def test_bridge_skips_skill_when_neither_llm_nor_keywords_fire(
@@ -270,6 +276,43 @@ def test_bridge_does_not_force_gmas_from_workspace_imports_alone(
 
         knowledge_dir = drive_root / "memory" / "knowledge"
         assert not (knowledge_dir / "gmas_active_context.md").exists()
+
+
+def test_bridge_does_not_auto_gmas_for_llm_meta_smoke_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "umbrella.control_plane.code_analyzer.get_llm_client",
+        lambda: _make_llm_stub(["multi_agent_gmas"]),
+    )
+    monkeypatch.setattr(
+        "umbrella.retrieval.gmas_context.build_gmas_context",
+        lambda repo, query, **kw: _stub_gmas_payload(query),
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        _seed_repo(
+            repo_root,
+            task_text=(
+                "LLM smoke verification: create smoke_result.txt with "
+                "static text only. Do not implement an LLM pipeline."
+            ),
+        )
+        drive_root = repo_root / ".umbrella" / "ouroboros_drive"
+
+        sync_umbrella_context_to_drive(
+            repo_root,
+            drive_root,
+            workspace_id="JKX",
+            task_input="Create the smoke marker file.",
+            task_id="task_llm_meta_smoke",
+        )
+
+        knowledge_dir = drive_root / "memory" / "knowledge"
+        assert not (knowledge_dir / "gmas_active_context.md").exists()
+        workspace_toml = repo_root / "workspaces" / "JKX" / "workspace.toml"
+        assert not workspace_toml.exists()
 
 
 def test_bridge_caches_verdict_and_does_not_recompute(

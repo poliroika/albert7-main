@@ -315,19 +315,37 @@ def _lexical_fallback_recall(
     workspace_id: str,
     task_input: str,
 ) -> str:
-    """When Chroma is down, surface hierarchical JSONL matches (lexical)."""
+    """When Chroma is unavailable, surface ideas.jsonl matches (lexical keyword scan)."""
+    import json as _json
     try:
-        from umbrella.memory.hierarchical import HierarchicalMemory
         from umbrella.memory.paths import workspace_memory_root
     except Exception:
         return ""
     try:
-        hm = HierarchicalMemory(workspace_memory_root(Path(repo_root), workspace_id))
-        rows = hm.query(
-            query=task_input[:1200],
-            limit=min(RECENT_LIMIT, 8),
-            workspace_id=workspace_id,
-        )
+        ws_root = workspace_memory_root(Path(repo_root), workspace_id)
+        ideas_path = ws_root / "ideas.jsonl"
+        if not ideas_path.exists():
+            return ""
+        query_lower = task_input[:1200].lower()
+        rows = []
+        with ideas_path.open(encoding="utf-8", errors="replace") as _fh:
+            for line in _fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except Exception:
+                    continue
+                content = str(rec.get("content") or rec.get("body") or "")
+                title = str(rec.get("title") or "")
+                if query_lower and not (
+                    query_lower in content.lower() or query_lower in title.lower()
+                ):
+                    continue
+                rows.append(rec)
+                if len(rows) >= min(RECENT_LIMIT, 8):
+                    break
     except Exception as exc:
         log.debug("Lexical memory fallback failed: %s", exc)
         return ""
@@ -336,13 +354,14 @@ def _lexical_fallback_recall(
     lines = [
         f"[MEMORY_RECALL] Task-start recall (lexical fallback; workspace={workspace_id})",
         "[WORKSPACE MEMORY]",
-        "Hierarchical ideas (no Chroma):",
+        "Ideas (from ideas.jsonl):",
     ]
     for r in rows:
-        snippet = (r.content or "").strip().replace("\n", " ")
+        snippet = str(r.get("content") or r.get("body") or "").strip().replace("\n", " ")
         if len(snippet) > DRAWER_PREVIEW_CHARS:
             snippet = snippet[:DRAWER_PREVIEW_CHARS].rstrip() + "…"
-        lines.append(f"  - [{r.palace_path}] {r.title}: {snippet}")
+        path = r.get("palace_path") or r.get("kind") or "idea"
+        lines.append(f"  - [{path}] {r.get('title', '')}: {snippet}")
     lines.append(
         "Use `get_umbrella_memory` / `list_memory_tree` once MemPalace is available."
     )
@@ -440,6 +459,51 @@ def recall_for_task_start(
     return recall
 
 
+_RUN_SCOPED_RECALL_ROOMS = {"changes", "errors"}
+
+
+def _run_id_from_task_id(task_id: str) -> str:
+    value = str(task_id or "").strip()
+    return value.split(":", 1)[0] if ":" in value else value
+
+
+def _memory_hit_metadata(hit: dict[str, Any]) -> dict[str, Any]:
+    meta = hit.get("metadata")
+    return meta if isinstance(meta, dict) else hit
+
+
+def _memory_hit_room(hit: dict[str, Any]) -> str:
+    meta = _memory_hit_metadata(hit)
+    return str(meta.get("room") or meta.get("event_type") or "").strip().lower()
+
+
+def _memory_hit_run_id(hit: dict[str, Any]) -> str:
+    meta = _memory_hit_metadata(hit)
+    run_id = str(meta.get("run_id") or "").strip()
+    if run_id:
+        return run_id
+    task_id = str(meta.get("task_id") or "").strip()
+    return _run_id_from_task_id(task_id)
+
+
+def _filter_run_scoped_recall_hits(
+    hits: list[dict[str, Any]], *, task_id: str = ""
+) -> list[dict[str, Any]]:
+    current_run_id = _run_id_from_task_id(task_id)
+    if not current_run_id:
+        return hits
+    filtered: list[dict[str, Any]] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        if _memory_hit_room(hit) in _RUN_SCOPED_RECALL_ROOMS:
+            hit_run_id = _memory_hit_run_id(hit)
+            if not hit_run_id or hit_run_id != current_run_id:
+                continue
+        filtered.append(hit)
+    return filtered
+
+
 def recall_periodic(
     *,
     workspace_id: str,
@@ -447,6 +511,7 @@ def recall_periodic(
     recent_actions_summary: str,
     repo_root: Path,
     phase: str | None = None,
+    task_id: str = "",
 ) -> str:
     """Build a fresh recall block for the periodic mid-loop injection.
 
@@ -480,6 +545,7 @@ def recall_periodic(
             recent_ws = (
                 ws_palace.recent(workspace_id=workspace_id, limit=RECENT_LIMIT) or []
             )
+            recent_ws = _filter_run_scoped_recall_hits(recent_ws, task_id=task_id)
         except Exception as exc:
             log.warning(
                 "Palace.recent failed at round %d (workspace): %s", round_idx, exc
@@ -494,6 +560,10 @@ def recall_periodic(
                         n_results=SEARCH_LIMIT,
                     )
                     or []
+                )
+                semantic_ws = _filter_run_scoped_recall_hits(
+                    semantic_ws,
+                    task_id=task_id,
                 )
             except Exception as exc:
                 log.warning(
@@ -601,6 +671,7 @@ def record_workspace_change(
     result_summary: str,
     repo_root: Path,
     success: bool = True,
+    task_id: str = "",
 ) -> None:
     """Fire-and-forget palace write after a successful write-style tool call.
 
@@ -626,6 +697,10 @@ def record_workspace_change(
             content=body,
             kind="info" if success else "warning",
             tags=[tool_name, "auto-recorded"],
+            task_id=task_id,
+            metadata_extra={"run_id": _run_id_from_task_id(task_id)}
+            if task_id
+            else None,
         )
     except Exception as exc:
         log.debug("Auto-record failed for %s: %s", tool_name, exc)
@@ -638,7 +713,7 @@ def mirror_subtask_to_memory(
     repo_root: Path,
     workspace_id: str,
 ) -> None:
-    """Persist a finished planner subtask into HierarchicalMemory.
+    """Persist a finished planner subtask into MemPalace.
 
     The plan file remains the canonical state — this mirror only serves
     cross-task recall (other workspaces, future runs, periodic recall
@@ -651,57 +726,31 @@ def mirror_subtask_to_memory(
     if subtask is None or plan is None:
         return
     try:
-        from umbrella.memory.hierarchical import HierarchicalMemory
-        from umbrella.memory.paths import workspace_memory_root
-    except Exception:
-        return
+        import pathlib
+        from umbrella.memory.palace.facade import MemPalace
 
-    memory_dir: Path
-    try:
-        memory_dir = workspace_memory_root(Path(repo_root), workspace_id or "")
-    except Exception:
-        return
-    try:
-        hm = HierarchicalMemory(memory_dir)
-        cursor_for_record = max(0, plan.cursor)
-        palace_path = f"workspace/{workspace_id or '_root'}/plan/{plan.task_id}/subtask/{cursor_for_record}"
-        evidence = list(getattr(subtask, "evidence", None) or [])
-        verified_evidence = _subtask_has_verified_evidence(evidence)
-        memory_status = (
-            subtask.status if verified_evidence else f"{subtask.status}_unverified"
-        )
-        title = f"Subtask {cursor_for_record} [{memory_status}]: {subtask.title}"
-        body_parts = [
-            f"status: {memory_status}",
-            f"reported_status: {subtask.status}",
-            f"verified_evidence: {str(verified_evidence).lower()}",
-            f"title: {subtask.title}",
-            f"description: {subtask.description}",
-            f"success_check: {subtask.success_check}",
-            f"summary: {subtask.summary}",
-        ]
-        if evidence:
-            body_parts.append("evidence:\n" + "\n".join(f"  - {e}" for e in evidence))
-        body = "\n".join(body_parts)
-        hm.add(
-            palace_path=palace_path,
-            title=title,
-            content=body,
-            kind="subtask_result",
-            workspace_id=workspace_id or "",
-            task_id=plan.task_id,
-            tags=[memory_status, "planner", "subtask"],
-            metadata={
-                "task_id": plan.task_id,
-                "plan_revisions": plan.revisions,
-                "cursor": cursor_for_record,
-                "total_subtasks": len(plan.subtasks),
-                "reported_status": subtask.status,
-                "verified_evidence": verified_evidence,
+        palace = MemPalace(pathlib.Path(repo_root), workspace_id or "")
+        subtask_id = getattr(subtask, "id", "") or str(getattr(plan, "cursor", ""))
+        goal = (
+            getattr(subtask, "title", "") or getattr(subtask, "description", "") or ""
+        )[:400]
+        content = f"subtask:{subtask_id} goal:{goal}"
+        palace.add(
+            store="palace.subtask",
+            content=content,
+            tier="hot",
+            scope="subtask_scoped",
+            tags=["subtask"],
+            phase="execute",
+            subtask_id=subtask_id,
+            run_id=str(getattr(plan, "run_id", "") or ""),
+            extra={
+                "task_id": str(getattr(plan, "task_id", "") or ""),
+                "status": str(getattr(subtask, "status", "") or ""),
             },
         )
-    except Exception as exc:
-        log.debug("mirror_subtask_to_memory failed: %s", exc, exc_info=True)
+    except Exception:
+        pass
 
 
 def _subtask_has_verified_evidence(evidence: list[Any]) -> bool:
@@ -829,6 +878,7 @@ def maybe_inject_periodic_recall(
     repo_root: Path,
     messages: list[dict[str, Any]],
     phase: str | None = None,
+    task_id: str = "",
 ) -> int:
     """If it's time, inject a periodic recall block into ``messages``.
 
@@ -850,6 +900,7 @@ def maybe_inject_periodic_recall(
             recent_actions_summary=recent_actions_summary,
             repo_root=repo_root,
             phase=phase,
+            task_id=task_id,
         )
     except Exception:
         log.debug("Periodic memory recall failed", exc_info=True)
@@ -868,6 +919,7 @@ def observe_tool_calls(
     verify_gate: Any,
     repo_root: Path,
     current_workspace_id: str,
+    task_id: str = "",
 ) -> str:
     """Process the tool_calls list for the freshly executed round.
 
@@ -918,6 +970,7 @@ def observe_tool_calls(
                     result_summary=result_summary,
                     repo_root=repo_root,
                     success=success,
+                    task_id=task_id,
                 )
             except Exception:
                 log.debug("Auto-record of %s failed", fn_name, exc_info=True)

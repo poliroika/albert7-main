@@ -43,6 +43,30 @@ class TestStrictPath:
         assert "list" in note
 
 
+class TestPhasePlanRepair:
+    def test_propose_phase_plan_content_alias_maps_to_plan(self) -> None:
+        args, note = repair_tool_arguments(
+            "propose_phase_plan",
+            {
+                "content": {
+                    "subtasks": [
+                        {
+                            "id": "domain",
+                            "success_test": "python -m pytest tests/test_domain.py -q",
+                        }
+                    ]
+                },
+                "summary": "planner draft",
+            },
+        )
+
+        assert "content" not in args
+        assert args["plan"]["subtasks"][0]["id"] == "domain"
+        assert args["notes"] == "planner draft"
+        assert "alias_content_to_plan" in note
+        assert "alias_summary_to_notes" in note
+
+
 class TestControlCharRepair:
     def test_raw_newline_inside_string_gets_escaped(self) -> None:
         # The raw newline inside the value is what trips strict json.loads.

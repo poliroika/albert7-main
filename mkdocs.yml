@@ -1,27 +1,26 @@
-# Сборка статики для GitLab Pages: mkdocs build → каталог public/
-# Локально: pip install mkdocs-material && mkdocs serve
+# MkDocs → public/ for GitLab Pages. Locally: pip install mkdocs-material && mkdocs serve
 
 site_name: Umbrella
-site_description: Документация и технический отчёт
+site_description: Umbrella documentation and technical report
 docs_dir: docs
 site_dir: public
 
 theme:
   name: material
-  language: ru
+  language: en
   palette:
     - scheme: default
       primary: indigo
       accent: deep purple
       toggle:
         icon: material/brightness-7
-        name: Тёмная тема
+        name: Switch to dark mode
     - scheme: slate
       primary: indigo
       accent: deep purple
       toggle:
         icon: material/brightness-4
-        name: Светлая тема
+        name: Switch to light mode
   font:
     text: Roboto
     code: Roboto Mono
@@ -59,7 +58,7 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
-      permalink_title: Ссылка на этот раздел
+      permalink_title: Anchor link to this section
   - pymdownx.superfences:
       custom_fences:
         - name: mermaid
@@ -84,36 +83,30 @@ markdown_extensions:
   - pymdownx.keys
   - pymdownx.smartsymbols
 
-# Редирект-заглушка technical-report.md не нужна на сайте (дублирует раздел)
-exclude_docs: |
-  technical-report.md
-
 nav:
-  - Главная: README.md
-  - Архитектура: architecture.md
+  - Home: README.md
+  - Architecture: architecture.md
   - Workspaces:
-      - Обзор: workspaces.md
-      - Создание workspace: creating-workspaces.md
-  - Компоненты:
+      - Overview: workspaces.md
+      - Creating workspaces: creating-workspaces.md
+  - Components:
       - GMAS: gmas.md
       - Umbrella: umbrella-layer.md
       - Ouroboros: ouroboros.md
-      - Meta-Harness (план): meta-harness-improvement-plan.md
-      - Технический долг (harness): agent_harness_refactor_debt.md
-  - Технический отчёт:
-      - Оглавление: technical-report/README.md
-      - "1. Цели и термины": technical-report/01-scope-terms.md
-      - "2. Контекст системы": technical-report/02-system-context.md
-      - "3. Топология репозитория": technical-report/03-repository-topology.md
-      - "4. Артефакты .umbrella": technical-report/04-runtime-artifacts.md
-      - "5. Слои и потоки": technical-report/05-architecture-flows.md
-      - "6. Подсистемы Umbrella": technical-report/06-umbrella-subsystems.md
-      - "7. Workspaces и политика": technical-report/07-workspaces-and-policy.md
-      - "8. Ouroboros": technical-report/08-ouroboros-runtime.md
+  - Technical report:
+      - Contents: technical-report/README.md
+      - "1. Scope and terms": technical-report/01-scope-terms.md
+      - "2. System context": technical-report/02-system-context.md
+      - "3. Repository topology": technical-report/03-repository-topology.md
+      - "4. Runtime artifacts": technical-report/04-runtime-artifacts.md
+      - "5. Architecture flows": technical-report/05-architecture-flows.md
+      - "6. Umbrella subsystems": technical-report/06-umbrella-subsystems.md
+      - "7. Workspaces and policy": technical-report/07-workspaces-and-policy.md
+      - "8. Ouroboros runtime": technical-report/08-ouroboros-runtime.md
       - "9. Verification": technical-report/09-verification.md
       - "10. Web bridge": technical-report/10-web-bridge.md
-      - "11. Конфигурация": technical-report/11-configuration.md
-      - "12. Meta-Harness": technical-report/12-meta-harness.md
-      - "13. Эксплуатация": technical-report/13-operations.md
-      - "14. Тесты и документация": technical-report/14-testing-and-docs.md
-      - "15. Task Planner": technical-report/15-task-planner.md
+      - "11. Configuration": technical-report/11-configuration.md
+      - "12. Harness vs meta-harness": technical-report/12-meta-harness.md
+      - "13. Operations": technical-report/13-operations.md
+      - "14. Testing and docs": technical-report/14-testing-and-docs.md
+      - "15. Task planner": technical-report/15-task-planner.md

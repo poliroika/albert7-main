@@ -51,6 +51,15 @@ def test_deep_search_rejects_unknown_intent(tmp_path: Path) -> None:
 
 
 def test_deep_search_falls_back_when_gmas_missing(tmp_path: Path) -> None:
+    with patch.dict(
+        "os.environ",
+        {"OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK": "1"},
+        clear=False,
+    ):
+        _assert_deep_search_falls_back_when_gmas_missing(tmp_path)
+
+
+def _assert_deep_search_falls_back_when_gmas_missing(tmp_path: Path) -> None:
     ds.reset_budget_for_task("task_ds_fb")
     ctx = _make_ctx(tmp_path, "task_ds_fb")
     fake_results = [
@@ -69,7 +78,44 @@ def test_deep_search_falls_back_when_gmas_missing(tmp_path: Path) -> None:
     fb.assert_called_once()
 
 
-def test_deep_search_writes_to_knowledge_md(tmp_path: Path) -> None:
+def test_parse_formatted_results_handles_indented_urls() -> None:
+    text = """Found 1 result(s):
+
+[1] WebSockets - FastAPI
+    URL: https://fastapi.tiangolo.com/advanced/websockets/
+    Install websockets before using the endpoint.
+"""
+
+    parsed = ds._parse_formatted_results(text)
+
+    assert parsed == [
+        {
+            "title": "WebSockets - FastAPI",
+            "url": "https://fastapi.tiangolo.com/advanced/websockets/",
+            "snippet": "Install websockets before using the endpoint.",
+            "content": "",
+        }
+    ]
+
+
+def test_deep_search_provider_unavailable_without_fast_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    for name in ds._FAST_SEARCH_PROVIDER_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("OUROBOROS_DEEP_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK", raising=False)
+    monkeypatch.delenv("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO", raising=False)
+    ctx = _make_ctx(tmp_path, "task_ds_no_provider")
+
+    out = ds._deep_search(ctx, query="slow web", intent="planner_research")
+
+    payload = json.loads(out)
+    assert payload["status"] == "provider_unavailable"
+
+
+def test_deep_search_writes_to_knowledge_md(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SERPER_API_KEY", "test-key")
     ds.reset_budget_for_task("task_ds_persist")
     ctx = _make_ctx(tmp_path, "task_ds_persist")
     fake_results = [{"title": "T1", "url": "https://t1.example", "snippet": "s1"}]
@@ -129,6 +175,7 @@ def test_deep_search_uses_drive_root_workspace_memory_when_repo_dir_is_ouroboros
 
 def test_deep_search_budget_exhausted(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("OUROBOROS_DEEP_SEARCH_BUDGET", "2")
+    monkeypatch.setenv("SERPER_API_KEY", "test-key")
     ds.reset_budget_for_task("task_ds_budget")
     ctx = _make_ctx(tmp_path, "task_ds_budget")
     fake_results = [{"title": "T", "url": "https://t.example", "snippet": "s"}]

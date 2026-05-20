@@ -4,6 +4,7 @@ from pathlib import Path
 from ouroboros.agent import Env
 from ouroboros.context import build_llm_messages
 from ouroboros.memory import Memory
+from ouroboros.utils import sanitize_task_for_event
 
 
 def _system_text(messages):
@@ -74,3 +75,27 @@ def test_system_prompt_does_not_mention_legacy_identity_or_channels() -> None:
     ]
     for needle in forbidden:
         assert needle not in prompt
+
+
+def test_task_event_sanitizer_converts_frozensets(tmp_path: Path) -> None:
+    task = {
+        "id": "task1",
+        "context_overlays": {
+            "phase_node": {
+                "subtasks": [
+                    {
+                        "id": "st1",
+                        "allowed_tools": frozenset({"shell"}),
+                        "allowed_skills": frozenset({"task-decomposition"}),
+                    }
+                ]
+            }
+        },
+    }
+
+    sanitized = sanitize_task_for_event(task, tmp_path)
+
+    json.dumps(sanitized, ensure_ascii=False)
+    subtask = sanitized["context_overlays"]["phase_node"]["subtasks"][0]
+    assert subtask["allowed_tools"] == ["shell"]
+    assert subtask["allowed_skills"] == ["task-decomposition"]

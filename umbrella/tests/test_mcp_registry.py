@@ -99,9 +99,12 @@ def test_mcp_discover_tool_uses_github_search(tmp_path: Path) -> None:
         },
     ]
     with patch.object(discovery, "discover_servers", return_value=fake):
-        out = discovery._mcp_discover(ctx, query="foo", max_results=5)
+        out = discovery._mcp_discover(
+            ctx, query="foo", max_results=5, intent="mcp_discovery"
+        )
     payload = json.loads(out)
     assert payload["status"] == "ok"
+    assert payload["intent"] == "mcp_discovery"
     assert payload["results"] == fake
 
 

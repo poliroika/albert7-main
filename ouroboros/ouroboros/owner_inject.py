@@ -17,13 +17,15 @@ import pathlib
 import uuid
 from typing import List, Optional
 
+from ouroboros.utils import task_artifact_stem
+
 log = logging.getLogger(__name__)
 
 _MAILBOX_DIR = "memory/owner_mailbox"
 
 
 def _mailbox_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
-    return drive_root / _MAILBOX_DIR / f"{task_id}.jsonl"
+    return drive_root / _MAILBOX_DIR / f"{task_artifact_stem(task_id)}.jsonl"
 
 
 def get_pending_path(drive_root: pathlib.Path) -> pathlib.Path:

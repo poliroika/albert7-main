@@ -1,33 +1,28 @@
 # GMAS
 
-GMAS — мультиагентный фреймворк, на котором строятся все workspace в Umbrella.
-Он предоставляет движок графов агентов, execution runtime, инструменты, память
-и систему callback-ов.
+GMAS is the multi-agent framework on which all workspaces in Umbrella are built. It provides the agent graph engine, execution runtime, tools, memory, and callback system.
 
-## Роль в Umbrella
+## Role in Umbrella
 
-GMAS — это vendor-like, read-only слой. Он выступает стандартным языком сборки
-мультиагентных систем: любой workspace по умолчанию описывает свою логику средствами GMAS.
+GMAS is a vendor-like, read-only layer. It serves as the standard assembly language for multi-agent systems: any workspace describes its logic using GMAS primitives.
 
 ```
-┌────────────────────────────────────────┐
-│         Ouroboros (менеджер)            │
-│  выбирает workspace, строит гипотезу   │
-├────────────────────────────────────────┤
-│        Umbrella (control-plane)          │
-│  реестр, политика, рантайм, retrieval  │
-├────────────────────────────────────────┤
-│        Workspace (прикладной)          │
-│  граф агентов, промпты, evals          │
-├────────────────────────────────────────┤
-│         GMAS (фреймворк)              │
-│  раннер, шедулер, инструменты, память  │
-└────────────────────────────────────────┘
++------------------------------------------+
+|        Umbrella (control plane)          |
+|  phases, orchestrator, memory,           |
+|  permissions, retrieval                  |
++------------------------------------------+
+|        Workspaces (application)          |
+|  agent graphs, prompts, evals            |
++------------------------------------------+
+|         GMAS (framework)                 |
+|  runners, scheduler, tools, memory       |
++------------------------------------------+
 ```
 
-## Правило read-only
+## Read-Only Policy
 
-Директория `gmas/` защищена политикой (`umbrella/policies/default_policy.yaml`):
+The `gmas/` directory is protected by policy (`umbrella/policies/default_policy.yaml`):
 
 ```yaml
 framework_boundary:
@@ -37,60 +32,54 @@ framework_boundary:
     - "gmas/"
 ```
 
-Вызов `can_edit_path(Path("gmas/foo.py"))` вернёт `allowed=False` с эскалацией.
-Это правило зафиксировано и в коде `umbrella/policies/engine.py`, где `gmas` — один из якорей
-классификации путей.
+Calling `can_edit_path(Path("gmas/foo.py"))` returns `allowed=False` with escalation.
 
-Если возможностей GMAS не хватает, решение ищется через:
+If GMAS capabilities are insufficient, the solution is found through:
 
-1. Конфигурацию и композицию вне `gmas/`.
-2. Локальные helper-скрипты в workspace.
-3. Адаптеры для доменных инструментов.
-4. Thin-layer обёртки поверх GMAS API.
+1. Configuration and composition outside `gmas/`.
+2. Local helper scripts in the workspace.
+3. Domain-specific tool adapters.
+4. Thin wrappers over the GMAS API.
 
-Прямое редактирование `gmas/` — это отдельное архитектурное решение, требующее
-одобрения человека.
+Direct editing of `gmas/` requires explicit human approval.
 
-## Что предоставляет GMAS
+## What GMAS Provides
 
-| Компонент | Описание |
-|-----------|----------|
-| Графы агентов | `gmas.core.graph` — определение топологий и маршрутов |
-| Execution runtime | `gmas.execution.runner` — запуск графов с состоянием |
-| Шедулер | `gmas.execution.scheduler` — порядок обхода агентов |
-| Инструменты | `gmas.tools` — web search, file search, MCP client, shell, computer use |
-| Память | `gmas.utils.memory` — shared memory между агентами |
-| Бюджет | `gmas.execution.budget` — контроль расхода токенов и денег |
-| Callback-система | `gmas.callbacks` — события, метрики, хендлеры |
-| Стриминг | `gmas.execution.streaming` — потоковая передача результатов |
-| Auto-builder | `gmas.builder.auto_builder` — автоматическая сборка графов |
+| Component | Description |
+|-----------|-------------|
+| Agent graphs | `gmas.core.graph` — topology definitions and routes |
+| Execution runtime | `gmas.execution.runner` — graph execution with state |
+| Scheduler | `gmas.execution.scheduler` — agent traversal order |
+| Tools | `gmas.tools` — web search, file search, MCP client, shell, computer use |
+| Memory | `gmas.utils.memory` — shared memory between agents |
+| Budget | `gmas.execution.budget` — token and cost control |
+| Callback system | `gmas.callbacks` — events, metrics, handlers |
+| Streaming | `gmas.execution.streaming` — streaming result delivery |
+| Auto-builder | `gmas.builder.auto_builder` — automatic graph assembly |
 
-## Контракт использования в workspace
+## Usage Contract in Workspaces
 
-Каждый workspace, если это возможно, должен описывать свою мультиагентность средствами GMAS.
+Every workspace should describe its multi-agent logic using GMAS primitives when possible.
 
-Разрешено поверх GMAS:
+Allowed on top of GMAS:
 
-- Локальные helper-скрипты запуска.
-- Адаптеры для доменных инструментов.
-- Внешние eval harness-ы.
-- Конвертеры артефактов.
+- Local helper launch scripts.
+- Domain-specific tool adapters.
+- External eval harnesses.
+- Artifact converters.
 - Workspace-specific policies.
 
-Запрещено по умолчанию:
+Prohibited by default:
 
-- Клонировать логику GMAS внутри workspace.
-- Заменять раннер GMAS самодельной системой без веской причины.
-- Редактировать `gmas/` ради одной задачи.
+- Cloning GMAS logic inside a workspace.
+- Replacing the GMAS runner with a custom system without strong justification.
+- Editing `gmas/` for a single task.
 
-## Retrieval по GMAS
+## GMAS Retrieval
 
-Umbrella индексирует код и документацию GMAS для того, чтобы менеджер мог грамотно
-улучшать workspace. Retrieval реализован в `umbrella/retrieval/`.
+Umbrella indexes GMAS code and documentation so that the Worker can make informed improvements to workspaces. Retrieval is implemented in `umbrella/retrieval/`.
 
-### Источники индекса
-
-Конфигурация из `default_policy.yaml`:
+### Index Sources
 
 ```yaml
 gmas_retrieval:
@@ -105,29 +94,24 @@ gmas_retrieval:
     - gmas/examples/
 ```
 
-### Стек поиска
+### Search Stack
 
-`RetrievalService` (`umbrella/retrieval/service.py`) комбинирует несколько методов:
+`RetrievalService` (`umbrella/retrieval/service.py`) combines multiple methods:
 
-1. **Lexical (BM25)** — точные совпадения по символам, конфигам и API.
-2. **Symbol index** — классы, функции, модули и инструменты GMAS.
-3. **Docs index** — навигация по `gmas/docs/` через `mkdocs.yml`.
-4. **Workspace usage index** — паттерны использования GMAS в существующих workspace.
-5. **Retrieval cards** — компактные structured briefs с рекомендуемым паттерном, ключевыми
-   символами и файлами.
+1. **Lexical (BM25)** — exact matches on symbols, configs, and APIs.
+2. **Symbol index** — classes, functions, modules, and tools in GMAS.
+3. **Docs index** — navigation of `gmas/docs/` via `mkdocs.yml`.
+4. **Workspace usage index** — patterns of GMAS usage in existing workspaces.
+5. **Retrieval cards** — compact structured briefs with recommended patterns, key symbols, and files.
 
-### Контекст для Ouroboros
+### Context for Ouroboros
 
-Модуль `umbrella/retrieval/gmas_context.py` предоставляет функцию `build_gmas_context()`,
-которая по запросу возвращает набор retrieval-хитов с кодом и документацией, готовых
-для прямого использования в контексте LLM.
+`umbrella/retrieval/gmas_context.py` provides `build_gmas_context()`, which returns retrieval hits with code and documentation ready for direct inclusion in the LLM context.
 
-## Документация GMAS
+## GMAS Documentation
 
-Внутренняя документация фреймворка находится в:
+Internal framework documentation:
 
-- `gmas/README.md` — обзор.
-- `gmas/QUICKSTART.md` — быстрый старт.
-- `gmas/DOCUMENTATION.md` — полная документация.
-- `gmas/docs/` — структурированные руководства (getting started, user guide, API reference,
-  examples, contributing).
+- `gmas/README.md` — overview
+- `gmas/DOCUMENTATION.md` — full documentation
+- `gmas/docs/` — structured guides (getting started, user guide, API reference, examples, contributing)

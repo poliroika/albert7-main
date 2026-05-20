@@ -95,7 +95,9 @@ def _resolve_repo_root(ctx: Any) -> Path:
     return Path.cwd()
 
 
-def _mcp_discover(ctx: Any, query: str = "", max_results: int = 5) -> str:
+def _mcp_discover(
+    ctx: Any, query: str = "", max_results: int = 5, intent: str = ""
+) -> str:
     try:
         from ouroboros.tools.umbrella_tools import _record_subtask_discovery_tool_call
 
@@ -158,6 +160,7 @@ def _mcp_discover(ctx: Any, query: str = "", max_results: int = 5) -> str:
         {
             "status": "ok",
             "query": query_norm,
+            "intent": str(intent or ""),
             "results": results,
             "memory_mirrored_count": mirrored,
             "github_token_present": bool(
@@ -241,6 +244,13 @@ def get_tools() -> list[Any]:
                             "default": 5,
                             "minimum": 1,
                             "maximum": 10,
+                        },
+                        "intent": {
+                            "type": "string",
+                            "description": (
+                                "Optional caller metadata such as mcp_discovery "
+                                "or planner_research; ignored by server search."
+                            ),
                         },
                     },
                     "required": ["query"],

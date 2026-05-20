@@ -1,42 +1,99 @@
-# Часть 2. Контекст системы
+# Part 2: System Context
 
-[← Оглавление](README.md) · [← Часть 1](01-scope-terms.md) · [Далее: топология репозитория →](03-repository-topology.md)
+This chapter describes the roles of each major component and how they interact in a single narrative.
+
+## Component Roles
+
+### GMAS (`gmas/`)
+
+The stable multi-agent framework. Provides graph execution, tools, memory between agents, budget control, callbacks, and streaming. Treated as a read-only vendor dependency.
+
+### Workspaces (`workspaces/`)
+
+Application systems built on GMAS. Each workspace contains agent graphs, prompts, models, evals, and experiments. Seeds are human-created templates; task-instances are mutable copies for specific tasks.
+
+### Umbrella (`umbrella/`)
+
+The phase-driven control plane. Owns:
+- **Phase machine** (`phases/`): YAML manifests describing what each phase can do.
+- **Orchestrator** (`orchestrator/`): PhaseRunner that walks the plan, spawns agents.
+- **Memory** (`memory/palace/`): MemPalace facade with tiered stores.
+- **Permissions** (`permissions/`): PermissionEnvelope gating all tool calls.
+- **Retrieval** (`retrieval/`): Search over GMAS code and docs.
+- **Web bridge** (`web_bridge/`): HTTP server with JSON API and React UI.
+
+### Ouroboros (`ouroboros/`)
+
+The deep LLM agent. Spawned by PhaseRunner as Worker or Watcher. Consumes phase manifests. Contains the tool loop (`loop.py`), LLM client (`llm.py`), context builder (`context.py`), and 22 tool modules.
+
+### Supervisor (`ouroboros/supervisor/`)
+
+Process management, event dispatch, Telegram notifications, task queue, state persistence, and git operations for Ouroboros workers.
+
+## Interaction Diagram
+
+```mermaid
+graph TB
+    subgraph External
+        User["User / Operator"]
+        Browser["Web Browser"]
+    end
+
+    subgraph Umbrella
+        CLI["CLI<br/>app_ouroboros.py"]
+        Bridge["Web Bridge<br/>:8765"]
+        Runner["PhaseRunner<br/>orchestrator/runner.py"]
+        Phases["Phase Manifests<br/>phases/manifests/*.yaml"]
+        Perm["PermissionEnvelope<br/>permissions/"]
+        Palace["MemPalace<br/>memory/palace/"]
+    end
+
+    subgraph Ouroboros
+        Worker["Worker Agent"]
+        Watcher["Watcher Agent"]
+        Loop["LLM Tool Loop<br/>loop.py"]
+        Tools["Tool Registry<br/>tools/"]
+    end
+
+    subgraph Data
+        WS["Workspace<br/>workspaces/"]
+        Drive["Drive<br/>.umbrella/"]
+    end
+
+    User --> CLI
+    User --> Browser
+    Browser --> Bridge
+    CLI --> Runner
+    Bridge --> Runner
+    Runner --> Phases
+    Runner --> Worker
+    Runner --> Watcher
+    Worker --> Loop
+    Loop --> Tools
+    Tools --> Perm
+    Tools --> WS
+    Tools --> Palace
+    Watcher --> Palace
+    Worker --> Drive
+    Watcher --> Runner
+```
+
+## Data Flow in a Run
+
+1. User provides a task (CLI or Web UI).
+2. PhaseRunner loads the PhasePlan and the first manifest.
+3. For each phase:
+   - MemPalace builds a `RecallBundle` for the phase.
+   - Worker is spawned with manifest, tool filter, and recall bundle.
+   - Watcher starts monitoring (idle by default).
+   - Worker executes tool calls, gated by PermissionEnvelope.
+   - Worker writes findings to MemPalace stores.
+   - On trigger, Watcher sends a control signal.
+   - Runner processes signals (abort, restart, mutate plan).
+   - Phase completes, Runner advances to next phase.
+4. After verify(pass), Runner builds FinalReport with evidence.
+5. Verified memory nodes are promoted to cross-run durable stores.
 
 ---
 
-## 2.1 Проблема, которую закрывает Umbrella
-
-Когда интеллектуальный агент получает прямой доступ к монорепозиторию, типичный сбой не в синтаксисе, а в **дисциплине изменений**: компетенция размазывается по системным промптам, повторяемый артефакт не отделён от черновика, а «успех» определяется самим агентом без воспроизводимых проверок.
-
-Umbrella задаёт другую модель:
-
-1. **Компетенция материализуется в workspace** — это переносимый пакет с кодом, конфигом и проверками.
-2. **GMAS остаётся движком** — его не переопределяют на каждую задачу заново.
-3. **Umbrella даёт инфраструктуру доверия** — политика путей, запуск, retrieval, verification, логирование, UI.
-4. **Ouroboros ведёт долгий цикл** — но не подменяет собой продуктовый workspace; он оркестрирует итерации и память.
-
-Формула из операторской документации остаётся верной: **Ouroboros управляет, GMAS исполняет, workspace решает задачу.**
-
-## 2.2 Два «клиента» одной машины состояний
-
-Практически один и тот же задний план обслуживает:
-
-- **CLI** — `umbrella/app_ouroboros.py`, `run_ouroboros_self_improve.py`, утилиты Meta-Harness.
-- **Web UI** — пользователь жмёт кнопки в React, фронт ходит в `/api/*` на bridge.
-
-Оба контура пишут статус и артефакты в согласованные места под `.umbrella/`, чтобы оператор мог переключаться между интерфейсами, не теряя контекст.
-
-## 2.3 Где заканчивается «ум» и начинается «доказательство»
-
-LLM может объяснить, почему задача «готова». Umbrella после этого включает **verification**: фиксированный набор команд или проверок из спецификации workspace. Это сознательный разрыв шаблона «модель сказала — значит правда». Отчёт verification попадает обратно в цикл при retry и в observability для человека.
-
-Подробнее о механике: [09-verification.md](09-verification.md).
-
-## 2.4 Связь с продуктовой документацией
-
-- Архитектурные диаграммы и слои: [../architecture.md](../architecture.md).
-- Роль Ouroboros в терминах двух контуров улучшения: [../ouroboros.md](../ouroboros.md).
-
----
-
-Далее — карта каталогов и зависимостей: [03-repository-topology.md](03-repository-topology.md).
+Next: [Part 3 — Repository Topology](03-repository-topology.md)
