@@ -4,6 +4,33 @@ Purpose: keep a short audit trail for the `workspaces/civilization` calibration 
 
 Rule for future fixes: before patching product code, prompts, tools, schemas, validators, tests, or orchestration for this calibration, read this file and confirm whether the new failure is a regression of a prior entry or a distinct bug.
 
+## 2026-05-20 - Research Summary Claimed Empty Discovery Sources As Evidence
+
+- Run: `phase_web_b63586a5`.
+- Symptom: `github_project_search` and `mcp_discover` both returned `status=ok` with empty `results`, and no accepted research finding had GitHub or MCP provenance. `submit_research_summary` still accepted notes saying "MCP discovery returned docker and simulation-related servers" and "GitHub results for strategy games inform..." because the cited findings were valid GMAS findings.
+- Risk: EvidenceGraph can be clean at the finding level while the summary handoff adds unsupported positive source claims. Plan/review phases then inherit fabricated prior-art/discovery context even though the tool rows show empty sources.
+- Cause: research summary validation checked that `findings_ids` were accepted, but did not link summary-level source-family claims back to the provenance of the cited findings.
+- Fix: research summary validation now scans positive source-family claims for GitHub, MCP, and web-search evidence, ignores explicit negative/unavailable wording, and requires at least one cited accepted finding with matching source provenance before accepting the claim.
+- Regression: `test_submit_research_summary_rejects_positive_empty_discovery_source_claims` and `test_submit_research_summary_allows_positive_github_claim_with_matching_source`.
+
+## 2026-05-20 - Host LLM Aliases Leaked Into Standalone Workspace API
+
+- Run: follow-up from `phase_web_0adc8b93` plus earlier `phase_web_92538072` alias failures.
+- Symptom: even after `OUROBOROS_LLM_MODEL` was blocked, generated workspace docs/tests could still describe `OUROBOROS_LLM_API_KEY`, `OUROBOROS_LLM_BASE_URL`, or `OUROBOROS_MODEL` as compatibility/user-facing runtime inputs. The current run's env docs used public `LLM_*` first but still documented control-plane fallback aliases.
+- Risk: standalone generated projects absorb Umbrella/Ouroboros control-plane internals as product API. This couples user workspaces to the deep-agent host and makes future agents like Hermes inherit the same trivia.
+- Cause: Umbrella relied on generated code to read both public `LLM_*` aliases and host `OUROBOROS_*` aliases. Prompts, write guards, completion memory, and verification all therefore treated host aliases as valid generated-project content.
+- Fix: DomainPolicy now separates public generated-project aliases from host bridge aliases. Workspace command and verification runners map host launch env into `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` before generated tests run. Phase prompts and write/completion guards now require generated code/docs/tests/env examples to expose only public `LLM_*` aliases and reject control-plane alias leaks.
+- Regression: `test_run_workspace_command_bridges_host_llm_env_to_public_aliases`, `test_shell_bridges_host_llm_env_to_public_aliases`, `test_apply_workspace_patch_blocks_control_plane_aliases_even_with_public_aliases`, `test_completion_memory_rejects_control_plane_llm_alias_leak`, `test_propose_phase_plan_rejects_control_plane_llm_alias_contract`, and `test_latest_phase_plan_execution_floor_rejects_control_plane_llm_aliases`.
+
+## 2026-05-20 - Research Summary Shortfall Feedback Did Not Point To Usable Source
+
+- Run: `phase_web_23267f3c`.
+- Symptom: research had two accepted findings, then called `search_gmas_knowledge` successfully, but repeatedly retried `submit_research_summary` with invented or duplicate ids instead of first saving a third `palace_add(kind=research_finding)`. The summary gate only said "got 2; add another concrete palace_add finding" and did not name the recent usable source.
+- Risk: a phase can burn many rounds in a summary/error loop even though the needed evidence is already in the current tool log. This is a ReviewBundle/EvidenceGraph handoff problem: the next action is recoverable but not projected into the feedback.
+- Cause: `submit_research_summary` shortfall validation did not inspect recent successful discovery rows to produce a concrete repair source.
+- Fix: the shortfall error now appends a source-aware repair hint. If a usable discovery result exists, it names the exact source id candidate, tells the agent to call `palace_add(kind="research_finding")` grounded in that source, and to cite the returned primary id once before retrying the summary.
+- Regression: `test_submit_research_summary_shortfall_suggests_recent_discovery_source`.
+
 ## 2026-05-20 - Explicit Research Observations Were Promoted Into Findings
 
 - Run: `phase_web_694128fb`.
@@ -28,7 +55,7 @@ Rule for future fixes: before patching product code, prompts, tools, schemas, va
 - Symptom: execute generated `tests/test_config.py` with a test named around `OUROBOROS_LLM_MODEL`, even though the user-facing workspace project is a standalone app and should expose generic `LLM_*` runtime settings rather than teaching deep-agent/control-plane typo details.
 - Risk: control-plane alias trivia becomes product API, docs, and tests inside generated workspaces. That creates brittle tests, confuses users, and couples standalone projects to Umbrella/Ouroboros internals.
 - Cause: plan/execute/policy prompts, `env_check` advisories, and generic `llm_runtime_contract` feedback repeatedly put Umbrella compatibility aliases ahead of the standalone project contract or said "the model alias is `OUROBOROS_MODEL`, not `OUROBOROS_LLM_MODEL`" even when the rejected payload did not contain the bad alias. Plan validators also allowed protective mentions of the unsupported alias, so the model preserved the anti-pattern as product logic.
-- Fix: agent-facing prompts and `env_check` now present `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` as the standalone public contract, with `OUROBOROS_*` only as optional inherited compatibility aliases. Structured `env_check.accepted_*` lists are public-first. Generic guard feedback no longer names `OUROBOROS_LLM_MODEL`; validators reject any appearance of that unsupported alias in plan/workspace artifacts, including protective wording, and keep the bad alias visible only when the payload actually contains it.
+- Fix: agent-facing prompts and `env_check` now present `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` as the standalone public contract. Follow-up tightened this so Umbrella maps host control-plane aliases into public `LLM_*` before workspace commands run, and generated projects should not document or test those host aliases. Generic guard feedback no longer names `OUROBOROS_LLM_MODEL`; validators reject any appearance of that unsupported alias in plan/workspace artifacts, including protective wording, and keep the bad alias visible only when the payload actually contains it.
 - Regression: `test_env_check_accepts_ouroboros_llm_key_alias`, `test_agent_facing_runtime_prompts_do_not_teach_unsupported_model_alias`, `test_apply_workspace_patch_blocks_protective_unsupported_model_alias_docs`, `test_propose_phase_plan_accepts_public_llm_alias_contract_without_ouroboros_aliases`, `test_propose_phase_plan_rejects_protective_unsupported_model_alias_note`, `test_latest_phase_plan_execution_floor_accepts_public_llm_alias_contract`, and `test_latest_phase_plan_execution_floor_rejects_protective_model_alias_note`.
 
 ## 2026-05-20 - Watcher Did Not Structure Bad Generated Success-Test Contract
@@ -983,3 +1010,333 @@ Rule for future fixes: before patching product code, prompts, tools, schemas, va
 - Cause: LLM env checks verified that all required aliases appeared somewhere in the plan, but there was no Umbrella-level DomainPolicy list of unsupported alias tokens. A typo could coexist with correct aliases elsewhere and pass.
 - Fix: added `umbrella.deep_agent_tools.domain_policy` with canonical LLM runtime alias groups and unsupported alias detection. Phase-contract validation and runner execution-floor validation now reject `LL_BASE_URL` with guidance to use `LLM_BASE_URL`. Existing protective handling for `OUROBOROS_LLM_MODEL` remains in place.
 - Regression: `test_propose_phase_plan_rejects_unsupported_ll_base_url_alias` and `test_latest_phase_plan_execution_floor_rejects_unsupported_ll_base_url_alias`.
+
+## 2026-05-20 - Verification Could Treat Missing Or Weak Evaluator As Success Signal
+
+- Run: architecture audit requested after stopped calibration run `phase_web_cdf9408f`.
+- Symptom: the control plane still had bypass channels where a code task could rely on absent verifier config, missing tests, weak test assertions, shell mutation, or verifier/test tampering while chasing a green visible signal.
+- Risk: Goodhart pressure pushes the deep agent toward shortest visible success: deleting/weaking tests, changing verifier files, writing through shell, or recording self-justifying memory. This undermines Umbrella as a universal control plane for future deep agents.
+- Cause: enforcement was spread across prompts, local regex guards, test quality heuristics, and individual tool implementations. There was no single capability kernel, supervisor-only ledger, diff-aware anti-tamper gate, or proof graph tying claims to evidence.
+- Fix: added `umbrella/enforcement/kernel.py` and `umbrella/enforcement/ledger.py`, hooked workspace patch/delete/shell/self-edit paths into kernel checks and a hash-chained supervisor ledger, made no verifier a hard failure, made missing behavioral tests fail for code tasks, added `umbrella/verification/diff_policy.py`, `umbrella/verification/test_tamper.py`, and mutation smoke verification for changed Python production files. `sandbox_self_edit` now rolls back by default; persistent no-rollback requires explicit approval.
+- Regression: `test_enforcement_kernel.py`, `test_diff_policy.py`, `test_verification_enforcement.py`, `test_verify_loop_hard_gate.py`, and updated `test_sandbox_self_edit.py`.
+
+## 2026-05-20 - Memory And Completion Claims Needed Evidence-Bound Structure
+
+- Run: same architecture audit requested after stopped calibration run `phase_web_cdf9408f`.
+- Symptom: durable memories and completion claims could still become narrative assertions without a machine-checkable link to changed files, tests/probes, runtime evidence, verifier results, or ledger events.
+- Risk: memory self-poisoning and fake completion evidence become possible even when individual test commands pass. Later phases may retrieve stale or unjustified "lessons" as trusted context.
+- Cause: the existing evidence graph only covered phase-plan pytest target ownership. Durable memory hygiene existed for lessons, but generic memory writes did not expose one shared evidence-bound policy.
+- Fix: expanded `umbrella.deep_agent_tools.evidence_graph` with `BehaviorClaim`, `ProofGraph`, and `ProofGraphIssue` (`claim -> changed_files -> tests/probes -> runtime_evidence -> verification_result`). Added `memory_write_policy_issues` and blocked durable/manager/competency memory writes without evidence refs such as `source_id`, `tool_result_id`, `artifact_id`, `verify_run_id`, or `ledger_event_id`.
+- Regression: `test_proof_graph.py` and `test_memory_evidence_policy.py`.
+
+## 2026-05-20 - Research Memory Accepted Broad Or Fallback Provenance As Verified Findings
+
+- Run: `phase_web_96995622`.
+- Symptom: research first rejected a summary that claimed positive GitHub evidence without matching accepted findings, but then accepted a `palace_add(kind="research_finding")` with `source_id="github_project_search"` and later allowed summary wording `GitHub discovery executed - see finding ...`. The same run also promoted a `get_gmas_context` result with `confidence=0.16` and `metadata.fallback=true` into `verified=true` research memory.
+- Risk: plan and execute can build from hot "verified" findings that are really broad discovery bookkeeping or weak retrieval fallback. This weakens the MemoryWriteService/EvidenceGraph contract and lets phrasing drift around summary validators.
+- Cause: `palace_add` provenance validation accepted bare result-bearing tool ids as exact sources, and `gmas:*` provenance only required any successful GMAS row, not a non-fallback/strong retrieval. The research summary source-claim detector also missed the positive wording "GitHub discovery executed".
+- Fix: `palace_add` now rejects bare `github_project_search` for counted findings and requires concrete `github:owner/repo` or tool-qualified `github_project_search:<exact query>` provenance. `gmas:*` counted findings now reject fallback or low-confidence GMAS retrieval and must be saved as observations unless backed by stronger GMAS evidence. Summary source-claim detection now treats "GitHub discovery executed" / "see finding" as positive GitHub evidence that must have usable GitHub provenance.
+- Regression: `test_palace_add_rejects_captured_bare_github_project_search_source`, `test_palace_add_rejects_captured_fallback_gmas_context_as_verified_finding`, and `test_submit_research_summary_rejects_captured_bare_github_discovery_claim`.
+- Follow-up from clean rerun `phase_web_30ea3d17`: tool-qualified sources still bypassed the stronger source contract. `get_gmas_context:multi-agent game simulation economy diplomacy negotiation strategy` was accepted as verified with `confidence=0.21`, and `mcp_discover:file data analysis web requests` was accepted even though the logged MCP result had `results=[]`.
+- Follow-up fix: tool-qualified source validation now routes GMAS tools through the same non-fallback/confidence gate as `gmas:*`, and treats `mcp_discover`, `web_search`, `deep_search`, and `github_project_search` as result-bearing sources that require non-empty results before they can support counted research findings. Research-summary repair hints no longer suggest weak GMAS or empty-result discovery rows as usable source candidates.
+- Follow-up regression: `test_palace_add_rejects_captured_tool_qualified_low_confidence_gmas_source`, `test_palace_add_rejects_captured_empty_mcp_tool_qualified_source`, and updated `test_palace_add_accepts_verified_mcp_source_after_nonempty_success`.
+- Follow-up from clean rerun `phase_web_387fc41c`: product validation was fixed, but `umbrella/prompts/phases/research.system.md` still told the research agent that bare `github_project_search`, `mcp_discover`, `deep_search`, and `web_search` were valid exact `source_id` values and included preflight-only sources such as `read_workspace_charter`. The agent then attempted a counted finding with `source_id="read_workspace_charter"` during research, which the validator rejected because there was no current research-phase tool row.
+- Follow-up prompt fix: research phase instructions now describe the same source contract as the validator: result-bearing tools need concrete namespace/tool-qualified source ids with non-empty results, GMAS needs non-fallback/sufficiently confident retrieval, and preflight-only calls do not count as research finding provenance.
+- Follow-up from clean rerun `phase_web_2cff1a0e`: the prompt was fixed, but the missing-`source_id` validator feedback itself still said "Use an exact tool source such as `github_project_search`, `mcp_discover`, `web_search`, `deep_search`..." after rejecting a counted finding. That feedback could steer the agent back into the old invalid source grammar.
+- Follow-up fix: missing/unknown source feedback now uses the same source contract as prompt/schema/validator and points to concrete namespaces, tool-qualified usable result sources, or non-fallback GMAS sources. It tells the agent to save empty-result discovery as `kind=observation`.
+- Follow-up from clean rerun `phase_web_6b78e406`: the validator still accepted GMAS `result_preview` rows that were truncated/invalid JSON. The captured `get_gmas_context` and `search_gmas_knowledge` rows had high or usable-looking top-level fields but also contained nested `"metadata": {"fallback": true}` in the raw preview. Because JSON parsing failed, fallback metadata and confidence were not inspected, and three fallback-derived rows were saved as verified `research_finding` memory.
+- Follow-up fix: GMAS provenance validation now scans raw `result_preview` text when structured JSON parsing fails, rejects `metadata.fallback=true`, and extracts raw `confidence` values for the same low-confidence gate. This keeps the source contract tied to evidence text instead of assuming logged previews are always parseable JSON.
+- Follow-up regression: `test_palace_add_rejects_truncated_fallback_gmas_preview_source`.
+- Systemic refactor after repeated provenance regressions: added `umbrella/deep_agent_tools/research_provenance.py` as the shared ResearchProvenance/SourceEvidenceContract for usable tool results, GMAS fallback/confidence checks, source-handle validation, schema text, and `submit_research_summary` repair hints. This removes the separate hint-side GMAS/result-bearing logic from `phase_control_research.py` and keeps `palace_add`, schema descriptions, and summary repair guidance on one contract.
+- Sync regression: `test_research_provenance_contract_drives_schema_description` and `test_research_provenance_contract_rejects_truncated_fallback_gmas_handle`.
+- Follow-up from clean rerun `phase_web_779c6ad4`: the shared source contract correctly rejected fallback GMAS and the research agent adapted to three accepted finding ids, but `submit_research_summary` still accepted freeform `notes` with explicit `Source:` labels that were not the exact `source_path` values of the cited accepted findings, such as `deep_search:fastapi react full stack tutorial`, `deep_search:github isadri transcendence`, and `deep_search:GMAS early_stop_example.py`. `research_review` then read the artifact and submitted `ok`, so the unbacked narrative could have flowed into planning despite valid `findings_ids`.
+- Follow-up fix: `research_provenance.py` now validates research-summary handoff source labels: explicit `Source:`/`Sources:` handles in notes must be exactly backed by the cited accepted findings' `source_path` values. `research_review` applies the same check to latest summary artifacts, so legacy/previously accepted summaries cannot pass merely because their id list is valid.
+- Follow-up regression: `test_submit_research_summary_rejects_captured_unbacked_source_labels`, `test_submit_research_summary_accepts_exact_backed_source_labels`, and `test_research_review_rejects_summary_with_unbacked_source_labels`.
+
+## 2026-05-20 - Plan Review Converted Structural Final-Proof Gap Into Nonblocking Note
+
+- Run: `phase_web_883b9f7e`.
+- Symptom: the submitted plan reached `plan_review`, and the reviewer correctly attempted `verdict=revise` because `final-verification` claimed to prove localhost deployment/WebSocket/real LLM behavior while reusing the earlier `tests/integration/test_game_loop.py` success target. The same plan also declared `workspace.toml` in `files_to_change`. `submit_micro_review` rejected the revise as an implementation-owned detail, the reviewer resubmitted `ok`, and execute started writing docs.
+- Risk: Umbrella can allow execute to begin from a plan whose final proof is only a repeat of candidate-visible tests and whose file contract mutates supervisor/evaluator config. This is a Goodhart bypass at the plan/review boundary, not a generated-code implementation bug.
+- Cause: `PhasePlanEvidenceGraph` only checked that pytest targets existed in same/earlier leaves; it did not distinguish a final verification proof from ordinary leaf proof reuse. `phase_contract_paths` did not treat `workspace.toml`, `verification.toml`, or `verify.sh` as protected control/evaluator mutation targets in phase plans. `plan_review` also treated a request to replace the weak final proof as a nonblocking implementation detail even when the submitted plan violated product policy.
+- Fix: `PhasePlanEvidenceGraph` now rejects final/e2e/verification leaves that reuse prior pytest targets without owning a distinct final proof artifact or managed verifier. Phase-plan path policy now rejects generated-workspace mutations of `workspace.toml`, `verification.toml`, and `verify.sh`, plus parent-path/`.git`/host-control boundary escapes. `plan_review` can submit `revise` for these structural proof/capability blockers while still rejecting loops over ordinary implementation details.
+- Regression: `test_propose_phase_plan_rejects_control_plane_file_mutation`, `test_propose_phase_plan_rejects_paths_outside_workspace_boundary`, `test_propose_phase_plan_rejects_final_verification_reusing_prior_target`, `test_propose_phase_plan_accepts_final_verification_owned_target`, `test_plan_review_ok_rejects_captured_final_proof_gap_plan`, and `test_plan_review_allows_revise_for_policy_detected_final_proof_gap`.
+
+## 2026-05-20 - Execute Deadlocked Because Leaf Completion Required Whole-Project Verify
+
+- Run: `phase_web_e6708d53`.
+- Symptom: execute reached the first leaf `fix-model-validators`. Its declared focused success test `python -m pytest tests/test_models.py::TestGameState::test_game_state_creation -q` passed repeatedly, but `mark_subtask_complete` kept rejecting the leaf because full `run_workspace_verify` still had broader pytest failures in `tests/test_models.py`. Those failures were intended for the later `domain-fix-all-tests` leaf, so the agent stayed trapped in the first card, repeatedly mutating the plan, requesting ineffective watcher reviews, and rewriting/truncating `src/civilization/game/models.py`.
+- Risk: Umbrella conflates "can close this bounded leaf" with "can close the whole execute/final verification phase". The deep agent then optimizes against contradictory gates and broadens local repairs into destructive rewrites instead of advancing to the planned owner of the remaining failures.
+- Cause: `_workspace_verify_completion_issue` treated any full-verifier failure mentioning the current success-test file as current-leaf debt. `request_watcher_review` counted only declared success-test command failures, not red verifier/completion-rejection loops. `loop_back_to` allowed a forward jump from execute to verify, and `submit_phase_plan` could leave stale `plan_review=done` state after a new submitted plan. Same-path source replacement could also bypass truncation protection with any non-empty validation summary.
+- Fix: completion gating now classifies pytest verifier failures by proof scope. A focused leaf can close when its exact success test passed and broader pytest failures are covered by a later pending leaf, while global safety gates such as source-policy/anti-gaming/mutation/evaluator failures still block immediately. Watcher retry state now counts red `run_workspace_verify` and rejected `mark_subtask_complete` rows as semantic deadlock evidence. `loop_back_to` rejects forward targets, `submit_phase_plan` invalidates stale plan_review/downstream phases, and same-path source replacement blocks large symbol/contract loss even with a validation summary.
+- Web discovery follow-up from the same run: initial fix still left `OPENAI_API_KEY` in the `web_search` provider branch and documented a legacy DuckDuckGo disable env. This was later replaced with the GMAS WebSearchTool adapter described below.
+- Regression: `test_mark_subtask_complete_defers_full_verify_failures_owned_by_later_leaf`, `test_mark_subtask_complete_blocks_unowned_full_verify_failure`, `test_request_watcher_review_counts_verify_and_completion_deadlock`, `test_loop_back_to_rejects_forward_phase_target`, `test_submit_phase_plan_invalidates_stale_plan_review_and_downstream`, and `test_apply_workspace_patch_blocks_same_path_replacement_contract_loss`.
+- Verification: focused regressions passed (`8 passed`); affected phase/write/runtime suite passed (`228 passed`); affected phase-control/contract/runner suite passed (`508 passed`); py_compile passed for changed modules.
+
+## 2026-05-20 - Ouroboros web_search Had a Hardcoded OpenAI Provider Branch
+
+- Run: `phase_web_7941d4a5`.
+- Symptom: after the discovery fixes, `ouroboros/ouroboros/tools/search.py` still selected an `openai_web_search` provider whenever `OPENAI_API_KEY` existed and described missing `OPENAI_API_KEY` as relevant to web search availability. This kept OpenAI semantics inside a generic internet tool, exactly the confusion that made research think web access was tied to an OpenAI credential.
+- Risk: generic discovery becomes provider-specific and teaches the agent the wrong mental model: no OpenAI key looks like no internet, and generated project/runtime reasoning can inherit that false association.
+- Cause: Ouroboros had its own bespoke `web_search` implementation instead of using the existing GMAS WebSearchTool provider stack. The custom branch mixed three separate concerns: public web search, OpenAI Responses web_search, and LLM summarization.
+- Fix: `ouroboros/ouroboros/tools/search.py` is now a thin adapter over GMAS WebSearchTool. DuckDuckGo is the default provider and requires no API key; optional providers are handled by GMAS provider routing/fallback. The Ouroboros tool returns structured JSON with `status`, `answer`, `sources`, and provider `attempts`, but no longer branches on `OPENAI_API_KEY` and no longer uses `OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO` to disable internet access.
+- Regression: `test_web_search_uses_duckduckgo_fallback`, `test_web_search_uses_duckduckgo_fallback_without_openai_key`, `test_web_search_ignores_legacy_fallback_disable_env`, `test_web_search_returns_structured_provider_error`, `test_web_search_accepts_intent_metadata_from_capture`, `test_web_search_does_not_select_openai_when_openai_key_exists`, `test_web_search_adapter_default_provider_is_gmas_duckduckgo`, and `test_web_search_schema_does_not_mention_openai`.
+- Verification: focused runtime-control tests passed (`21 passed`); affected phase/provenance suites passed (`364 passed` and `161 passed`); py_compile passed for `ouroboros/ouroboros/tools/search.py`.
+
+## 2026-05-20 - deep_search Still Had Legacy Provider Gating And Broken Fallback
+
+- Run: follow-up before clean rerun after `phase_web_81f6c293` start was stopped for product edits.
+- Symptom: after `web_search` was moved to GMAS, `deep_search` still carried a fast-provider API-key gate, listed `OPENAI_API_KEY` as a search provider signal, used legacy slow-fallback env vars, and fell back to the removed `_web_search_via_duckduckgo` helper. This made the preferred research tool diverge from the GMAS provider-independent model.
+- Risk: research could still treat missing OpenAI credentials as a generic internet-search problem, or return `provider_unavailable` before trying the no-key DuckDuckGo provider. The tool also had a dead fallback path after the web_search refactor.
+- Cause: `deep_search.py` had its own provider-gating logic and fallback pile instead of sharing the GMAS WebSearchTool adapter boundary. The Web UI bridge also still set a legacy "allow slow fallback" env var based on provider-key detection.
+- Fix: `deep_search` now always uses GMAS WebSearchTool. It defaults to DuckDuckGo/no-key provider routing, fetches result page content by default, and uses GMAS Playwright page reading by default for deep mode. If Playwright is unavailable, it retries with GMAS HTTP content fetch and reports the browser fallback in the structured payload. The Web UI bridge no longer injects legacy slow-fallback env flags, and schemas/docs no longer describe OpenAI as controlling generic discovery.
+- Regression: `test_deep_search_uses_gmas_playwright_by_default`, `test_deep_search_no_key_provider_uses_gmas_duckduckgo`, `test_gmas_search_playwright_error_falls_back_to_http`, `test_deep_search_schema_does_not_mention_openai`, plus updated knowledge/budget persistence tests.
+- Follow-up design refinement: `deep_search` is now an engine boundary, not a GMAS-only hardcode. Auto mode keeps GMAS/DuckDuckGo/Playwright as the no-key baseline, and can route to stronger hosted engines when configured: Firecrawl search+scrape via `FIRECRAWL_API_KEY`, or Jina Reader Search via `JINA_API_KEY`/explicit engine. External engine failure in auto mode falls back to GMAS with structured provenance instead of blocking discovery.
+- Follow-up regression: `test_deep_search_auto_uses_firecrawl_when_key_configured`, `test_deep_search_external_auto_error_falls_back_to_gmas`, `test_firecrawl_search_normalizes_scraped_markdown`, and `test_jina_search_parses_reader_urls`.
+
+## 2026-05-20 - Research Loop Had No Honest Scarce-Discovery Handoff
+
+- Run: `phase_web_af37a8b6`.
+- Symptom: clean rerun reached `research` and then looped before `research_review`. `github_project_search` produced one usable result row, `mcp_discover` returned empty results, `deep_search` returned `no_results`, `web_search` attempted the DuckDuckGo fallback but hit an SSL timeout, and GMAS context rows were fallback/low-confidence. The provenance gates correctly rejected fallback GMAS, empty MCP/web claims, duplicate primary/legacy ids, and invented findings; however `submit_research_summary` still required three accepted findings and only told the model to keep searching.
+- Risk: a strict evidence floor can become a deadlock when the supervisor already knows usable discovery is scarce. The agent then pressures the system by duplicating aliases, relabeling one finding, or promoting fallback/empty sources instead of handing off a truthful low-evidence state.
+- Cause: `ResearchProvenance` distinguished usable versus unusable sources for `palace_add`, but there was no supervisor-computed source-attempt ledger or typed `source_scarce` handoff for `submit_research_summary`/runner. `web_search` network failures also returned a bare `{error: ...}` payload, so research could not reason over provider, query, intent, or retryability.
+- Fix: `research_provenance.py` now builds source-attempt coverage reports, treats `web_search.sources` as usable source rows, and exposes a `source_scarce` handoff gate. `submit_research_summary` accepts `coverage_status="source_scarce"` only after GitHub, internet, and MCP discovery were attempted, at least one accepted finding exists, and every usable source row has been harvested into an accepted finding. The summary artifact stores `coverage_status`, `coverage_report`, and `source_scarcity_reason`. `PhaseRunner` uses the same scarcity contract and canonical primary/legacy finding identity, so aliases cannot inflate the handoff floor. `web_search` now returns structured `provider_error` payloads on timeout instead of a bare error object.
+- Regression: `test_submit_research_summary_accepts_source_scarce_after_exhausted_discovery`, `test_submit_research_summary_source_scarce_rejects_unharvested_usable_source`, `test_latest_research_summary_counts_unique_canonical_findings`, `test_latest_research_summary_allows_source_scarce_handoff`, `test_web_search_returns_structured_provider_error`, and `test_palace_add_accepts_web_search_source_with_sources_payload`.
+
+## 2026-05-21 - Typed Plan Declared Supervisor Control File As Candidate Work
+
+- Run: `phase_web_673d3dae`.
+- Symptom: a submitted typed phase plan could include candidate workspace changes to supervisor/evaluator control files such as `workspace.toml`, `verification.toml`, or root `verify.sh`, and could also declare parent-path or `.git` paths in leaf file/proof scope.
+- Risk: execute could treat Umbrella control-plane configuration as generated project implementation, weakening capability boundaries and verifier isolation before watcher/verify had a chance to object.
+- Cause: `ContractValidator` validated typed proof shape and shell masking but did not validate candidate file paths across `files_to_create`, `files_to_change`, `proof.scope.files_under_test`, and `proof.scope.changed_files_expected`.
+- Fix: `validate_plan_candidate_paths` now blocks absolute paths, `..` escapes, `.git`, `.memory`, `.umbrella`, `.umbrella_scratch`, and root `workspace.toml`/`verification.toml`/`verify.sh` in typed plan candidate paths.
+- Regression: `test_plan_contract_blocks_candidate_control_paths_and_workspace_escapes`.
+
+## 2026-05-21 - Research Review Demoted Current Source-Scarce Finding Via Stale Recall
+
+- Run: `phase_web_9751efb0`, preserved for the next clean rerun after the recovery pass.
+- Symptom: `research_review` could submit `verdict=revise` with `insufficient_research_evidence` after stale `palace_search` recall suggested accepted findings were absent, even though the latest current-run `research_summary_latest.json` cited an accepted `research_finding` and used the supervisor-approved `coverage_status="source_scarce"` handoff.
+- Risk: review could convert a truthful low-evidence handoff into an endless research loop, pressuring the research agent to invent/duplicate findings instead of passing constrained evidence to planning.
+- Cause: `submit_micro_review` validated the typed review shape but did not bind `insufficient_research_evidence` to the authoritative current summary artifact and current-run accepted `palace_add` ids.
+- Fix: `submit_micro_review` now applies research-review artifact validation and rejects revise decisions that demote a current source-scarce summary with accepted current-run finding ids unless the review cites a concrete source-policy/fabrication/unbacked-label blocker.
+- Regression: `test_research_review_revise_cannot_demote_current_source_scarce_finding`.
+
+## 2026-05-21 - Copy Sandbox Rollback Left Ouroboros Half-Deleted And Emptied Review Tool Surface
+
+- Run: `phase_web_65c28d9f`.
+- Symptom: `research` exited through copy-sandbox rollback with `FileExistsError: Cannot create a file when that file already exists: ...\\ouroboros`. The next `research_review` phase emitted `phase_tool_contract_missing` for every allowed review tool, started an LLM round with zero tools, then crashed with `TypeError: argument of type 'NoneType' is not iterable` in `_call_llm_for_phase_round`.
+- Risk: a rollback failure in product-code isolation can corrupt the deep-agent source tree between phases. Umbrella then launches a review phase with an empty actual registry despite valid phase manifests, turning a system boundary failure into an agent-facing missing-tools crash.
+- Cause: copy snapshot restore deleted the target surface before copying the snapshot back, then called `shutil.copytree(saved, target)` assuming the target no longer existed. On Windows a surviving/locked directory caused `copytree` to fail after partial deletion.
+- Fix: copy-sandbox restore now first builds a staging copy, then removes the target. If the target survives removal, the snapshot is overlaid with `dirs_exist_ok=True` and extra paths are pruned best-effort. The sentinel bug found during regression writing was fixed by using `None`, not `Path()`, for a consumed staging path.
+- Regression: `test_copy_snapshot_restore_overlays_when_target_survives_removal`.
+
+## 2026-05-21 - palace_add Research Handler Crashed On Missing Tool-Log Helper
+
+- Run: `phase_web_a31fd64b`.
+- Symptom: during `research`, every counted `palace_add` call returned `TOOL_ERROR: name '_tool_log_rows_for_task' is not defined`. The captured payloads included normal research finding attempts with `source_id="get_gmas_context:multi-agent civilization game LLM bot architecture"` and later prior-art source attempts, so the phase loop could not save accepted findings.
+- Risk: evidence policy failures were surfaced as Python runtime errors instead of typed contract feedback. That turns a recoverable provenance problem into an opaque loop and prevents source-scarce handoff from operating.
+- Cause: `phase_contract_handlers._palace_add` used phase-control evidence helpers without importing them explicitly. Existing tests covered downstream contract decisions but not the handler import surface used by the live tool registry.
+- Fix: `phase_contract_handlers` now explicitly imports the shared tool-log, LLM handoff, contradiction, and unread-workspace-path helpers used by `palace_add`, restores the LLM runtime alias contract helper for research findings, and `phase_contract_base` imports `sys` explicitly for the legacy memory bridge.
+- Regression: `test_research_palace_add_can_read_tool_rows_without_name_error`.
+
+## 2026-05-21 - Copy Sandbox Rollback Deleted Umbrella When Staging Rename Was Denied
+
+- Run: `phase_web_a31fd64b`.
+- Symptom: the same run exited `research` with `.umbrella/sandbox_sessions/sandbox_4d55146a.json` reporting `rollback_ok=false` and `PermissionError: [WinError 5] Access is denied: '.umbrella.restore_sandbox_4d55146a' -> 'umbrella'`. After stop, `git status` showed the entire tracked `umbrella/` tree as deleted.
+- Risk: a failed rollback can remove Umbrella's own control-plane code after the agent phase, forcing operator recovery and making the next run depend on a half-restored repository.
+- Cause: the staging-copy restore handled a surviving target directory, but when the target had been removed and `Path.rename(staging, target)` failed on Windows, cleanup still removed the staging snapshot and left no `umbrella/` target.
+- Fix: copy-sandbox restore now falls back to `shutil.copytree(staging, target, dirs_exist_ok=True)` when staging rename fails, then prunes extras and only removes staging after the target exists.
+- Regression: `test_copy_snapshot_restore_falls_back_when_staging_rename_is_denied`.
+
+## 2026-05-21 - Web Bridge Worker Died Before Preflight Without Bundled Ouroboros Import Path
+
+- Run: `phase_web_792ccf60`.
+- Symptom: after clean restart, WebBridge created the run record but `phase_plan.json` was never written and the run was later repaired to `failed` with the stale preview `Phase run started.`. A foreground import reproduced the cause: `ModuleNotFoundError: No module named 'ouroboros.tools'` while importing `umbrella.orchestrator.runner`.
+- Risk: a source checkout bridge can fail before preflight without a useful run error, and the operator sees a failed run with no phase events or tool logs.
+- Cause: the recreated editable environment installed `umbrella` but did not install the sibling `ouroboros` package. Pytest adds `ouroboros/` through `pythonpath`, but `bridge.exe` did not add the bundled deep-agent package path at runtime. The worker also imported `PhaseRunner` before its exception-handling block.
+- Fix: `WebBridgeApp` now injects the bundled `repo_root/ouroboros` source path into `sys.path` when launched from source, and `_run_phase_runner_worker` records import failures into the run record instead of silently dying before phase events.
+- Regression: `test_web_bridge_adds_bundled_agent_import_paths` plus existing worker-limit coverage.
+
+## 2026-05-21 - Web And Deep Search Could Not Import Local GMAS Tools
+
+- Run: `phase_web_3054b3ab`.
+- Symptom: `research` reached the expected discovery tools, but both `web_search` and `deep_search` returned structured provider errors with `ModuleNotFoundError("No module named 'gmas.tools'")` instead of using the no-key GMAS WebSearchTool/DuckDuckGo baseline.
+- Risk: the research phase loses its generic internet channel and can misclassify discovery scarcity as external-source scarcity, even though the local GMAS source tree is present.
+- Cause: the same source-checkout import boundary fix added `repo_root/ouroboros` for the deep agent package but did not add `repo_root/gmas/src`, where the `gmas.tools` package lives.
+- Fix: `WebBridgeApp` now injects both bundled agent source roots, `ouroboros/` and `gmas/src`, before phase runner work starts.
+- Regression: `test_web_bridge_adds_bundled_agent_import_paths`.
+- Follow-up from clean rerun `phase_web_1bdf61a4`: after `gmas/src` was importable, `web_search`/`deep_search` advanced to `ModuleNotFoundError("No module named 'loguru'")`; `gmas.tools.__init__` also hard-imported vector search, which would require heavy optional deps such as `torch` before the web-search submodule could load.
+- Follow-up fix: `gmas.config.logging` now falls back to stdlib logging when `loguru` is absent, and `gmas.tools` treats vector search as optional so the web-search package can load in the bridge's Python 3.11 environment.
+- Follow-up regression: `test_web_bridge_can_import_bundled_gmas_web_search`.
+
+## 2026-05-21 - DuckDuckGo No-Key Provider Reported Missing ddgs As Discovery Failure
+
+- Run: `phase_web_3447e8c2`.
+- Symptom: after the GMAS web-search package became importable, `web_search` and `deep_search` returned structured provider errors whose only concrete attempt was `DuckDuckGoProvider` with `error="No module named 'ddgs'"`. The run could still use `source_scarce`, but the no-key internet channel was not actually available in the bridge runtime.
+- Risk: research can misclassify a local runtime dependency gap as external source scarcity. The generic internet tool contract says DuckDuckGo is the no-key baseline, so missing `ddgs` should not look like a provider/API-key availability problem.
+- Cause: the source-checkout Python 3.11 bridge injects local `gmas/src` directly, but root `pyproject.toml` only installed the `frontier-ai-gmas[web-search]` extra for Python >=3.12. GMAS also let an optional missing `ddgs` backend remain the final error after HTML fallbacks had honestly returned no results, and the stdlib logging fallback did not understand loguru-style `{}` formatting.
+- Fix: root runtime dependencies now include `ddgs>=9.11.4` for the bridge environment. DuckDuckGo search returns an honest empty result after non-ddgs fallbacks run empty instead of surfacing the missing optional backend as `provider_error`, and the GMAS stdlib logger fallback formats loguru-style messages.
+- Regression: `test_bridge_runtime_declares_no_key_duckduckgo_dependency`, `test_duckduckgo_missing_ddgs_empty_html_fallback_is_no_results`, and `test_gmas_stdlib_logging_fallback_accepts_loguru_format`.
+
+## 2026-05-21 - Research Summary Feedback Hid Usable Source When No Findings Were Accepted
+
+- Run: `phase_web_fc69f439`.
+- Symptom: research had a non-empty `github_project_search` result for `python game engine web browser`, but zero accepted `research_finding` ids. Repeated `submit_research_summary` failures only said `Known ids: none` / `do not submit an empty findings list`, so the agent tried broad `github_project_search`, observation drawer ids, empty-result claims, and fallback GMAS sources instead of saving the usable GitHub row as a concrete finding.
+- Risk: a correct evidence gate can still create a loop if its repair feedback omits the next valid source handle. The model then pressures other policies by promoting observations or fallback sources rather than harvesting existing usable evidence.
+- Cause: the source-aware `next_finding_source_hint` was only appended for partial shortfalls after the unknown/empty findings checks. The zero-finding and unknown-id paths returned before the repair hint ran.
+- Fix: research summary validation now appends the same recent usable source hint to empty `findings_ids` and unknown-id errors, including the exact `github:owner/repo` or tool-qualified handle to use in the next `palace_add(kind="research_finding")`.
+- Regression: `test_research_summary_empty_findings_suggests_recent_usable_source` and `test_research_summary_unknown_ids_suggests_recent_usable_source`.
+
+## 2026-05-21 - Stale Plan Review Revise Blocked Newly Submitted Phase Plans
+
+- Run: `phase_web_2f34ab21`.
+- Symptom: `plan_review` correctly submitted one typed `verdict=revise` at `02:43:02` for weak proofs in the first submitted plan. The agent then submitted revised plans at `02:44:28` and `02:45:36`, but Umbrella looped directly back to `plan` without launching a fresh `plan_review`, reusing the old retry reason from the prior review.
+- Captured shape: `phase_control_signals.jsonl` contained one `submit_micro_review` from `phase_web_2f34ab21:plan_review` followed by newer `submit_phase_plan` signals from `phase_web_2f34ab21:plan`; `phase_plan.json` showed `plan` overlay `retry_reason="contract decision loop_back to plan: ..."` with the stale weak-proof message.
+- Risk: a valid revised plan can never reach review/execute because stale review issues remain in the compiled ContractBundle after the authoritative submitted plan changes. This turns a healthy review loop into an orchestration deadlock.
+- Cause: `ContractCompiler` kept the latest `submit_micro_review` contract across the whole run without checking whether a newer `submit_phase_plan` invalidated the reviewed artifact.
+- Fix: `ContractCompiler` now ignores `plan_review` micro-review contracts whose `created_at` is older than the latest `submit_phase_plan` signal for the run. Fresh reviews after the latest submit are still compiled and can block normally.
+- Regression: `test_contract_compiler_ignores_plan_review_older_than_latest_submitted_plan` and `test_contract_compiler_keeps_plan_review_after_latest_submitted_plan`.
+
+## 2026-05-21 - Valid Discovery Handle Laundered Invented MCP Result Details
+
+- Run: `phase_web_98b70476`.
+- Symptom: research saved two `palace_add(kind="research_finding")` entries with `source_id="mcp_discover:game AI simulation"`, but the finding content listed MCP servers that were not present in the current `mcp_discover` result. The actual result rows were `nikhilkichili/nba-analytics-mcp` and `geeks-accelerator/animal-house-ai-tamagotchi`; the saved findings instead named unrelated server packages and research review accepted them.
+- Risk: a current, non-empty source handle can still launder invented narrative details into verified research memory. Downstream plan then treats hallucinated source rows as evidence, even though source provenance technically points at a real tool call.
+- Cause: `research_finding_source_provenance_issue` verified that a tool-qualified discovery source existed and had non-empty rows, but did not require the finding content to mention any concrete row from that tool output.
+- Fix: shared `research_provenance.py` now adds `tool_result_content_grounding_issue` for tool-qualified discovery handles. Counted findings backed by `github_project_search:<query>`, `mcp_discover:<query>`, `web_search:<query>`, or `deep_search:<query>` must mention at least one concrete result item from the logged source output, such as a repo/name/title/url. Synthesis or unsupported inference must be stored as observation.
+- Regression: `test_research_palace_add_rejects_tool_qualified_finding_not_grounded_in_rows`.
+
+## 2026-05-21 - Source-Scarce Handoff Counted GitHub Search As One Usable Source Despite Multiple Returned Repos
+
+- Run: `phase_web_cadd6381`.
+- Symptom: research submitted `coverage_status="source_scarce"` with one accepted finding for `github:Grimmys/rpg_tactical_fantasy_game`, while the current `github_project_search("python turn-based game")` result contained three concrete repositories. The handoff passed to `research_review` because the coverage report counted the whole GitHub search as one usable source handle.
+- Risk: the agent can under-harvest usable source rows, then claim scarcity even though additional concrete results are visible in the supervisor logs. This weakens the research evidence floor and pushes planning with less evidence than the discovery tools already provided.
+- Cause: `usable_research_source_handles` emitted one handle per usable discovery attempt (`github_project_search:<query>`) instead of repo-level handles for GitHub search rows.
+- Fix: GitHub discovery coverage now expands usable result rows into concrete `github:owner/repo` handles before `source_scarce` acceptance. The source-scarce gate blocks until the expected number of usable repo rows has accepted findings or the normal finding floor is met.
+- Regression: `test_research_summary_source_scarce_requires_each_usable_github_row`.
+
+## 2026-05-21 - Truncated GitHub Preview Rejected Returned Repo Handle
+
+- Run: `phase_web_5cb4d4af`.
+- Symptom: `github_project_search("python game AI LLM strategy")` returned `sonpiaz/4x-game-agent`, but the next `palace_add(kind="research_finding", source_id="github:sonpiaz/4x-game-agent")` was rejected with "does not match any repository returned". The raw `result_preview` contained the repo in visible text, but the preview was long/truncated and no longer valid JSON.
+- Risk: the source gate tells the agent to use concrete `github:owner/repo` provenance, then rejects the exact handle when the supervisor log stores a truncated preview. The model falls back to broad tool-qualified handles, weakening row-level provenance and source-scarce accounting.
+- Cause: GitHub provenance matching, source-scarce handle expansion, and repair hints only read parsed JSON payloads. They did not extract repo handles from raw `result_preview` text when JSON parsing failed.
+- Fix: shared `research_provenance.py` now extracts GitHub repo handles from both parsed payloads and raw preview text, and reuses that parser for `github:` provenance checks, usable source handles, repair hints, and tool-qualified grounding anchors.
+- Regression: `test_research_palace_add_accepts_repo_handle_from_truncated_github_preview`.
+
+## 2026-05-21 - Source-Scarce Coverage Treated Raw GitHub Rows As Unusable
+
+- Run: `phase_web_17d93f38`.
+- Symptom: `github_project_search("civ civilization strategy game")` returned visible repo handles including `bigai-ai/civrealm`, `pikodrak/pikodrak-game-civgame`, and `jcarn/civ-builder`, but `research_summary_latest.json` recorded `coverage_report.usable_source_count=0` and accepted `coverage_status="source_scarce"` with only two findings.
+- Risk: source-scarce can pass even when raw supervisor logs still contain harvestable GitHub rows. That weakens the research floor and lets planning inherit "scarcity" as a positive handoff instead of asking the agent to save another concrete finding.
+- Cause: `_attempt_status` classified non-JSON result previews as `unstructured_result` before checking whether the raw GitHub text contained concrete repo handles, so `usable_research_source_handles` skipped the row.
+- Fix: GitHub search rows with raw `github:owner/repo` handles are now treated as usable attempts even when JSON parsing fails, and source-attempt reporting counts those raw handles.
+- Regression: `test_research_summary_source_scarce_counts_truncated_github_rows`.
+
+## 2026-05-21 - Workspace Patch Tool Lost Split Helper Functions
+
+- Run: `phase_web_be5825b0`.
+- Symptom: execute reached project creation, but every `apply_workspace_patch` call failed with `WARNING: workspace patch error: name '_add_file_literal_hunk_marker_block' is not defined`; later update attempts also hit `_patch_hunk_mismatch_replacement_required_block` missing. The run failed with `execute phase completed without any effective workspace write tool calls`.
+- Risk: Umbrella's primary generated-workspace write tool is unavailable, so the agent burns execute rounds, tries blocked shell writes, and can mark subtasks complete with infrastructure-blocker claims instead of producing project files.
+- Cause: after the workspace tool split, `workspace_ops.py` still called patch-policy helpers for literal Add File hunk markers, repeated hunk mismatch replacement, and sidecar replacement prevention, but those helpers were no longer defined/imported.
+- Fix: restored the missing patch-policy helpers in `workspace_ops.py` as typed blocking payloads, including Add File literal hunk-marker detection, repeated hunk mismatch replacement-required payloads, replacement artifact blocks, and pending replacement sidecar blocks.
+- Regression: `test_apply_workspace_patch_rejects_add_file_literal_hunk_marker`, `test_apply_workspace_patch_allows_active_subtask_declared_file`, `test_apply_workspace_patch_requires_replacement_after_repeated_hunk_mismatches`, `test_apply_workspace_patch_blocks_corrected_sidecar_replacement_artifact`, `test_apply_workspace_patch_blocks_extra_sidecar_after_replacement_required`, and related patch-tool focused tests.
+
+## 2026-05-21 - Truncated Deep Search Results Could Not Become Findings
+
+- Run: `phase_web_4eaea518`.
+- Symptom: `deep_search("LLM AI opponent game economy diplomacy decision making examples")` returned concrete results, including `https://github.com/GoodStartLabs/AI_Diplomacy`, but `palace_add(kind="research_finding", source_id="deep_search:<query>")` repeatedly failed as "not a verifiable current discovery source". Research got stuck with no accepted findings.
+- Risk: a successful internet discovery channel becomes unusable whenever `result_preview` is long/truncated or stores sources in raw `answer` text instead of parsed `results/sources`. The agent then invents ids, submits empty summaries, or mislabels a validator limitation as source scarcity.
+- Cause: result-bearing source validation only considered parsed JSON `results` / `sources`. For truncated `web_search` / `deep_search` previews, `tool_result_payload` was empty or lacked parsed entries, so `tool_row_has_usable_result`, source hints, and grounding checks all treated concrete URLs/titles as unusable.
+- Fix: shared `research_provenance.py` now extracts raw result anchors (URLs, GitHub repo names, JSON title/name labels, and answer-list titles) from truncated result previews. Result-bearing tools are usable when those anchors exist, and counted findings must mention a concrete raw anchor from the cited tool output.
+- Regression: `test_research_palace_add_accepts_deep_search_from_truncated_raw_sources`.
+
+## 2026-05-21 - Completion Gate Accepted Artifact Refs As Proof Evidence
+
+- Run: `phase_web_6acec8d3`.
+- Symptom: during `execute`, the `project-scaffold` leaf repeatedly failed `run_workspace_verify` with `no_verifier_for_code_task` and had fake evidence refs rejected, but finally `mark_subtask_complete` returned OK. The authoritative `phase_control_signals.jsonl` payload showed `CompletionContract.completed_claims[*].proof_refs` using `ref_type="artifact"` with `ref_id="backend/requirements.txt"` / `package.json`, not ledger-backed proof. `tools.jsonl` hid nested evidence fields as `{"_depth_limit": true}`, so the first audit pass mistook sanitizer output for the actual payload until the unsanitized control signal was checked.
+- Risk: a subtask can close on agent-owned file existence artifacts after failed verifier/proof attempts. This breaks the typed Contract/Evidence Gate promise that completion claims require fresh supervisor/verifier evidence, and it makes audits harder because the shallow tool log hides the accepted refs.
+- Cause: `CompletionContract` schema and validator reused the generic `EvidenceRef` type, where `artifact`, `diff`, and `memory_node` are valid reference types for context. `validate_completion_contract` only required "some refs" and `EvidenceResolver` only looked up ledger rows for ledger-like ref types, so artifact refs silently counted as completion proof.
+- Fix: completion proof refs now use a ledger-backed evidence schema and validator rule. `CompletionContract` claims/evidence must cite `ledger_event`, `verification_report`, `test_run`, `mutation_report`, or `input_sensitivity_report`; artifact/context refs no longer satisfy completion proof. `EvidenceRef.from_mapping` and `EvidenceResolver` also reject malformed nested objects instead of stringifying them into apparently valid fields.
+- Regression: `test_completion_rejects_artifact_refs_as_proof` and `test_completion_rejects_depth_limited_evidence_ref_shape`.
+
+## 2026-05-21 - Proof Command Hid Shell Execution Inside Python Subprocess
+
+- Run: `phase_web_5a636852`.
+- Symptom: the plan validator correctly rejected explicit `workspace.toml` control-path edits, but later accepted/submitted proof commands with `execution.shell=false` whose argv was `["python", "-c", "import subprocess; subprocess.check_call([...], cwd='frontend', shell=True); ..."]`. Plan review even described that nested `shell=True` as acceptable build orchestration.
+- Risk: a plan can satisfy the top-level argv/shell contract while reintroducing shell eval inside inline Python, bypassing the same anti-gaming and portability policy that blocks `bash -lc`, `cmd /c`, `&&`, `|| true`, and failure masking.
+- Cause: `umbrella.analysis.shell_commands.validate_argv` only checked the outer argv and shell executable tokens. It did not parse inline `python -c` code for `subprocess.*(shell=True)` or `check=False`.
+- Fix: proof argv validation now parses inline `python -c` snippets with Python AST and rejects nested `subprocess` calls using `shell=True` or `check=False`. This keeps the boundary universal: direct argv/test files are allowed, but shell/failure-masking cannot be smuggled through Python.
+- Regression: `test_proof_blocks_python_c_subprocess_shell_bypass`.
+
+## 2026-05-21 - Plan Accepted Syntactically Invalid Inline Python Proof
+
+- Run: `phase_web_38d3a3c9`.
+- Symptom: after the shell-smuggling fix, the submitted plan removed `workspace.toml` paths and nested `shell=True`, but plan review accepted final verification proof argv `["python", "-c", "import subprocess, time, sys, urllib.request, json; ...; time.sleep(3); try: ... except Exception as e: ..."]`. The inline script is not valid Python because compound `try` statements cannot start after a semicolon in the same simple-statement list.
+- Risk: a final proof can pass plan/review gates even though it cannot execute. That delays a structural proof-contract error until execute/final verification and encourages the agent to treat a validator gap as an implementation/runtime failure.
+- Cause: the new inline Python AST inspection only reported syntax errors when the raw text also contained `shell=True`; otherwise invalid `python -c` snippets produced no blocking issue.
+- Fix: proof argv validation now rejects any syntactically invalid inline `python -c` proof with `invalid_python_c_proof`, before nested subprocess policy checks.
+- Regression: `test_proof_blocks_invalid_python_c_script`.
+
+## 2026-05-21 - Blocked Shell Mutation Remained In Candidate Workspace
+
+- Run: `phase_web_53c9ebef`.
+- Symptom: during `execute`, `run_workspace_command` ran `npm install --prefix frontend` with dependency install allowed. The enforcement kernel returned `status="blocked"` / `shell_tool_workspace_mutation` because the command created `frontend/package-lock.json`, but the file stayed on disk. The next tool call successfully read `frontend/package-lock.json`, and `delete_workspace_file` then blocked cleanup because it was not a cleanup-only path.
+- Risk: a blocked opaque command can still mutate candidate state. This undermines the phase capability model: shell tools are described as read-only verification surfaces, but a dependency install or other command can leave generated files behind after the supervisor says the mutation was rejected.
+- Cause: `run_workspace_command` captured a filesystem diff after opaque command execution and returned a typed blocked payload, but it did not restore the pre-command snapshot before handing control back to the agent.
+- Fix: enforcement snapshots can now capture file content for opaque command rollback. When `run_workspace_command` gets post-diff enforcement issues, it restores changed files before returning the blocked payload and includes rollback details.
+- Regression: `test_run_workspace_command_rolls_back_post_diff_shell_mutation`.
+
+## 2026-05-21 - Plan Validator Accepted Shell Chain Tokens In Proof Argv
+
+- Run: `phase_web_d27d4bb3`.
+- Symptom: `propose_phase_plan` accepted and `submit_phase_plan` made authoritative a plan whose frontend proofs used argv such as `["cd", "frontend", "&&", "npm", "run", "build"]`. `plan_review` later caught this as a blocking `policy_violation`, so the system recovered through review, but the contract gate had already accepted an invalid proof command.
+- Risk: invalid shell-shaped proof commands can enter submitted artifacts, forcing review/loopback to do validator work and leaving stale bad plans in memory/artifacts until a reviewer catches them. Similar shapes can also bypass top-level `shell=false` checks without invoking `bash -lc` or `cmd /c`.
+- Cause: `validate_argv` rejected shell executables, eval flags, and failure-masking phrases, but did not reject shell chaining operators when they appeared as standalone argv tokens.
+- Fix: proof argv validation now emits `shell_operator_in_argv` for standalone shell chain tokens (`&&`, `||`, `|`, `;`, `&`), requiring direct commands or checked-in scripts instead.
+- Regression: `test_proof_blocks_shell_chain_tokens_in_argv`.
+
+## 2026-05-21 - Rollback Snapshot Content Made Every Shell Proof Look Mutating
+
+- Run: `phase_web_df54fcf8`.
+- Symptom: execute reached the first subtask and `apply_workspace_patch` created the declared scaffold files, but the read-only proof command was blocked by the enforcement kernel. The blocked payload listed existing files such as `.memory/drive/logs/events.jsonl`, `.memory/palace/*`, `TASK_MAIN.md`, `workspace.toml`, `pyproject.toml`, and `src/civilization/__init__.py` as modified even though the proof was an import check.
+- Risk: every `run_workspace_command` can be rejected after a successful workspace patch, causing execute to deadlock on false `post_tool_supervisor_path_mutation` / `shell_tool_workspace_mutation` issues. The rollback path could also rewrite unchanged files unnecessarily.
+- Cause: `run_workspace_command` captured the pre-command snapshot with file `content` for rollback, then compared it to a normal post-command snapshot. `diff_snapshots` compared the whole `FileSnapshotEntry` dataclass, so `content=b"..."` versus `content=None` made unchanged files look modified.
+- Fix: `diff_snapshots` now compares only stable file metadata (`size`, `mtime_ns`, `digest`) and ignores the optional rollback-only `content` payload. Rollback still uses captured content for real blocked mutations.
+- Regression: `test_diff_snapshots_ignores_capture_content_payload` and `test_run_workspace_command_does_not_treat_snapshot_content_as_mutation`.
+
+## 2026-05-21 - Plan Prompt And Validator Treated Umbrella Tool As Workspace Proof Command
+
+- Run: `phase_web_d593bdc4`.
+- Symptom: `propose_phase_plan` accepted and `submit_phase_plan` made authoritative a plan whose final verification leaf used `execution.command=["run_workspace_verify"]`. `plan_review` later rejected it with `unavailable_proof_target`, explaining that `run_workspace_verify` is an Umbrella supervisor tool, not a subprocess command available inside the generated workspace. The bad shape repeated because `plan.system.md` itself included an example final-e2e leaf with `files_to_change=["workspace.toml"]` and `command=["run_workspace_verify"]`.
+- Risk: invalid proof commands can enter authoritative plan artifacts and force review loops to repair validator/prompt mistakes. Worse, the planner is taught to mutate supervisor-owned verification config as generated project work.
+- Cause: argv validation blocked shell wrappers and failure masking, but did not reject Umbrella tool names as proof executables. The phase prompt also contained a stale example from before the candidate/evaluator boundary was tightened.
+- Fix: proof argv validation now emits `unavailable_proof_target` when a proof command targets Umbrella tools such as `run_workspace_verify`, `run_workspace_command`, `shell`, `apply_workspace_patch`, or phase-control tools. The plan and plan-review prompts now state that proof commands must be concrete workspace commands, and the example final-e2e leaf uses a real pytest smoke test instead of `workspace.toml` / `run_workspace_verify`.
+- Regression: `test_proof_blocks_umbrella_tool_pseudo_command`.
+
+## 2026-05-21 - Plan Review Downgraded Production Import-Only Proof To Warning
+
+- Run: `phase_web_99ced8d5`.
+- Symptom: `propose_phase_plan` and `submit_phase_plan` accepted a `gmas-agents` leaf that created production files under `src/civgame/agents/*.py` but used `execution.kind="import_check"` and `required_properties=["module_imports"]` as the only proof. `plan_review` even emitted `weak_proof` for that leaf, but with `severity="warning"` and `verdict="ok"`, so execute started from an under-proven plan.
+- Risk: production agent behavior can be accepted on module import alone. For LLM/agent/game logic this leaves the system open to stubs or nonfunctional wiring that imports cleanly but never proves schema validation, action execution, input sensitivity, or real decision behavior.
+- Cause: `ContractValidator` validated proof syntax without subtask path context, so it could not distinguish package-export import checks from import-only proofs on production source leaves. `validate_review_contract` also allowed `verdict="ok"` to carry typed blocker codes such as `weak_proof` when the reviewer labeled them as warnings.
+- Fix: `ContractValidator` now emits blocking `weak_proof` when a subtask creates or changes implementation files under `src/` and tries to prove them with `import_check`, except narrow `__init__.py` package-export leaves. `validate_review_contract` now rejects `ok` reviews that include typed blocker codes such as `weak_proof`, requiring `revise`/`abort` or plain notes for nonblocking recommendations. Plan and plan-review prompts were aligned with the same rule.
+- Regression: `test_plan_blocks_import_only_proof_for_production_source_leaf`, `test_plan_allows_import_check_for_package_init_only_leaf`, and `test_review_ok_cannot_downgrade_weak_proof_to_warning`.
+
+## 2026-05-21 - Palace Search Recall Became Verified Research Provenance
+
+- Run: `phase_web_510d982f`.
+- Symptom: after clean research, `palace_search("game simulation AI bot strategy architecture")` initially returned no memory, but later `palace_add(kind="research_finding", source_id="palace_search:game simulation AI bot strategy architecture")` was accepted as `verified=true`. `submit_research_summary` then cited that id and passed a `source_scarce` handoff with one real GitHub source plus one memory-recall-derived finding.
+- Risk: current-run recall or stale memory can be laundered into verified research evidence. This undermines the research provenance contract because a memory search is only a lead unless it is reverified against a concrete current source, ledger-backed artifact, or non-fallback GMAS result.
+- Cause: `research_provenance.py` listed `palace_search` in `EXACT_SOURCE_TOOL_IDS`. Because `tool_row_has_usable_result` treated non-empty `palace_search` output as usable, `tool_qualified_source_seen` accepted `palace_search:<query>` as a valid counted-finding source.
+- Fix: `palace_search` is no longer a verifiable research source tool, and `research_finding_source_provenance_issue` now explicitly rejects `palace_search` / `palace_search:<query>` / `tool:palace_search:*` for counted `research_finding` memory. Prompt/schema source text now says palace recall is observation/lead material until verified elsewhere.
+- Regression: `test_research_palace_add_rejects_palace_search_as_finding_source`.
+
+## 2026-05-21 - Execute Layout Deadlock And Workspace Source Loss
+
+- Run: civilization calibration (`execute-deadlock` track).
+- Symptom: plans declared `backend/src/app.py` while execute writer enforced canonical `src/<package>/...`; `mutate_phase_plan` crashed on missing `_merge_phase_plan_string_list`; successful workspace patches were followed by missing `src/`, `tests/`, and `frontend/` trees between phase tasks; subtasks could be marked `done` without materialized declared files.
+- Risk: structural plan/layout conflicts loop in execute instead of bounded repair; generated workspace code disappears across `phase_run` boundaries; completion advances on proof text without on-disk materialization.
+- Cause: plan-time validator lacked shared greenfield layout policy; runner could sync execute scope from proposal artifacts; normal `phase_run` tasks were wrapped in product self-edit sandbox rollback; completion validation did not require declared files to exist on disk.
+- Fix: shared `layout_policy` + `ContractValidator` blocking code `greenfield_python_src_layout_policy`; submitted-only execution payload and sync gate; repaired `mutate_phase_plan` list replace/remove merge; launcher skips sandbox for `phase_run`; `validate_completion_materialization` and runner done-subtask materialization floor; auditable `LLMInputBundle` persistence; watcher repeat trigger for structural layout blocks; read freshness metadata and `stale_read_before_patch`.
+- Regression: `umbrella/tests/test_contracts_layout_policy.py`, `test_runner_phase_plan_execution_gate.py`, `test_phase_plan_mutate_controls.py`, `test_completion_materialization.py`, `test_ouroboros_launcher_sandbox.py`, `test_sandbox_workspace_preserve.py`, `test_phase_context_compiler.py`, `test_watcher_structural_layout.py`, and `ouroboros/tests/test_context_builder.py::test_task_context_overlay_serializes_dict_as_json`.

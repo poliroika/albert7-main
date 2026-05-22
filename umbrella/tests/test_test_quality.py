@@ -19,6 +19,13 @@ class TestEmptyOrMissing:
         assert result.status == VerificationStatus.PASSED
         assert "no test_*.py" in result.summary
 
+    def test_workspace_without_tests_fails_when_code_task_requires_tests(
+        self, tmp_path: Path
+    ) -> None:
+        result = run_test_quality_guard(tmp_path, require_tests=True)
+        assert result.status == VerificationStatus.FAILED
+        assert "no behavioral tests" in result.error
+
     def test_test_files_without_test_functions_pass(self, tmp_path: Path) -> None:
         _write(
             tmp_path / "test_helper.py",
@@ -30,6 +37,20 @@ class TestEmptyOrMissing:
         result = run_test_quality_guard(tmp_path)
         assert result.status == VerificationStatus.PASSED
         assert "no `test_*` functions" in result.summary
+
+    def test_test_files_without_test_functions_fail_when_required(
+        self, tmp_path: Path
+    ) -> None:
+        _write(
+            tmp_path / "test_helper.py",
+            """
+            def helper():
+                return 1
+            """,
+        )
+        result = run_test_quality_guard(tmp_path, require_tests=True)
+        assert result.status == VerificationStatus.FAILED
+        assert "no executable pytest functions" in result.error
 
 
 class TestTrivialDetection:

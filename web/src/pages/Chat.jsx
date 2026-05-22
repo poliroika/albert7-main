@@ -10,10 +10,11 @@ import ThreadList from '../components/chat/ThreadList';
 import { UserInputRequestCard, PermissionRequestCard } from '../components/chat/AgentRequestCard';
 import {
   listThreads, createThread, listMessages, sendMessage,
-  getRun, getRunSteps, listModels, listTools, startRun, cancelRun,
+  getRun, getRunSteps, getRunTimeline, getRunPhases, listModels, listTools,
+  startRun, cancelRun,
   listUserInputRequests, listPermissionRequests, getSettings, deleteThread,
 } from '../lib/api';
-import { Loader2, Trash2 } from 'lucide-react';
+import { Loader2, Trash2, GitBranch, CheckCircle2, XCircle, Clock, RefreshCw } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
 
@@ -51,6 +52,7 @@ export default function Chat() {
   const [maxVerifyRetries, setMaxVerifyRetries] = useState('20');
   const [harnessMode, setHarnessMode] = useState(false);
   const [harnessCandidates, setHarnessCandidates] = useState('3');
+  const [phaseRunnerPlan, setPhaseRunnerPlan] = useState(null);
 
   // Agent communication state
   const [pendingUserRequests, setPendingUserRequests] = useState([]);
@@ -128,7 +130,6 @@ export default function Chat() {
     }
   }, []);
 
-  // Poll for run completion and agent requests
   const pollRun = useCallback(async (runId) => {
     try {
       const run = await getRun(runId);
@@ -136,12 +137,18 @@ export default function Chat() {
       const steps = await getRunSteps(runId);
       setRunSteps(steps);
 
-      // Also poll for agent communication requests
+      try {
+        const phaseData = await getRunPhases(runId);
+        const plan = phaseData?.data?.nodes ? phaseData.data : (phaseData?.nodes ? phaseData : null);
+        if (plan) setPhaseRunnerPlan(plan);
+      } catch (_) { /* run may not be PhaseRunner-driven */ }
+
       await pollAgentRequests(runId);
 
-      if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
-        clearInterval(pollRef.current);
-        clearInterval(requestPollRef.current);
+      const terminal = ['completed', 'succeeded', 'failed', 'cancelled'].includes(run.status);
+      if (terminal) {
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+        if (requestPollRef.current) { clearInterval(requestPollRef.current); requestPollRef.current = null; }
         setPendingUserRequests([]);
         setPendingPermissions([]);
         if (activeThread) {
@@ -207,6 +214,7 @@ export default function Chat() {
     }
 
     setSending(true);
+    setPhaseRunnerPlan(null);
     setPendingUserRequests([]);
     setPendingPermissions([]);
     try {
@@ -219,7 +227,7 @@ export default function Chat() {
         harness_candidates: harnessMode ? Number(harnessCandidates) : undefined,
       });
       if (harnessMode) {
-        toast.info(`Harness mode активен — запускаю ${harnessCandidates} кандидата(ов) параллельно`);
+        toast.info(`Harness активен — ${harnessCandidates} кандидата(ов) на каждую фазу`);
       }
 
       setMessages(prev => [
@@ -230,9 +238,8 @@ export default function Chat() {
       setCurrentRun(result.run);
       setRunSteps([]);
 
-      // Poll run status and agent requests every 800ms
       if (pollRef.current) clearInterval(pollRef.current);
-      pollRef.current = setInterval(() => pollRun(result.run.id), 800);
+      pollRef.current = setInterval(() => pollRun(result.run.id), 1500);
     } catch (err) {
       console.error(err);
       setSending(false);
@@ -459,18 +466,62 @@ export default function Chat() {
               <div className="flex items-center justify-center h-40">
                 <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
               </div>
-            ) : messages.length === 0 ? (
+            ) : messages.length === 0 && !phaseRunnerPlan ? (
               <div className="flex flex-col items-center justify-center h-full min-h-[400px] text-center">
                 <div className="w-14 h-14 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center mb-4">
                   <span className="text-lg font-semibold text-blue-400">A7</span>
                 </div>
                 <h2 className="text-lg font-semibold mb-2">Umbrella</h2>
                 <p className="text-sm text-muted-foreground max-w-md leading-relaxed">
-                  Напишите задачу — агент выполнит её, используя доступные инструменты. Во время выполнения агент может задавать вопросы и запрашивать права.
+                  Напишите задачу — она будет разбита на фазы: preflight → research → plan → execute → verify → reflexion.
+                  {harnessMode ? ` Harness активен: ${harnessCandidates} кандидата(ов) на каждую фазу.` : ''}
                 </p>
               </div>
             ) : (
               <div className="max-w-[800px] mx-auto space-y-5">
+                {phaseRunnerPlan && (
+                  <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-4">
+                    <div className="flex items-center gap-2 mb-3">
+                      <GitBranch className="h-4 w-4 text-blue-400" />
+                      <span className="text-sm font-semibold text-blue-400">Phase Plan</span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/15 border border-blue-500/20 text-blue-400 font-mono ml-auto">
+                        {phaseRunnerPlan.run_id?.slice(0, 8)}
+                      </span>
+                    </div>
+                    <div className="space-y-1">
+                      {(phaseRunnerPlan.nodes || []).map((node) => {
+                        const StatusIcon = node.status === 'done' ? CheckCircle2
+                          : node.status === 'failed' ? XCircle
+                          : node.status === 'running' ? RefreshCw
+                          : Clock;
+                        const iconCls = node.status === 'done' ? 'text-emerald-400'
+                          : node.status === 'failed' ? 'text-rose-400'
+                          : node.status === 'running' ? 'text-blue-400 animate-spin'
+                          : 'text-zinc-600';
+                        const labelMap = {
+                          preflight: 'Pre-flight', research: 'Research',
+                          research_review: 'Research Review', plan: 'Plan',
+                          plan_review: 'Plan Review', execute: 'Execute',
+                          execute_review: 'Execute Review', final: 'Final',
+                          verify: 'Verify', reflexion: 'Reflexion',
+                        };
+                        const dur = (node.started_at && node.ended_at)
+                          ? `${((node.ended_at - node.started_at)).toFixed(1)}s`
+                          : node.status === 'running' ? '…' : '';
+                        return (
+                          <div key={node.id} className="flex items-center gap-3 py-1.5 border-b border-border/20 last:border-0 text-sm">
+                            <StatusIcon className={`h-3.5 w-3.5 shrink-0 ${iconCls}`} />
+                            <span className={`flex-1 ${node.status === 'pending' ? 'text-muted-foreground/50' : ''}`}>
+                              {labelMap[node.id] || node.id}
+                            </span>
+                            {dur && <span className="text-[11px] text-muted-foreground font-mono">{dur}</span>}
+                            <span className={`text-[10px] uppercase font-semibold ${iconCls}`}>{node.status}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
                 {messages.map((msg, i) => (
                   <MessageCard key={msg.id || i} message={msg} />
                 ))}

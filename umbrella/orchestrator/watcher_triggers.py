@@ -56,6 +56,18 @@ class WatcherTriggers:
                         "signature": recent_errors[-1],
                         "count": self._repeat_m,
                     })
+            if phase == "execute":
+                structural = _recent_structural_layout_signatures(
+                    tools_path, n=self._repeat_m + 1
+                )
+                if len(structural) >= self._repeat_m:
+                    if len(set(structural[-self._repeat_m:])) == 1:
+                        return TriggerEvent("repeat_structural_layout", {
+                            "phase": phase,
+                            "reason": "greenfield_python_src_layout_policy",
+                            "file_path": structural[-1],
+                            "count": self._repeat_m,
+                        })
 
         budget_exceeded = self._check_budget(phase, phase_started_at)
         if budget_exceeded:
@@ -119,6 +131,40 @@ def _recent_error_signatures(tools_path: pathlib.Path, *, n: int) -> list[str]:
                 sigs.append(sig)
         except Exception:
             pass
+        if len(sigs) >= n:
+            break
+    return list(reversed(sigs))
+
+
+def _recent_structural_layout_signatures(tools_path: pathlib.Path, *, n: int) -> list[str]:
+    lines: list[str] = []
+    try:
+        with tools_path.open(encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    sigs: list[str] = []
+    for line in reversed(lines):
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        blob = json.dumps(ev, ensure_ascii=False)
+        if "greenfield_python_src_layout_policy" not in blob:
+            continue
+        path = ""
+        for key in ("output", "result"):
+            raw = ev.get(key)
+            if isinstance(raw, dict):
+                path = str(raw.get("file_path") or raw.get("bad_declared_path") or "")
+                if path:
+                    break
+            text = str(raw or "")
+            match = re.search(r'"file_path"\s*:\s*"([^"]+)"', text)
+            if match:
+                path = match.group(1)
+                break
+        sigs.append(path or "greenfield_python_src_layout_policy")
         if len(sigs) >= n:
             break
     return list(reversed(sigs))

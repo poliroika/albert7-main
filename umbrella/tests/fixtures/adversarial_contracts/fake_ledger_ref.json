@@ -1,0 +1,25 @@
+{
+  "schema_name": "completion",
+  "schema_version": "1",
+  "run_id": "fixture",
+  "phase": "execute",
+  "actor": "agent",
+  "payload": {
+    "subtask_id": "s1",
+    "status": "done",
+    "completed_claims": [
+      {
+        "claim_id": "s1.claim.1",
+        "text": "Valid-looking claim with fake evidence",
+        "proof_refs": [
+          {
+            "ref_type": "ledger_event",
+            "ref_id": "does-not-exist",
+            "produced_by": "verifier"
+          }
+        ]
+      }
+    ],
+    "changed_files": ["src/app.py"]
+  }
+}

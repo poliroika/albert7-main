@@ -3,80 +3,27 @@
 from umbrella.deep_agent_tools.phase_contract_common import *
 from umbrella.deep_agent_tools.phase_contract_base import *
 from umbrella.deep_agent_tools.phase_contract_declarations import _iter_plan_strings
-from umbrella.deep_agent_tools.phase_contract_success import *
-from umbrella.deep_agent_tools.phase_contract_paths import *
-
-def _coerce_object_payload(value: Any, *, field_name: str) -> tuple[dict[str, Any], str]:
-    """Accept model-produced object payloads even when emitted as JSON text."""
-    if value is None:
-        return {}, ""
-    if isinstance(value, dict):
-        return value, ""
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return {}, f"{field_name} was an empty string; treated as empty object"
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            try:
-                import yaml  # type: ignore
-
-                parsed = yaml.safe_load(stripped)
-            except Exception:
-                parsed = None
-            if isinstance(parsed, dict):
-                return (
-                    parsed,
-                    f"{field_name} was parsed as YAML-compatible object after JSON parsing failed: {exc.msg}",
-                )
-            return (
-                {"text": value},
-                f"{field_name} was a string and JSON parsing failed: {exc.msg}",
-            )
-        if isinstance(parsed, dict):
-            return parsed, ""
-        return (
-            {"value": parsed},
-            f"{field_name} JSON decoded to {type(parsed).__name__}; wrapped as value",
-        )
-    return (
-        {"value": value},
-        f"{field_name} expected object, got {type(value).__name__}; wrapped as value",
-    )
-
-
-def _coerce_phase_plan_payload(value: Any) -> tuple[dict[str, Any], str]:
-    plan, warning = _coerce_object_payload(value, field_name="plan")
-    embedded = plan.get("plan") if isinstance(plan, dict) else None
-    if isinstance(embedded, dict) and not _iter_plan_subtasks(plan):
-        return embedded, _join_payload_warnings(
-            warning,
-            "unwrapped nested object from plan.plan",
-        )
-    if isinstance(embedded, str):
-        if plan.get("plan_truncated") is True:
-            return plan, _join_payload_warnings(
-                warning,
-                "plan.plan was marked truncated; keeping wrapper so validation can reject it clearly",
-            )
-        parsed, nested_warning = _coerce_object_payload(
-            embedded,
-            field_name="plan.plan",
-        )
-        if _iter_plan_subtasks(parsed):
-            return parsed, _join_payload_warnings(
-                warning,
-                nested_warning,
-                "unwrapped serialized object from plan.plan",
-            )
-        return plan, _join_payload_warnings(warning, nested_warning)
-    return plan, warning
-
-
-def _join_payload_warnings(*warnings: str) -> str:
-    return "; ".join(str(item).strip() for item in warnings if str(item).strip())
-
+from umbrella.deep_agent_tools.phase_control_base import (
+    _llm_cached_decision_handoff_issue,
+    _llm_fallback_handoff_issue,
+    _llm_test_double_handoff_issue,
+    _tool_log_rows_for_task,
+)
+from umbrella.deep_agent_tools.phase_control_research import (
+    _negative_claim_contradiction_issue,
+    _unread_existing_workspace_path_issue,
+)
+from umbrella.deep_agent_tools.research_provenance import (
+    research_finding_source_provenance_issue as _research_finding_source_provenance_issue,
+    tool_result_content_grounding_issue as _tool_result_content_grounding_issue,
+)
+from umbrella.contracts import (
+    ContractBundle,
+    ContractIssue,
+    ContractValidator,
+    build_workspace_context,
+    compile_phase_plan,
+)
 
 def _list_files(ctx: ToolContext, workspace_id: str = "", subdir: str = "", max_entries: int = 300) -> str:
     return umbrella_tools.list_workspace_files(
@@ -382,14 +329,24 @@ _PALACE_ADD_VERIFIED_OUTCOME_KINDS = {
 
 
 def _palace_add_memory_verified(
-    *, phase: str, kind: str, evidence_kind: str
+    ctx: ToolContext,
+    *,
+    phase: str,
+    kind: str,
+    evidence_kind: str,
 ) -> bool:
     kind_l = str(kind or "").strip().lower()
     if phase == "research" and kind_l == "research_finding":
         return True
     if str(evidence_kind or "").strip().lower() != "verified_outcome":
         return False
-    return kind_l in _PALACE_ADD_VERIFIED_OUTCOME_KINDS
+    if kind_l not in _PALACE_ADD_VERIFIED_OUTCOME_KINDS:
+        return False
+    rules = _phase_memory_write_rules(ctx)
+    rule = rules.get(kind_l) if isinstance(rules, dict) else None
+    if isinstance(rule, dict) and rule.get("verified") is False:
+        return False
+    return True
 
 
 def _plan_phase_direct_plan_memory_issue(
@@ -419,209 +376,6 @@ _VERIFIABLE_TOOL_SOURCE_IDS = {
     "mcp_discover",
     "web_search",
 }
-
-_RESEARCH_EXACT_SOURCE_TOOL_IDS = {
-    *_VERIFIABLE_TOOL_SOURCE_IDS,
-    "env_check",
-    "get_gmas_context",
-    "palace_search",
-    "read_file",
-    "read_workspace_charter",
-    "search_gmas_knowledge",
-}
-
-_RESEARCH_GMAS_SOURCE_TOOLS = {"get_gmas_context", "search_gmas_knowledge"}
-_RESEARCH_RESULT_BEARING_SOURCE_TOOLS = {"github_project_search"}
-
-
-def _tool_result_payload(row: dict[str, Any]) -> dict[str, Any]:
-    raw = row.get("result_preview") or row.get("result") or {}
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str) or not raw.strip():
-        return {}
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _mapping_payload(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return {}
-    try:
-        data = json.loads(value)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _tool_row_provenance_payloads(row: dict[str, Any]) -> list[dict[str, Any]]:
-    payloads: list[dict[str, Any]] = []
-    args_payload = _mapping_payload(row.get("args"))
-    if args_payload:
-        payloads.append(args_payload)
-    result_payload = _tool_result_payload(row)
-    if result_payload:
-        payloads.append(result_payload)
-    return payloads
-
-
-def _tool_row_has_usable_result(row: dict[str, Any]) -> bool:
-    preview = str(row.get("result_preview") or row.get("result") or "")
-    if "TOOL_ARG_ERROR" in preview or preview.strip().startswith("ERROR:"):
-        return False
-    payload = _tool_result_payload(row)
-    if not payload:
-        return bool(preview.strip())
-    status = str(payload.get("status") or "").strip().lower()
-    if status:
-        if status not in {"ok", "success"}:
-            return False
-    tool = str(row.get("tool") or "").strip().lower()
-    if tool in _RESEARCH_RESULT_BEARING_SOURCE_TOOLS:
-        results = payload.get("results")
-        if isinstance(results, list):
-            return bool(results)
-    if int(payload.get("exit_code") or 0) != 0 and "exit_code" in payload:
-        return False
-    return "error" not in payload and "reason" not in payload
-
-
-def _github_namespace_source_seen(rows: list[dict[str, Any]], target: str) -> bool:
-    wanted = str(target or "").strip().strip("/").lower()
-    if not wanted:
-        return False
-    for row in rows:
-        if str(row.get("tool") or "") != "github_project_search":
-            continue
-        if not _tool_row_has_usable_result(row):
-            continue
-        payload = _tool_result_payload(row)
-        results = payload.get("results")
-        if not isinstance(results, list):
-            continue
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            full_name = str(result.get("full_name") or "").strip().lower()
-            url = str(result.get("html_url") or "").strip().lower()
-            if wanted == full_name or url.rstrip("/").endswith("/" + wanted):
-                return True
-    return False
-
-
-def _tool_qualified_source_seen(
-    rows: list[dict[str, Any]], *, tool_name: str, qualifier: str
-) -> bool:
-    tool_l = str(tool_name or "").strip().lower()
-    needle = str(qualifier or "").strip().lower()
-    if not tool_l or tool_l not in _RESEARCH_EXACT_SOURCE_TOOL_IDS:
-        return False
-    for row in rows:
-        if str(row.get("tool") or "").strip().lower() != tool_l:
-            continue
-        if not _tool_row_has_usable_result(row):
-            continue
-        if not needle:
-            return True
-        haystack_parts: list[str] = []
-        for payload in _tool_row_provenance_payloads(row):
-            for key in ("intent", "query", "url", "title", "source_id"):
-                value = payload.get(key)
-                if isinstance(value, str):
-                    haystack_parts.append(value)
-            results = payload.get("results")
-            if isinstance(results, list):
-                for result in results[:20]:
-                    if not isinstance(result, dict):
-                        continue
-                    for key in ("full_name", "html_url", "url", "title", "name"):
-                        value = result.get(key)
-                        if isinstance(value, str):
-                            haystack_parts.append(value)
-        if needle in "\n".join(haystack_parts).lower():
-            return True
-    return False
-
-
-def _research_finding_source_provenance_issue(
-    rows: list[dict[str, Any]], *, source_id: str = ""
-) -> str:
-    source = str(source_id or "").strip()
-    source_l = source.lower()
-    if not source:
-        return (
-            "ERROR: palace_add research_finding requires a source_id tied to "
-            "current discovery evidence. Use an exact tool source such as "
-            "`github_project_search`, `mcp_discover`, `web_search`, "
-            "`deep_search`, `search_gmas_knowledge`; a tool-qualified source "
-            "such as `deep_search:<intent-or-query>`; or a concrete namespace "
-            "source like `github:owner/repo` / `gmas:topic`. Save summaries, "
-            "progress notes, and self-referential memory as `kind=observation`."
-        )
-    if source_l in {"palace_add", "tool:palace_add", "self", "memory"} or source_l.startswith(
-        "tool:palace_add"
-    ):
-        return (
-            "ERROR: palace_add research_finding cannot use palace_add itself "
-            "as provenance. Cite the current discovery tool/result that "
-            "supports the finding, or save this as `kind=observation`."
-        )
-    if source_l in _RESEARCH_EXACT_SOURCE_TOOL_IDS:
-        if any(
-            str(row.get("tool") or "").strip().lower() == source_l
-            and _tool_row_has_usable_result(row)
-            for row in rows
-        ):
-            return ""
-        return (
-            f"ERROR: palace_add research_finding source_id `{source}` has no "
-            "usable logged result in this research task. Run/cite the discovery "
-            "tool first, or save this note as `kind=observation`."
-        )
-    if source_l.startswith("github:"):
-        target = source.split(":", 1)[1]
-        if _github_namespace_source_seen(rows, target):
-            return ""
-        return (
-            f"ERROR: palace_add research_finding source_id `{source}` does not "
-            "match any repository returned by `github_project_search` in this "
-            "research task. Use a returned `github:owner/repo` value, the exact "
-            "`github_project_search` tool source, or save this as "
-            "`kind=observation`."
-        )
-    if source_l.startswith("gmas:"):
-        if any(
-            str(row.get("tool") or "").strip().lower() in _RESEARCH_GMAS_SOURCE_TOOLS
-            and _tool_row_has_usable_result(row)
-            for row in rows
-        ):
-            return ""
-        return (
-            f"ERROR: palace_add research_finding source_id `{source}` requires "
-            "a successful current `get_gmas_context` or `search_gmas_knowledge` "
-            "call. Run/cite GMAS discovery first, or save this as "
-            "`kind=observation`."
-        )
-    if ":" in source:
-        tool_name, qualifier = source.split(":", 1)
-        if _tool_qualified_source_seen(
-            rows,
-            tool_name=tool_name,
-            qualifier=qualifier,
-        ):
-            return ""
-    return (
-        f"ERROR: palace_add research_finding source_id `{source}` is not a "
-        "verifiable current discovery source. Use an exact discovery tool id, "
-        "`tool:intent-or-query`, `github:owner/repo`, or `gmas:topic`; keep local summaries and "
-        "memory bookkeeping as `kind=observation`."
-    )
-
 
 def _tool_source_verified_outcome_issue(
     rows: list[dict[str, Any]], *, source_id: str = "", evidence_kind: str = ""
@@ -690,6 +444,51 @@ def _infer_phase_palace_add_kind(
     return "research_finding"
 
 
+def _llm_env_contract_issue_from_text(
+    text: str,
+    *,
+    subject: str,
+    require_explicit_contract: bool,
+) -> str:
+    value = str(text or "")
+    public_aliases = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
+    unsupported_aliases = {
+        "LL_BASE_URL": "Use LLM_BASE_URL.",
+        "OUROBOROS_LLM_MODEL": "Use public LLM_MODEL in generated workspaces; Umbrella host launch uses OUROBOROS_MODEL.",
+    }
+    present = {alias for alias in public_aliases if alias in value}
+    mentions_runtime_contract = require_explicit_contract or bool(
+        present
+        or "OPENAI_API_KEY" in value
+        or "OUROBOROS_LLM_API_KEY" in value
+        or "OUROBOROS_LLM_BASE_URL" in value
+        or "OUROBOROS_MODEL" in value
+        or any(alias in value for alias in unsupported_aliases)
+    )
+    if not mentions_runtime_contract:
+        return ""
+    unsupported = [
+        f"{alias}: {hint}"
+        for alias, hint in unsupported_aliases.items()
+        if alias in value
+    ]
+    missing = [alias for alias in public_aliases if alias not in present]
+    if "OPENAI_API_KEY" in value and "LLM_API_KEY" not in present:
+        unsupported.append(
+            "OPENAI_API_KEY: generated workspaces must expose provider-neutral LLM_API_KEY unless they intentionally choose OpenAI-only behavior."
+        )
+    if not missing and not unsupported:
+        return ""
+    parts: list[str] = []
+    if missing:
+        parts.append(
+            f"{subject} must include the public LLM runtime aliases {', '.join(public_aliases)}; missing: {', '.join(missing)}."
+        )
+    if unsupported:
+        parts.append("Unsupported or host-only alias references: " + "; ".join(unsupported))
+    return " ".join(parts)
+
+
 def _palace_add(
     ctx: ToolContext,
     title: str = "",
@@ -704,6 +503,12 @@ def _palace_add(
 ) -> str:
     if stop := _stop_requested_message(ctx, "palace_add"):
         return stop
+    blocked_kinds = {"core_lesson", "accepted_lesson"}
+    if str(kind or "").strip().lower() in blocked_kinds:
+        return (
+            "ERROR: palace_add cannot write core lessons directly. Use "
+            "submit_reflection(proposed_bkb_rules=[...]) then accept_bkb_proposal."
+        )
     ws = workspace_id or _workspace_id(ctx)
     phase = _palace_add_guard_phase(ctx)
     phase_path = phase or "phase"
@@ -893,6 +698,13 @@ def _palace_add(
         )
         if provenance_issue:
             return provenance_issue
+        grounding_issue = _tool_result_content_grounding_issue(
+            rows,
+            source_id=source_id,
+            content="\n".join(part for part in (title, content) if part),
+        )
+        if grounding_issue:
+            return grounding_issue
     mem_store, mem_tier, mem_scope = _palace_add_store_policy(
         ctx,
         palace_path=palace_path,
@@ -907,6 +719,7 @@ def _palace_add(
         tags=tag_list,
     )
     memory_verified = _palace_add_memory_verified(
+        ctx,
         phase=phase,
         kind=kind,
         evidence_kind=evidence_kind,
@@ -939,6 +752,7 @@ def _palace_add(
                     extra={
                         "palace_path": palace_path,
                         "kind": kind,
+                        "type": kind,
                     },
                 )
             finally:
@@ -963,6 +777,8 @@ def _palace_add(
             "phase": phase,
             "run_id": _run_id(ctx),
             "subtask_id": subtask_id,
+            "kind": kind,
+            "type": kind,
             "source_path": source_id or "tool:palace_add",
             "evidence_kind": evidence_kind,
         },
@@ -972,7 +788,11 @@ def _palace_add(
         legacy_payload = json.loads(str(legacy_result))
     except Exception:
         pass
-    saved = bool(mempalace_id) or not str(legacy_result).startswith("WARNING:")
+    saved = bool(mempalace_id)
+    if not saved and isinstance(legacy_payload, dict):
+        saved = bool(legacy_payload.get("saved"))
+    elif not saved:
+        saved = not str(legacy_result).startswith("WARNING:")
     payload = {
         "saved": saved,
         "id": mempalace_id,
@@ -1068,8 +888,8 @@ def _env_check(ctx: ToolContext) -> str:
             "accepted_api_key_vars": api_key_vars,
             "accepted_model_vars": model_vars,
             "advisories": [
-                "LLM_API_KEY is the standalone project credential alias; when Umbrella launches the workspace, OUROBOROS_LLM_API_KEY can be accepted as inherited compatibility.",
-                "For generated workspaces, prefer a runtime resolver whose public env contract is LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL. It may also read OUROBOROS_LLM_API_KEY, OUROBOROS_LLM_BASE_URL, and OUROBOROS_MODEL as inherited compatibility aliases. OPENAI_API_KEY is not required unless the chosen provider is OpenAI or the task specifically uses web_search.",
+                "Generated workspace projects should expose LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL as their public runtime contract.",
+                "Umbrella maps host control-plane launch env into public LLM_* aliases before workspace commands run. Do not document, test, or require control-plane aliases inside generated projects. OPENAI_API_KEY is not required unless the generated project intentionally chooses OpenAI as its LLM provider.",
             ]
             if provider_ready and not present.get("LLM_API_KEY")
             else [],
@@ -1078,11 +898,29 @@ def _env_check(ctx: ToolContext) -> str:
 
 
 def _palace_health(ctx: ToolContext) -> str:
+    repo_root = pathlib.Path(getattr(ctx, "host_repo_root", None) or getattr(ctx, "repo_dir", ".")).resolve()
+    ws = _workspace_id(ctx)
+    health: dict[str, Any] = {"ok": True, "backend": "canonical_mempalace"}
+    status = "ok"
     try:
-        tree = umbrella_tools.list_memory_tree(ctx, workspace_id=_workspace_id(ctx))
-        return _json({"status": "ok", "tree": json.loads(tree)})
+        from umbrella.memory.palace.facade import MemPalace
+
+        palace = MemPalace(repo_root, ws or None)
+        try:
+            health = palace.health()
+            if not health.get("ok", True):
+                status = "error"
+        finally:
+            palace.close()
     except Exception as exc:
-        return _json({"status": "error", "error": str(exc)})
+        status = "error"
+        health = {"ok": False, "error": str(exc)}
+    try:
+        tree = umbrella_tools.list_memory_tree(ctx, workspace_id=ws)
+        tree_payload = json.loads(tree)
+    except Exception as exc:
+        tree_payload = {"error": str(exc)}
+    return _json({"status": status, "health": health, "tree": tree_payload})
 
 
 def _mcp_health(ctx: ToolContext) -> str:
@@ -1119,13 +957,44 @@ def _request_human_checkpoint(ctx: ToolContext, reason: str = "", payload: dict[
     return f"OK: human checkpoint requested (signal: {signal_id})"
 
 
-_EXTRA_SUBTASK_CONTROL_GATE_RE = re.compile(
-    r"(?i)\b(?:false[-\s]?positive\s+skill[_\s-]?compliance|"
-    r"mark\s+(?:the\s+)?(?:multi[_-]?agent[_-]?gmas|skill|verification)\s+"
-    r"(?:as\s+)?optional|blocker_note|configure_workspace_skills|"
-    r"verification\s+framework\s+(?:should|must)|"
-    r"update\s+verification\s+to\s+scope\s+skill\s+checks)\b"
-)
+def _blocking_contract_issues(issues: list[ContractIssue]) -> list[ContractIssue]:
+    return [
+        issue
+        for issue in issues
+        if issue.severity in {"error", "blocking", "human_required"}
+    ]
+
+
+def _contract_issue_text(issues: list[ContractIssue], *, limit: int = 12) -> str:
+    return "; ".join(
+        f"{issue.code}: {issue.message or issue.code}" for issue in issues[:limit]
+    )
+
+
+def _validate_phase_plan_contract(
+    ctx: ToolContext,
+    plan: dict[str, Any],
+) -> list[ContractIssue]:
+    plan_ir, compile_issues = compile_phase_plan(
+        plan,
+        run_id=_run_id(ctx),
+        workspace_id=_workspace_id(ctx),
+    )
+    workspace_id = _workspace_id(ctx)
+    context = build_workspace_context(
+        repo_root=pathlib.Path(ctx.host_repo_root or ctx.repo_dir),
+        workspace_root=_workspace_root_for_phase(ctx, workspace_id),
+        workspace_id=workspace_id,
+    )
+    return ContractValidator.validate(
+        ContractBundle(
+            run_id=_run_id(ctx),
+            workspace_id=workspace_id,
+            plan=plan_ir,
+            issues=tuple(compile_issues),
+        ),
+        context=context,
+    )
 
 
 def _request_extra_subtask_policy_issue(
@@ -1136,33 +1005,16 @@ def _request_extra_subtask_policy_issue(
 ) -> str:
     if not isinstance(proposed_subtask, dict) or not proposed_subtask:
         return ""
-    issues = _phase_plan_policy_issues(
-        {"subtasks": [proposed_subtask]},
-        ctx=ctx,
-        notes=reason,
+    issues = _blocking_contract_issues(
+        _validate_phase_plan_contract(ctx, {"subtasks": [proposed_subtask]})
     )
     if issues:
         return (
             "ERROR: request_extra_subtask rejected: proposed subtask violates "
-            "workspace policy: "
-            + "; ".join(issues)
+            "the typed contract: "
+            + _contract_issue_text(issues)
             + ". Extra subtasks must be executable product work inside the "
-            "workspace, not edits to Umbrella memory/control-plane state."
-        )
-    text = "\n".join(
-        _iter_plan_strings(
-            {"reason": reason, "proposed_subtask": proposed_subtask}
-        )
-    )
-    if _EXTRA_SUBTASK_CONTROL_GATE_RE.search(text):
-        return (
-            "ERROR: request_extra_subtask rejected: extra subtasks cannot be "
-            "used to mark Umbrella skill/verification gates optional, add "
-            "blocker notes, or work around a suspected control-plane false "
-            "positive from inside the generated workspace. Use "
-            "`request_watcher_review` for diagnosis, continue with the planned "
-            "future subtask that owns the capability, or fix Umbrella policy in "
-            "the main product code."
+            "workspace with a typed proof."
         )
     return ""
 
@@ -1197,42 +1049,35 @@ def _register_temp_tool(ctx: ToolContext, name: str, description: str = "", sche
 
 def _propose_phase_plan(
     ctx: ToolContext,
-    plan: dict[str, Any] | str | None = None,
+    plan: dict[str, Any] | None = None,
     notes: str = "",
-    content: dict[str, Any] | str | None = None,
     **extra: Any,
 ) -> str:
     if stop := _stop_requested_message(ctx, "propose_phase_plan"):
         return stop
-    if plan is None and content is not None:
-        plan = content
+    if not isinstance(plan, dict):
+        return "ERROR: phase plan contract rejected: `plan` must be a typed object."
     if not notes:
         for key in ("note", "rationale", "explanation", "summary"):
             value = extra.get(key)
             if isinstance(value, str) and value.strip():
                 notes = value.strip()
                 break
-    coerced_plan, warning = _coerce_phase_plan_payload(plan)
-    policy_issues = _phase_plan_policy_issues(coerced_plan, ctx=ctx, notes=notes)
-    if policy_issues:
+    contract_issues = _blocking_contract_issues(_validate_phase_plan_contract(ctx, plan))
+    if contract_issues:
         return (
-            "ERROR: phase plan violates workspace policy: "
-            + "; ".join(policy_issues)
-            + ". Revise the plan before submitting it."
-            + _phase_plan_repair_hint(policy_issues)
+            "ERROR: phase plan contract rejected: "
+            + _contract_issue_text(contract_issues, limit=8)
+            + ". Revise the typed proof contract before submitting it."
         )
-    final_notes = notes
-    if warning:
-        final_notes = f"{notes}\n\nPayload warning: {warning}".strip()
-    plan_id = _record_phase_plan_artifact(ctx, plan=coerced_plan, notes=final_notes)
+    plan_id = _record_phase_plan_artifact(ctx, plan=plan, notes=notes)
     signal_id = _write_phase_signal(
         ctx,
         "propose_phase_plan",
         {
             "plan_id": plan_id,
-            "plan": coerced_plan,
-            "notes": final_notes,
-            "payload_warning": warning,
+            "plan": plan,
+            "notes": notes,
         },
     )
     return f"OK: phase plan proposal recorded (plan_id: {plan_id}, signal: {signal_id})"
@@ -1242,13 +1087,12 @@ def _propose_subtasks(ctx: ToolContext, steps: list[dict[str, Any]] | None = Non
     if stop := _stop_requested_message(ctx, "propose_subtasks"):
         return stop
     plan = {"subtasks": steps or []}
-    policy_issues = _phase_plan_policy_issues(plan, ctx=ctx, notes=notes)
-    if policy_issues:
+    contract_issues = _blocking_contract_issues(_validate_phase_plan_contract(ctx, plan))
+    if contract_issues:
         return (
-            "ERROR: subtask proposal violates workspace policy: "
-            + "; ".join(policy_issues)
-            + ". Revise the subtask cards before recording them."
-            + _phase_plan_repair_hint(policy_issues)
+            "ERROR: subtask proposal contract rejected: "
+            + _contract_issue_text(contract_issues, limit=8)
+            + ". Revise the typed proof contracts before recording them."
         )
     proposal_id = _record_subtask_proposal_artifact(ctx, steps=steps or [], notes=notes)
     signal_id = _write_phase_signal(
@@ -1257,64 +1101,6 @@ def _propose_subtasks(ctx: ToolContext, steps: list[dict[str, Any]] | None = Non
         {"proposal_id": proposal_id, "steps": steps or [], "notes": notes},
     )
     return f"OK: subtask proposal recorded (proposal_id: {proposal_id}, signal: {signal_id})"
-
-
-def _phase_plan_repair_hint(policy_issues: list[str]) -> str:
-    """Give compact, reusable steering after plan validation failures."""
-
-    text = " ".join(str(issue or "") for issue in policy_issues).lower()
-    hints: list[str] = []
-    if (
-        "8-16" in text
-        or "too broad" in text
-        or "executable leaves" in text
-        or "implementation subtask" in text
-    ):
-        hints.append(
-            "Resubmit one complete flat `subtasks` array with roughly 8-16 "
-            "vertical leaves; keep each implementation leaf to about 2-4 files "
-            "and one behavior-focused `success_test`."
-        )
-        hints.append(
-            "[PHASE_PLAN_REPAIR_SCAFFOLD] For a large full-stack/LLM app, aim "
-            "for 12-14 leaves such as: docs-env, project-setup, domain-state, "
-            "domain-rules, llm-runtime, agent-graph, ai-turn-api, backend-api, "
-            "realtime-integration, frontend-shell, frontend-client-state, "
-            "frontend-game-ui, final-e2e. Do not oscillate by merging rejected "
-            "leaves back into broad 5+ file domains; instead keep only the "
-            "first runnable 2-4 owned files on the current leaf and move "
-            "future/optional files to a later leaf or the goal checklist."
-        )
-    if "llm runtime env contract" in text or "credential contract" in text:
-        hints.append(
-            "Add a top-level `llm_runtime_contract` and relevant leaf goals "
-            "that spell the exact pairs "
-            "`OUROBOROS_LLM_API_KEY`/`LLM_API_KEY`, "
-            "`OUROBOROS_LLM_BASE_URL`/`LLM_BASE_URL`, and "
-            "`OUROBOROS_MODEL`/`LLM_MODEL`; wildcard shorthand alone is not "
-            "enough."
-        )
-    if (
-        "mock/fake/dry-run" in text
-        or "heuristic fallback" in text
-        or "deterministic/static" in text
-        or "generic fallback" in text
-    ):
-        hints.append(
-            "Remove mock/fake/dry-run/heuristic/random fallback wording from "
-            "implementation and test strategy; say `real LLM runtime only` and "
-            "put missing-env skip/error behavior inside checked-in tests."
-        )
-    if "success_test" in text or "non-automatable" in text:
-        hints.append(
-            "Leave every `success_test` as one exact command such as "
-            "`python -m pytest tests/test_x.py -q` or `cd frontend && npm run "
-            "build`; do not include prose, custom skip flags, manual steps, or "
-            "pseudo-arguments."
-        )
-    if not hints:
-        return ""
-    return " Repair recipe: " + " ".join(hints)
 
 
 def _read_drive_log(ctx: ToolContext, log_name: str = "events.jsonl", tail: int = 100) -> str:
@@ -1333,7 +1119,16 @@ def _read_terminal_scrollback(ctx: ToolContext, workspace_id: str = "", last_lin
     )
 
 
-def _promote_to_durable(ctx: ToolContext, title: str = "", content: str = "", workspace_id: str = "", tags: str = "") -> str:
+def _promote_to_durable(
+    ctx: ToolContext,
+    title: str = "",
+    content: str = "",
+    workspace_id: str = "",
+    tags: str = "",
+    evidence_refs: list[Any] | None = None,
+    trust_level: str = "public_verified",
+    verification_report_ref: dict[str, Any] | None = None,
+) -> str:
     if stop := _stop_requested_message(ctx, "promote_to_durable"):
         return stop
     if _umbrella_phase_id(ctx) == "verify" and _mentions_unresolved_pass_blocker(content):
@@ -1342,8 +1137,97 @@ def _promote_to_durable(ctx: ToolContext, title: str = "", content: str = "", wo
             "record that mentions unresolved blockers or limitations. Loop back "
             "to execute with the concrete failures, then verify again."
         )
+    from umbrella.contracts import EvidenceRef, VerificationReportRef, json_ready
+    from umbrella.contracts.evidence import EvidenceResolver
+    from umbrella.contracts.validators import validate_verification_report_ref
+    from umbrella.deep_agent_tools.memory import memory_write_policy_issues
+
     ws = workspace_id or _workspace_id(ctx)
     body = content or title or ""
+    tag_list = [tag.strip() for tag in str(tags or "durable").replace(";", ",").split(",") if tag.strip()]
+    if "durable" not in {tag.lower() for tag in tag_list}:
+        tag_list.append("durable")
+    phase = _umbrella_phase_id(ctx) or "verify"
+    if phase == "verify" and "verification_report" not in {tag.lower() for tag in tag_list}:
+        tag_list.append("verification_report")
+
+    repo_root = pathlib.Path(ctx.host_repo_root or ctx.repo_dir)
+    try:
+        repo_root = pathlib.Path(umbrella_tools._resolve_umbrella_repo_root(ctx))
+    except Exception:
+        pass
+    ws_ctx = build_workspace_context(
+        repo_root=str(repo_root.resolve()),
+        workspace_root=str(_workspace_root_for_phase(ctx, ws).resolve()),
+        workspace_id=ws,
+    )
+
+    typed_refs: list[dict[str, Any]] = []
+    resolver_refs: list[EvidenceRef] = []
+    if verification_report_ref:
+        report = VerificationReportRef.from_mapping(verification_report_ref)
+        issues = validate_verification_report_ref(
+            report,
+            context=ws_ctx,
+            phase=phase,
+        )
+        if issues:
+            return _json(
+                {
+                    "saved": False,
+                    "status": "blocked",
+                    "reason": "invalid_verification_report_ref",
+                    "issues": [issue.message for issue in issues],
+                }
+            )
+        report_ref = report.evidence_ref(phase=phase)
+        typed_refs.append(json_ready(report_ref))
+        resolver_refs.append(report_ref)
+    for raw in evidence_refs or []:
+        if isinstance(raw, dict):
+            ref = EvidenceRef.from_mapping(raw)
+            typed_refs.append(json_ready(ref))
+            resolver_refs.append(ref)
+
+    if resolver_refs:
+        resolver_issues = EvidenceResolver(ws_ctx).validate_refs(
+            tuple(resolver_refs),
+            phase=phase,
+        )
+        if resolver_issues:
+            return _json(
+                {
+                    "saved": False,
+                    "status": "blocked",
+                    "reason": "invalid_evidence_refs",
+                    "issues": [issue.message for issue in resolver_issues],
+                }
+            )
+
+    metadata_extra: dict[str, Any] = {
+        "verify_run_id": _run_id(ctx),
+        "evidence_refs": typed_refs,
+        "trust_level": trust_level,
+        "scope": "cross_run_durable",
+        "tier": "warm",
+        "phase": phase,
+        "verified": True,
+    }
+    policy_issues = memory_write_policy_issues(
+        kind="durable",
+        tags=tag_list,
+        metadata=metadata_extra,
+    )
+    if policy_issues:
+        return _json(
+            {
+                "saved": False,
+                "status": "blocked",
+                "reason": "evidence_bound_memory",
+                "issues": policy_issues,
+            }
+        )
+
     legacy_result = _save_umbrella_memory(
         ctx,
         palace_path=f"workspaces/{ws}/durable" if ws else "durable",
@@ -1351,43 +1235,23 @@ def _promote_to_durable(ctx: ToolContext, title: str = "", content: str = "", wo
         content=body,
         kind="durable",
         workspace_id=ws,
-        tags=tags or "durable",
+        tags=",".join(tag_list) if tag_list else (tags or "durable"),
+        metadata_extra=metadata_extra,
     )
     try:
-        from umbrella.memory.palace.facade import MemPalace
-
-        repo_root = pathlib.Path(getattr(ctx, "host_repo_root", None) or getattr(ctx, "repo_dir", ".")).resolve()
-        tag_list = [tag.strip() for tag in str(tags or "durable").replace(";", ",").split(",") if tag.strip()]
-        if "durable" not in {tag.lower() for tag in tag_list}:
-            tag_list.append("durable")
-        if _umbrella_phase_id(ctx) == "verify" and "verification_report" not in {tag.lower() for tag in tag_list}:
-            tag_list.append("verification_report")
-        node_id = MemPalace(repo_root, ws or None).add(
-            store="palace.durable",
-            content=body,
-            tier="always_on",
-            scope="cross_run_durable",
-            tags=tag_list,
-            verified=True,
-            phase=_umbrella_phase_id(ctx) or "verify",
-            run_id=_run_id(ctx),
-            extra={
-                "title": title or "durable phase artifact",
-                "task_id": str(getattr(ctx, "task_id", "") or ""),
-            },
-        )
+        payload = json.loads(legacy_result)
     except Exception:
-        node_id = ""
-    if node_id:
-        try:
-            payload = json.loads(legacy_result)
-            if isinstance(payload, dict):
-                payload["durable_store"] = "palace.durable"
-                payload["durable_node_id"] = node_id
-                return _json(payload)
-        except Exception:
-            pass
-    return legacy_result
+        return legacy_result
+    if not isinstance(payload, dict):
+        return legacy_result
+    if payload.get("saved") is False:
+        return legacy_result
+    canonical_id = str(payload.get("canonical_id") or payload.get("durable_node_id") or "")
+    if canonical_id:
+        payload["durable_store"] = "palace.durable"
+        payload["durable_node_id"] = canonical_id
+        payload["store"] = "palace.durable"
+    return _json(payload)
 
 
 def _blocked_destructive(_ctx: ToolContext, **_kwargs: Any) -> str:
@@ -1407,9 +1271,6 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
 
 
 __all__ = [
-    '_coerce_object_payload',
-    '_coerce_phase_plan_payload',
-    '_join_payload_warnings',
     '_list_files',
     '_read_file',
     '_shell',
@@ -1432,6 +1293,7 @@ __all__ = [
     '_skill_audit',
     '_request_human_checkpoint',
     '_request_extra_subtask',
+    '_validate_phase_plan_contract',
     '_register_temp_tool',
     '_propose_phase_plan',
     '_propose_subtasks',

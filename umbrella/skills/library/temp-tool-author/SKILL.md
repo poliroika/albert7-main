@@ -2,7 +2,7 @@
 name: temp-tool-author
 status: active
 domains: ["tooling", "automation"]
-phases: ["research", "plan", "execute"]
+phases: ["research", "plan", "execute", "subtask_template"]
 when_to_use: "When no existing tool covers a needed capability and mcp_discover / enable_tools have been checked first."
 ---
 

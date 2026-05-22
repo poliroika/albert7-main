@@ -8,11 +8,11 @@ in context without re-querying.
 
 Implementation notes:
 
-- The heavy lifting tries to delegate to GMAS's :class:`WebSearchTool`,
-  which already supports caching, dedup, multi-provider routing and an
-  optional Playwright/Selenium "deep" mode for dynamic pages.  When GMAS
-  is unavailable the tool falls back to the existing
-  :func:`ouroboros.tools.search._web_search` (DuckDuckGo + LLM summary).
+- The heavy lifting delegates to GMAS's :class:`WebSearchTool`, which
+  already supports caching, dedup, multi-provider routing and a
+  Playwright/Selenium page-reading mode for dynamic pages. DuckDuckGo is
+  GMAS's no-key default provider. This tool must not make generic internet
+  access depend on any model-provider key.
 - A per-run budget (env ``OUROBOROS_DEEP_SEARCH_BUDGET``, default 6)
   keeps the model from spamming the network: once exhausted the tool
   returns a structured ``BUDGET_EXHAUSTED`` payload.
@@ -31,10 +31,21 @@ import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.web_search_adapter import (
+    attempt_rows as _attempt_rows,
+    create_gmas_web_search_tool as _create_gmas_web_search_tool,
+    fallback_answer_from_results as _fallback_answer_from_results,
+    normalize_results as _normalize_results,
+    source_rows as _source_rows,
+    status_from_attempts as _status_from_attempts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,18 +70,6 @@ _BUDGET_LOCK = threading.Lock()
 _BUDGET_USED: dict[str, int] = {}
 
 
-_FAST_SEARCH_PROVIDER_ENV = (
-    "SERPER_API_KEY",
-    "TAVILY_API_KEY",
-    "BRAVE_API_KEY",
-    "BING_SEARCH_API_KEY",
-    "BING_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_CSE_ID",
-    "OPENAI_API_KEY",
-)
-
-
 def _budget_for_run() -> int:
     raw = (os.environ.get("OUROBOROS_DEEP_SEARCH_BUDGET") or "").strip()
     try:
@@ -88,19 +87,19 @@ def _provider_name() -> str:
     return (os.environ.get("OUROBOROS_DEEP_SEARCH_PROVIDER") or "").strip().lower()
 
 
-def _slow_fallback_allowed() -> bool:
-    raw = (
-        os.environ.get("OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK")
-        or os.environ.get("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO")
-        or ""
-    ).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+def _engine_name(engine: str = "") -> str:
+    return (engine or os.environ.get("OUROBOROS_DEEP_SEARCH_ENGINE") or "").strip().lower()
 
 
-def _has_fast_search_provider() -> bool:
-    if _provider_name():
-        return True
-    return any(os.environ.get(name, "").strip() for name in _FAST_SEARCH_PROVIDER_ENV)
+def _available_external_engine(engine: str = "") -> str:
+    requested = _engine_name(engine)
+    if requested in {"firecrawl", "jina", "gmas"}:
+        return requested
+    if os.environ.get("FIRECRAWL_API_KEY", "").strip():
+        return "firecrawl"
+    if os.environ.get("JINA_API_KEY", "").strip():
+        return "jina"
+    return "gmas"
 
 
 def reset_budget_for_task(task_id: str | None) -> None:
@@ -128,109 +127,370 @@ def _gmas_search(
     max_results: int,
     fetch_content: bool,
     deep: bool,
-) -> list[dict[str, str]] | None:
-    """Try the GMAS WebSearchTool when available.  Returns None on any failure."""
-    try:
-        from gmas.tools.web_search import WebSearchTool
-    except Exception:
-        return None
-    try:
-        kwargs: dict[str, Any] = {
-            "max_results": max_results,
-            "fetch_content": fetch_content,
-            "deduplicate": True,
-            "cache": True,
+    provider: str = "",
+    intent: str = "",
+) -> dict[str, Any]:
+    """Run GMAS WebSearchTool, using Playwright for deep page reads when asked.
+
+    ``deep_search`` should be provider-independent. DuckDuckGo is the default
+    GMAS provider, so there is no API-key preflight. If the browser backend is
+    unavailable, retry once with GMAS HTTP page fetch so discovery can still
+    produce honest evidence instead of reporting a false provider-missing state.
+    """
+    payload = _gmas_search_once(
+        query,
+        max_results=max_results,
+        fetch_content=fetch_content,
+        deep=deep,
+        provider=provider,
+        intent=intent,
+    )
+    if deep and payload.get("status") == "provider_error":
+        fallback = _gmas_search_once(
+            query,
+            max_results=max_results,
+            fetch_content=True,
+            deep=False,
+            provider=provider,
+            intent=intent,
+        )
+        fallback["browser_fallback_from"] = payload.get("error", "")
+        fallback["browser_attempts_before_fallback"] = payload.get("attempts", [])
+        if fallback.get("browser_backend") == "http_fetch":
+            fallback["browser_backend"] = "http_fetch_fallback"
+        return fallback
+    return payload
+
+
+def _external_deep_search(
+    query: str,
+    *,
+    max_results: int,
+    fetch_content: bool,
+    engine: str,
+) -> dict[str, Any]:
+    if engine == "firecrawl":
+        return _firecrawl_search(
+            query,
+            max_results=max_results,
+            fetch_content=fetch_content,
+        )
+    if engine == "jina":
+        return _jina_search(
+            query,
+            max_results=max_results,
+        )
+    return {
+        "status": "provider_error",
+        "provider": f"{engine}_deep_search",
+        "browser_backend": engine,
+        "answer": "",
+        "results": [],
+        "sources": [],
+        "attempts": [
+            {
+                "provider": engine,
+                "status": "error",
+                "reason": "unknown_deep_search_engine",
+            }
+        ],
+        "error": f"unknown deep_search engine {engine!r}",
+        "retryable": False,
+    }
+
+
+def _post_json(
+    url: str,
+    body: dict[str, Any],
+    *,
+    headers: dict[str, str],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    payload = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **headers,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read(5_000_000)
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def _get_text(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: int = 45,
+) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/plain, text/markdown, application/json;q=0.8",
+            "User-Agent": "OuroborosDeepSearch/1.0",
+            **(headers or {}),
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read(5_000_000)
+    return raw.decode("utf-8", errors="replace")
+
+
+def _firecrawl_search(
+    query: str,
+    *,
+    max_results: int,
+    fetch_content: bool,
+) -> dict[str, Any]:
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "status": "provider_error",
+            "provider": "firecrawl_deep_search",
+            "browser_backend": "firecrawl",
+            "answer": "",
+            "results": [],
+            "sources": [],
+            "attempts": [
+                {
+                    "provider": "firecrawl",
+                    "status": "error",
+                    "reason": "missing_FIRECRAWL_API_KEY",
+                }
+            ],
+            "error": "FIRECRAWL_API_KEY is required for engine='firecrawl'",
+            "retryable": False,
         }
-        if deep:
-            kwargs["deep_search"] = "playwright"
-        # GMAS auto-routes by env keys (SERPER, TAVILY, BRAVE, ...).  If the
-        # caller pinned a provider via OUROBOROS_DEEP_SEARCH_PROVIDER we let
-        # GMAS pick that provider explicitly.
-        provider_hint = _provider_name()
-        if provider_hint:
-            kwargs["provider"] = provider_hint
-        tool = WebSearchTool(**kwargs)
-        result = tool.execute(query=query, fetch_content=fetch_content)
-        if not getattr(result, "success", False):
-            return None
-        # WebSearchTool formats text; we still need raw items.  When
-        # `structured_output` is present prefer it, otherwise parse the
-        # formatted string.
-        structured = getattr(result, "structured_output", None) or {}
-        items = structured.get("results") if isinstance(structured, dict) else None
-        if isinstance(items, list):
-            return _normalize_results(items)
-        text = getattr(result, "output", "") or ""
-        return _parse_formatted_results(text)
-    except Exception:
-        log.warning("GMAS WebSearchTool failed", exc_info=True)
-        return None
-
-
-def _normalize_results(items: list[Any]) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        out.append(
-            {
-                "title": str(item.get("title") or ""),
-                "url": str(item.get("url") or ""),
-                "snippet": str(item.get("snippet") or ""),
-                "content": str(item.get("content") or "")[:4000],
-            }
-        )
-    return out
-
-
-def _parse_formatted_results(text: str) -> list[dict[str, str]]:
-    """Best-effort extraction of (title, url, snippet) blocks from formatted text."""
-    if not text:
-        return []
-    out: list[dict[str, str]] = []
-    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
-    for block in blocks:
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if not lines:
-            continue
-        if len(lines) == 1 and re.match(r"(?i)^found\s+\d+\s+result", lines[0]):
-            continue
-        title = lines[0]
-        url = ""
-        snippet_parts: list[str] = []
-        for line in lines[1:]:
-            if line.lower().startswith(("url:", "https://", "http://")):
-                url = (
-                    line.split(":", 1)[-1].strip()
-                    if line.lower().startswith("url:")
-                    else line.strip()
-                )
-            else:
-                snippet_parts.append(line)
-        out.append(
-            {
-                "title": re.sub(r"^\[?\d+\]?\s*[\.)-]?\s*", "", title).strip(),
-                "url": url,
-                "snippet": " ".join(snippet_parts)[:600],
-                "content": "",
-            }
-        )
-    return out
-
-
-def _fallback_search(query: str, *, max_results: int) -> list[dict[str, str]]:
+    body: dict[str, Any] = {
+        "query": query,
+        "limit": max(1, min(max_results, 10)),
+        "sources": ["web"],
+        "timeout": 60000,
+    }
+    if fetch_content:
+        body["scrapeOptions"] = {"formats": [{"type": "markdown"}]}
     try:
-        from ouroboros.tools.search import _web_search_via_duckduckgo
-    except Exception:
-        return []
+        payload = _post_json(
+            "https://api.firecrawl.dev/v2/search",
+            body,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=70,
+        )
+        rows = ((payload.get("data") or {}).get("web") or []) if isinstance(payload, dict) else []
+        results = _normalize_results(
+            [
+                {
+                    "title": row.get("title") or (row.get("metadata") or {}).get("title") or "",
+                    "url": row.get("url") or (row.get("metadata") or {}).get("url") or "",
+                    "snippet": row.get("description")
+                    or (row.get("metadata") or {}).get("description")
+                    or "",
+                    "content": row.get("markdown") or row.get("html") or row.get("rawHtml") or "",
+                }
+                for row in rows
+                if isinstance(row, dict)
+            ]
+        )
+        return {
+            "status": "ok" if results else "no_results",
+            "provider": "firecrawl_deep_search",
+            "browser_backend": "firecrawl_search_scrape",
+            "answer": _fallback_answer_from_results(results) if results else "(no results)",
+            "results": results,
+            "sources": _source_rows(results),
+            "attempts": [
+                {
+                    "provider": "firecrawl",
+                    "status": "success" if results else "no_results",
+                    "result_count": len(results),
+                    "credits_used": payload.get("creditsUsed") if isinstance(payload, dict) else None,
+                }
+            ],
+        }
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "status": "provider_error",
+            "provider": "firecrawl_deep_search",
+            "browser_backend": "firecrawl_search_scrape",
+            "answer": "",
+            "results": [],
+            "sources": [],
+            "attempts": [
+                {
+                    "provider": "firecrawl",
+                    "status": "error",
+                    "reason": type(exc).__name__,
+                    "error": str(exc),
+                }
+            ],
+            "error": repr(exc),
+            "retryable": True,
+        }
+
+
+def _jina_search(
+    query: str,
+    *,
+    max_results: int,
+) -> dict[str, Any]:
+    headers: dict[str, str] = {}
+    api_key = os.environ.get("JINA_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = "https://s.jina.ai/" + urllib.parse.quote(query)
     try:
-        payload = _web_search_via_duckduckgo(query, max_results=max_results)
-    except Exception:
-        return []
-    sources = payload.get("sources") if isinstance(payload, dict) else []
-    if not isinstance(sources, list):
-        return []
-    return _normalize_results(sources)
+        text = _get_text(url, headers=headers, timeout=45)
+        urls = []
+        seen: set[str] = set()
+        for match in re.finditer(r"https?://[^\s)>\]\"']+", text):
+            candidate = match.group(0).rstrip(".,;:")
+            if candidate.startswith("https://s.jina.ai/") or candidate in seen:
+                continue
+            seen.add(candidate)
+            urls.append(candidate)
+            if len(urls) >= max_results:
+                break
+        results = [
+            {
+                "title": f"Jina Reader result {idx}",
+                "url": item_url,
+                "snippet": "",
+                "content": text[:4000] if idx == 1 else "",
+            }
+            for idx, item_url in enumerate(urls, start=1)
+        ]
+        if not results and text.strip():
+            results = [
+                {
+                    "title": "Jina Search result",
+                    "url": url,
+                    "snippet": text[:280].replace("\n", " "),
+                    "content": text[:4000],
+                }
+            ]
+        normalized = _normalize_results(results)
+        return {
+            "status": "ok" if normalized else "no_results",
+            "provider": "jina_reader_search",
+            "browser_backend": "jina_reader",
+            "answer": text[:4000] if text else "(no results)",
+            "results": normalized,
+            "sources": _source_rows(normalized),
+            "attempts": [
+                {
+                    "provider": "jina",
+                    "status": "success" if normalized else "no_results",
+                    "result_count": len(normalized),
+                    "api_key_present": bool(api_key),
+                }
+            ],
+        }
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return {
+            "status": "provider_error",
+            "provider": "jina_reader_search",
+            "browser_backend": "jina_reader",
+            "answer": "",
+            "results": [],
+            "sources": [],
+            "attempts": [
+                {
+                    "provider": "jina",
+                    "status": "error",
+                    "reason": type(exc).__name__,
+                    "error": str(exc),
+                    "api_key_present": bool(api_key),
+                }
+            ],
+            "error": repr(exc),
+            "retryable": True,
+        }
+
+
+def _gmas_search_once(
+    query: str,
+    *,
+    max_results: int,
+    fetch_content: bool,
+    deep: bool,
+    provider: str = "",
+    intent: str = "",
+) -> dict[str, Any]:
+    tool: Any | None = None
+    backend = "playwright" if deep else ("http_fetch" if fetch_content else "search_only")
+    try:
+        tool = _create_gmas_web_search_tool(
+            max_results=max_results,
+            fetch_content=fetch_content,
+            deep_search="playwright" if deep else None,
+            max_fetch_pages=min(max_results, 5) if fetch_content else None,
+        )
+        results, attempts = tool._search_with_fallback(
+            query,
+            max_results,
+            provider=(provider or None),
+            intent=(intent or None),
+        )
+        if fetch_content and results:
+            tool._fetch_content_for_results(
+                results,
+                None,
+                query=query,
+                no_cache=False,
+            )
+        prepared = results
+        answer = ""
+        with_context = bool(fetch_content)
+        try:
+            prepared = tool._prepare_results_for_output(
+                results,
+                query=query,
+                with_content=with_context,
+            )
+            answer = tool._format_search_results(
+                prepared,
+                with_content=with_context,
+            )
+        except Exception:
+            log.debug("GMAS deep_search output formatting failed", exc_info=True)
+        normalized = _normalize_results(prepared)
+        sources = _source_rows(normalized)
+        if not answer:
+            answer = _fallback_answer_from_results(sources)
+        return {
+            "status": _status_from_attempts(normalized, attempts),
+            "provider": "gmas_deep_search",
+            "browser_backend": backend,
+            "answer": answer if normalized else "(no results)",
+            "results": normalized,
+            "sources": sources,
+            "attempts": _attempt_rows(attempts),
+        }
+    except Exception as exc:
+        log.warning("GMAS deep_search failed", exc_info=True)
+        return {
+            "status": "provider_error",
+            "provider": "gmas_deep_search",
+            "browser_backend": backend,
+            "answer": "",
+            "results": [],
+            "sources": [],
+            "attempts": [],
+            "error": repr(exc),
+            "retryable": True,
+        }
+    finally:
+        close = getattr(tool, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                log.debug("GMAS deep_search close failed", exc_info=True)
 
 
 def _workspace_memory_paths(ctx: ToolContext) -> tuple[Path, Path, Path, Path]:
@@ -355,8 +615,10 @@ def _deep_search(
     query: str = "",
     intent: str = "",
     max_results: int = 5,
-    fetch_content: bool = False,
-    deep: bool = False,
+    fetch_content: bool = True,
+    deep: bool = True,
+    provider: str = "",
+    engine: str = "",
 ) -> str:
     try:
         from ouroboros.tools.umbrella_tools import _record_subtask_discovery_tool_call
@@ -398,21 +660,6 @@ def _deep_search(
             },
             ensure_ascii=False,
         )
-    if not _has_fast_search_provider() and not _slow_fallback_allowed():
-        return json.dumps(
-            {
-                "status": "provider_unavailable",
-                "reason": (
-                    "No fast web search provider is configured. Slow DuckDuckGo "
-                    "fallback is disabled by default to avoid long phase stalls. "
-                    "Use GitHub/MCP/local memory evidence, or set "
-                    "OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK=1 to allow it."
-                ),
-                "query": query_norm,
-                "intent": intent_norm,
-            },
-            ensure_ascii=False,
-        )
 
     ok, used, limit = _consume_budget(getattr(ctx, "task_id", None))
     if not ok:
@@ -431,23 +678,50 @@ def _deep_search(
         )
 
     max_results = max(1, min(int(max_results or 5), 15))
-    results = _gmas_search(
-        query_norm,
-        max_results=max_results,
-        fetch_content=bool(fetch_content),
-        deep=bool(deep),
-    )
-    used_provider = "gmas"
+    provider_norm = (provider or _provider_name()).strip().lower()
+    engine_norm = _available_external_engine(engine)
+    if engine_norm in {"firecrawl", "jina"}:
+        search_payload = _external_deep_search(
+            query_norm,
+            max_results=max_results,
+            fetch_content=bool(fetch_content),
+            engine=engine_norm,
+        )
+        if search_payload.get("status") == "provider_error" and not _engine_name(engine):
+            fallback_payload = _gmas_search(
+                query_norm,
+                max_results=max_results,
+                fetch_content=bool(fetch_content),
+                deep=bool(deep),
+                provider=provider_norm,
+                intent=intent_norm,
+            )
+            fallback_payload["external_engine_fallback_from"] = search_payload.get("provider", engine_norm)
+            fallback_payload["external_engine_error"] = search_payload.get("error", "")
+            search_payload = fallback_payload
+    else:
+        search_payload = _gmas_search(
+            query_norm,
+            max_results=max_results,
+            fetch_content=bool(fetch_content),
+            deep=bool(deep),
+            provider=provider_norm,
+            intent=intent_norm,
+        )
+    results = _normalize_results(search_payload.get("results", []))
     if not results:
-        results = _fallback_search(query_norm, max_results=max_results)
-        used_provider = "duckduckgo_fallback"
-    if not results:
+        status = str(search_payload.get("status") or "no_results")
         return json.dumps(
             {
-                "status": "no_results",
+                "status": status,
                 "reason": "no provider returned results for this query",
                 "query": query_norm,
                 "intent": intent_norm,
+                "provider": search_payload.get("provider", "gmas_deep_search"),
+                "browser_backend": search_payload.get("browser_backend", ""),
+                "attempts": search_payload.get("attempts", []),
+                "error": search_payload.get("error", ""),
+                "retryable": bool(search_payload.get("retryable", status == "provider_error")),
             },
             ensure_ascii=False,
         )
@@ -459,11 +733,19 @@ def _deep_search(
         "status": "ok",
         "query": query_norm,
         "intent": intent_norm,
-        "provider": used_provider,
+        "provider": search_payload.get("provider", "gmas_deep_search"),
+        "browser_backend": search_payload.get("browser_backend", ""),
+        "engine": engine_norm,
+        "requested_provider": provider_norm,
         "budget_used": used,
         "budget_limit": limit,
         "knowledge_md": knowledge_path,
         "ideas_jsonl": ideas_path,
+        "answer": search_payload.get("answer", ""),
+        "sources": search_payload.get("sources", []),
+        "attempts": search_payload.get("attempts", []),
+        "browser_fallback_from": search_payload.get("browser_fallback_from", ""),
+        "external_engine_fallback_from": search_payload.get("external_engine_fallback_from", ""),
         "results": results,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -477,7 +759,13 @@ def get_tools() -> list[ToolEntry]:
             {
                 "name": "deep_search",
                 "description": (
-                    "Intent-aware web search.  Call ONLY when you genuinely need "
+                    "Intent-aware deep web search with pluggable engines. "
+                    "Default engine is GMAS WebSearchTool: DuckDuckGo no-key "
+                    "search plus Playwright-backed page reading, with an HTTP "
+                    "content-fetch fallback if the browser backend is not "
+                    "available. Optional stronger engines are `firecrawl` "
+                    "(requires FIRECRAWL_API_KEY) and `jina` (uses Jina Reader "
+                    "Search, optionally with JINA_API_KEY). Call ONLY when you genuinely need "
                     "external evidence (unknown library/API, fresh standards, "
                     "recent error message, similar-project research).  You MUST "
                     "pass a non-empty `intent` from the whitelist: planner_research, "
@@ -506,13 +794,23 @@ def get_tools() -> list[ToolEntry]:
                         },
                         "fetch_content": {
                             "type": "boolean",
-                            "default": False,
-                            "description": "When true, fetch each result page and include its content.",
+                            "default": True,
+                            "description": "Fetch result pages and include query-focused page content.",
                         },
                         "deep": {
                             "type": "boolean",
-                            "default": False,
-                            "description": "Use Playwright for dynamic pages (slow; only for JS-heavy sites).",
+                            "default": True,
+                            "description": "Use GMAS Playwright page reading for dynamic pages; falls back to HTTP content fetch if the browser backend fails.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Optional GMAS provider override such as duckduckgo, brave, serper, tavily, exa, searxng, bocha, or google.",
+                        },
+                        "engine": {
+                            "type": "string",
+                            "default": "auto",
+                            "enum": ["auto", "gmas", "firecrawl", "jina"],
+                            "description": "Deep-search engine. auto uses Firecrawl or Jina only when their keys are configured, otherwise GMAS.",
                         },
                     },
                     "required": ["query", "intent"],

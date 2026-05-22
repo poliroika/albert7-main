@@ -85,6 +85,44 @@ _SURFACE_CATALOG: tuple[PromptSurface, ...] = (
     ),
 )
 
+_DYNAMIC_SURFACE_GROUPS: tuple[
+    tuple[Path, str, str, PromptSurfaceKind, str, str],
+    ...
+] = (
+    (
+        Path("umbrella/prompts/phases"),
+        "*.md",
+        "umbrella_phase_prompt",
+        PromptSurfaceKind.POLICY_FRAGMENT,
+        "Umbrella phase prompt",
+        "Phase-specific worker prompt loaded through phase manifests.",
+    ),
+    (
+        Path("umbrella/prompts/policies"),
+        "*.md",
+        "umbrella_runtime_policy",
+        PromptSurfaceKind.POLICY_FRAGMENT,
+        "Umbrella runtime policy",
+        "Domain policy capsule injected into phase worker context.",
+    ),
+    (
+        Path("umbrella/phases/manifests"),
+        "*.yaml",
+        "umbrella_phase_manifest",
+        PromptSurfaceKind.POLICY_FRAGMENT,
+        "Umbrella phase manifest",
+        "Phase tool, skill, memory, permission, and exit contract.",
+    ),
+    (
+        Path("umbrella/skills/library"),
+        "*/SKILL.md",
+        "umbrella_skill_pack",
+        PromptSurfaceKind.POLICY_FRAGMENT,
+        "Umbrella skill pack",
+        "Reusable procedural skill pack surfaced to phase workers.",
+    ),
+)
+
 _HUMAN_GATE_KEYWORDS = (
     "human checkpoint",
     "approval",
@@ -115,7 +153,51 @@ def identify_prompt_surfaces(repo_root: Path | None = None) -> list[PromptSurfac
     for surface in _SURFACE_CATALOG:
         if (repo_root / surface.path).exists():
             surfaces.append(surface)
+    surfaces.extend(
+        _dynamic_prompt_surfaces(
+            repo_root,
+            existing_paths={s.path for s in surfaces},
+        )
+    )
     return surfaces
+
+
+def _dynamic_prompt_surfaces(
+    repo_root: Path,
+    *,
+    existing_paths: set[Path],
+) -> list[PromptSurface]:
+    surfaces: list[PromptSurface] = []
+    for base, pattern, id_prefix, kind, label_prefix, description in _DYNAMIC_SURFACE_GROUPS:
+        root = repo_root / base
+        if not root.exists():
+            continue
+        for path in sorted(root.glob(pattern)):
+            if not path.is_file():
+                continue
+            rel_path = path.relative_to(repo_root)
+            if rel_path in existing_paths:
+                continue
+            surfaces.append(
+                PromptSurface(
+                    id=_surface_id_from_path(id_prefix, rel_path),
+                    path=rel_path,
+                    kind=kind,
+                    label=f"{label_prefix}: {rel_path.as_posix()}",
+                    description=description,
+                    metadata={"dynamic": True},
+                )
+            )
+    return surfaces
+
+
+def _surface_id_from_path(prefix: str, rel_path: Path) -> str:
+    safe = "".join(
+        ch.lower() if ch.isalnum() else "_"
+        for ch in rel_path.as_posix()
+    )
+    safe = "_".join(part for part in safe.split("_") if part)
+    return f"{prefix}_{safe}"
 
 
 def get_prompt_surface(

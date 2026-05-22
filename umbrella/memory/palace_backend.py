@@ -143,6 +143,16 @@ class PalaceBackend:
             log.debug("Failed to close palace client", exc_info=True)
 
         try:
+            from mempalace import palace as mempalace_palace
+
+            backend = getattr(mempalace_palace, "_DEFAULT_BACKEND", None)
+            close_palace = getattr(backend, "close_palace", None)
+            if callable(close_palace):
+                close_palace(self._palace_path)
+        except Exception:
+            log.debug("Failed to close mempalace backend cache", exc_info=True)
+
+        try:
             del inner
         except UnboundLocalError:
             pass

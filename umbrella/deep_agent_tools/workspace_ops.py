@@ -9,6 +9,13 @@ from umbrella.deep_agent_tools.workspace_gmas import (
     _llm_runtime_contract_block,
 )
 from umbrella.deep_agent_tools.workspace_read import _workspace_file_was_read
+from umbrella.enforcement import (
+    append_supervisor_ledger_event,
+    blocked_payload,
+    check_workspace_paths,
+    phase_from_context,
+)
+from umbrella.contracts import hash_value, workspace_hash
 
 def _workspace_layout_policy_block(rel_path: str) -> dict[str, Any] | None:
     norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
@@ -205,6 +212,107 @@ def _workspace_src_python_package_roots(seed_path: Path) -> set[str]:
     except OSError:
         return set()
     return _src_python_package_roots_from_paths(paths)
+
+
+def _enrich_greenfield_layout_block(
+    block: dict[str, Any],
+    *,
+    declared_paths: set[str] | None = None,
+) -> dict[str, Any]:
+    if str(block.get("reason") or "") != "greenfield_python_src_layout_policy":
+        return block
+    bad = str(block.get("file_path") or "").replace("\\", "/").strip().lstrip("/")
+    enriched = dict(block)
+    enriched["structural_deadlock"] = True
+    enriched["recommended_action"] = (
+        "mutate_phase_plan.replace_files_to_create_or_loop_back_to_plan"
+    )
+    enriched["bad_declared_path"] = bad
+    enriched["suggested_path_pattern"] = "src/<package>/..."
+    message = str(enriched.get("message") or "")
+    if "structural plan/layout conflict" not in message.lower():
+        enriched["message"] = (
+            message
+            + " This is a structural plan/layout conflict. The active subtask "
+            "declares a non-canonical Python layout, while workspace write policy "
+            "requires `src/<package>/...`. Replace the bad declared path via "
+            "`mutate_phase_plan` or loop back to plan; do not keep retrying the "
+            "same write in execute."
+        ).strip()
+    if declared_paths and bad and bad in {p.replace("\\", "/").strip().lstrip("/") for p in declared_paths}:
+        enriched["scope_conflict"] = True
+    return enriched
+
+
+def _stale_read_before_patch_block(
+    ctx: Any,
+    workspace_id: str,
+    rel_path: str,
+    target: Path,
+) -> dict[str, Any] | None:
+    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
+    try:
+        view = getattr(ctx, "loop_state_view", None)
+        if not isinstance(view, dict):
+            return None
+        digests = view.get("file_read_digests")
+        if not isinstance(digests, dict):
+            return None
+        last = digests.get(str(workspace_id), {}).get(norm)
+        if not isinstance(last, dict):
+            return None
+        stat = target.stat()
+        last_mtime = int(last.get("mtime_ns") or 0)
+        if last_mtime and stat.st_mtime_ns != last_mtime:
+            return {
+                "status": "blocked",
+                "reason": "stale_read_before_patch",
+                "file_path": norm,
+                "last_read_mtime_ns": last_mtime,
+                "current_mtime_ns": stat.st_mtime_ns,
+                "next_step": "Re-read the file with read_file before patching it again.",
+            }
+        import hashlib
+
+        current_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+        last_sha = str(last.get("sha256") or "")
+        if last_sha and current_sha != last_sha:
+            return {
+                "status": "blocked",
+                "reason": "stale_read_before_patch",
+                "file_path": norm,
+                "last_read_sha256": last_sha,
+                "current_sha256": current_sha,
+                "next_step": "Re-read the file with read_file before patching it again.",
+            }
+    except OSError:
+        return None
+    return None
+
+
+def _active_declared_paths_from_ctx(ctx: Any) -> set[str]:
+    active, _, _ = _active_execute_subtask_for_write_scope(ctx)
+    if not active:
+        return set()
+    return _subtask_declared_paths(active)
+
+
+def _greenfield_layout_block_for_write(
+    seed_path: Path,
+    rel_path: str,
+    *,
+    planned_paths: set[str] | None = None,
+    declared_paths: set[str] | None = None,
+) -> dict[str, Any] | None:
+    block = _greenfield_python_src_layout_block(
+        seed_path, rel_path, planned_paths=planned_paths
+    )
+    if block is None:
+        return None
+    merged_declared = set(declared_paths or set())
+    if planned_paths:
+        merged_declared |= {str(p) for p in planned_paths}
+    return _enrich_greenfield_layout_block(block, declared_paths=merged_declared or None)
 
 
 def _greenfield_python_src_layout_block(
@@ -967,20 +1075,27 @@ def _source_truncation_block(
     line_ratio = (len(new_lines) / max(1, len(old_lines))) if old_lines else 1.0
     if byte_ratio >= 0.45 and line_ratio >= 0.45:
         return None
-    if allow_large_overwrite and str(validation_summary or "").strip():
-        return None
     if suffix in {".py", ".pyi"}:
         old_symbols = _top_level_python_symbols(old_text)
         new_symbols = _top_level_python_symbols(new_text)
     else:
         old_symbols = _generic_source_markers(old_text)
         new_symbols = _generic_source_markers(new_text)
+    missing_symbols = sorted(old_symbols - new_symbols)
+    contract_drop = (
+        len(old_lines) >= 120
+        and line_ratio < 0.40
+        and len(old_symbols) >= 5
+        and len(missing_symbols) >= max(3, int(len(old_symbols) * 0.40))
+    )
     symbol_drop = (
         len(old_symbols) >= 3
         and len(new_symbols) <= max(1, len(old_symbols) // 3)
     )
     severe_drop = byte_ratio < 0.20 and line_ratio < 0.25 and len(new_text) < 2000
-    if not (symbol_drop or severe_drop):
+    if not (symbol_drop or severe_drop or contract_drop):
+        return None
+    if allow_large_overwrite and str(validation_summary or "").strip() and not contract_drop:
         return None
     return {
         "status": "blocked",
@@ -992,6 +1107,7 @@ def _source_truncation_block(
         "new_lines": len(new_lines),
         "old_symbol_count": len(old_symbols),
         "new_symbol_count": len(new_symbols),
+        "missing_symbols": missing_symbols[:20],
         "message": (
             "This full-file write would remove most of an existing source file. "
             "That usually means the model is repairing from a truncated preview "
@@ -1212,7 +1328,11 @@ def update_workspace_seed(
         file_path = _strip_workspace_prefix(workspace_id, file_path)
         if layout_block := _workspace_layout_policy_block(file_path):
             return _json(layout_block)
-        if src_layout_block := _greenfield_python_src_layout_block(seed_path, file_path):
+        if src_layout_block := _greenfield_layout_block_for_write(
+            seed_path,
+            file_path,
+            declared_paths=_active_declared_paths_from_ctx(ctx),
+        ):
             return _json(src_layout_block)
         if verification_block := _workspace_toml_verification_guard(
             seed_path, file_path, new_content
@@ -1311,444 +1431,90 @@ def update_workspace_seed(
 
 
 def _phase_plan_write_order_block(ctx: Any) -> dict[str, Any] | None:
-    """Block writes that jump ahead of an explicit non-write subtask gate."""
-    try:
-        from ouroboros.tools.phase_control import (
-            _current_phase_node,
-            _first_incomplete_subtask,
-            _is_phase_run_context,
-            _latest_tool_result_for_task,
-            _phase_subtasks,
-            _required_tool_from_success_test,
-            _read_phase_plan,
-            _subtask_success_test_text,
-        )
-
-        if not _is_phase_run_context(ctx):
-            return None
-        plan = _read_phase_plan(ctx)
-        if not isinstance(plan, dict):
-            return None
-        current_phase = _current_phase_node(ctx, plan)
-        first = _first_incomplete_subtask(_phase_subtasks(current_phase))
-        if not isinstance(first, dict):
-            return None
-        subtask_id = str(first.get("id") or "").strip()
-        required_tool = _required_tool_from_success_test(
-            _subtask_success_test_text(first)
-        )
-        prewrite_tools = {
-            "harness_run",
-            "web_search",
-            "deep_search",
-            "github_project_search",
-            "mcp_discover",
-        }
-        if required_tool not in prewrite_tools:
-            return None
-        if _latest_tool_result_for_task(
-            ctx,
-            tool_name=required_tool,
-            subtask_id=subtask_id,
-        ):
-            return None
-        return {
-            "status": "blocked",
-            "reason": "phase_subtask_order_before_write",
-            "subtask_id": subtask_id,
-            "required_tool": required_tool,
-            "message": (
-                f"The next phase-plan subtask `{subtask_id}` declares "
-                f"`{required_tool}` as its success test. Run that tool before "
-                "applying workspace writes so execution follows the accepted plan."
-            ),
-        }
-    except Exception:
-        log.debug("phase plan write order guard failed open", exc_info=True)
-        return None
+    return None
 
 
 def _phase_subtask_retry_escalation_block(
     ctx: Any, *, tool_name: str
 ) -> dict[str, Any] | None:
-    """Require watcher review after repeated declared success-test failures."""
-
-    try:
-        from ouroboros.tools.phase_control import (
-            _phase_subtask_retry_escalation_block as _phase_control_retry_block,
-        )
-
-        return _phase_control_retry_block(ctx, tool_name=tool_name)
-    except Exception:
-        log.debug("phase subtask retry escalation guard failed open", exc_info=True)
-        return None
-
-
-def _active_declared_success_test_edit_block(
-    ctx: Any, *, rel_path: str
-) -> dict[str, Any] | None:
-    """Block attempts to repair implementation failures by editing the active test.
-
-    A real execute run tried to resolve repeated `tests/test_state.py` failures by
-    rewriting the declared success-test file instead of repairing the missing
-    implementation API. The broader test-weakening guard catches large removals,
-    but small edits such as changing `world.get_state_summary()` to `world.to_dict()`
-    can preserve test item counts while still weakening the accepted contract.
-    Another run hit the same pattern after only one failing success-test run.
-    """
-
-    try:
-        from umbrella.deep_agent_tools.phase_control_base import (
-            _is_phase_run_context,
-            _read_phase_plan,
-            _subtask_success_test_text,
-        )
-        from umbrella.deep_agent_tools.phase_control_completion import (
-            _current_phase_node,
-            _first_incomplete_subtask,
-            _phase_subtask_retry_state,
-            _phase_subtasks,
-            _success_test_command_groups,
-        )
-        from ouroboros.tools.git import (
-            _repo_write_active_success_test_has_latest_failure,
-            _repo_write_success_test_targets_rel,
-        )
-
-        if not _is_phase_run_context(ctx):
-            return None
-        plan = _read_phase_plan(ctx)
-        if not isinstance(plan, dict):
-            return None
-        current_phase = _current_phase_node(ctx, plan)
-        if not isinstance(current_phase, dict):
-            return None
-        if str(current_phase.get("id") or "").strip() != "execute":
-            return None
-        subtask = _first_incomplete_subtask(_phase_subtasks(current_phase))
-        if not isinstance(subtask, dict):
-            return None
-        success_text = _subtask_success_test_text(subtask)
-        norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-        if not _repo_write_success_test_targets_rel(success_text, norm):
-            return None
-        state = _phase_subtask_retry_state(ctx)
-        if not state:
-            return None
-        failed_attempts = int(state.get("failures") or 0)
-        if failed_attempts < 1:
-            return None
-        groups = _success_test_command_groups(success_text)
-        if not groups:
-            return None
-        if not _repo_write_active_success_test_has_latest_failure(
-            ctx,
-            plan=plan,
-            groups=groups,
-            rel=norm,
-        ):
-            return None
-        migration_reason = _active_success_test_contract_migration_reason(
-            plan=plan,
-            subtask=subtask,
-            rel_path=norm,
-            latest_failure_time=state.get("latest_failure_time"),
-        )
-        if migration_reason:
-            return None
-        return {
-            "status": "blocked",
-            "reason": "active_success_test_edit_after_failure",
-            "file_path": norm,
-            "subtask_id": str(subtask.get("id") or ""),
-            "success_test": success_text,
-            "failed_attempts": failed_attempts,
-            "message": (
-                "The active declared success-test file has already failed for "
-                "the current execute subtask. Do not repair the subtask by "
-                "changing that test contract."
-            ),
-            "next_step": (
-                "Repair the implementation/source/config that the test is "
-                "exercising. If the declared success test itself is genuinely "
-                "wrong, do not keep calling `request_watcher_review`. First "
-                "call `mutate_phase_plan` with "
-                "`patch={\"subtasks\":[{\"id\":\""
-                + str(subtask.get("id") or "")
-                + "\",\"contract_migration_reason\":\"why the generated "
-                "test contract is internally wrong\",\"contract_migration_files\":[\""
-                + norm
-                + "\"]}]}`. After that accepted plan mutation, edit only the "
-                "minimal generated test assertion needed to preserve the "
-                "intended behavior and rerun the same success_test."
-            ),
-        }
-    except Exception:
-        log.debug("active success-test edit guard failed open", exc_info=True)
-        return None
-
-
-_CONTRACT_MIGRATION_KEYS = {
-    "contract_migration_reason",
-    "test_contract_migration_reason",
-    "success_test_contract_migration_reason",
-    "contract_migration",
-    "test_contract_migration",
-    "success_test_contract_migration",
-}
-
-
-def _migration_patch_reason(item: Any) -> str:
-    if not isinstance(item, dict):
-        return ""
-    for key in _CONTRACT_MIGRATION_KEYS:
-        value = item.get(key)
-        if isinstance(value, dict):
-            text = str(value.get("reason") or value.get("summary") or "").strip()
-        else:
-            text = str(value or "").strip()
-        if text:
-            return text
-    return ""
-
-
-def _migration_patch_mentions_file(item: Any, rel_path: str) -> bool:
-    if not isinstance(item, dict):
-        return False
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    raw_files = item.get("contract_migration_files") or item.get("test_contract_migration_files")
-    if raw_files is None:
-        raw_files = item.get("files") or item.get("file_paths")
-    if isinstance(raw_files, str):
-        raw_files = [raw_files]
-    if not isinstance(raw_files, list):
-        return True
-    files = {
-        str(file_path or "").replace("\\", "/").strip().lstrip("/")
-        for file_path in raw_files
-        if str(file_path or "").strip()
-    }
-    return not files or norm in files
-
-
-def _active_success_test_contract_migration_reason(
-    *,
-    plan: dict[str, Any],
-    subtask: dict[str, Any],
-    rel_path: str,
-    latest_failure_time: Any,
-) -> str:
-    subtask_id = str(subtask.get("id") or "").strip()
-    if not subtask_id:
-        return ""
-    try:
-        failure_time = float(latest_failure_time or 0)
-    except (TypeError, ValueError):
-        failure_time = 0.0
-    edits = plan.get("edits_log")
-    if not isinstance(edits, list):
-        return ""
-    for edit in reversed(edits):
-        if not isinstance(edit, dict):
-            continue
-        try:
-            edit_time = float(edit.get("timestamp") or 0)
-        except (TypeError, ValueError):
-            edit_time = 0.0
-        if failure_time and edit_time and edit_time < failure_time:
-            continue
-        patch = edit.get("patch")
-        if not isinstance(patch, dict):
-            continue
-        for item in patch.get("subtasks") or []:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("id") or "").strip() != subtask_id:
-                continue
-            reason = _migration_patch_reason(item)
-            if reason and _migration_patch_mentions_file(item, rel_path):
-                return reason
-    return ""
-
-
-def _active_success_test_contract_migration_reason_for_path(
-    ctx: Any, rel_path: str
-) -> str:
-    try:
-        from umbrella.deep_agent_tools.phase_control_base import (
-            _is_phase_run_context,
-            _read_phase_plan,
-            _subtask_success_test_text,
-        )
-        from umbrella.deep_agent_tools.phase_control_completion import (
-            _current_phase_node,
-            _first_incomplete_subtask,
-            _phase_subtask_retry_state,
-            _phase_subtasks,
-            _success_test_command_groups,
-        )
-        from ouroboros.tools.git import (
-            _repo_write_active_success_test_has_latest_failure,
-            _repo_write_success_test_targets_rel,
-        )
-
-        if not _is_phase_run_context(ctx):
-            return ""
-        plan = _read_phase_plan(ctx)
-        if not isinstance(plan, dict):
-            return ""
-        current_phase = _current_phase_node(ctx, plan)
-        if not isinstance(current_phase, dict):
-            return ""
-        if str(current_phase.get("id") or "").strip() != "execute":
-            return ""
-        subtask = _first_incomplete_subtask(_phase_subtasks(current_phase))
-        if not isinstance(subtask, dict):
-            return ""
-        success_text = _subtask_success_test_text(subtask)
-        norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-        if not _repo_write_success_test_targets_rel(success_text, norm):
-            return ""
-        state = _phase_subtask_retry_state(ctx)
-        if not state or int(state.get("failures") or 0) < 1:
-            return ""
-        groups = _success_test_command_groups(success_text)
-        if not groups:
-            return ""
-        if not _repo_write_active_success_test_has_latest_failure(
-            ctx,
-            plan=plan,
-            groups=groups,
-            rel=norm,
-        ):
-            return ""
-        return _active_success_test_contract_migration_reason(
-            plan=plan,
-            subtask=subtask,
-            rel_path=norm,
-            latest_failure_time=state.get("latest_failure_time"),
-        )
-    except Exception:
-        log.debug(
-            "active success-test contract migration lookup failed open",
-            exc_info=True,
-        )
-        return ""
-
-
-_PATCH_HUNK_MISMATCH_REPLACEMENT_THRESHOLD = 2
-
-
-def _tool_result_payload(row: dict[str, Any]) -> dict[str, Any]:
-    raw = row.get("result_preview") or row.get("result") or {}
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            return {}
-        if isinstance(parsed, dict):
-            return parsed
-    return {}
-
-
-def _patch_payload_mentions_path(payload: dict[str, Any], rel_path: str) -> bool:
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    if not norm:
-        return False
-    direct_values = (
-        payload.get("file_path"),
-        payload.get("path"),
-        payload.get("existing_file"),
-    )
-    if any(str(value or "").replace("\\", "/").strip().lstrip("/") == norm for value in direct_values):
-        return True
-    applied = payload.get("applied")
-    if isinstance(applied, list):
-        return any(norm in str(item).replace("\\", "/") for item in applied)
-    return False
-
-
-def _patch_hunks_contain_escaped_line_endings(hunks: Any) -> bool:
-    """Detect hunks copied from JSON-rendered read previews.
-
-    Real patch lines must be separated by actual newlines. When a model copies
-    `read_file` JSON content verbatim it can emit lines ending in the literal
-    characters ``\r`` or ``\n``; those can never match the file text.
-    """
-
-    if not isinstance(hunks, list):
-        return False
-    for hunk in hunks:
-        if not isinstance(hunk, list):
-            continue
-        for line in hunk:
-            text = str(line or "")
-            stripped = text.rstrip()
-            if (
-                stripped.endswith("\\r")
-                or stripped.endswith("\\n")
-                or "\\r\\n" in stripped
-            ):
-                return True
-    return False
-
-
-def _latest_failure_line_for_path(ctx: Any, rel_path: str) -> int | None:
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    drive_root = getattr(ctx, "drive_root", None)
-    if not task_id or drive_root is None:
-        return None
-    logs_path = Path(drive_root) / "logs" / "tools.jsonl"
-    try:
-        rows = logs_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return None
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    if not norm:
-        return None
-    path_pattern = re.escape(norm).replace("/", r"[\\/]+")
-    line_re = re.compile(rf"{path_pattern}:(?P<line>\d+)")
-    for raw in reversed(rows[-300:]):
-        try:
-            row = json.loads(raw)
-        except Exception:
-            continue
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("task_id") or "") != task_id:
-            continue
-        text = json.dumps(row, ensure_ascii=False, default=str)
-        match = line_re.search(text)
-        if not match:
-            continue
-        try:
-            line_no = int(match.group("line"))
-        except (TypeError, ValueError):
-            continue
-        if line_no > 0:
-            return line_no
     return None
 
 
-def _line_context_payload(
-    text: str, line_no: int | None, *, radius: int = 6
-) -> list[dict[str, Any]]:
-    if not line_no or line_no < 1:
+def _add_file_literal_hunk_marker_block(
+    rel_path: str, content_lines: Iterable[str]
+) -> dict[str, Any] | None:
+    line_numbers = [
+        index
+        for index, line in enumerate(content_lines or [], start=1)
+        if str(line or "").strip() == "@@"
+    ]
+    if not line_numbers:
+        return None
+    norm = _norm_workspace_rel_path(rel_path)
+    return {
+        "status": "blocked",
+        "reason": "patch_add_file_literal_hunk_marker",
+        "file_path": norm,
+        "line_numbers": line_numbers[:20],
+        "message": (
+            "`@@` is an update-hunk marker, not valid new-file content in "
+            "`*** Add File:` patches."
+        ),
+        "next_step": (
+            "Re-emit the Add File patch without the `@@` line. In Add File "
+            "operations, every content line may be prefixed with `+`, but hunk "
+            "markers belong only under `*** Update File:`."
+        ),
+    }
+
+
+def _workspace_patch_tool_payloads(ctx: Any) -> list[dict[str, Any]]:
+    drive_root = getattr(ctx, "drive_root", None)
+    if not drive_root:
         return []
-    lines = str(text or "").splitlines()
-    if not lines:
+    tools_log = Path(drive_root) / "logs" / "tools.jsonl"
+    if not tools_log.is_file():
         return []
-    start = max(1, int(line_no) - radius)
-    end = min(len(lines), int(line_no) + radius)
-    context: list[dict[str, Any]] = []
-    for idx in range(start, end + 1):
-        value = lines[idx - 1]
-        if len(value) > 240:
-            value = value[:237] + "..."
-        context.append({"line": idx, "text": value})
-    return context
+    current_task = str(getattr(ctx, "task_id", "") or "")
+    payloads: list[dict[str, Any]] = []
+    try:
+        for line in tools_log.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("tool") or "") != "apply_workspace_patch":
+                continue
+            if current_task and str(row.get("task_id") or "") != current_task:
+                continue
+            raw = row.get("result_preview") or row.get("result") or ""
+            if isinstance(raw, dict):
+                payload = raw
+            elif isinstance(raw, str):
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+    except OSError:
+        return []
+    return payloads
+
+
+def _required_replacement_patch_shape(rel_path: str) -> str:
+    norm = _norm_workspace_rel_path(rel_path)
+    return (
+        "*** Begin Patch\n"
+        f"*** Delete File: {norm}\n"
+        f"*** Add File: {norm}\n"
+        "+<full replacement file content, every line prefixed with +>\n"
+        "*** End Patch"
+    )
 
 
 def _patch_hunk_mismatch_payload(
@@ -1756,329 +1522,179 @@ def _patch_hunk_mismatch_payload(
     *,
     rel_path: str,
     error: str,
-    migration_reason: str,
-    old_content: str,
-    hunks: Any,
+    old_content: str = "",
+    hunks: list[list[str]] | None = None,
 ) -> dict[str, Any]:
-    escaped_line_endings = _patch_hunks_contain_escaped_line_endings(hunks)
-    failure_line = _latest_failure_line_for_path(ctx, rel_path)
-    read_hint = ""
-    if failure_line:
-        line_start = max(1, int(failure_line) - 8)
-        read_hint = (
-            f'read_file(file_path="{rel_path}", line_start={line_start}, '
-            "line_count=32)"
-        )
-
-    next_parts: list[str] = []
-    if migration_reason:
-        next_parts.append(
-            "This file has an accepted contract migration, so preserve every "
-            "existing test item and retry with a tiny exact `*** Update File:` "
-            "hunk for only the wrong generated line or smallest contradictory "
-            "block. Do not use full Delete/Add replacement unless you can "
-            "preserve the whole file verbatim except the migrated assertion."
-        )
-    else:
-        next_parts.append(
-            "Re-read the file and retry once with a smaller exact hunk. If it "
-            "still mismatches, use one `apply_workspace_patch` with paired "
-            f"same-path `*** Delete File: {rel_path}` and "
-            f"`*** Add File: {rel_path}` entries for an audited replacement, "
-            "or call `request_watcher_review`. Do not create "
-            "`.new`/`_corrected` sidecar files or shell rewrites."
-        )
-    if escaped_line_endings:
-        next_parts.append(
-            "The attempted hunk appears to contain literal JSON-rendered line "
-            "endings such as `\\r` or `\\n`. Patch hunks must use real line "
-            "breaks and literal source lines; do not copy JSON `content` text "
-            "with escaped line endings into the hunk."
-        )
-    if read_hint:
-        next_parts.append(
-            f"Use `{read_hint}` to get the exact local context around the "
-            "latest failure line, then paste those displayed source lines as "
-            "normal patch lines. When a line-slice read returns "
-            "`line_range_complete=true`, that requested slice is complete; "
-            "`has_more_lines_after=true` only means the rest of the file "
-            "continues below it."
-        )
-
-    payload: dict[str, Any] = {
+    norm = _norm_workspace_rel_path(rel_path)
+    recent = [
+        payload
+        for payload in _workspace_patch_tool_payloads(ctx)
+        if str(payload.get("file_path") or "").replace("\\", "/").strip("/")
+        == norm
+        and str(payload.get("reason") or "")
+        in {"patch_hunk_mismatch", "patch_hunk_mismatch_replacement_required"}
+    ]
+    recent_count = len(recent) + 1
+    if recent_count >= 2:
+        return {
+            "status": "blocked",
+            "reason": "patch_hunk_mismatch_replacement_required",
+            "file_path": norm,
+            "error": error,
+            "recent_mismatches": recent_count,
+            "message": (
+                "This task has hit repeated Update hunk mismatches for this "
+                "file since the last successful patch."
+            ),
+            "next_step": (
+                "Use one apply_workspace_patch with paired same-path Delete/Add "
+                "entries for an audited replacement."
+            ),
+            "required_patch_shape": _required_replacement_patch_shape(norm),
+            "forbidden_next_write": f"*** Update File: {norm}",
+        }
+    return {
         "status": "blocked",
         "reason": "patch_hunk_mismatch",
-        "file_path": rel_path,
+        "file_path": norm,
         "error": error,
-        "escaped_line_endings_detected": escaped_line_endings,
-        "next_step": " ".join(next_parts),
+        "recent_mismatches": recent_count,
+        "old_line_count": len(str(old_content or "").splitlines()),
+        "hunk_count": len(hunks or []),
+        "next_step": (
+            "Re-read the file and retry once with a smaller exact hunk. If the "
+            "next Update hunk still mismatches, use a paired same-path Delete/Add "
+            "replacement; do not create a `.new`, `_fixed`, or sidecar file."
+        ),
     }
-    if read_hint:
-        payload["read_file_hint"] = read_hint
-    context = _line_context_payload(old_content, failure_line)
-    if context:
-        payload["current_context"] = context
-    return payload
 
 
 def _patch_hunk_mismatch_replacement_required_block(
     ctx: Any, rel_path: str
 ) -> dict[str, Any] | None:
-    """Escalate repeated update-hunk mismatches into a hard replacement contract.
-
-    The patch tool already tells the agent to retry once and then switch to
-    paired same-path Delete/Add. Real runs showed the model can keep emitting
-    mismatching Update hunks anyway, burning rounds while Umbrella only repeats
-    the same advice. The control plane should make that transition explicit.
-    """
-
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    drive_root = getattr(ctx, "drive_root", None)
-    if not task_id or drive_root is None:
+    norm = _norm_workspace_rel_path(rel_path)
+    recent = [
+        payload
+        for payload in _workspace_patch_tool_payloads(ctx)
+        if str(payload.get("file_path") or "").replace("\\", "/").strip("/")
+        == norm
+        and str(payload.get("reason") or "")
+        in {"patch_hunk_mismatch", "patch_hunk_mismatch_replacement_required"}
+    ]
+    if len(recent) < 2 and not any(
+        str(payload.get("reason") or "") == "patch_hunk_mismatch_replacement_required"
+        for payload in recent
+    ):
         return None
-    logs_path = Path(drive_root) / "logs" / "tools.jsonl"
-    try:
-        lines = logs_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return None
-
-    mismatch_count = 0
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    if _active_success_test_contract_migration_reason_for_path(ctx, norm):
-        return None
-    for line in reversed(lines[-300:]):
-        try:
-            row = json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("task_id") or "") != task_id:
-            continue
-        if str(row.get("tool") or "") != "apply_workspace_patch":
-            continue
-        payload = _tool_result_payload(row)
-        if not payload or not _patch_payload_mentions_path(payload, norm):
-            continue
-        if str(payload.get("status") or "") == "applied":
-            break
-        if (
-            str(payload.get("status") or "") == "blocked"
-            and str(payload.get("reason") or "") == "patch_hunk_mismatch"
-        ):
-            mismatch_count += 1
-            if mismatch_count >= _PATCH_HUNK_MISMATCH_REPLACEMENT_THRESHOLD:
-                return {
-                    "status": "blocked",
-                    "reason": "patch_hunk_mismatch_replacement_required",
-                    "file_path": norm,
-                    "recent_mismatches": mismatch_count,
-                    "message": (
-                        "This task has already hit repeated Update hunk "
-                        "mismatches for this file since the last successful "
-                        "patch. Stop emitting more `*** Update File:` hunks "
-                        "for the same path."
-                    ),
-                    "required_patch_shape": (
-                        "*** Begin Patch\n"
-                        f"*** Delete File: {norm}\n"
-                        f"*** Add File: {norm}\n"
-                        "+<full replacement file content, every line prefixed with +>\n"
-                        "*** End Patch"
-                    ),
-                    "forbidden_next_write": f"*** Update File: {norm}",
-                    "next_step": (
-                        f"Use `read_file` or `repo_read` to read `{norm}` in "
-                        "full if needed; do not use shell for file inspection. "
-                        "Then use one "
-                        "`apply_workspace_patch` envelope with paired "
-                        f"`*** Delete File: {norm}` and "
-                        f"`*** Add File: {norm}` entries for an audited "
-                        "same-path replacement, or call "
-                        "`request_watcher_review` if replacement would weaken "
-                        "the contract. The paired replacement still runs the "
-                        "normal syntax, layout, LLM-contract, and test "
-                        "weakening guards."
-                    ),
-                }
-    return None
+    return {
+        "status": "blocked",
+        "reason": "patch_hunk_mismatch_replacement_required",
+        "file_path": norm,
+        "recent_mismatches": max(2, len(recent)),
+        "message": (
+            "This task has already hit repeated Update hunk mismatches for "
+            "this file since the last successful patch."
+        ),
+        "next_step": (
+            "Use one apply_workspace_patch with paired same-path Delete/Add "
+            "entries for an audited replacement."
+        ),
+        "required_patch_shape": _required_replacement_patch_shape(norm),
+        "forbidden_next_write": f"*** Update File: {norm}",
+    }
 
 
-_REPLACEMENT_SUFFIX_RE = re.compile(r"\.(?:new|tmp|replacement)$", re.IGNORECASE)
-_REPLACEMENT_STEM_RE = re.compile(
-    r"^(?P<base>.+)_(?:corrected|fixed|updated|new|replacement)$",
-    re.IGNORECASE,
+_REPLACEMENT_ARTIFACT_SUFFIXES = (
+    "_corrected",
+    "_fixed",
+    "_new",
+    "_replacement",
+    "_updated",
 )
-_CONTEXTUAL_REPLACEMENT_STEM_RE = re.compile(
-    r"^(?P<base>.+)_(?:extra|extras|aux|auxiliary|additional|patch|patched|repair|repaired)$",
-    re.IGNORECASE,
-)
-
-
-def _replacement_artifact_candidate(
-    rel_path: str, *, include_contextual_names: bool = False
-) -> str | None:
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    if not norm:
-        return None
-    path = Path(norm)
-    name = path.name
-    if _REPLACEMENT_SUFFIX_RE.search(name):
-        return norm[: -len(path.suffix)]
-    stem_patterns = [_REPLACEMENT_STEM_RE]
-    if include_contextual_names:
-        stem_patterns.append(_CONTEXTUAL_REPLACEMENT_STEM_RE)
-    for pattern in stem_patterns:
-        match = pattern.match(path.stem)
-        if match:
-            candidate_name = f"{match.group('base')}{path.suffix}"
-            return str(path.with_name(candidate_name)).replace("\\", "/")
-    return None
 
 
 def _replacement_artifact_block(seed_path: Path, rel_path: str) -> dict[str, Any] | None:
-    """Block sidecar files that are really failed same-path rewrites."""
-
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    if not norm:
+    norm = _norm_workspace_rel_path(rel_path)
+    path = Path(norm)
+    stem = path.stem
+    base_stem = ""
+    existing_suffix = path.suffix
+    for suffix in _REPLACEMENT_ARTIFACT_SUFFIXES:
+        if stem.lower().endswith(suffix):
+            base_stem = stem[: -len(suffix)]
+            break
+    if not base_stem and path.suffix.lower() == ".new":
+        original = Path(stem)
+        base_stem = original.stem
+        existing_suffix = original.suffix
+    if not base_stem:
         return None
-    candidate = _replacement_artifact_candidate(norm)
-    if not candidate:
-        return None
-    try:
-        original = _workspace_path(seed_path, candidate)
-    except ValueError:
-        return None
-    if not original.is_file():
+    existing_rel = (path.parent / f"{base_stem}{existing_suffix}").as_posix()
+    existing = seed_path / existing_rel
+    if not existing.is_file():
         return None
     return {
         "status": "blocked",
         "reason": "replacement_artifact_blocked",
         "file_path": norm,
-        "existing_file": candidate,
+        "existing_file": existing_rel,
         "message": (
-            "Do not create alternate `.new`, `_corrected`, or similar source/test "
-            "files to work around patch mismatches; they leave duplicate contracts "
-            "for verification."
+            "Do not create sidecar replacement artifacts for an existing file."
         ),
         "next_step": (
-            f"Read `{candidate}` in full, then use one `apply_workspace_patch` "
-            f"with paired `*** Delete File: {candidate}` and "
-            f"`*** Add File: {candidate}` entries to perform an audited same-path "
-            "replacement, or call `request_watcher_review` if the replacement "
-            "would weaken the contract."
+            f"Read `{existing_rel}` and update it directly. After repeated hunk "
+            "mismatches, use paired same-path Delete/Add replacement instead."
         ),
+        "required_patch_shape": _required_replacement_patch_shape(existing_rel),
     }
+
+
+def _same_replacement_family(existing_file: str, candidate_file: str) -> bool:
+    existing = Path(_norm_workspace_rel_path(existing_file))
+    candidate = Path(_norm_workspace_rel_path(candidate_file))
+    if existing.parent != candidate.parent or existing.suffix != candidate.suffix:
+        return False
+    existing_stem = existing.stem.lower()
+    candidate_stem = candidate.stem.lower()
+    if candidate_stem == existing_stem:
+        return True
+    if candidate_stem.startswith(existing_stem + "_"):
+        return True
+    if candidate_stem.startswith(existing_stem + "-"):
+        return True
+    return False
 
 
 def _pending_replacement_required_sidecar_block(
     ctx: Any, seed_path: Path, rel_path: str
 ) -> dict[str, Any] | None:
-    """Block contextual sidecars after Umbrella has required same-path replacement."""
-
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    candidate = _replacement_artifact_candidate(
-        norm, include_contextual_names=True
-    )
-    if not norm or not candidate or candidate == norm:
-        return None
-    try:
-        original = _workspace_path(seed_path, candidate)
-    except ValueError:
-        return None
-    if not original.is_file():
-        return None
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    drive_root = getattr(ctx, "drive_root", None)
-    if not task_id or drive_root is None:
-        return None
-    logs_path = Path(drive_root) / "logs" / "tools.jsonl"
-    try:
-        lines = logs_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return None
-
-    for line in reversed(lines[-300:]):
-        try:
-            row = json.loads(line)
-        except Exception:
+    norm = _norm_workspace_rel_path(rel_path)
+    for payload in reversed(_workspace_patch_tool_payloads(ctx)):
+        if str(payload.get("reason") or "") != "patch_hunk_mismatch_replacement_required":
             continue
-        if not isinstance(row, dict):
+        existing_file = _norm_workspace_rel_path(payload.get("file_path"))
+        if not existing_file:
             continue
-        if str(row.get("task_id") or "") != task_id:
+        if not (seed_path / existing_file).is_file():
             continue
-        if str(row.get("tool") or "") != "apply_workspace_patch":
+        if not _same_replacement_family(existing_file, norm):
             continue
-        payload = _tool_result_payload(row)
-        if not payload or not _patch_payload_mentions_path(payload, candidate):
-            continue
-        if str(payload.get("status") or "") == "applied":
-            return None
-        if (
-            str(payload.get("status") or "") == "blocked"
-            and str(payload.get("reason") or "")
-            == "patch_hunk_mismatch_replacement_required"
-        ):
-            return {
-                "status": "blocked",
-                "reason": "replacement_required_sidecar_blocked",
-                "file_path": norm,
-                "existing_file": candidate,
-                "message": (
-                    "This task already requires an audited same-path "
-                    f"replacement for `{candidate}`. Do not add auxiliary, "
-                    "extra, patched, or repair files to route around that "
-                    "contract."
-                ),
-                "required_patch_shape": (
-                    "*** Begin Patch\n"
-                    f"*** Delete File: {candidate}\n"
-                    f"*** Add File: {candidate}\n"
-                    "+<full replacement file content, every line prefixed with +>\n"
-                    "*** End Patch"
-                ),
-                "next_step": (
-                    f"Use `read_file` or `repo_read` to read `{candidate}` in "
-                    "full if needed, then use one paired same-path Delete/Add "
-                    "replacement for that file. Call `request_watcher_review` "
-                    "instead if the replacement would weaken the contract."
-                ),
-            }
+        return {
+            "status": "blocked",
+            "reason": "replacement_required_sidecar_blocked",
+            "file_path": norm,
+            "existing_file": existing_file,
+            "message": (
+                "A prior hunk-mismatch gate required same-path replacement; "
+                "creating a sidecar file would leave the stale file in place."
+            ),
+            "next_step": (
+                "Use one paired same-path Delete/Add patch for the existing "
+                "file instead of adding an auxiliary replacement artifact."
+            ),
+            "required_patch_shape": _required_replacement_patch_shape(existing_file),
+        }
     return None
-
-
-def _add_file_literal_hunk_marker_block(
-    rel_path: str, content_lines: list[str]
-) -> dict[str, Any] | None:
-    marker_lines: list[dict[str, Any]] = []
-    for line_no, line in enumerate(content_lines or [], start=1):
-        text = str(line or "")
-        if not text.lstrip().startswith("@@"):
-            continue
-        marker_lines.append({"line": line_no, "text": text[:120]})
-        if len(marker_lines) >= 5:
-            break
-    if not marker_lines:
-        return None
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    return {
-        "status": "blocked",
-        "reason": "patch_add_file_literal_hunk_marker",
-        "file_path": norm,
-        "line_numbers": [item["line"] for item in marker_lines],
-        "offending_lines": marker_lines,
-        "message": (
-            "`*** Add File:` content must not include literal `@@` hunk marker "
-            "lines. `@@` belongs to `*** Update File:` hunks, not new-file "
-            "content."
-        ),
-        "next_step": (
-            "Re-emit the Add File patch without the `@@` line. Put each new "
-            "file content line under `*** Add File:` as `+<content>`, then end "
-            "the patch with bare `*** End Patch`. Use `*** Update File:` with "
-            "`@@` only for existing files after reading them first."
-        ),
-    }
 
 
 def _plan_workspace_patch_replacement_operation(
@@ -2101,12 +1717,11 @@ def _plan_workspace_patch_replacement_operation(
         return None, _json(add_hunk_marker_block)
     if layout_block := _workspace_layout_policy_block(rel_path):
         return None, _json(layout_block)
-    if active_test_block := _active_declared_success_test_edit_block(
-        ctx, rel_path=rel_path
-    ):
-        return None, _json(active_test_block)
-    if src_layout_block := _greenfield_python_src_layout_block(
-        seed_path, rel_path, planned_paths=operation_paths
+    if src_layout_block := _greenfield_layout_block_for_write(
+        seed_path,
+        rel_path,
+        planned_paths=operation_paths,
+        declared_paths=_active_declared_paths_from_ctx(ctx),
     ):
         return None, _json(src_layout_block)
     if not _workspace_file_was_read(ctx, workspace_id, rel_path):
@@ -2219,15 +1834,12 @@ def _plan_workspace_patch_operation(
         )
     ):
         return None, _json(pending_replacement_block)
-    if op.action in {"update", "delete"} and (
-        active_test_block := _active_declared_success_test_edit_block(
-            ctx, rel_path=rel_path
-        )
-    ):
-        return None, _json(active_test_block)
     if op.action != "delete" and (
-        src_layout_block := _greenfield_python_src_layout_block(
-            seed_path, rel_path, planned_paths=operation_paths
+        src_layout_block := _greenfield_layout_block_for_write(
+            seed_path,
+            rel_path,
+            planned_paths=operation_paths,
+            declared_paths=_active_declared_paths_from_ctx(ctx),
         )
     ):
         return None, _json(src_layout_block)
@@ -2250,6 +1862,11 @@ def _plan_workspace_patch_operation(
         )
 
     target = _workspace_path(seed_path, rel_path)
+    if op.action in {"update", "delete"} and target.is_file():
+        if stale_block := _stale_read_before_patch_block(
+            ctx, workspace_id, rel_path, target
+        ):
+            return None, _json(stale_block)
     old_content = ""
     new_content = ""
     if op.action == "update":
@@ -2270,15 +1887,11 @@ def _plan_workspace_patch_operation(
         try:
             new_content = apply_update_to_text(old_content, op.hunks, rel_path)
         except ValueError as exc:
-            migration_reason = _active_success_test_contract_migration_reason_for_path(
-                ctx, rel_path
-            )
             return None, _json(
                 _patch_hunk_mismatch_payload(
                     ctx,
                     rel_path=rel_path,
                     error=str(exc),
-                    migration_reason=migration_reason,
                     old_content=old_content,
                     hunks=op.hunks,
                 )
@@ -2460,7 +2073,6 @@ _SUBTASK_WRITE_SCOPE_KEYS = (
     "files_to_create",
     "files_to_change",
     "files_affected",
-    "contract_migration_files",
 )
 
 
@@ -2687,10 +2299,6 @@ def apply_workspace_patch(
             return _json(gmas_block)
         if phase_order_block := _phase_plan_write_order_block(ctx):
             return _json(phase_order_block)
-        if retry_block := _phase_subtask_retry_escalation_block(
-            ctx, tool_name="apply_workspace_patch"
-        ):
-            return _json(retry_block)
         try:
             operations = parse_workspace_patch(patch)
         except ValueError as exc:
@@ -2739,6 +2347,22 @@ def apply_workspace_patch(
             )
         if scope_block := _execute_subtask_write_scope_block(ctx, planned=planned):
             return _json(scope_block)
+        phase = phase_from_context(ctx)
+        planned_paths = [str(item.get("path") or "") for item in planned]
+        if enforcement_issues := check_workspace_paths(
+            "apply_workspace_patch",
+            phase,
+            planned_paths,
+            write_kind="patch",
+        ):
+            return _json(
+                blocked_payload(
+                    enforcement_issues,
+                    tool_name="apply_workspace_patch",
+                    phase=phase,
+                    touched_files=planned_paths,
+                )
+            )
 
         applied, backups, response = _apply_workspace_patch_plan(
             ctx,
@@ -2759,6 +2383,19 @@ def apply_workspace_patch(
             severity="info",
             tags="change,seed,patch",
         )
+        try:
+            append_supervisor_ledger_event(
+                repo_root=repo_root,
+                workspace_id=workspace_id,
+                actor="agent",
+                phase=phase,
+                tool="apply_workspace_patch",
+                args={"paths": planned_paths, "validation_summary": validation_summary},
+                result={"status": "applied", "applied": applied},
+                touched_files=planned_paths,
+            )
+        except Exception:
+            log.debug("supervisor ledger append failed for apply patch", exc_info=True)
         body = _json(
             {
                 "status": "applied",
@@ -3068,6 +2705,21 @@ def delete_workspace_file(
             return _json(blocked or {"status": "error", "reason": "unknown"})
         if repair_block := _source_repair_delete_block(rel_norm, reason):
             return _json(repair_block)
+        phase = phase_from_context(ctx)
+        if enforcement_issues := check_workspace_paths(
+            "delete_workspace_file",
+            phase,
+            [rel_norm],
+            write_kind="delete",
+        ):
+            return _json(
+                blocked_payload(
+                    enforcement_issues,
+                    tool_name="delete_workspace_file",
+                    phase=phase,
+                    touched_files=[rel_norm],
+                )
+            )
         try:
             byte_size = target.stat().st_size
         except OSError:
@@ -3105,6 +2757,19 @@ def delete_workspace_file(
             )
         except Exception:
             log.debug("record_workspace_event after delete failed", exc_info=True)
+        try:
+            append_supervisor_ledger_event(
+                repo_root=repo_root,
+                workspace_id=workspace_id,
+                actor="agent",
+                phase=phase,
+                tool="delete_workspace_file",
+                args={"file_path": rel_norm, "reason": reason_norm},
+                result={"status": "deleted", "byte_size": byte_size},
+                touched_files=[rel_norm],
+            )
+        except Exception:
+            log.debug("supervisor ledger append failed for delete", exc_info=True)
         payload: dict[str, Any] = {
             "status": "deleted",
             "workspace_id": workspace_id,
@@ -3169,6 +2834,34 @@ def _verification_next_actions(report_dict: dict[str, Any]) -> list[str]:
     return deduped[:5]
 
 
+def _workspace_candidate_code_files(workspace_root: Path) -> list[str]:
+    code_exts = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs"}
+    files: list[str] = []
+    for path in workspace_root.rglob("*"):
+        try:
+            if not path.is_file() or path.suffix.lower() not in code_exts:
+                continue
+            rel = path.relative_to(workspace_root).as_posix()
+        except (OSError, ValueError):
+            continue
+        parts = [part.lower() for part in rel.split("/") if part]
+        if not parts or parts[0] in {
+            "tests",
+            "test",
+            "docs",
+            "doc",
+            ".memory",
+            ".umbrella",
+            ".umbrella_scratch",
+            "node_modules",
+        }:
+            continue
+        if parts[-1].startswith("test_") and parts[-1].endswith(".py"):
+            continue
+        files.append(rel)
+    return sorted(files)
+
+
 def run_workspace_verify(
     ctx: Any, workspace_id: str, timeout_seconds: int = 600
 ) -> str:
@@ -3207,15 +2900,16 @@ def run_workspace_verify(
                 {
                     "passed": False,
                     "pass_rate": 0.0,
-                    "skipped": True,
-                    "reason": (
-                        "No verification steps found in workspace.toml or "
-                        "verification.toml, and autodetect produced none. "
-                        'Add [[verification.steps]] entries (or steps = ["..."]) '
-                        "to workspace.toml so this tool can do its job."
+                    "skipped": False,
+                    "reason": "no_verifier_for_code_task",
+                    "error": (
+                        "No verification steps found in supervisor/workspace "
+                        "verification config, and autodetect produced none. "
+                        "For code tasks, missing verifier is a hard failure, "
+                        "not a successful skip."
                     ),
                     "next_actions": [
-                        "Add deterministic verification steps to `workspace.toml` or `verification.toml`, including tests under `tests/` when code is changed."
+                        "Add deterministic supervisor-owned verification steps and real tests/probes under `tests/`."
                     ],
                     "results": [],
                 }
@@ -3244,11 +2938,13 @@ def run_workspace_verify(
                 )
             )
 
+        candidate_files = _workspace_candidate_code_files(workspace_root)
         report = run_verification(
             workspace_root,
             steps_with_policy,
             workspace_id=workspace_id,
             overall_timeout_seconds=max(60, int(timeout_seconds)),
+            changed_files=candidate_files,
         )
         report_dict = report.to_dict()
         summary = report.render_summary(limit_chars=4000)
@@ -3281,6 +2977,39 @@ def run_workspace_verify(
             )
         except Exception:
             log.debug("record_verify_outcome failed", exc_info=True)
+        verification_report_ref = {}
+        try:
+            report_hash = hash_value(report_dict)
+            current_workspace_hash = workspace_hash(workspace_root)
+            current_diff_hash = current_workspace_hash
+            ledger_result = {
+                "report_hash": report_hash,
+                "passed": bool(report.passed),
+                "workspace_hash": current_workspace_hash,
+                "diff_hash": current_diff_hash,
+            }
+            ledger_event = append_supervisor_ledger_event(
+                repo_root=repo_root,
+                workspace_id=workspace_id,
+                actor="verifier",
+                phase=phase_from_context(ctx) or "verify",
+                tool="run_workspace_verify",
+                args={"workspace_id": workspace_id, "timeout_seconds": timeout_seconds},
+                result=ledger_result,
+                touched_files=[],
+            )
+            verification_report_ref = {
+                "report_id": ledger_event.event_id,
+                "report_hash": report_hash,
+                "workspace_hash": current_workspace_hash,
+                "diff_hash": current_diff_hash,
+                "produced_after_event_id": "",
+                "verifier_id": "run_workspace_verify",
+                "passed": bool(report.passed),
+                "ledger_hash": ledger_event.event_hash,
+            }
+        except Exception:
+            log.debug("supervisor ledger append failed for verification", exc_info=True)
 
         return _json(
             {
@@ -3292,6 +3021,7 @@ def run_workspace_verify(
                 "next_actions": next_actions,
                 "results": report_dict["results"],
                 "verify_run_id": verify_run_id,
+                "verification_report_ref": verification_report_ref,
                 "failed_step_count": failed_required,
             }
         )
@@ -3390,6 +3120,23 @@ def sandbox_self_edit(
                 }
             )
 
+        phase = phase_from_context(ctx)
+        if enforcement_issues := check_workspace_paths(
+            "sandbox_self_edit",
+            phase or "self_improve",
+            [file_path],
+            write_kind="patch",
+            allow_verifier_policy_edit=True,
+        ):
+            return _json(
+                blocked_payload(
+                    enforcement_issues,
+                    tool_name="sandbox_self_edit",
+                    phase=phase or "self_improve",
+                    touched_files=[file_path],
+                )
+            )
+
         target = (repo_root / file_path).resolve()
         if not str(target).startswith(str(repo_root.resolve())):
             return "ERROR: path traversal detected"
@@ -3408,6 +3155,21 @@ def sandbox_self_edit(
             severity="warning",
             tags="sandbox,self_edit,capability_gap",
         )
+        try:
+            append_supervisor_ledger_event(
+                repo_root=repo_root,
+                workspace_id="_self",
+                actor="agent",
+                phase=phase or "self_improve",
+                tool="sandbox_self_edit",
+                args={"file_path": file_path, "surface": surface, "reason": reason},
+                result={"status": "updated", "session": session_id},
+                touched_files=[file_path],
+            )
+        except Exception:
+            log.debug(
+                "supervisor ledger append failed for sandbox self edit", exc_info=True
+            )
 
         return _json(
             {

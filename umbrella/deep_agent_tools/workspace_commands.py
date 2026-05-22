@@ -1,7 +1,43 @@
 """Workspace command, Python execution, and terminal helpers."""
 
+from contextlib import contextmanager
+
+from umbrella.deep_agent_tools.domain_policy import public_workspace_llm_env_bridge
 from umbrella.deep_agent_tools.workspace_common import *
 from umbrella.deep_agent_tools.workspace_ops import _phase_subtask_retry_escalation_block
+from umbrella.enforcement import (
+    append_supervisor_ledger_event,
+    blocked_payload,
+    check_post_tool_diff,
+    diff_snapshots,
+    phase_from_context,
+    restore_snapshot_changes,
+    snapshot_workspace,
+)
+
+
+@contextmanager
+def _workspace_public_llm_env(extra_env: dict[str, str] | None = None):
+    """Expose Umbrella host LLM env to generated projects as public LLM_*."""
+
+    effective = dict(os.environ)
+    if extra_env:
+        effective.update({str(k): str(v) for k, v in extra_env.items()})
+    updates = public_workspace_llm_env_bridge(effective)
+    updates.setdefault("PYTHONIOENCODING", "utf-8")
+    updates.setdefault("PYTHONUTF8", "1")
+    if extra_env:
+        updates.update({str(k): str(v) for k, v in extra_env.items()})
+    saved = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 def _scrollback_path(ctx: Any) -> Path | None:
     """Locate ``<drive_root>/memory/terminal_scrollback.md`` for ``ctx``.
@@ -638,8 +674,70 @@ def run_workspace_command(
             cmd, repo_root=repo_root, workspace_root=workspace_root
         )
         cmd = _wrap_compound_command_for_host(cmd)
-        session = get_or_create_session(ctx, workspace_id)
-        result = session.run(cmd, cwd=str(cwd), timeout=timeout)
+        phase = phase_from_context(ctx)
+        before_snapshot = snapshot_workspace(workspace_root, capture_content=True)
+        with _workspace_public_llm_env():
+            session = get_or_create_session(ctx, workspace_id)
+            result = session.run(cmd, cwd=str(cwd), timeout=timeout)
+        changes = diff_snapshots(before_snapshot, snapshot_workspace(workspace_root))
+        enforcement_issues = check_post_tool_diff(
+            "run_workspace_command",
+            phase,
+            changes,
+        )
+        if enforcement_issues:
+            touched_files = [change.path for change in changes]
+            rollback = restore_snapshot_changes(before_snapshot, changes)
+            try:
+                record_workspace_event(
+                    ctx,
+                    workspace_id=workspace_id,
+                    event_type="command_blocked",
+                    summary="run_workspace_command mutated protected workspace paths",
+                    details="\n".join(touched_files[:100]),
+                    severity="error",
+                    tags="command,enforcement_kernel,blocked",
+                )
+            except Exception:
+                log.debug("record enforcement event failed", exc_info=True)
+            try:
+                append_supervisor_ledger_event(
+                    repo_root=repo_root,
+                    workspace_id=workspace_id,
+                    actor="agent",
+                    phase=phase,
+                    tool="run_workspace_command",
+                    args={"command": cmd, "cwd": str(cwd)},
+                    result={
+                        "status": "blocked",
+                        "exit_code": result.exit_code,
+                        "issue_codes": [issue.code for issue in enforcement_issues],
+                        "rollback": rollback,
+                    },
+                    touched_files=touched_files,
+                )
+            except Exception:
+                log.debug(
+                    "supervisor ledger append failed for blocked command",
+                    exc_info=True,
+                )
+            payload = blocked_payload(
+                enforcement_issues,
+                tool_name="run_workspace_command",
+                phase=phase,
+                touched_files=touched_files,
+            )
+            payload.update(
+                {
+                    "workspace_id": workspace_id,
+                    "cwd": str(cwd),
+                    "command": cmd,
+                    "exit_code": result.exit_code,
+                    "output_tail": (result.output or "")[-4000:],
+                    "rollback": rollback,
+                }
+            )
+            return _json(payload)
 
         output = result.output
         # Scrollback gets the *full* slice (head/tail-truncated only as a
@@ -687,6 +785,23 @@ def run_workspace_command(
             payload["terminal_session_recovered"] = True
         if result.truncated_head or result.truncated_tail:
             payload["truncated"] = True
+        try:
+            append_supervisor_ledger_event(
+                repo_root=repo_root,
+                workspace_id=workspace_id,
+                actor="agent",
+                phase=phase,
+                tool="run_workspace_command",
+                args={"command": cmd, "cwd": str(cwd)},
+                result={
+                    "exit_code": result.exit_code,
+                    "timed_out": bool(result.timed_out),
+                    "duration_seconds": round(result.duration_seconds, 3),
+                },
+                touched_files=[change.path for change in changes],
+            )
+        except Exception:
+            log.debug("supervisor ledger append failed for command", exc_info=True)
         return _json(payload)
     except Exception as e:
         return f"WARNING: workspace command error: {e}"
@@ -829,23 +944,9 @@ def run_python_code(
             requested = _RUN_WORKSPACE_DEFAULT_TIMEOUT_S
         timeout = max(1, min(requested, _RUN_WORKSPACE_MAX_TIMEOUT_S))
 
-        session = get_or_create_session(ctx, workspace_id)
         env_overrides = dict(extra_env or {})
-        if env_overrides:
-            # OneShotBackend.run accepts env_overrides via kwargs only on
-            # some backends; fall back to setting via os.environ for the
-            # subprocess at the call site.
-            saved = {k: os.environ.get(k) for k in env_overrides}
-            os.environ.update({str(k): str(v) for k, v in env_overrides.items()})
-            try:
-                result = session.run(argv, cwd=str(cwd), timeout=timeout)
-            finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
-        else:
+        with _workspace_public_llm_env(env_overrides):
+            session = get_or_create_session(ctx, workspace_id)
             result = session.run(argv, cwd=str(cwd), timeout=timeout)
 
         try:

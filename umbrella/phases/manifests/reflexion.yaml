@@ -43,6 +43,9 @@ memory:
   write_rules:
     lesson: {store: palace.global, tier: warm, scope: cross_run_durable}
     failure_pattern: {store: palace.global, tier: warm, scope: cross_run_durable}
+    # core_lesson: propose via submit_reflection(proposed_bkb_rules=[...]);
+    # Umbrella supervisor post-phase hook accepts/rejects via BKB gate (not palace_add / not agent accept_bkb_proposal)
+    core_lesson: {store: palace.lesson, tier: always_on, scope: cross_run_durable, verified: false}
 
 permissions:
   rules:

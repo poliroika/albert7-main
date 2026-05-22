@@ -1,0 +1,19 @@
+{
+  "schema_name": "review",
+  "schema_version": "1",
+  "run_id": "fixture",
+  "phase": "plan_review",
+  "actor": "agent",
+  "payload": {
+    "verdict": "ok",
+    "issues": [
+      {
+        "code": "llm_judge_only_evidence",
+        "severity": "warning",
+        "phase": "plan_review",
+        "message": "A model said it looks good, but there is no verifier evidence."
+      }
+    ],
+    "notes": "looks good"
+  }
+}

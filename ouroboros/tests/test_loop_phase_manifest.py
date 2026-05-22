@@ -942,9 +942,14 @@ def test_promote_to_durable_writes_verified_palace_durable_store(
     tmp_path, monkeypatch
 ):
     import sys
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    (tmp_path / "umbrella").mkdir()
+    (tmp_path / "workspaces").mkdir()
     from ouroboros.tools.phase_contract import _promote_to_durable
     from ouroboros.tools.registry import ToolContext
+    from umbrella.enforcement.ledger import append_supervisor_ledger_event
 
     calls = []
 
@@ -957,19 +962,51 @@ def test_promote_to_durable_writes_verified_palace_durable_store(
             calls.append(kw)
             return "durable-node"
 
+        def close(self):
+            return None
+
     monkeypatch.setattr("umbrella.memory.palace.facade.MemPalace", _FakeMemPalace)
+    monkeypatch.setenv("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", "1")
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=tmp_path)
     ctx.task_id = "run-verify:verify"
     ctx.context_overlays = {
         "phase_node": {"id": "verify", "manifest_id": "verify"},
     }
 
+    blocked = _promote_to_durable(
+        ctx,
+        workspace_id="mini_game",
+        tags="verification_report",
+        title="Verification report",
+        content="PASS: all required checks are green.",
+    )
+    blocked_payload = json.loads(blocked)
+    assert blocked_payload["saved"] is False
+    assert not calls
+
+    event = append_supervisor_ledger_event(
+        repo_root=tmp_path,
+        workspace_id="mini_game",
+        actor="verifier",
+        phase="verify",
+        tool="run_workspace_verify",
+        result={"passed": True},
+    )
     result = _promote_to_durable(
         ctx,
         workspace_id="mini_game",
         tags="verification_report",
         title="Verification report",
         content="PASS: all required checks are green.",
+        evidence_refs=[
+            {
+                "ref_type": "ledger_event",
+                "ref_id": event.event_id,
+                "hash": event.event_hash,
+                "produced_by": "verifier",
+            }
+        ],
+        trust_level="public_verified",
     )
 
     payload = json.loads(result)
@@ -978,10 +1015,11 @@ def test_promote_to_durable_writes_verified_palace_durable_store(
     assert payload["durable_node_id"] == "durable-node"
     assert calls
     assert calls[-1]["store"] == "palace.durable"
-    assert calls[-1]["tier"] == "always_on"
     assert calls[-1]["scope"] == "cross_run_durable"
     assert calls[-1]["verified"] is True
     assert "verification_report" in calls[-1]["tags"]
+    assert calls[-1]["extra"]["trust_level"] == "public_verified"
+    assert "ledger_event" in calls[-1]["extra"]["evidence_refs_json"]
 
 
 def test_submit_preflight_report_ready(tmp_path):
@@ -1051,6 +1089,40 @@ def test_loop_back_to_marks_phase_pending(tmp_path):
     updated = json.loads((state_dir / "phase_plan.json").read_text())
     research_node = next(n for n in updated["nodes"] if n["id"] == "research")
     assert research_node["status"] == "pending"
+
+
+def test_loop_back_to_rejects_forward_phase_target(tmp_path):
+    import sys, json
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_control import _loop_back_to
+    from unittest.mock import MagicMock
+
+    plan = {
+        "plan_id": "p1", "workspace_id": "ws1", "run_id": "r1", "version": 1,
+        "nodes": [
+            {"id": "plan", "manifest_id": "plan", "status": "done"},
+            {"id": "execute", "manifest_id": "execute", "status": "running"},
+            {"id": "verify", "manifest_id": "verify", "status": "pending"},
+        ],
+        "edits_log": [],
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "phase_plan.json").write_text(json.dumps(plan))
+
+    ctx = MagicMock()
+    ctx.drive_root = tmp_path
+    ctx.task_id = "r1:execute"
+    ctx.context_overlays = {"phase_node": {"id": "execute", "manifest_id": "execute"}}
+
+    result = _loop_back_to(ctx, phase="verify", reason="captured forward jump")
+
+    assert result.startswith("ERROR:")
+    assert "current or an earlier phase" in result
+    updated = json.loads((state_dir / "phase_plan.json").read_text())
+    assert updated["nodes"][1]["status"] == "running"
+    assert updated["nodes"][2]["status"] == "pending"
+    assert not (state_dir / "phase_control_signal.json").exists()
 
 
 def test_mark_subtask_complete_accepts_phase_level_phase_run(tmp_path):
@@ -1666,6 +1738,101 @@ def test_request_watcher_review_mirrors_captured_retry_to_subtask_memory(
     assert "audit tests and source" in mirrored["content"]
 
 
+def test_request_watcher_review_counts_verify_and_completion_deadlock(
+    tmp_path,
+):
+    import sys, json
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_control import _request_watcher_review
+    from ouroboros.tools.registry import ToolContext
+
+    success_test = "python -m pytest tests/test_models.py::test_one -q"
+    plan = {
+        "plan_id": "p1",
+        "workspace_id": "ws1",
+        "run_id": "run-1",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "execute",
+                "manifest_id": "execute",
+                "status": "running",
+                "subtasks": [
+                    {
+                        "id": "fix-model-validators",
+                        "status": "pending",
+                        "success_test": success_test,
+                    }
+                ],
+            },
+        ],
+        "edits_log": [],
+    }
+    state_dir = tmp_path / "state"
+    logs_dir = tmp_path / "logs"
+    state_dir.mkdir()
+    logs_dir.mkdir()
+    (state_dir / "phase_plan.json").write_text(json.dumps(plan))
+    rows = [
+        {
+            "task_id": "run-1:execute",
+            "tool": "shell",
+            "args": {
+                "argv": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/test_models.py::test_one",
+                    "-q",
+                ]
+            },
+            "result_preview": json.dumps({"exit_code": 0, "output": "1 passed"}),
+        },
+        {
+            "task_id": "run-1:execute",
+            "tool": "run_workspace_verify",
+            "result_preview": json.dumps({"passed": False, "failed_step_count": 8}),
+        },
+        {
+            "task_id": "run-1:execute",
+            "tool": "mark_subtask_complete",
+            "args": {"subtask_id": "fix-model-validators"},
+            "result_preview": (
+                "ERROR: mark_subtask_complete rejected: latest "
+                "run_workspace_verify failed"
+            ),
+        },
+        {
+            "task_id": "run-1:execute",
+            "tool": "run_workspace_verify",
+            "result_preview": json.dumps({"passed": False, "failed_step_count": 7}),
+        },
+    ]
+    (logs_dir / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n"
+    )
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "run-1:execute"
+    ctx.current_task_type = "phase_run"
+    ctx.context_overlays = {"phase_node": {"id": "execute", "manifest_id": "execute"}}
+
+    payload = json.loads(
+        _request_watcher_review(
+            ctx,
+            reason=(
+                "Focused success_test passes, but full verify and completion "
+                "keep rejecting the same active subtask."
+            ),
+        )
+    )
+
+    assert payload["status"] == "review_recorded"
+    assert payload["failed_attempts"] >= 3
+    assert payload["subtask_id"] == "fix-model-validators"
+    assert payload["latest_failure"]["tool"] == "run_workspace_verify"
+
+
 def test_mark_subtask_complete_rejects_out_of_order_phase_subtask(tmp_path):
     import sys, json
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -1885,6 +2052,204 @@ def test_mark_subtask_complete_requires_passing_workspace_verify(tmp_path):
     )
 
     assert result.startswith("OK:")
+
+
+def test_mark_subtask_complete_defers_full_verify_failures_owned_by_later_leaf(
+    tmp_path,
+):
+    import sys, json
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_control import _mark_subtask_complete
+    from ouroboros.tools.registry import ToolContext
+
+    success_test = (
+        "python -m pytest "
+        "tests/test_models.py::TestGameState::test_game_state_creation -q"
+    )
+    plan = {
+        "plan_id": "p1",
+        "workspace_id": "ws1",
+        "run_id": "run-1",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "execute",
+                "manifest_id": "execute",
+                "status": "running",
+                "subtasks": [
+                    {
+                        "id": "fix-model-validators",
+                        "status": "pending",
+                        "success_test": success_test,
+                        "files_to_change": ["src/civilization/game/models.py"],
+                    },
+                    {
+                        "id": "domain-fix-all-tests",
+                        "status": "pending",
+                        "success_test": "python -m pytest tests/test_models.py -q",
+                        "files_to_change": ["src/civilization/game/models.py"],
+                    },
+                ],
+            },
+        ],
+        "edits_log": [],
+    }
+    state_dir = tmp_path / "state"
+    logs_dir = tmp_path / "logs"
+    state_dir.mkdir()
+    logs_dir.mkdir()
+    (state_dir / "phase_plan.json").write_text(json.dumps(plan))
+    (logs_dir / "tools.jsonl").write_text(
+        json.dumps({
+            "task_id": "run-1:execute",
+            "tool": "shell",
+            "args": {
+                "argv": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/test_models.py::TestGameState::test_game_state_creation",
+                    "-q",
+                ],
+            },
+            "result_preview": json.dumps({
+                "exit_code": 0,
+                "output": "1 passed in 0.21s",
+            }),
+        })
+        + "\n"
+        + json.dumps({
+            "task_id": "run-1:execute",
+            "tool": "run_workspace_verify",
+            "result_preview": json.dumps({
+                "passed": False,
+                "failed_step_count": 1,
+                "results": [
+                    {
+                        "name": "pytest:tests",
+                        "kind": "pytest",
+                        "status": "failed",
+                        "stdout": (
+                            "FAILED "
+                            "tests/test_models.py::TestCity::test_city_growth"
+                        ),
+                    }
+                ],
+            }),
+        })
+        + "\n"
+    )
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "run-1:execute"
+    ctx.current_task_type = "phase_run"
+    ctx.context_overlays = {"phase_node": {"id": "execute", "manifest_id": "execute"}}
+
+    result = _mark_subtask_complete(
+        ctx,
+        subtask_id="fix-model-validators",
+        summary="Focused model validator test passed.",
+        evidence=[success_test + " passed"],
+    )
+
+    assert result.startswith("OK:"), result
+    updated = json.loads((state_dir / "phase_plan.json").read_text())
+    assert updated["nodes"][0]["subtasks"][0]["status"] == "done"
+    assert updated["nodes"][0]["subtasks"][1]["status"] == "pending"
+
+
+def test_mark_subtask_complete_blocks_unowned_full_verify_failure(tmp_path):
+    import sys, json
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_control import _mark_subtask_complete
+    from ouroboros.tools.registry import ToolContext
+
+    success_test = (
+        "python -m pytest "
+        "tests/test_models.py::TestGameState::test_game_state_creation -q"
+    )
+    plan = {
+        "plan_id": "p1",
+        "workspace_id": "ws1",
+        "run_id": "run-1",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "execute",
+                "manifest_id": "execute",
+                "status": "running",
+                "subtasks": [
+                    {
+                        "id": "fix-model-validators",
+                        "status": "pending",
+                        "success_test": success_test,
+                        "files_to_change": ["src/civilization/game/models.py"],
+                    }
+                ],
+            },
+        ],
+        "edits_log": [],
+    }
+    state_dir = tmp_path / "state"
+    logs_dir = tmp_path / "logs"
+    state_dir.mkdir()
+    logs_dir.mkdir()
+    (state_dir / "phase_plan.json").write_text(json.dumps(plan))
+    (logs_dir / "tools.jsonl").write_text(
+        json.dumps({
+            "task_id": "run-1:execute",
+            "tool": "shell",
+            "args": {
+                "argv": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/test_models.py::TestGameState::test_game_state_creation",
+                    "-q",
+                ],
+            },
+            "result_preview": json.dumps({
+                "exit_code": 0,
+                "output": "1 passed in 0.21s",
+            }),
+        })
+        + "\n"
+        + json.dumps({
+            "task_id": "run-1:execute",
+            "tool": "run_workspace_verify",
+            "result_preview": json.dumps({
+                "passed": False,
+                "failed_step_count": 1,
+                "results": [
+                    {
+                        "name": "pytest:tests",
+                        "kind": "pytest",
+                        "status": "failed",
+                        "stdout": (
+                            "FAILED "
+                            "tests/test_models.py::TestCity::test_city_growth"
+                        ),
+                    }
+                ],
+            }),
+        })
+        + "\n"
+    )
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "run-1:execute"
+    ctx.current_task_type = "phase_run"
+    ctx.context_overlays = {"phase_node": {"id": "execute", "manifest_id": "execute"}}
+
+    result = _mark_subtask_complete(
+        ctx,
+        subtask_id="fix-model-validators",
+        summary="Focused model validator test passed.",
+        evidence=[success_test + " passed"],
+    )
+
+    assert result.startswith("ERROR:"), result
+    assert "run_workspace_verify" in result
 
 
 def test_mark_subtask_complete_parses_truncated_workspace_verify_preview(tmp_path):
@@ -3246,6 +3611,106 @@ def test_submit_phase_plan_defaults_to_latest_proposal(tmp_path, monkeypatch):
     assert signal["payload"]["plan_id"] == "llm_civ_game_implementation"
 
 
+def test_submit_phase_plan_invalidates_stale_plan_review_and_downstream(
+    tmp_path, monkeypatch
+):
+    import sys, json
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_contract import _propose_phase_plan
+    from ouroboros.tools.phase_control import _submit_phase_plan
+    from umbrella.memory.palace import facade
+    from unittest.mock import MagicMock
+
+    ws_root = tmp_path / "workspaces" / "ws1"
+    drive = ws_root / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    monkeypatch.setattr(facade.MemPalace, "add", lambda self, **kwargs: "memory-id")
+
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "plan_id": "p1",
+                "workspace_id": "ws1",
+                "run_id": "run-1",
+                "version": 7,
+                "nodes": [
+                    {"id": "plan", "manifest_id": "plan", "status": "running"},
+                    {
+                        "id": "plan_review",
+                        "manifest_id": "plan_review",
+                        "status": "done",
+                        "started_at": 1,
+                        "ended_at": 2,
+                        "overlay": {"old": True},
+                    },
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "started_at": 3,
+                        "ended_at": None,
+                    },
+                    {
+                        "id": "final_review",
+                        "manifest_id": "final_review",
+                        "status": "done",
+                        "started_at": 4,
+                        "ended_at": 5,
+                    },
+                    {
+                        "id": "verify",
+                        "manifest_id": "verify",
+                        "status": "done",
+                        "started_at": 6,
+                        "ended_at": 7,
+                    },
+                ],
+                "edits_log": [],
+            }
+        )
+    )
+
+    ctx = MagicMock()
+    ctx.drive_root = drive
+    ctx.host_repo_root = tmp_path
+    ctx.repo_dir = tmp_path
+    ctx.task_id = "run-1:plan"
+    ctx.loop_state_view = {
+        "active_workspace_id": "ws1",
+        "phase_label": "plan",
+    }
+
+    _propose_phase_plan(
+        ctx,
+        plan={
+            "phase_id": "revised_plan",
+            "steps": [
+                {
+                    "id": "build",
+                    "title": "Build",
+                    "success_test": "python -m pytest tests -q",
+                }
+            ],
+        },
+        notes="ready",
+    )
+    result = _submit_phase_plan(ctx)
+
+    assert result.startswith("OK:"), result
+    updated = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    by_id = {node["id"]: node for node in updated["nodes"]}
+    for node_id in ("plan_review", "execute", "final_review", "verify"):
+        assert by_id[node_id]["status"] == "pending"
+        assert by_id[node_id].get("started_at") is None
+        assert by_id[node_id].get("ended_at") is None
+    assert by_id["plan_review"].get("overlay") == {}
+    assert any(
+        "invalidate_downstream_review_for_plan_id" in edit.get("patch", {})
+        for edit in updated["edits_log"]
+    )
+
+
 def test_mark_subtask_complete_blocks_after_run_cancel(tmp_path):
     import sys, json
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -3543,8 +4008,8 @@ def test_env_check_accepts_ouroboros_llm_key_alias(tmp_path, monkeypatch):
     assert payload["accepted_model_vars"] == ["LLM_MODEL", "OUROBOROS_MODEL"]
     assert payload["advisories"]
     advisory_text = "\n".join(payload["advisories"])
-    assert "standalone project credential alias" in advisory_text
-    assert "public env contract is LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL" in advisory_text
-    assert "inherited compatibility" in advisory_text
+    assert "Generated workspace projects" in advisory_text
+    assert "LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL" in advisory_text
+    assert "control-plane aliases" in advisory_text
     assert "OUROBOROS_LLM_MODEL" not in advisory_text
     assert "OUROBOROS_LLM_API_KEY/LLM_API_KEY" not in advisory_text

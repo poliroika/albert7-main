@@ -349,6 +349,7 @@ class DuckDuckGoProvider(SearchProvider):
 
     def search(self, query: str, max_results: int = 5) -> list[dict[str, str]]:
         last_exc: Exception | None = None
+        attempted_fallback = False
 
         for stage in self._backend_order[: self._max_backend_attempts]:
             try:
@@ -361,6 +362,8 @@ class DuckDuckGoProvider(SearchProvider):
 
                 if results:
                     return results
+                if stage != "ddgs":
+                    attempted_fallback = True
             except ImportError as exc:
                 last_exc = exc
                 logger.debug("DuckDuckGo backend={} unavailable: {}", stage, exc)
@@ -368,6 +371,8 @@ class DuckDuckGoProvider(SearchProvider):
                 last_exc = exc
                 logger.debug("DuckDuckGo backend={} failed: {}", stage, exc)
 
+        if attempted_fallback:
+            return []
         if last_exc is not None:
             raise _classify_urllib_error(last_exc, provider="duckduckgo") from last_exc
         return []

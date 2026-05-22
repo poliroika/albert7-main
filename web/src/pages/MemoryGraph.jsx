@@ -35,7 +35,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 
-// Node icon mapping
+// Node icon mapping (includes MemPalace store-derived types)
 const nodeIcons = {
   concept: FileText,
   entity: Wrench,
@@ -69,6 +69,22 @@ const nodeIcons = {
   harness_promotion: CheckSquare,
   harness_stage_result: CheckSquare,
   harness_result: Trophy,
+};
+
+// Tier → border color class for MemPalace nodes
+const tierBorderClass = {
+  always_on: 'border-purple-500/40',
+  hot:       'border-blue-500/35',
+  warm:      'border-sky-500/25',
+  cold:      'border-zinc-600/30',
+  transient: 'border-zinc-700/20',
+};
+const tierDotClass = {
+  always_on: 'bg-purple-400',
+  hot:       'bg-blue-400',
+  warm:      'bg-sky-500',
+  cold:      'bg-zinc-500',
+  transient: 'bg-zinc-700',
 };
 
 const ALL_RUNS = '__all__';
@@ -124,7 +140,11 @@ function MemoryNode({ data, selected }) {
   const linkCount = data.connectionCount || 0;
   const sourceLabel = data.source || data.scope || data.path || data.nodeType;
   const isSource = data.nodeType === 'source';
-  const iconClass = isSource ? 'text-emerald-300/80' : 'text-blue-400/70';
+  const isPalace = typeof data.source === 'string' && data.source.startsWith('palace.');
+  const tier = data.tier || '';
+  const tierBorder = isPalace ? (tierBorderClass[tier] || 'border-sky-500/20') : '';
+  const tierDot = isPalace ? (tierDotClass[tier] || 'bg-sky-500') : null;
+  const iconClass = isSource ? 'text-emerald-300/80' : isPalace ? 'text-purple-400/80' : 'text-blue-400/70';
 
   return (
     <div
@@ -133,7 +153,9 @@ function MemoryNode({ data, selected }) {
           ? 'border-blue-500/60 bg-[#1a1f2e] shadow-[0_0_12px_rgba(59,130,246,0.15)]'
           : isSource
             ? 'border-emerald-500/25 bg-[#121a1a] hover:border-emerald-400/40 hover:bg-[#162121]'
-            : 'border-[#2a3040] bg-[#141820] hover:border-[#3a4050] hover:bg-[#1a1f2e]'
+            : isPalace
+              ? `${tierBorder} bg-[#131520] hover:bg-[#18192a]`
+              : 'border-[#2a3040] bg-[#141820] hover:border-[#3a4050] hover:bg-[#1a1f2e]'
       }`}
     >
       {/* Top handle with blue dot */}
@@ -175,7 +197,10 @@ function MemoryNode({ data, selected }) {
 
       {/* Metadata row */}
       <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground/60">
-        <span>{linkCount} links</span>
+        <div className="flex items-center gap-1.5">
+          {tierDot && <div className={`w-1.5 h-1.5 rounded-full ${tierDot}`} title={`tier: ${tier}`} />}
+          <span>{linkCount} links</span>
+        </div>
         <span>{timeAgo}</span>
       </div>
     </div>
@@ -533,6 +558,20 @@ export default function MemoryGraph() {
                       <div className="flex justify-between gap-3">
                         <span className="text-muted-foreground/60">Source</span>
                         <span className="font-medium text-right truncate max-w-[190px]">{selectedNode.source}</span>
+                      </div>
+                    )}
+                    {selectedNode.tier && (
+                      <div className="flex justify-between gap-3">
+                        <span className="text-muted-foreground/60">Tier</span>
+                        <span className="font-medium text-right font-mono text-xs">{selectedNode.tier}</span>
+                      </div>
+                    )}
+                    {selectedNode.verified !== undefined && (
+                      <div className="flex justify-between gap-3">
+                        <span className="text-muted-foreground/60">Verified</span>
+                        <span className={`font-medium text-right text-xs ${selectedNode.verified ? 'text-emerald-400' : 'text-muted-foreground/50'}`}>
+                          {selectedNode.verified ? 'yes' : 'no'}
+                        </span>
                       </div>
                     )}
                     {selectedNode.scope && (

@@ -1,179 +1,217 @@
 # Umbrella
 
-Umbrella — это **workspace-first control-plane** вокруг мультиагентного фреймворка **GMAS**: политика границ репозитория, реестр и рантайм workspace’ов, retrieval, артефакты запусков и операторский Web UI. Поверх этого крутится **Ouroboros** — менеджер долгих циклов улучшения: он не подменяет прикладной код в `workspaces/`, а ведёт итерации, память и (при необходимости) вторичный контур self-improvement.
+Umbrella is a **workspace-first, phase-driven control plane** around the multi-agent framework **GMAS**. It orchestrates long-running improvement cycles through a deterministic phase machine, governs tool access via `PermissionEnvelope`, and maintains a unified memory layer (`MemPalace`) across runs.
 
-Идея в одном предложении: **Ouroboros управляет эволюцией, GMAS исполняет графы, workspace — место, где лежит решение задачи.**
+The system runs two Ouroboros agents in parallel per run: a **Worker** executing the current phase, and a **Watcher** monitoring for stalls, repeated errors, and budget overruns.
 
-Большой техотчёт по частям — **[docs/technical-report/README.md](docs/technical-report/README.md)** (удобно открывать как раздел в GitHub/GitLab).
+**One-sentence summary:** **PhaseRunner orchestrates phases, Worker executes, Watcher guards, MemPalace remembers, workspace delivers.**
 
-## Из чего состоит репозиторий
+Full technical report: [docs/technical-report/README.md](docs/technical-report/README.md).
 
-| Каталог | Роль |
-|--------|------|
-| `gmas/` | Движок графов, раннеры, инструменты. По политике проекта считается **read-only** для автопатчей. |
-| `workspaces/` | Прикладные системы: seed-шаблоны и рабочие копии под задачи (`workspace.toml`, `TASK_MAIN.md`, тесты). |
-| `umbrella/` | Control-plane: политика, registry, runtime, verification, web bridge, интеграция с Ouroboros. |
-| `ouroboros/` | Код менеджера (loop, planner, tools, память); ставится как зависимость/путь для тестов. |
-| `web/` | React-операторка (чат, ранны, workspace’ы, память, MCP, настройки). |
+## Architecture Overview
 
-Служебные данные рантайма по умолчанию лежат под `.umbrella/` (логи, диск Ouroboros, web-store и т.д.).
+```mermaid
+flowchart LR
+    CLI["CLI / Web Bridge"] --> Runner[PhaseRunner]
+    Runner --> Manifests["Phase manifests (YAML + jsonschema)"]
+    Manifests --> Envelope[PermissionEnvelope]
+    Runner --> Worker["Worker Ouroboros"]
+    Runner --> Watcher["Watcher Ouroboros"]
+    Watcher -- "control signals" --> Runner
+    Worker --> Tools["Phase tool set"]
+    Worker --> Skills["Phase skill set"]
+    Worker --> Prompts["Phase prompt overlay"]
+    Envelope -. "gate" .-> Tools
+    Worker --> Palace["MemPalace facade"]
+    Watcher --> Palace
+    Palace --> CrossRun[("cross-run: charter, lesson, idea, codeptr, skill_index")]
+    Palace --> RunScope[("run-scoped: PhasePlan, findings, run_lessons")]
+    Palace --> PhaseScope[("phase / subtask scratchpads")]
+    Palace --> Transient[("transient sqlite: logs, tool I/O, TTL")]
+    Palace --> Graph[("graph edges sqlite")]
+```
 
-Имя **корневой папки** репозитория на диске не зафиксировано (часто это всё ещё старый каталог вроде `albert7`); в командах и документации ориентируйтесь на наличие `pyproject.toml` и каталога `umbrella/`, а не на имя родительской директории.
+## Three-Layer Model
 
-## Документация
+| Layer | Directory | Role | Mutability |
+|-------|-----------|------|------------|
+| Framework | `gmas/` | Multi-agent graph engine, runners, tools, memory | **Read-only** for auto-patches |
+| Workspaces | `workspaces/` | Application systems solving concrete tasks | Primary change surface |
+| Control plane | `umbrella/` | Phase machine, memory, permissions, retrieval, web bridge | Freely mutable |
+| Deep agent | `ouroboros/` | LLM loop, tool registry, phase manifest consumer | Mutable by rules |
 
-Оглавление по-русски — **[docs/README.md](docs/README.md)**. Коротко:
+## Phase-Driven Run Lifecycle
 
-- [Архитектура](docs/architecture.md) — три слоя и связи.
-- [Технический отчёт (многостраничный)](docs/technical-report/README.md) — Umbrella, Ouroboros, verification, bridge, конфигурация, эксплуатация.
-- [Workspaces](docs/workspaces.md), [создание workspace](docs/creating-workspaces.md).
-- [Umbrella-слой](docs/umbrella-layer.md), [Ouroboros](docs/ouroboros.md), [GMAS в контексте проекта](docs/gmas.md).
-- Документация самого GMAS — в `gmas/docs/`.
-- **GitLab Pages:** статический сайт из `docs/` собирается MkDocs (`mkdocs.yml` + job `pages` в `.gitlab-ci.yml`).
+Every run follows a `PhasePlan` — a sequence of phases, each described by a YAML manifest that defines allowed tools, skills, prompts, memory access, and exit criteria.
 
-## Требования
+```mermaid
+flowchart LR
+    Preflight[preflight] --> Research[research]
+    Research --> ResearchReview["research_review"]
+    ResearchReview --> Plan[plan]
+    Plan --> PlanReview["plan_review"]
+    PlanReview --> Execute[execute]
+    Execute --> SubtaskReview["subtask_review (per subtask)"]
+    SubtaskReview --> Execute
+    Execute --> FinalReview["final_review"]
+    FinalReview --> Verify[verify]
+    Verify -->|pass| Report[FinalReport]
+    Verify -->|fail| Reflexion[reflexion]
+    Reflexion --> Execute
+    FinalReview -->|loop_back| Research
+```
 
-- **Python** ≥ 3.11 ([`pyproject.toml`](pyproject.toml)).
-- **[uv](https://docs.astral.sh/uv/)** для зависимостей и запуска скриптов.
-- Для UI: **Node.js** и **Yarn** или **npm** (в `web/` зафиксирован `packageManager` для Yarn; скрипты `build` / `start` те же).
+Each phase manifest is validated against `umbrella/phases/schema/manifest.schema.json`. The `PhaseRunner` spawns a Worker-Ouroboros per phase with the manifest's tool filter and prompt overlays. The Watcher-Ouroboros runs in parallel, waking only on trigger conditions (stall, repeated error, verify fail, budget overrun).
 
-## Установка (терминал)
+## Repository Structure
 
-Из корня репозитория:
+```
+umbrella/
+  phases/           Phase machine: manifests, loader, registry, schema
+  orchestrator/     Runner, Worker, Watcher, PhasePlan, FinalReport
+  permissions/      PermissionEnvelope, global.yaml, watcher envelope
+  memory/palace/    MemPalace facade: stores, tiers, graph, recall
+  prompts/phases/   System + overlay prompts per phase + watcher prompt
+  skills/library/   Skill packs with phase-tagged frontmatter
+  web_bridge/       HTTP server + JSON API (/api/*) + React static hosting
+  retrieval/        BM25 + symbol + docs search over GMAS
+  verification/     Workspace verification runner
+  workspace_registry/  Discovery and catalog of workspaces
+  workspace_runtime/   Instance creation, adapters, snapshot
+  integration/      UmbrellaServices locator, Ouroboros launcher/bridge
+  control_plane/    Critic, remediation planner, sandbox self-edit
+  tests/            Test suite
+
+ouroboros/
+  ouroboros/
+    loop.py         Main LLM tool loop (~5800 lines)
+    agent.py        Thin orchestrator, delegates to loop/tools/llm
+    context.py      Context builder: messages, compaction
+    tools/          22 tool modules including phase_control, palace_tools
+  supervisor/       Telegram, event dispatch, task queue, worker lifecycle
+
+gmas/               Multi-agent framework (read-only)
+workspaces/         Application workspaces (seeds + instances)
+web/                React operator UI (chat, runs, memory, phases, settings)
+```
+
+## Requirements
+
+- **Python** >= 3.11
+- **[uv](https://docs.astral.sh/uv/) for dependency management
+- **Node.js** + **Yarn** or **npm** (for the Web UI in `web/`)
+
+## Installation
+
+From the repository root:
 
 ```powershell
 uv sync --extra dev
 ```
 
-Опционально профиль с Terminal Bench: `uv sync --extra dev --extra tb` (см. `pyproject.toml`).
+Optional Terminal Bench profile: `uv sync --extra dev --extra tb`.
 
-Проверка тестов Umbrella и Ouroboros:
+Verify installation:
 
 ```powershell
 uv run pytest -q
 ```
 
-## Конфигурация LLM (`.env`)
+## LLM Configuration (`.env`)
 
-В корне репозитория положите `.env` (подхватывается `umbrella.env.load_env`). Минимально для «живого» режима:
+Place a `.env` file in the repository root (loaded by `umbrella.env.load_env`):
 
-- `LLM_API_KEY` — ключ API (при необходимости сработает и `OPENAI_API_KEY`).
-- `LLM_MODEL` — модель по умолчанию для части путей.
-- `LLM_BASE_URL` — необязательно, если используете совместимый прокси или нестандартный endpoint.
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `LLM_API_KEY` | Yes | API key (or `OPENAI_API_KEY`) |
+| `LLM_MODEL` | No | Default model for some paths |
+| `LLM_BASE_URL` | No | Proxy or non-standard endpoint |
+| `OUROBOROS_MODEL` | No | Override model for Ouroboros |
+| `OUROBOROS_MAX_ROUNDS` | No | Max LLM rounds per phase (<=0 = unlimited) |
 
-Для Ouroboros/Web часто задают также `OUROBOROS_MODEL` / `LLM_MODEL` (дефолт чата в bridge берётся из этих переменных и `.env`, см. `umbrella/web_bridge/util.py`).
+## Running
 
-Ограничение числа раундов LLM в цикле Ouroboros: `OUROBOROS_MAX_ROUNDS` (число ≤ 0 обычно означает «без жёсткого потолка» в логике приложения; см. `--max-rounds` в `umbrella/app_ouroboros.py`).
-
-Для Web UI при старте рана через API можно переопределить лимит повторов verification: `OUROBOROS_WEB_MAX_VERIFY_RETRIES` (по умолчанию в коде bridge — 20).
-
-## Запуск из терминала
-
-Все команды — из **корня** репозитория, если не указано иное.
-
-### Одноразовый прогон Ouroboros по workspace
+### Single run via CLI
 
 ```powershell
-uv run python umbrella/app_ouroboros.py workspaces/agent_research --live --verbose --max-verify-retries 3
+uv run python umbrella/app_ouroboros.py workspaces/<workspace_id> --live --verbose --max-verify-retries 3
 ```
 
-Полезные флаги (см. `umbrella/app_ouroboros.py`): `--task`, `--task-file`, `--timeout-hours`, `--max-budget`, `--max-rounds`, `--mock`, `--no-verify`, `--verification-timeout-seconds`, `--allow-seed-writes` (отключает требование task-instance). Код возврата `0` ожидается, когда прошла runtime-verification (если она не отключена).
+Key flags: `--task`, `--task-file`, `--timeout-hours`, `--max-budget`, `--max-rounds`, `--mock`, `--no-verify`, `--verification-timeout-seconds`, `--allow-seed-writes`.
 
-### Непрерывное улучшение по `TASK_MAIN.md`
+### Web Bridge (API + UI)
 
 ```powershell
-uv run python run_ouroboros_self_improve.py
+# Build frontend
+cd web && yarn install && yarn build && cd ..
+
+# Start bridge (default port 8765)
+uv run bridge
 ```
 
-Скрипт ожидает ключ в `.env`; параметры — `--help` у файла.
+Then open `http://127.0.0.1:8765`.
 
-### Meta-Harness (внешний контур экспериментов)
+Arguments (`umbrella/web_bridge/server.py`): `--host` (default `127.0.0.1`), `--port` (default `8765`), `--repo-root`, `--log-level`.
 
-```powershell
-uv run python run_meta_harness.py
-```
+### Development mode (hot reload)
 
-или `uv run python -m umbrella.meta_harness` — см. [docs/meta-harness-improvement-plan.md](docs/meta-harness-improvement-plan.md).
+Two processes:
+1. Bridge API: `uv run bridge`
+2. React dev server: `cd web && yarn start` (usually `http://localhost:3000`)
 
-### Web bridge (API + раздача собранного UI)
+In dev mode, Craco proxies `/api` to `http://127.0.0.1:8765`. Override with `REACT_APP_DEV_API_PROXY`.
 
-Точка входа: `uv run bridge` ≡ `uv run python -m umbrella.web_bridge` (по умолчанию порт **8765**).
+## Key Entrypoints
 
-Аргументы сервера (см. `umbrella/web_bridge/server.py`):
+| Module | Purpose |
+|--------|---------|
+| `umbrella/app_ouroboros.py` | CLI single-run entrypoint |
+| `umbrella/web_bridge/server.py` | Operator UI server |
+| `umbrella/orchestrator/runner.py` | PhaseRunner: walk PhasePlan, spawn Worker/Watcher |
+| `umbrella/orchestrator/watcher.py` | Watcher pump-loop with trigger conditions |
+| `umbrella/orchestrator/worker.py` | Worker spawn via OuroborosLauncher |
+| `umbrella/orchestrator/final_report.py` | Evidence-based FinalReport builder |
+| `umbrella/phases/registry.py` | Discover + validate phase manifests |
+| `umbrella/memory/palace/facade.py` | MemPalace: add/search/recall/link/walk/promote |
+| `umbrella/permissions/envelope.py` | PermissionEnvelope: allow/deny per phase |
+| `umbrella/web_bridge/api/report_api.py` | Report API routes |
 
-- `--host` (по умолчанию `127.0.0.1`)
-- `--port` (по умолчанию `8765`)
-- `--repo-root` — корень репозитория, если запускаете не из него
-- `--log-level` — например `DEBUG`
+## MemPalace Stores
 
-## Web UI
+| Store | Backend | Purpose |
+|-------|---------|---------|
+| `palace.charter` | Chroma | Project goal, architecture, active envelope (always_on) |
+| `palace.lesson` | Chroma | Durable verified lessons |
+| `palace.idea` | Chroma | Hypotheses, findings (verified=false suppressed by default) |
+| `palace.codeptr` | Chroma | External code pointers for reuse |
+| `palace.skill_index` | Chroma | Mirror of skills library for semantic search |
+| `palace.run` | Chroma | Current run state: PhasePlan, findings, subtask results |
+| `palace.phase` | Chroma | Phase scratchpad |
+| `palace.subtask` | Chroma | Subtask scratchpad |
+| `palace.transient` | SQLite | Events, tool I/O, terminal scrollback (TTL 24h) |
+| `palace.graph` | SQLite | Edge table linking nodes across all stores |
 
-### Режим «как у оператора»: одна сборка, один процесс
+## Documentation
 
-1. Собрать фронт (из корня). Подойдут **Yarn** (как в `packageManager`) или **npm** — скрипты те же: `build` кладёт статику в `web/build` (см. `web/package.json`).
+- [Docs index](docs/README.md)
+- [Architecture](docs/architecture.md) — layers, phase lifecycle, dual-agent pattern
+- [Technical report (multi-page)](docs/technical-report/README.md) — in-depth code analysis
+- [Workspaces](docs/workspaces.md) — seed, instance, contracts
+- [Creating workspaces](docs/creating-workspaces.md) — practical scenarios
+- [Umbrella layer](docs/umbrella-layer.md) — subsystems after refactoring
+- [Ouroboros](docs/ouroboros.md) — deep agent, phase manifest consumption
+- [GMAS](docs/gmas.md) — framework role and retrieval
 
-   **Yarn:**
+GMAS-internal docs: `gmas/docs/`.
 
-   ```powershell
-   cd web
-   yarn install
-   yarn build
-   cd ..
-   ```
+Static docs site via MkDocs Material: `mkdocs.yml` + GitLab CI job `pages`.
 
-   **npm:**
+## Working Principles
 
-   ```powershell
-   cd web
-   npm install
-   npm run build
-   cd ..
-   ```
-
-2. Запустить bridge из **корня** репозитория (порт по умолчанию **8765**, см. `umbrella/web_bridge/server.py`):
-
-   ```powershell
-   uv run bridge
-   ```
-
-   То же самое явно:
-
-   ```powershell
-   uv run python -m umbrella.web_bridge --port 8765
-   ```
-
-   Без `uv` (если окружение уже с установленным пакетом): `python -m umbrella.web_bridge --port 8765`.
-
-3. Открыть в браузере: `http://127.0.0.1:8765` (или свой `--host` / `--port`).
-
-Статика читается из `web/build` или `web/dist`. Если не сделать `yarn build` / `npm run build`, корень страницы может открыться, но `/api/*` и ассеты будут вести себя непредсказуемо.
-
-**Важно:** после сборки **не** используйте `npm start` / `yarn start` для этого сценария — `start` поднимает отдельный dev-сервер React (обычно порт 3000), см. ниже. Для одного процесса с API и статикой нужен только bridge.
-
-### Режим разработки UI (горячая перезагрузка)
-
-Нужны **два** процесса:
-
-1. Bridge с API: `uv run bridge` (порт по умолчанию **8765**).
-2. Dev-сервер React: `cd web && yarn start` — обычно **http://localhost:3000**.
-
-В dev Craco проксирует `/api` на `http://127.0.0.1:8765`; цель можно сменить переменной **`REACT_APP_DEV_API_PROXY`**. Если фронт отдаётся отдельно без bridge, для production-сборки можно задать базовый URL API через **`REACT_APP_BACKEND_URL`**.
-
-Страницы приложения: лендинг `/`, дальше под оболочкой — `/chat`, `/workspaces`, `/runs`, `/memory`, `/logs`, `/dashboard`, `/mcp`, `/settings` (см. `web/src/App.js`).
-
-## Ключевые entrypoints в коде
-
-- Политика: `umbrella/policies/engine.py`
-- Реестр workspace’ов: `umbrella/workspace_registry/registry.py`
-- Рантайм: `umbrella/workspace_runtime/runner.py`
-- Индекс запусков: `umbrella/artifacts/run_index.py`
-- Retrieval: `umbrella/retrieval/service.py`
-- Синхронный запуск Ouroboros из Umbrella: `umbrella/control_plane/ouroboros_integration.py`
-- Verification: `umbrella/verification/`
-- HTTP bridge: `umbrella/web_bridge/server.py`, маршруты — `umbrella/web_bridge/handler.py`
-
-## Принципы работы с репозиторием
-
-- Улучшать в первую очередь **workspace**, а не «менеджера ради менеджера».
-- Не автопатчить `gmas/` без явного решения человека.
-- Мутировать прикладную работу предпочтительно в **task-instance**, а не в seed; материализация — см. документацию в `docs/workspaces.md`.
+- Improve **workspaces** first, not the manager.
+- Do not auto-patch `gmas/` without explicit human decision.
+- Mutate application work in **task-instances**, not seeds.
+- Every phase has a **PermissionEnvelope** — no tool call escapes its boundary.
+- **Watcher** is idle by default — only invokes LLM on trigger conditions.
+- **FinalReport** is evidence-first: every claim must cite an event/artifact ID.
+- Reflexion promotes to durable lessons **only after verified evidence of success**.

@@ -8,9 +8,11 @@ function as either *trivial* or *substantive*, and fail the verification
 report when a workspace ships predominantly trivial tests OR when a
 web-shaped workspace has zero tests that exercise an HTTP client.
 
-The guard is intentionally conservative — it returns ``PASSED`` when
-there is nothing to look at (no tests, no Python files) so that pure-doc
-workspaces are not punished.
+The guard is intentionally conservative by default — it returns ``PASSED``
+when there is nothing to look at (no tests, no Python files) so that pure-doc
+workspaces are not punished.  Verification callers can pass
+``require_tests=True`` for code tasks; then missing behavioral tests are a hard
+failure instead of an advisory.
 
 Knobs (declared on the workspace ``[verification]`` table):
 
@@ -252,13 +254,16 @@ def _empty_synthetic_step() -> VerificationStep:
     )
 
 
-def run_test_quality_guard(workspace_path: str | Path) -> VerificationStepResult:
+def run_test_quality_guard(
+    workspace_path: str | Path,
+    *,
+    require_tests: bool = False,
+) -> VerificationStepResult:
     """Walk ``workspace_path`` and report on test depth.
 
     Always returns a single :class:`VerificationStepResult`. The guard fails
-    only when we find tests AND those tests are dominated by trivial
-    asserts.  No tests at all is not considered a failure here because the
-    surrounding pytest step would have caught a missing test file.
+    only when we find tests AND those tests are dominated by trivial asserts,
+    unless ``require_tests`` is set by a code-task verifier.
     """
 
     root = Path(workspace_path).resolve()
@@ -266,6 +271,16 @@ def run_test_quality_guard(workspace_path: str | Path) -> VerificationStepResult
 
     test_files = _iter_test_files(root)
     if not test_files:
+        if require_tests:
+            return VerificationStepResult(
+                step=step,
+                status=VerificationStatus.FAILED,
+                summary="test_quality_guard: no test_*.py files found for a code task",
+                error=(
+                    "no behavioral tests found for a code task; production "
+                    "changes require executable tests/probes under `tests/`"
+                ),
+            )
         return VerificationStepResult(
             step=step,
             status=VerificationStatus.PASSED,
@@ -325,6 +340,16 @@ def run_test_quality_guard(workspace_path: str | Path) -> VerificationStepResult
             )
 
     if total_tests == 0:
+        if require_tests:
+            return VerificationStepResult(
+                step=step,
+                status=VerificationStatus.FAILED,
+                summary="test_quality_guard: test files contain no `test_*` functions",
+                error=(
+                    "test files exist but no executable pytest functions were "
+                    "found for this code task"
+                ),
+            )
         return VerificationStepResult(
             step=step,
             status=VerificationStatus.PASSED,

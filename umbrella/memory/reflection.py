@@ -10,12 +10,10 @@ from typing import Any
 
 from umbrella.memory import (
     get_workspace_store,
-    palace_path_for,
     record_competency_signal,
     record_workspace_lesson,
 )
 from umbrella.memory.models import SignalCategory
-from umbrella.memory.palace_backend import get_palace_backend
 
 log = logging.getLogger(__name__)
 
@@ -161,17 +159,19 @@ def run_reflection_phase(
         signal_id = signal.id
 
     try:
-        palace = get_palace_backend(palace_path_for(repo_root, workspace_id))
-        palace.add(
+        from umbrella.deep_agent_tools.memory import canonical_palace_add
+
+        canonical_palace_add(
+            repo_root,
             workspace_id=workspace_id,
-            event_type="lesson",
-            room="reflection",
-            title=f"reflection {task_id}",
             content=lesson.conclusion,
+            title=f"reflection {task_id}",
             kind="insight",
+            store="palace.idea",
             tags=["reflection", "lesson"],
-            task_id=task_id,
-            metadata_extra={"skill_slug": skill_slug},
+            phase="reflection",
+            source_path=f"reflection/{task_id}",
+            extra={"room": "reflection", "skill_slug": skill_slug},
         )
     except Exception:
         log.debug("Reflection phase palace write failed", exc_info=True)

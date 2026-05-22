@@ -25,9 +25,6 @@ def mirror_external_finding_to_memory(
     """Persist an external discovery result to ideas.jsonl and MemPalace."""
 
     try:
-        from umbrella.memory.palace_backend import get_palace_backend
-        from umbrella.memory.paths import palace_path_for
-
         repo_root = _resolve_repo_root(ctx)
         ws = workspace_id or _current_workspace_id_from_drive(ctx)
         if not ws:
@@ -70,19 +67,21 @@ def mirror_external_finding_to_memory(
         except Exception:
             log.debug("mirror_external_finding jsonl write skipped", exc_info=True)
 
-        # Mirror to MemPalace (semantic store)
         palace_result: dict[str, Any] = {}
         try:
-            palace_result = get_palace_backend(palace_path_for(repo_root, ws)).add(
+            from umbrella.deep_agent_tools.memory import canonical_palace_add
+
+            palace_result = canonical_palace_add(
+                repo_root,
                 workspace_id=ws,
-                event_type=kind,
-                room=palace_room or "external_research",
-                title=title_norm[:200],
                 content=body_norm,
+                title=title_norm[:200],
                 kind=kind,
+                store="palace.idea",
                 tags=tag_list,
-                task_id=str(getattr(ctx, "task_id", "") or ""),
-                metadata_extra={
+                source_path=hier_path,
+                extra={
+                    "room": palace_room or "external_research",
                     "idea_id": record_id,
                     "palace_path": hier_path,
                     "evidence_kind": "verified_outcome",

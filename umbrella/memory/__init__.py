@@ -40,9 +40,6 @@ from umbrella.memory.paths import (
     palace_path_for,
     workspace_memory_root,
 )
-from umbrella.memory.migrations import migrate_to_per_workspace
-
-
 def reprioritize_memory(store: MemoryStore) -> None:
     """Apply decay and priority adjustments to all lessons.
 
@@ -106,7 +103,6 @@ __all__ = [
     "manager_memory_root",
     "palace_path_for",
     "workspace_memory_root",
-    "migrate_to_per_workspace",
     # Lessons
     "record_workspace_lesson",
     "record_manager_lesson",

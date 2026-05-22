@@ -10,6 +10,7 @@ fully cross-platform (no tmux/bash dependency).
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -64,6 +65,53 @@ class _RecordingBackend:
 
     def kill(self) -> None:
         self.killed = True
+
+
+class _EnvRecordingBackend(_RecordingBackend):
+    def run(
+        self, cmd: Sequence[str] | str, *, cwd: str | None, timeout: int
+    ) -> RunResult:
+        now = time.time()
+        env = {
+            "LLM_API_KEY": os.environ.get("LLM_API_KEY"),
+            "LLM_BASE_URL": os.environ.get("LLM_BASE_URL"),
+            "LLM_MODEL": os.environ.get("LLM_MODEL"),
+        }
+        self.calls.append({"cmd": cmd, "cwd": cwd, "timeout": timeout, "env": env})
+        body = json.dumps(env, sort_keys=True)
+        return RunResult(
+            exit_code=0,
+            output=body,
+            marker="00112233",
+            started_at=now - 0.1,
+            finished_at=now,
+            raw_output=body,
+        )
+
+
+class _FilesystemMutatingBackend(_RecordingBackend):
+    def __init__(self, rel_path: str, content: str = "{}") -> None:
+        super().__init__()
+        self.rel_path = rel_path
+        self.content = content
+
+    def run(
+        self, cmd: Sequence[str] | str, *, cwd: str | None, timeout: int
+    ) -> RunResult:
+        self.calls.append({"cmd": cmd, "cwd": cwd, "timeout": timeout})
+        target = Path(str(cwd or ".")) / self.rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.content, encoding="utf-8")
+        now = time.time()
+        body = f"mutated: {self.rel_path}"
+        return RunResult(
+            exit_code=0,
+            output=body,
+            marker="00112233",
+            started_at=now - 0.1,
+            finished_at=now,
+            raw_output=body,
+        )
 
 
 class _FakeCtx:
@@ -564,6 +612,40 @@ def test_run_workspace_command_uses_persistent_session(workspace, monkeypatch) -
     assert payload["backend"] == "recording"
 
 
+def test_run_workspace_command_bridges_host_llm_env_to_public_aliases(
+    workspace, monkeypatch
+) -> None:
+    ctx, _ws_dir, ws_id = workspace
+    backend = _EnvRecordingBackend()
+    ctx._terminal_sessions = {
+        ws_id: TerminalSession(workspace_id=ws_id, backend=backend)
+    }
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setenv("OUROBOROS_LLM_API_KEY", "host-key")
+    monkeypatch.setenv("OUROBOROS_LLM_BASE_URL", "https://host.example/v1")
+    monkeypatch.setenv("OUROBOROS_MODEL", "host/model")
+
+    out = umbrella_tools.run_workspace_command(
+        ctx,
+        workspace_id=ws_id,
+        argv=["python", "-c", "print('env')"],
+        timeout_seconds=5,
+    )
+
+    payload = json.loads(out)
+    env = json.loads(payload["output"])
+    assert env == {
+        "LLM_API_KEY": "host-key",
+        "LLM_BASE_URL": "https://host.example/v1",
+        "LLM_MODEL": "host/model",
+    }
+    assert os.environ.get("LLM_API_KEY") is None
+    assert os.environ.get("LLM_BASE_URL") is None
+    assert os.environ.get("LLM_MODEL") is None
+
+
 def test_run_workspace_command_rewrites_python_to_repo_venv(workspace) -> None:
     ctx, _ws_dir, ws_id = workspace
     backend = _install_recording_session(ctx, ws_id)
@@ -874,6 +956,82 @@ def test_mark_subtask_complete_does_not_accept_partial_pytest_success_from_combi
     assert result.startswith("ERROR:")
     assert "declares success_test" in result
     assert "no matching successful shell/run_workspace_command evidence" in result
+
+
+def test_mark_subtask_complete_rejects_shell_wrapper_success_evidence(
+    workspace,
+) -> None:
+    ctx, _ws_dir, _ws_id = workspace
+    _phase_run_ctx(ctx)
+    success_test = "python tests/verify_docs.py"
+    _write_execute_phase_with_success_test(ctx.drive_root, success_test=success_test)
+    _append_shell_result(
+        ctx.drive_root,
+        ts="2026-05-20T12:00:00+00:00",
+        command=["python", "tests/verify_docs.py"],
+        exit_code=1,
+        output="UnicodeEncodeError: 'charmap' codec can't encode character",
+    )
+    _append_shell_result(
+        ctx.drive_root,
+        ts="2026-05-20T12:01:00+00:00",
+        command=[
+            "powershell",
+            "-Command",
+            "$env:PYTHONIOENCODING='utf-8'; python tests/verify_docs.py",
+        ],
+        exit_code=0,
+        output="Documentation verification passed",
+    )
+
+    result = phase_control._mark_subtask_complete(
+        ctx,
+        subtask_id="1.2",
+        summary="Docs verified through an env wrapper.",
+        evidence=["powershell wrapper passed"],
+    )
+
+    assert result.startswith("ERROR:")
+    assert "shell/env command" in result
+    assert "exact declared success_test command" in result
+
+
+def test_contract_migration_reason_survives_later_success_test_failure() -> None:
+    from umbrella.deep_agent_tools.workspace_ops import (
+        _active_success_test_contract_migration_reason,
+    )
+
+    plan = {
+        "edits_log": [
+            {
+                "timestamp": 100.0,
+                "patch": {
+                    "subtasks": [
+                        {
+                            "id": "project-setup",
+                            "contract_migration_reason": (
+                                "bad generated success test imports tomli on Python 3.13"
+                            ),
+                            "contract_migration_files": ["tests/test_project_setup.py"],
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+    subtask = {
+        "id": "project-setup",
+        "success_test": "python -m pytest tests/test_project_setup.py -q",
+    }
+
+    reason = _active_success_test_contract_migration_reason(
+        plan=plan,
+        subtask=subtask,
+        rel_path="tests/test_project_setup.py",
+        latest_failure_time=200.0,
+    )
+
+    assert reason == "bad generated success test imports tomli on Python 3.13"
 
 
 def test_mark_subtask_complete_rejects_stale_shell_success_after_repair_write(
@@ -2123,6 +2281,60 @@ def test_run_workspace_command_blocks_python_c_file_mutations(workspace) -> None
     assert backend.calls == []
 
 
+def test_run_workspace_command_rolls_back_post_diff_shell_mutation(workspace) -> None:
+    ctx, ws_dir, ws_id = workspace
+    backend = _FilesystemMutatingBackend("frontend/package-lock.json")
+    ctx._terminal_sessions = {
+        ws_id: TerminalSession(workspace_id=ws_id, backend=backend)
+    }
+
+    raw = umbrella_tools.run_workspace_command(
+        ctx,
+        workspace_id=ws_id,
+        argv=["npm", "install", "--prefix", "frontend"],
+        allow_dependency_install=True,
+        timeout_seconds=5,
+    )
+
+    payload = json.loads(raw)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "umbrella_enforcement_kernel"
+    assert payload["issues"][0]["code"] == "shell_tool_workspace_mutation"
+    assert "frontend/package-lock.json" in payload["touched_files"]
+    assert "frontend/package-lock.json" in payload["rollback"]["restored"]
+    assert payload["rollback"]["errors"] == []
+    assert not (ws_dir / "frontend" / "package-lock.json").exists()
+    assert backend.calls
+
+
+def test_run_workspace_command_does_not_treat_snapshot_content_as_mutation(
+    workspace,
+) -> None:
+    ctx, ws_dir, ws_id = workspace
+    ctx.drive_root = ws_dir / ".memory" / "drive"
+    (ctx.drive_root / "logs").mkdir(parents=True)
+    (ctx.drive_root / "logs" / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    (ws_dir / "TASK_MAIN.md").write_text("build it\n", encoding="utf-8")
+    (ws_dir / "src" / "civilization").mkdir(parents=True)
+    (ws_dir / "src" / "civilization" / "__init__.py").write_text(
+        "__version__ = '0.1.0'\n", encoding="utf-8"
+    )
+    backend = _install_recording_session(ctx, ws_id)
+
+    raw = umbrella_tools.run_workspace_command(
+        ctx,
+        workspace_id=ws_id,
+        argv=["python", "-c", "print('ok')"],
+        timeout_seconds=5,
+    )
+
+    payload = json.loads(raw)
+    assert payload["exit_code"] == 0
+    assert payload["output"] == "recorded: python -c print('ok')"
+    assert payload.get("reason") != "umbrella_enforcement_kernel"
+    assert backend.calls
+
+
 def test_run_workspace_command_blocks_captured_absolute_python_c_file_mutation(
     workspace,
 ) -> None:
@@ -2820,6 +3032,51 @@ def test_apply_workspace_patch_same_path_replacement_after_read(workspace) -> No
     assert ctx.loop_state_view["subtask_diff"]["app.py"]["deleted_file"] is False
 
 
+def test_apply_workspace_patch_blocks_same_path_replacement_contract_loss(
+    workspace,
+) -> None:
+    ctx, ws_dir, ws_id = workspace
+    ctx.loop_state_view = {}
+    target = ws_dir / "src" / "civilization" / "game" / "models.py"
+    target.parent.mkdir(parents=True)
+    old_content = (
+        '"""Models."""\n\n'
+        + "\n\n".join(
+            f"class Model{i}:\n    def method_{i}(self):\n        return {i}\n"
+            for i in range(40)
+        )
+    )
+    target.write_text(old_content, encoding="utf-8")
+
+    umbrella_tools.read_workspace_file(
+        ctx,
+        workspace_id=ws_id,
+        file_path="src/civilization/game/models.py",
+    )
+    raw = umbrella_tools.apply_workspace_patch(
+        ctx,
+        workspace_id=ws_id,
+        patch=(
+            "*** Begin Patch\n"
+            "*** Delete File: src/civilization/game/models.py\n"
+            "*** Add File: src/civilization/game/models.py\n"
+            "+\"\"\"Models.\"\"\"\n"
+            "+\n"
+            "+class Model0:\n"
+            "+    def method_0(self):\n"
+            "+        return 0\n"
+            "*** End Patch\n"
+        ),
+        validation_summary="Captured hunk-mismatch loop requires same-path replacement.",
+    )
+
+    payload = json.loads(raw)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "source_truncation_guard"
+    assert "Model10" in payload["missing_symbols"]
+    assert "Model39" in target.read_text(encoding="utf-8")
+
+
 def test_apply_workspace_patch_same_path_replacement_after_captured_mismatch_loop(
     workspace,
 ) -> None:
@@ -3299,7 +3556,7 @@ def test_mutate_phase_plan_accepts_watcher_proven_bad_generated_success_test_con
     assert subtask["contract_migration_files"] == ["tests/test_config.py"]
 
 
-def test_apply_workspace_patch_contract_migration_allows_exact_update_after_repeated_hunk_mismatches(
+def test_apply_workspace_patch_contract_migration_requires_replacement_after_repeated_hunk_mismatches(
     workspace,
 ) -> None:
     ctx, ws_dir, ws_id = workspace
@@ -3402,6 +3659,30 @@ def test_apply_workspace_patch_contract_migration_allows_exact_update_after_repe
             "-            status=DiplomaticStatus.CHELLY,\n"
             "+            status=DiplomaticStatus.CHILLY,\n"
             "         )\n"
+            "*** End Patch\n"
+        ),
+    )
+
+    payload = json.loads(raw.split("\n\n", 1)[0])
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "patch_hunk_mismatch_replacement_required"
+
+    raw = umbrella_tools.apply_workspace_patch(
+        ctx,
+        workspace_id=ws_id,
+        patch=(
+            "*** Begin Patch\n"
+            "*** Delete File: tests/test_simulation.py\n"
+            "*** Add File: tests/test_simulation.py\n"
+            "+class TestGameState:\n"
+            "+    def test_diplomatic_relation(self, game_state):\n"
+            "+        game_state.add_player(Player(player_id=\"p1\", name=\"P1\"))\n"
+            "+        game_state.add_player(Player(player_id=\"p2\", name=\"P2\"))\n"
+            "+        relation = DiplomaticRelation(\n"
+            "+            player_1_id=\"p1\",\n"
+            "+            player_2_id=\"p2\",\n"
+            "+            status=DiplomaticStatus.CHILLY,\n"
+            "+        )\n"
             "*** End Patch\n"
         ),
     )
@@ -4034,8 +4315,8 @@ def test_apply_workspace_patch_allows_protective_llm_runtime_docs(workspace) -> 
             "*** Begin Patch\n"
             "*** Add File: docs/architecture.md\n"
             "+# Runtime Contract\n"
-            "+Resolve LLM runtime through OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and OUROBOROS_MODEL/LLM_MODEL.\n"
+            "+Resolve LLM runtime through LLM_API_KEY, "
+            "LLM_BASE_URL, and LLM_MODEL.\n"
             "+Forbidden provider defaults:\n"
             "+- Hardcoded https://api.openai.com/v1\n"
             "+- Hardcoded gpt-* model names\n"
@@ -4141,8 +4422,8 @@ def test_apply_workspace_patch_blocks_obsolete_ouroboros_alias_only_env(workspac
 
     payload = json.loads(raw)
     assert payload["reason"] == "llm_runtime_contract"
-    assert "OUROBOROS_LLM_API_KEY" in " ".join(payload["issues"])
-    assert "OUROBOROS_LLM_BASE_URL" in " ".join(payload["issues"])
+    assert "LLM_API_KEY" in " ".join(payload["issues"])
+    assert "LLM_BASE_URL" in " ".join(payload["issues"])
     assert not (ws_dir / ".env.example").exists()
 
 
@@ -4181,12 +4462,12 @@ def test_apply_workspace_patch_blocks_obsolete_ouroboros_alias_only_settings(
 
     payload = json.loads(raw)
     assert payload["reason"] == "llm_runtime_contract"
-    assert "OUROBOROS_LLM_API_KEY" in " ".join(payload["issues"])
-    assert "OUROBOROS_LLM_BASE_URL" in " ".join(payload["issues"])
+    assert "LLM_API_KEY" in " ".join(payload["issues"])
+    assert "LLM_BASE_URL" in " ".join(payload["issues"])
     assert not (ws_dir / "src" / "civgame" / "settings.py").exists()
 
 
-def test_apply_workspace_patch_allows_obsolete_aliases_with_required_llm_aliases(
+def test_apply_workspace_patch_blocks_control_plane_aliases_even_with_public_aliases(
     workspace,
 ) -> None:
     ctx, ws_dir, ws_id = workspace
@@ -4211,8 +4492,10 @@ def test_apply_workspace_patch_allows_obsolete_aliases_with_required_llm_aliases
         ),
     )
 
-    assert json.loads(raw.split("\n\n", 1)[0])["status"] == "applied"
-    assert (ws_dir / "src" / "civgame" / "settings.py").exists()
+    payload = json.loads(raw)
+    assert payload["reason"] == "llm_runtime_contract"
+    assert "host/control-plane LLM env alias" in " ".join(payload["issues"])
+    assert not (ws_dir / "src" / "civgame" / "settings.py").exists()
 
 
 def test_apply_workspace_patch_blocks_captured_llm_sentiment_fallback(workspace) -> None:

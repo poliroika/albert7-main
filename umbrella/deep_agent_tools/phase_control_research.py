@@ -2,6 +2,13 @@
 
 from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.deep_agent_tools.phase_control_base import *
+from umbrella.deep_agent_tools.research_provenance import (
+    next_finding_source_hint as _research_summary_next_finding_hint,
+    palace_add_source_paths_by_id as _shared_palace_add_source_paths_by_id,
+    research_scarcity_handoff_issue as _research_scarcity_handoff_issue,
+    research_source_coverage_report as _research_source_coverage_report,
+    research_summary_source_claim_issue as _shared_research_summary_source_claim_issue,
+)
 
 def _stale_claim_context(text: str) -> bool:
     window = str(text or "")
@@ -16,6 +23,14 @@ def _accepted_palace_add_ids_for_task(ctx: ToolContext) -> set[str]:
 
 def _accepted_palace_add_aliases_for_task(ctx: ToolContext) -> dict[str, str]:
     task_id = str(getattr(ctx, "task_id", "") or "")
+    return _accepted_research_finding_aliases_for_task_id(ctx, task_id)
+
+
+def _accepted_research_finding_aliases_for_task_id(
+    ctx: ToolContext,
+    task_id: str,
+) -> dict[str, str]:
+    task_id = str(task_id or "").strip()
     if not task_id:
         return {}
     path = pathlib.Path(ctx.drive_root) / "logs" / "tools.jsonl"
@@ -1042,6 +1057,22 @@ def _palace_add_text_by_id(
     return chunks
 
 
+def _palace_add_source_paths_by_id(
+    rows: list[dict[str, Any]], finding_ids: set[str]
+) -> dict[str, str]:
+    return _shared_palace_add_source_paths_by_id(rows, finding_ids)
+
+
+def _research_summary_source_claim_issue(
+    rows: list[dict[str, Any]], *, finding_ids: set[str], notes: str
+) -> str:
+    return _shared_research_summary_source_claim_issue(
+        rows,
+        finding_ids=finding_ids,
+        notes=notes,
+    )
+
+
 def _palace_add_text_for_ids(
     rows: list[dict[str, Any]], finding_ids: set[str]
 ) -> str:
@@ -1177,7 +1208,10 @@ def _research_discovery_row_counts(row: dict[str, Any]) -> bool:
     status = str(payload.get("status") or "").strip().lower()
     if not status:
         return True
-    if status == "provider_unavailable" and tool in _RESEARCH_INTERNET_DISCOVERY_TOOLS:
+    if (
+        status in {"provider_unavailable", "provider_error", "no_results"}
+        and tool in _RESEARCH_INTERNET_DISCOVERY_TOOLS
+    ):
         return True
     return status not in {"error", "failed", "failure"}
 
@@ -1345,6 +1379,52 @@ def _research_review_validation_issue(
     return ""
 
 
+def _research_review_current_finding_revise_issue(
+    ctx: ToolContext,
+    *,
+    verdict: str,
+    issues: list[Any],
+    notes: str,
+) -> str:
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    phase = task_id.split(":", 1)[1] if ":" in task_id else ""
+    if phase != "research_review" or str(verdict or "").strip().lower() != "revise":
+        return ""
+    issue_codes = {
+        str(getattr(item, "code", "") or "").strip()
+        for item in issues
+    }
+    if "insufficient_research_evidence" not in issue_codes:
+        return ""
+    summary_payload = _latest_research_summary_payload(ctx)
+    if str(summary_payload.get("coverage_status") or "").strip() != "source_scarce":
+        return ""
+    raw_ids = summary_payload.get("findings_ids")
+    if not isinstance(raw_ids, list):
+        return ""
+    finding_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+    if not finding_ids:
+        return ""
+    research_task_id = _research_task_id_for_review(task_id)
+    accepted_aliases = _accepted_research_finding_aliases_for_task_id(
+        ctx,
+        research_task_id,
+    )
+    current_ids = [item for item in finding_ids if item in accepted_aliases]
+    if not current_ids:
+        return ""
+    detail = str(notes or "").strip()
+    return (
+        "ERROR: research_review revise cannot demote the latest source_scarce "
+        "research handoff as insufficient evidence when the current summary "
+        "already cites accepted current-run research finding id(s): "
+        f"{', '.join(current_ids[:6])}. Treat source_scarce as a constrained "
+        "low-evidence handoff unless you cite a concrete source-policy, "
+        "fabrication, or unbacked-label blocker in typed issues. "
+        f"Review note: {detail[:300]}"
+    )
+
+
 def _research_task_id_for_review(task_id: str) -> str:
     text = str(task_id or "").strip()
     if ":" not in text:
@@ -1388,6 +1468,19 @@ def _latest_research_summary_memory_policy_issue(
     rows = _tool_log_rows_for_task(ctx, research_task_id)
     if not rows:
         return ""
+    source_claim_issue = _research_summary_source_claim_issue(
+        rows,
+        finding_ids=finding_ids,
+        notes=notes,
+    )
+    if source_claim_issue:
+        return (
+            source_claim_issue
+            + " Research review cannot accept ok while latest summary has "
+            "source labels or discovery claims not bound to its cited "
+            "accepted findings; loop back to research for a corrected "
+            "summary/finding handoff."
+        )
     for finding_id, finding_text in _palace_add_text_by_id(rows, finding_ids).items():
         fallback_issue = _llm_fallback_handoff_issue(
             finding_text,
@@ -1431,6 +1524,7 @@ def _research_summary_validation_issue(
     architecture_id: str,
     findings_ids: list[str],
     notes: str,
+    coverage_status: str = "",
 ) -> str:
     task_id = str(getattr(ctx, "task_id", "") or "")
     phase = task_id.split(":", 1)[1] if ":" in task_id else ""
@@ -1459,34 +1553,27 @@ def _research_summary_validation_issue(
             "shortcut or temporary implementation mode."
         )
     note_text = str(notes or "").strip()
-    if len(note_text) < 20:
-        return "ERROR: research summary notes are too short for a useful handoff"
-    if _looks_like_mojibake(note_text):
-        return (
-            "ERROR: research summary notes look encoding-corrupted/mojibake. "
-            "Rewrite the handoff in readable text before submitting."
-        )
-    if _RESEARCH_SUMMARY_PLACEHOLDER_RE.search(note_text):
-        return (
-            "ERROR: research summary notes look like placeholder/pending text; "
-            "write concrete findings before submitting the summary"
-        )
     concrete_findings = [str(item).strip() for item in findings_ids if str(item).strip()]
+    rows = _tool_log_rows_for_task(ctx, task_id)
     if not concrete_findings:
+        source_hint = _research_summary_next_finding_hint(rows)
         return (
             "ERROR: research summary needs findings_ids from accepted palace_add "
-            "result ids; do not submit an empty findings list"
+            "result ids; do not submit an empty findings list."
+            f"{source_hint}"
         )
     accepted_aliases = _accepted_palace_add_aliases_for_task(ctx)
     accepted = set(accepted_aliases)
     unknown = [item for item in concrete_findings if item not in accepted]
     if unknown:
         known = ", ".join(sorted(accepted)[:6]) or "none"
+        source_hint = _research_summary_next_finding_hint(rows)
         return (
             "ERROR: research summary references finding id(s) that were not "
             f"accepted by palace_add as research_finding for this task: "
             f"{', '.join(unknown[:6])}. Use the id or legacy.id returned by a "
-            f"concrete research_finding palace_add entry. Known ids: {known}"
+            f"concrete research_finding palace_add entry. Known ids: {known}."
+            f"{source_hint}"
         )
     min_findings = _research_summary_min_valid_findings(ctx)
     canonical_findings: list[str] = []
@@ -1511,14 +1598,26 @@ def _research_summary_validation_issue(
         )
     valid_unique = set(canonical_findings)
     if len(valid_unique) < min_findings:
-        return (
-            "ERROR: research summary needs at least "
-            f"{min_findings} accepted palace_add finding id(s) for this phase, "
-            "counted as unique memory entries; "
-            f"got {len(valid_unique)}. Add another concrete palace_add finding "
-            "or include the correct returned id."
+        scarcity_issue = _research_scarcity_handoff_issue(
+            rows,
+            accepted_count=len(valid_unique),
+            min_findings=min_findings,
+            coverage_status=coverage_status,
         )
-    rows = _tool_log_rows_for_task(ctx, task_id)
+        if not scarcity_issue:
+            pass
+        elif str(coverage_status or "").strip():
+            return scarcity_issue
+        else:
+            source_hint = _research_summary_next_finding_hint(rows)
+            return (
+                "ERROR: research summary needs at least "
+                f"{min_findings} accepted palace_add finding id(s) for this phase, "
+                "counted as unique memory entries; "
+                f"got {len(valid_unique)}. Add another concrete palace_add finding "
+                "or include the correct returned id."
+                f"{source_hint} {scarcity_issue}"
+            )
     discovery_issue = _research_discovery_validation_issue(ctx, rows)
     if discovery_issue:
         return discovery_issue
@@ -1528,6 +1627,11 @@ def _research_summary_validation_issue(
     if unread_issue:
         return unread_issue
     finding_id_set = {str(item).strip() for item in concrete_findings if str(item).strip()}
+    source_claim_issue = _research_summary_source_claim_issue(
+        rows, finding_ids=finding_id_set, notes=note_text
+    )
+    if source_claim_issue:
+        return source_claim_issue
     contradiction = _negative_claim_contradiction_issue(
         ctx,
         rows=rows,
@@ -1548,51 +1652,6 @@ def _research_summary_validation_issue(
                 f"{contradiction} Remove that finding id from findings_ids "
                 "or replace it with a corrected palace_add finding."
             )
-    fallback_issue = _llm_fallback_handoff_issue(note_text, label="research summary notes")
-    if fallback_issue:
-        return fallback_issue
-    test_double_issue = _llm_test_double_handoff_issue(
-        note_text,
-        label="research summary notes",
-    )
-    if test_double_issue:
-        return test_double_issue
-    cached_decision_issue = _llm_cached_decision_handoff_issue(
-        note_text,
-        label="research summary notes",
-    )
-    if cached_decision_issue:
-        return cached_decision_issue
-    for finding_id, finding_text in _palace_add_text_by_id(rows, finding_id_set).items():
-        fallback_issue = _llm_fallback_handoff_issue(
-            finding_text,
-            label=f"research finding `{finding_id}`",
-        )
-        if fallback_issue:
-            return fallback_issue
-        test_double_issue = _llm_test_double_handoff_issue(
-            finding_text,
-            label=f"research finding `{finding_id}`",
-        )
-        if test_double_issue:
-            return test_double_issue
-        cached_decision_issue = _llm_cached_decision_handoff_issue(
-            finding_text,
-            label=f"research finding `{finding_id}`",
-        )
-        if cached_decision_issue:
-            return cached_decision_issue
-    cited_text_by_id = _palace_add_text_by_id(rows, finding_id_set)
-    from umbrella.deep_agent_tools.phase_contract_success import (
-        _llm_env_contract_issue_from_text,
-    )
-
-    env_issue = _llm_env_contract_issue_from_text(
-        "\n\n".join([note_text, *cited_text_by_id.values()]),
-        subject="research summary handoff",
-    )
-    if env_issue:
-        return "ERROR: " + env_issue
     return ""
 
 
@@ -1600,6 +1659,7 @@ __all__ = [
     '_stale_claim_context',
     '_accepted_palace_add_ids_for_task',
     '_accepted_palace_add_aliases_for_task',
+    '_accepted_research_finding_aliases_for_task_id',
     '_normalise_research_finding_ids',
     '_tool_rows_after',
     '_coerce_log_payload',
@@ -1638,14 +1698,18 @@ __all__ = [
     '_parameter_or_dependency_claim_contradiction_issue',
     '_negative_claim_contradiction_issue',
     '_palace_add_text_by_id',
+    '_palace_add_source_paths_by_id',
     '_palace_add_text_for_ids',
+    '_research_summary_source_claim_issue',
     '_research_summary_unread_path_issue',
     '_phase_manifest_payload',
     '_research_summary_min_valid_findings',
+    '_research_source_coverage_report',
     '_research_discovery_validation_issue',
     '_research_discovery_row_counts',
     '_unread_existing_workspace_path_issue',
     '_latest_research_summary_payload',
     '_research_review_validation_issue',
+    '_research_review_current_finding_revise_issue',
     '_research_summary_validation_issue',
 ]

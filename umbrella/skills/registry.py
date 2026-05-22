@@ -9,6 +9,12 @@ import yaml
 
 
 _TOKEN_RE = re.compile(r"[\w']+")
+_DOMAIN_ALIASES: dict[str, frozenset[str]] = {
+    "multi_agent_gmas": frozenset({"multi_agent_gmas", "gmas", "multi_agent", "llm"}),
+    "gmas": frozenset({"gmas", "multi_agent_gmas"}),
+    "multi_agent": frozenset({"multi_agent", "multi_agent_gmas"}),
+    "llm": frozenset({"llm", "multi_agent_gmas"}),
+}
 
 
 @dataclass(slots=True)
@@ -88,7 +94,9 @@ def filter_by_domain(
     status: str | None = "active",
 ) -> list[SkillPack]:
     """Filter skills by status and domain tags."""
-    normalized_domains = {d.strip().lower() for d in domains if d and d.strip()}
+    normalized_domains = _expand_domain_aliases(
+        {d.strip().lower() for d in domains if d and d.strip()}
+    )
     out: list[SkillPack] = []
     for skill in skills:
         if status and skill.status != status:
@@ -198,6 +206,13 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
 
 def _tokens(text: str) -> set[str]:
     return set(_TOKEN_RE.findall((text or "").lower()))
+
+
+def _expand_domain_aliases(domains: set[str]) -> set[str]:
+    expanded: set[str] = set(domains)
+    for domain in list(domains):
+        expanded.update(_DOMAIN_ALIASES.get(domain, ()))
+    return expanded
 
 
 def _match_score(query_tokens: set[str], skill: SkillPack) -> float:

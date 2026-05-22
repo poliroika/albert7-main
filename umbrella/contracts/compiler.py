@@ -1,0 +1,150 @@
+"""Compile persisted run artifacts into a ContractBundle."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from umbrella.contracts.models import (
+    CompletionContract,
+    ContractBundle,
+    ContractIssue,
+    ReviewContract,
+    VerificationReportRef,
+)
+from umbrella.contracts.plan_ir import compile_phase_plan
+
+
+class ContractCompiler:
+    """Build contract bundles from the current Umbrella drive layout."""
+
+    def __init__(self, *, repo_root: str | Path, drive_root: str | Path, workspace_id: str) -> None:
+        self.repo_root = Path(repo_root).resolve()
+        self.drive_root = Path(drive_root).resolve()
+        self.workspace_id = workspace_id
+
+    @classmethod
+    def from_run(
+        cls,
+        *,
+        repo_root: str | Path,
+        drive_root: str | Path,
+        workspace_id: str,
+        run_id: str = "",
+    ) -> ContractBundle:
+        return cls(
+            repo_root=repo_root,
+            drive_root=drive_root,
+            workspace_id=workspace_id,
+        ).compile(run_id=run_id)
+
+    def _read_json(self, path: Path) -> Any:
+        try:
+            return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _tool_signal_rows(self, *, run_id: str = "") -> list[dict[str, Any]]:
+        path = self.drive_root / "state" / "phase_control_signals.jsonl"
+        rows: list[dict[str, Any]] = []
+        if not path.exists():
+            return rows
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if run_id and str(row.get("run_id") or "") not in {"", run_id}:
+                    continue
+                rows.append(row)
+        except OSError:
+            return rows
+        return rows
+
+    @staticmethod
+    def _signal_created_at(row: dict[str, Any]) -> float:
+        try:
+            return float(row.get("created_at") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _latest_signal_time(
+        cls,
+        rows: list[dict[str, Any]],
+        *,
+        kind: str,
+        phase: str = "",
+    ) -> float:
+        latest = 0.0
+        for row in rows:
+            if str(row.get("kind") or "") != kind:
+                continue
+            if phase and str(row.get("phase") or "") != phase:
+                continue
+            latest = max(latest, cls._signal_created_at(row))
+        return latest
+
+    def _compile_plan(self, *, run_id: str) -> tuple[Any, list[ContractIssue]]:
+        for name in (
+            "phase_plan_submitted_latest.json",
+            "phase_plan_proposal_latest.json",
+        ):
+            payload = self._read_json(self.drive_root / "state" / name)
+            if not isinstance(payload, dict):
+                continue
+            raw_plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
+            return compile_phase_plan(
+                raw_plan,
+                run_id=str(payload.get("run_id") or run_id or ""),
+                workspace_id=str(payload.get("workspace_id") or self.workspace_id),
+            )
+        return None, []
+
+    def compile(self, *, run_id: str = "") -> ContractBundle:
+        plan, issues = self._compile_plan(run_id=run_id)
+        latest_review: ReviewContract | None = None
+        completions: list[CompletionContract] = []
+        reports: list[VerificationReportRef] = []
+        research_summary = None
+        signal_rows = self._tool_signal_rows(run_id=run_id)
+        latest_plan_submit_at = self._latest_signal_time(
+            signal_rows,
+            kind="submit_phase_plan",
+            phase="plan",
+        )
+        for row in signal_rows:
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            kind = str(row.get("kind") or "")
+            if kind == "submit_micro_review":
+                if (
+                    str(row.get("phase") or "") == "plan_review"
+                    and latest_plan_submit_at
+                    and self._signal_created_at(row) < latest_plan_submit_at
+                ):
+                    continue
+                latest_review = ReviewContract.from_mapping(payload)
+            elif kind == "mark_subtask_complete":
+                contract = payload.get("completion_contract")
+                if isinstance(contract, dict):
+                    completions.append(CompletionContract.from_mapping(contract))
+            elif kind == "submit_verification":
+                ref = payload.get("verification_report_ref")
+                if isinstance(ref, dict):
+                    reports.append(VerificationReportRef.from_mapping(ref))
+        return ContractBundle(
+            run_id=run_id,
+            workspace_id=self.workspace_id,
+            plan=plan,
+            reviews=((latest_review,) if latest_review is not None else ()),
+            research_summary=research_summary,
+            completions=tuple(completions),
+            verification_reports=tuple(reports),
+            issues=tuple(issues),
+        )

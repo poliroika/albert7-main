@@ -1,19 +1,19 @@
 """
-Sandbox self-edit: managed code modifications without automatic rollback.
+Sandbox self-edit: managed code modifications with rollback by default.
 
 When the agent detects a capability gap mid-task it can patch its own code
 (ouroboros/, umbrella/) to unblock itself. Historically this module always
 created a git/copy snapshot and restored it at task end. That behavior made
 live debugging painful because working fixes disappeared after the run.
 
-The supported default is now a no-rollback session: the session still exists
-so policy checks and ``sandbox_self_edit`` can work, but task-end cleanup does
-not reset, checkout, clean, stash-pop, or otherwise undo the agent's edits.
+The supported default is a rollback session. Persistent/no-rollback self-edit
+is reserved for explicit human-approved self-improvement modes; normal live
+runs should not leave agent self-edits behind silently.
 
 Lifecycle managed by the launcher:
-    1. ``enter_sandbox(repo_root)``  — create a session (normally no snapshot)
+    1. ``enter_sandbox(repo_root)``  — create a rollback session
     2. agent runs, may call ``record_sandbox_edit(...)``
-    3. ``exit_sandbox(session)``     — mark the session exited
+    3. ``exit_sandbox(session)``     — rollback unless persistence was approved
 """
 
 import json
@@ -123,6 +123,72 @@ def _remove_path(target: Path) -> None:
         target.unlink(missing_ok=True)
 
 
+def _prune_paths_not_in_snapshot(snapshot: Path, target: Path) -> None:
+    """Best-effort cleanup after a merge-style copy restore.
+
+    Windows can keep a directory alive briefly while antivirus/indexers or a
+    child process still has a handle open. When that happens we overlay the
+    snapshot back into the surviving directory instead of leaving the source
+    tree half-deleted, then remove files that were not present in the snapshot.
+    """
+    if not snapshot.exists() or not target.exists():
+        return
+    for child in sorted(
+        target.rglob("*"),
+        key=lambda path: len(path.relative_to(target).parts),
+        reverse=True,
+    ):
+        try:
+            rel = child.relative_to(target)
+        except ValueError:
+            continue
+        if not (snapshot / rel).exists():
+            _remove_path(child)
+
+
+def _restore_snapshot_surface(session: SandboxSession, rel: str) -> None:
+    snapshot_root = Path(
+        session.snapshot_dir or _snapshot_dir(session.repo_root, session.session_id)
+    )
+    saved = snapshot_root / rel
+    target = session.repo_root / rel
+    if not saved.exists():
+        _remove_path(target)
+        if target.exists():
+            raise RuntimeError(
+                f"copy snapshot restore could not remove generated surface: {target}"
+            )
+        return
+
+    staging: Path | None = target.parent / f".{target.name}.restore_{session.session_id}"
+    _remove_path(staging)
+    shutil.copytree(saved, staging)
+    try:
+        _remove_path(target)
+        if target.exists():
+            log.warning(
+                "Copy snapshot target survived removal; overlaying snapshot: %s",
+                target,
+            )
+            shutil.copytree(staging, target, dirs_exist_ok=True)
+            _prune_paths_not_in_snapshot(staging, target)
+        else:
+            try:
+                staging.rename(target)
+                staging = None
+            except OSError:
+                log.warning(
+                    "Copy snapshot staging rename failed; restoring by overlay: %s",
+                    target,
+                    exc_info=True,
+                )
+                shutil.copytree(staging, target, dirs_exist_ok=True)
+                _prune_paths_not_in_snapshot(staging, target)
+    finally:
+        if staging is not None and staging.exists() and target.exists():
+            _remove_path(staging)
+
+
 def _prepare_copy_snapshot(session: SandboxSession) -> None:
     snapshot_root = _snapshot_dir(session.repo_root, session.session_id)
     _remove_path(snapshot_root)
@@ -140,11 +206,7 @@ def _restore_copy_snapshot(session: SandboxSession) -> None:
         session.snapshot_dir or _snapshot_dir(session.repo_root, session.session_id)
     )
     for rel in _COPY_SNAPSHOT_SURFACES:
-        target = session.repo_root / rel
-        saved = snapshot_root / rel
-        _remove_path(target)
-        if saved.exists():
-            shutil.copytree(saved, target)
+        _restore_snapshot_surface(session, rel)
     _remove_path(snapshot_root)
 
 
@@ -255,13 +317,13 @@ def _list_sandbox_stashes(repo_root: Path) -> list[tuple[str, str]]:
 def enter_sandbox(
     repo_root: Path,
     task_id: str,
-    snapshot_method: str = "none",
+    snapshot_method: str = "git_stash",
     workspace_id: str = "",
 ) -> SandboxSession:
     """Create a self-edit session.
 
-    Supports two strategies:
-    - ``none``: no rollback/snapshot; edits persist.
+    Supports three strategies:
+    - ``none``: no rollback/snapshot; edits persist only with explicit approval.
     - ``git_stash``: stash uncommitted changes, remember HEAD.
     - ``git_branch``: create a throwaway branch for sandbox edits.
 
@@ -270,31 +332,6 @@ def enter_sandbox(
     keeps user changes from silently piling up in the stash list.
     """
     repo_root = repo_root.resolve()
-
-    # Rollback has been intentionally disabled for live Ouroboros runs. Always
-    # return a no-op session, regardless of the requested snapshot method, so
-    # agent self-edits remain visible after task exit.
-    session_id = f"sandbox_{uuid.uuid4().hex[:8]}"
-    log.info(
-        "Sandbox entered in no-rollback mode (id=%s, repo=%s, requested_method=%s)",
-        session_id,
-        repo_root,
-        snapshot_method,
-    )
-    session = SandboxSession(
-        session_id=session_id,
-        task_id=task_id,
-        repo_root=repo_root,
-        snapshot_method="none",
-        workspace_id=str(workspace_id or "").strip(),
-        owner_pid=os.getpid(),
-        entered_at=time.time(),
-    )
-    try:
-        _persist_session(repo_root, session)
-    except Exception:
-        log.debug("Could not persist no-op sandbox session (non-fatal)", exc_info=True)
-    return session
 
     try:
         recovered = recover_orphan_sandbox_stashes(repo_root)
@@ -307,6 +344,18 @@ def enter_sandbox(
     except Exception:
         log.debug("Orphan-stash recovery failed (non-fatal)", exc_info=True)
 
+    requested_method = str(snapshot_method or "git_stash").strip()
+    persistent_approved = os.environ.get("UMBRELLA_SANDBOX_PERSISTENT_APPROVED") == "1"
+    persistent_approved = persistent_approved or os.environ.get(
+        "UMBRELLA_ALLOW_PERSISTENT_SELF_EDIT"
+    ) == "1"
+    if requested_method == "none" and not persistent_approved:
+        log.warning(
+            "Sandbox persistent no-rollback requested without approval; using git_stash rollback."
+        )
+        requested_method = "git_stash"
+
+    snapshot_method = requested_method
     snapshot_method = resolve_snapshot_method(repo_root, snapshot_method)
     session_id = f"sandbox_{uuid.uuid4().hex[:8]}"
     session = SandboxSession(
@@ -453,20 +502,37 @@ def capture_changed_files(session: SandboxSession) -> list[str]:
 
 
 def exit_sandbox(session: SandboxSession) -> SandboxSession:
-    """Close a self-edit session without rolling back edits.
-
-    Rollback is intentionally disabled: no reset, checkout, clean, branch
-    deletion, copy restore, or stash pop is performed here.
-    """
+    """Close a self-edit session and rollback unless persistence was approved."""
     repo_root = session.repo_root
     session.exited_at = time.time()
-    session.rollback_ok = True
+    try:
+        if session.snapshot_method == "none":
+            session.rollback_ok = True
+        elif session.snapshot_method == "copy":
+            _restore_copy_snapshot(session)
+            session.rollback_ok = True
+        elif session.snapshot_method == "git_branch":
+            branch = session.sandbox_branch or ""
+            original = session.original_branch or "main"
+            _git(repo_root, "checkout", original, check=False)
+            if branch:
+                _git(repo_root, "branch", "-D", branch, check=False)
+            session.rollback_ok = True
+        else:
+            _git(repo_root, "reset", "--hard", "HEAD", check=False)
+            _git(repo_root, "clean", "-fd", check=False)
+            if session.stash_ref:
+                stash_index = _find_stash_index(repo_root, session.stash_ref)
+                if stash_index:
+                    _git(repo_root, "stash", "apply", stash_index, check=False)
+            session.rollback_ok = True
+    except Exception as exc:  # noqa: BLE001 - preserve session diagnostics
+        session.rollback_ok = False
+        session.error = f"{type(exc).__name__}: {exc}"
     try:
         _persist_session(repo_root, session)
     except Exception:
-        log.debug(
-            "Could not persist no-rollback sandbox exit (non-fatal)", exc_info=True
-        )
+        log.debug("Could not persist sandbox exit (non-fatal)", exc_info=True)
     return session
 
 

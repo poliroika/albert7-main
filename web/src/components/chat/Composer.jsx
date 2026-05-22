@@ -140,7 +140,7 @@ export default function Composer({
             onClick={() => onHarnessModeChange?.(!harnessMode)}
             disabled={sending}
             data-testid="harness-mode-toggle"
-            title="Запускает несколько Ouroboros-кандидатов параллельно с разными моделями/seed, сравнивает результаты, применяет лучшего. Долгая, дорогая операция."
+            title="Phase-level harness: внутри каждой фазы запускается N кандидатов параллельно, Watcher выбирает лучшего и продвигает его в следующую фазу. Долгая, дорогая операция."
           >
             <Layers className="h-3 w-3" />
             Harness {harnessMode ? 'ON' : 'mode'}
@@ -149,9 +149,9 @@ export default function Composer({
           {harnessMode && (
             <label
               className="flex h-7 items-center gap-1.5 rounded-md border border-purple-500/40 bg-purple-500/10 px-2 text-[11px] text-purple-200"
-              title="Сколько параллельных кандидатов запускать в harness (2-8)"
+              title="Сколько параллельных кандидатов запускать на каждой фазе (2-8)"
             >
-              <span>Кандидатов</span>
+              <span>Кандидатов / фазу</span>
               <Input
                 type="number"
                 min="2"

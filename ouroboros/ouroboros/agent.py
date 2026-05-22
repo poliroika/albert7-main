@@ -443,6 +443,14 @@ class OuroborosAgent:
             task_depth=int(task.get("depth", 0)),
             is_direct_chat=bool(task.get("_is_direct_chat")),
         )
+        if task.get("umbrella_managed") or context_overlays.get("umbrella_managed"):
+            ctx.umbrella_managed = True  # type: ignore[attr-defined]
+        phase_node = context_overlays.get("phase_node")
+        if isinstance(phase_node, dict):
+            ctx.umbrella_phase_id = str(phase_node.get("id") or phase_node.get("manifest_id") or "")  # type: ignore[attr-defined]
+        pm = context_overlays.get("phase_manifest")
+        if pm is not None:
+            ctx.phase_manifest = pm  # type: ignore[attr-defined]
         self.tools.set_context(ctx)
 
         # Typing indicator via event queue (no direct Telegram API)

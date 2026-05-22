@@ -77,6 +77,15 @@ def test_system_prompt_does_not_mention_legacy_identity_or_channels() -> None:
         assert needle not in prompt
 
 
+def test_task_context_overlay_serializes_dict_as_json() -> None:
+    from ouroboros.context import _task_context_overlay
+
+    task = {"context_overlays": {"phase_manifest": {"id": "execute", "version": 1}}}
+    rendered = _task_context_overlay(task, "phase_manifest")
+    assert rendered.startswith("{")
+    assert '"id": "execute"' in rendered
+
+
 def test_task_event_sanitizer_converts_frozensets(tmp_path: Path) -> None:
     task = {
         "id": "task1",

@@ -1,6 +1,9 @@
 """State, memory, and artifact helpers for phase-contract tools."""
 
+import sys
+
 from umbrella.deep_agent_tools.phase_contract_common import *
+from umbrella.deep_agent_tools.phase_control_common import _UNRESOLVED_PASS_BLOCKER_RE
 
 
 def _save_umbrella_memory(ctx: ToolContext, **kwargs: Any) -> str:

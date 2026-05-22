@@ -351,20 +351,8 @@ def test_record_idea_verified_outcome_mirrors_to_semantic(
     tmp_path: Path, monkeypatch
 ) -> None:
     """When the agent explicitly marks an idea as verified outcome, it does
-    enter palace — that's the path for high-confidence knowledge."""
-    from ouroboros.tools import umbrella_tools
-
-    mirror_calls: list[dict] = []
-
-    class _FakePalace:
-        def add(self, **kw):
-            mirror_calls.append(kw)
-            return {"drawer_id": "drawer-1"}
-
-    fake_backend = lambda repo_root, ws: _FakePalace()
-    monkeypatch.setattr(umbrella_tools, "_palace_backend", fake_backend)
-    monkeypatch.setitem(record_idea.__globals__, "_palace_backend", fake_backend)
-
+    enter canonical MemPalace — that's the path for high-confidence knowledge."""
+    monkeypatch.setenv("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", "1")
     ctx = _workspace_ctx(tmp_path)
 
     result = record_idea(
@@ -378,4 +366,6 @@ def test_record_idea_verified_outcome_mirrors_to_semantic(
     assert payload["saved"] is True
     assert payload["evidence_kind"] == "verified_outcome"
     assert payload["mirrored_to_semantic"] is True
-    assert mirror_calls and mirror_calls[0]["workspace_id"] == "demo"
+    semantic = payload.get("semantic_memory") or {}
+    assert semantic.get("saved") is True
+    assert semantic.get("canonical_id")

@@ -1,13 +1,15 @@
+import os
 import pathlib
 import tempfile
 import pytest
-from umbrella.memory.palace.facade import MemPalace
+from umbrella.memory.palace.facade import MemPalace, _normalize_store_for_write
 from umbrella.memory.palace.tiers import Tier, Scope
 from umbrella.memory.palace.graph import EdgeType
 
 
 @pytest.fixture
-def palace(tmp_path):
+def palace(tmp_path, monkeypatch):
+    monkeypatch.setenv("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", "1")
     return MemPalace(repo_root=tmp_path, workspace_id="test_ws")
 
 
@@ -225,20 +227,119 @@ def test_expire_scope(palace):
     assert isinstance(count, int)
 
 
-def test_migrators(palace, tmp_path):
-    import json
-    from umbrella.memory.palace.migrators import run_full_migration
+def test_global_alias_write_routes_to_lesson_store(palace):
+    node_id = palace.add(
+        store="palace.global",
+        content="Always verify before declaring success",
+        kind="lesson",
+        tags=["lesson"],
+        tier=Tier.WARM,
+        scope=Scope.CROSS_RUN_DURABLE,
+    )
+    node = palace.get(node_id)
+    assert node is not None
+    assert node["store"] == "palace.lesson"
+    results = palace.search(
+        "verify before declaring",
+        stores=["palace.global"],
+        n=5,
+    )
+    assert any(r["id"] == node_id for r in results)
 
-    mem_root = tmp_path / "memory"
-    mem_root.mkdir()
-    (mem_root / "lessons.jsonl").write_text(
-        json.dumps({"content": "Always write tests", "tags": ["testing"]}) + "\n"
+
+def test_palace_durable_list_get_search(palace):
+    node_id = palace.add(
+        store="palace.durable",
+        content="verification report body",
+        tier=Tier.WARM,
+        scope=Scope.CROSS_RUN_DURABLE,
+        tags=["verification_report"],
+        verified=True,
     )
-    (mem_root / "ideas.jsonl").write_text(
-        json.dumps({"content": "Consider using Redis", "evidence_kind": "hypothesis", "tags": []}) + "\n"
-        + json.dumps({"content": "FastAPI works well", "evidence_kind": "verified_outcome", "tags": ["api"]}) + "\n"
+    assert palace.get(node_id, stores=["palace.durable"]) is not None
+    hits = palace.search("verification report", stores=["palace.durable"], n=5)
+    assert any(h["id"] == node_id for h in hits)
+    health = palace.health()
+    assert "palace.durable" in str(health.get("stores_ok", [])) or health.get("volatile_stub")
+
+
+def test_search_tags_any_and_tags_all(palace):
+    palace.add(
+        store="palace.idea",
+        content="research finding about GMAS",
+        tags=["research", "gmas"],
+        tier=Tier.WARM,
+        scope=Scope.CROSS_RUN_DURABLE,
     )
-    results = run_full_migration(palace, mem_root)
-    assert results["lessons"] == 1
-    assert results["ideas"] == 2
-    assert not (mem_root / "lessons.jsonl").exists()
+    palace.add(
+        store="palace.idea",
+        content="unrelated plan note",
+        tags=["plan"],
+        tier=Tier.WARM,
+        scope=Scope.CROSS_RUN_DURABLE,
+    )
+    any_hits = palace.search("", stores=["palace.idea"], tags_any=["research"], n=10)
+    assert len(any_hits) == 1
+    assert "GMAS" in any_hits[0]["content"]
+    all_hits = palace.search("", stores=["palace.idea"], tags_all=["lesson", "gmas"], n=10)
+    assert len(all_hits) == 0
+    palace.add(
+        store="palace.idea",
+        content="lesson with gmas tag",
+        tags=["lesson", "gmas"],
+        tier=Tier.WARM,
+        scope=Scope.CROSS_RUN_DURABLE,
+    )
+    all_hits = palace.search("", stores=["palace.idea"], tags_all=["lesson", "gmas"], n=10)
+    assert len(all_hits) == 1
+
+
+def test_expire_scope_respects_run_key(palace):
+    palace.add(
+        store="palace.run",
+        content="run a memory",
+        tier=Tier.HOT,
+        scope=Scope.RUN_SCOPED,
+        run_id="run-a",
+    )
+    palace.add(
+        store="palace.run",
+        content="run b memory",
+        tier=Tier.HOT,
+        scope=Scope.RUN_SCOPED,
+        run_id="run-b",
+    )
+    deleted = palace.expire_scope("run", "run-a")
+    assert deleted >= 1
+    remaining = palace.list_all(stores=["palace.run"], n=20)
+    contents = [n["content"] for n in remaining]
+    assert "run b memory" in contents
+    assert "run a memory" not in contents
+
+
+def test_null_chroma_stub_shared_across_instances(tmp_path, monkeypatch):
+    monkeypatch.setenv("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", "1")
+    a = MemPalace(tmp_path, "stub_ws")
+    try:
+        node_id = a.add(
+            store="palace.idea",
+            content="shared stub memory",
+            tags=["stub"],
+            kind="observation",
+        )
+    finally:
+        a.close()
+    b = MemPalace(tmp_path, "stub_ws")
+    try:
+        node = b.get(node_id, stores=["palace.idea"])
+    finally:
+        b.close()
+    assert node is not None
+    assert "shared stub memory" in str(node.get("content") or "")
+
+
+def test_normalize_store_for_write_global_alias():
+    assert _normalize_store_for_write("palace.global", kind="lesson") == "palace.lesson"
+    assert _normalize_store_for_write("palace.global", tags=["failure_pattern"]) == "palace.lesson"
+    assert _normalize_store_for_write("palace.idea") == "palace.idea"
+

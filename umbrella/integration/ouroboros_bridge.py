@@ -336,41 +336,68 @@ def _build_umbrella_memory_summary(
     return "\n".join(lines).strip()
 
 
+def _format_canonical_hits(hits: list[dict]) -> list[str]:
+    if not hits:
+        return ["- No palace memories yet."]
+    lines: list[str] = []
+    for hit in hits:
+        store = str(hit.get("store") or "palace")
+        phase = str(hit.get("phase") or "")
+        content = str(hit.get("content") or "")[:240]
+        score = hit.get("score")
+        score_str = f" (score={score:.2f})" if isinstance(score, (int, float)) else ""
+        label = f"{store}/{phase}" if phase else store
+        lines.append(f"- [{label}]{score_str} {content}")
+    return lines
+
+
 def _format_palace_memory(
     repo_root: Path,
     *,
     workspace_id: str | None,
     task_input: str | None,
 ) -> list[str]:
+    query = task_input or workspace_id or ""
+    try:
+        from umbrella.memory.palace.facade import MemPalace
+
+        palace = MemPalace(repo_root, workspace_id or None)
+        try:
+            health = palace.health()
+            if not health.get("ok"):
+                return ["- Memory unavailable (canonical backend not ready)."]
+            if query.strip():
+                hits = palace.search(query, n=8)
+            else:
+                hits = palace.list_all(n=8)
+        finally:
+            palace.close()
+        if hits:
+            return _format_canonical_hits(hits)
+    except Exception as exc:
+        log.warning("Canonical MemPalace bridge error: %s", exc, exc_info=True)
+
     try:
         from umbrella.memory.paths import palace_path_for
+        from umbrella.memory.palace_backend import get_palace_backend
 
         palace_path = palace_path_for(repo_root, workspace_id or "")
     except Exception:
-        palace_path = repo_root / ".umbrella" / "palace"
+        return ["- No palace memories yet."]
     if not palace_path.exists():
         return ["- No palace memories yet."]
 
     try:
-        from umbrella.memory.palace_backend import get_palace_backend
-
         palace = get_palace_backend(palace_path)
         try:
-            query = task_input or workspace_id or ""
-
             if query.strip():
                 hits = palace.search(query, workspace_id=workspace_id or "", n_results=8)
             else:
                 hits = palace.recent(workspace_id=workspace_id or "", limit=8)
         finally:
-            try:
-                palace.close()
-            except Exception:
-                pass
-
+            palace.close()
         if not hits:
             return ["- No palace memories yet."]
-
         lines = []
         for h in hits:
             wing = h.get("wing", "")
@@ -381,41 +408,8 @@ def _format_palace_memory(
             lines.append(f"- [{wing}/{room}]{dist_str} {content}")
         return lines
     except Exception as exc:
-        log.warning("MemPalace bridge error: %s", exc, exc_info=True)
-        # Retry once: flush stale ChromaDB state and try again
-        try:
-            from umbrella.memory.palace_backend import clear_palace_backend_cache
-
-            clear_palace_backend_cache(palace_path)
-            palace = get_palace_backend(palace_path)
-            try:
-                query = task_input or workspace_id or ""
-                if query.strip():
-                    hits = palace.search(
-                        query, workspace_id=workspace_id or "", n_results=8
-                    )
-                else:
-                    hits = palace.recent(workspace_id=workspace_id or "", limit=8)
-            finally:
-                try:
-                    palace.close()
-                except Exception:
-                    pass
-            if not hits:
-                return ["- No palace memories yet."]
-            lines = []
-            for h in hits:
-                wing = h.get("wing", "")
-                room = h.get("room", "")
-                content = h.get("content", "")[:240]
-                dist = h.get("distance")
-                dist_str = f" (d={dist:.2f})" if isinstance(dist, (int, float)) else ""
-                lines.append(f"- [{wing}/{room}]{dist_str} {content}")
-            log.info("MemPalace bridge recovered after retry")
-            return lines
-        except Exception as retry_exc:
-            log.error("MemPalace bridge retry also failed: %s", retry_exc)
-            return ["- Memory unavailable (ChromaDB error, see logs)."]
+        log.warning("Legacy MemPalace bridge error: %s", exc, exc_info=True)
+        return ["- Memory unavailable (see logs)."]
 
 
 def _build_meta_harness_summary(*, repo_root: Path) -> str:

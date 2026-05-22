@@ -52,6 +52,25 @@ def _commit(repo: Path, rel_paths: list[str], msg: str) -> str:
     return _run(repo, "rev-parse", "HEAD").stdout.strip()
 
 
+def test_git_clean_fd_removes_untracked_workspace_sources(tmp_path: Path) -> None:
+    """Document why phase_run must not use rollback sandbox.
+
+    ``exit_sandbox`` (git_stash mode) runs ``git clean -fd`` on the repo root,
+    which deletes untracked generated files under ``workspaces/<id>/``.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    ws = repo / "workspaces" / "civilization"
+    (ws / "src" / "civilization").mkdir(parents=True)
+    source = ws / "src" / "civilization" / "state.py"
+    source.write_text("class GameState: pass\n", encoding="utf-8")
+    assert source.is_file()
+
+    _run(repo, "clean", "-fd")
+
+    assert not source.is_file()
+
+
 def test_exit_sandbox_does_not_reset_or_cherry_pick(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     baseline = _init_repo(repo)

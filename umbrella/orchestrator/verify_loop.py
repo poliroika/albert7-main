@@ -12,6 +12,7 @@ def run_verify_loop(
     max_attempts: int = 3,
     launcher: Any = None,
 ) -> ResultEnvelope:
+    last_result: ResultEnvelope | None = None
     for attempt in range(max_attempts):
         result = _run_single_verify(
             run_id=run_id,
@@ -20,6 +21,7 @@ def run_verify_loop(
             launcher=launcher,
             attempt=attempt,
         )
+        last_result = result
         if result.ok:
             return result
         if attempt < max_attempts - 1:
@@ -28,6 +30,7 @@ def run_verify_loop(
         ErrorCode.VERIFY_FAILED,
         f"Verification failed after {max_attempts} attempts",
         retryable=False,
+        data=last_result.data if last_result is not None else None,
         run_id=run_id,
     )
 
@@ -42,8 +45,11 @@ def _run_single_verify(
 ) -> ResultEnvelope:
     verify_script = drive_root.parent / "verify.sh"
     if not verify_script.exists():
-        return ResultEnvelope.success(
-            data={"skipped": True, "reason": "no verify.sh found"},
+        return ResultEnvelope.failure(
+            ErrorCode.VERIFY_FAILED,
+            "No verify.sh found; missing verifier is a hard failure for code tasks",
+            retryable=True,
+            data={"skipped": False, "reason": "no verify.sh found"},
             run_id=run_id,
         )
     import subprocess

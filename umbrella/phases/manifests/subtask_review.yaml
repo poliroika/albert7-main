@@ -8,6 +8,9 @@ prompt_files:
 
 allowed_tools:
   - load_skill
+  - read_file
+  - list_files
+  - run_unit_tests
   - palace_search
   - submit_micro_review
   - add_phase
@@ -38,7 +41,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [load_skill, palace_search, submit_micro_review, add_phase, loop_back_to, request_extra_subtask, revise_remaining_plan]
+    - allow_tools: [load_skill, read_file, list_files, run_unit_tests, palace_search, submit_micro_review, add_phase, loop_back_to, request_extra_subtask, revise_remaining_plan]
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
 
 exit_criteria:

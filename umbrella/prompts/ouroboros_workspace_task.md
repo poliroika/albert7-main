@@ -27,21 +27,21 @@ The `[verification]` section in `workspace.toml` MUST include at least one shell
 
 ### Credentials & API keys / LLM runtime env (find them yourself)
 
-Credentials & API keys are your responsibility to discover, declare, and wire into the project without hardcoded provider assumptions. The verification subprocess inherits the host process env, but the verification subprocess does NOT auto-load the workspace `.env`. If your smoke/e2e step needs an LLM, use the current Umbrella/Ouroboros runtime contract instead of hardcoding a provider:
+Credentials & API keys are your responsibility to discover, declare, and wire into the project without hardcoded provider assumptions. The verification subprocess inherits the host process env, but the verification subprocess does NOT auto-load the workspace `.env`. If your smoke/e2e step needs an LLM, use the standalone generated-project runtime contract instead of hardcoding a provider:
 
-1. **Ask the inherited env.** Check aliases, not just one variable:
+1. **Ask the workspace env.** Check the public aliases:
 
    ```python
-   api_key = os.getenv("LLM_API_KEY") or os.getenv("OUROBOROS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-   base_url = os.getenv("LLM_BASE_URL") or os.getenv("OUROBOROS_LLM_BASE_URL")
-   model = os.getenv("LLM_MODEL") or os.getenv("OUROBOROS_MODEL")
+   api_key = os.getenv("LLM_API_KEY")
+   base_url = os.getenv("LLM_BASE_URL")
+   model = os.getenv("LLM_MODEL")
    ```
 
-   `OPENAI_API_KEY` is only one possible provider key and is also used by some web-search providers. Do not require it for a generated project unless the project intentionally chooses OpenAI as the provider. For a standalone generated project, document the generic `LLM_*` aliases as the public contract; keep `OUROBOROS_*` aliases as optional inherited compatibility when Umbrella launches the workspace.
+   Umbrella maps host control-plane launch env into these public `LLM_*` aliases before workspace commands run. `OPENAI_API_KEY` is only one possible provider key. Do not require it for a generated project unless the project intentionally chooses OpenAI as the provider. For a standalone generated project, document only the generic `LLM_*` aliases as the public contract.
 
-2. **Wire aliases into project code/tests.** Create a small runtime resolver if the project uses LLMs. Tests and e2e checks should use that resolver so they can run against the same model env that launched Umbrella. A test that requires only `LLM_API_KEY`, only `OPENAI_API_KEY`, or a hardcoded localhost/default model is too narrow.
+2. **Wire aliases into project code/tests.** Create a small runtime resolver if the project uses LLMs. Tests and e2e checks should use that resolver so they can run against the same model env that launched Umbrella after env normalization. A test that requires only `OPENAI_API_KEY` or a hardcoded localhost/default model is too narrow.
 
-3. **Ask the operator** via `request_user_input(prompt="...", request_id="api_key_<provider>")` only if no accepted key/model aliases are inherited and the task genuinely cannot proceed without a paid/external call. Once answered, document it in `workspaces/<id>/.env.example` or `.env` as appropriate and ensure verification actually sees the value.
+3. **Ask the operator** via `request_user_input(prompt="...", request_id="api_key_<provider>")` only if no public key/model aliases are available and the task genuinely cannot proceed without a paid/external call. Once answered, document it in `workspaces/<id>/.env.example` or `.env` as appropriate and ensure verification actually sees the value.
 
 4. **No fake LLM proof.** For generation, parsing, presentation, web, or agent tasks, dry-run/offline/mock mode is not sufficient as the production/e2e proof. If real LLM env is unavailable, fail or skip explicitly with a clear "real LLM env required" message, or pause/request configuration. Never silently switch to hard-coded sample responses, random choices, cached decisions, or stub agents.
 

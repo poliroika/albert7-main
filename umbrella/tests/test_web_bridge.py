@@ -1,6 +1,8 @@
 import json
 import os
+import sys
 import threading
+import tomllib
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import patch
@@ -8,7 +10,7 @@ from urllib.parse import quote
 
 import pytest
 
-from umbrella.web_bridge.app import WebBridgeApp
+from umbrella.web_bridge.app import WebBridgeApp, _ensure_repo_python_paths
 from umbrella.web_bridge.handler import build_handler
 from umbrella.web_bridge.util import REPO_ROOT
 
@@ -38,17 +40,80 @@ def _get_json(host: str, port: int, path: str) -> tuple[int, object]:
     return r.status, data
 
 
-def test_web_phase_defaults_enable_no_key_web_fallback(monkeypatch, tmp_path):
+def test_web_phase_defaults_do_not_need_no_key_web_fallback_env(monkeypatch, tmp_path):
     app = WebBridgeApp(tmp_path)
-    for name in app._FAST_SEARCH_PROVIDER_ENV:
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     monkeypatch.delenv("OUROBOROS_DEEP_SEARCH_PROVIDER", raising=False)
-    monkeypatch.delenv("OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK", raising=False)
-    monkeypatch.delenv("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO", raising=False)
 
     app._ensure_web_discovery_defaults()
 
-    assert os.environ["OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK"] == "1"
+    assert "OUROBOROS_DEEP_SEARCH_PROVIDER" not in os.environ
+
+
+def test_web_bridge_adds_bundled_agent_import_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ouroboros_root = tmp_path / "ouroboros"
+    gmas_root = tmp_path / "gmas" / "src"
+    (ouroboros_root / "ouroboros").mkdir(parents=True)
+    (gmas_root / "gmas").mkdir(parents=True)
+    monkeypatch.setattr(sys, "path", ["existing"])
+
+    _ensure_repo_python_paths(tmp_path)
+    _ensure_repo_python_paths(tmp_path)
+
+    assert str(ouroboros_root.resolve()) in sys.path
+    assert str(gmas_root.resolve()) in sys.path
+    assert sys.path.count(str(ouroboros_root.resolve())) == 1
+    assert sys.path.count(str(gmas_root.resolve())) == 1
+
+
+def test_web_bridge_can_import_bundled_gmas_web_search() -> None:
+    from gmas.tools.web_search import DuckDuckGoProvider, _create_web_search_tool
+
+    tool = _create_web_search_tool(auto_route=True, max_results=1)
+    try:
+        assert isinstance(tool._provider, DuckDuckGoProvider)
+    finally:
+        tool.close()
+
+
+def test_bridge_runtime_declares_no_key_duckduckgo_dependency() -> None:
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = [str(item).lower() for item in data["project"]["dependencies"]]
+
+    assert any(dep.startswith("ddgs") for dep in deps)
+
+
+def test_duckduckgo_missing_ddgs_empty_html_fallback_is_no_results() -> None:
+    from gmas.tools.web_search import DuckDuckGoProvider
+
+    provider = DuckDuckGoProvider()
+    with (
+        patch.object(
+            provider,
+            "_search_ddgs",
+            side_effect=ImportError("No module named 'ddgs'"),
+        ),
+        patch.object(provider, "_search_html_httpx", return_value=[]),
+        patch.object(provider, "_search_html_urllib", return_value=[]),
+    ):
+        assert provider.search("python turn based strategy game", max_results=3) == []
+
+
+def test_gmas_stdlib_logging_fallback_accepts_loguru_format(caplog) -> None:
+    from gmas.config.logging import logger
+
+    if type(logger).__name__ != "_StdlibLogger":
+        pytest.skip("stdlib fallback is only active when loguru is unavailable")
+
+    with caplog.at_level("WARNING", logger="gmas"):
+        logger.warning("DuckDuckGo backend={} unavailable: {}", "ddgs", "missing")
+
+    assert "DuckDuckGo backend=ddgs unavailable: missing" in caplog.text
 
 
 def test_health_and_workspaces(httpd: int) -> None:

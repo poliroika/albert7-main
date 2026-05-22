@@ -11,16 +11,16 @@ silently replace required LLM behavior.
 
 ## Runtime Contract
 
-- Resolve credentials and model through aliases:
-  public project aliases `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL`.
-  When a generated project runs under Umbrella, it may additionally accept
-  inherited compatibility aliases `OUROBOROS_LLM_API_KEY`,
-  `OUROBOROS_LLM_BASE_URL`, and `OUROBOROS_MODEL`.
+- Resolve credentials and model through public project aliases:
+  `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL`.
+  Umbrella maps host control-plane launch env into those public aliases before
+  workspace commands run, so generated projects should not read, document, or
+  test control-plane aliases.
 - Do not turn unsupported or obsolete control-plane alias names into generated
   project docs, tests, or user-facing requirements.
 - Do not require `OPENAI_API_KEY` as the universal workspace LLM credential.
-  It can be one provider credential or a web-search provider key, but not the
-  project runtime contract.
+  It can be one provider credential when the generated project intentionally
+  chooses OpenAI, but not the project runtime contract.
 - Do not hardcode provider/model defaults such as `https://api.openai.com/v1`
   or `gpt-*` as silent runtime fallbacks.
 

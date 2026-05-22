@@ -2,7 +2,7 @@
 name: research-strategy
 status: active
 domains: ["research", "architecture"]
-phases: ["research", "research_review"]
+phases: ["research"]
 when_to_use: "At the start of the research phase when exploring unfamiliar territory."
 ---
 

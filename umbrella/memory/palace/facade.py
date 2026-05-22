@@ -14,11 +14,71 @@ _PLAN_PROPOSAL_TAGS = {"phase_plan_proposal", "umbrella_plan_candidate"}
 _PLAN_DRAFT_TAGS = {"phase_plan", "umbrella_plan"}
 _PLAN_SELECTED_TAGS = {"phase_plan_submitted", "umbrella_plan_selected"}
 
+_DEFAULT_CHROMA_STORES = [
+    "palace.charter",
+    "palace.lesson",
+    "palace.idea",
+    "palace.codeptr",
+    "palace.skill_index",
+    "palace.run",
+    "palace.phase",
+    "palace.subtask",
+    "palace.durable",
+]
+
 
 def _palace_root(repo_root: pathlib.Path, workspace_id: str | None) -> pathlib.Path:
     if workspace_id:
         return repo_root / "workspaces" / workspace_id / ".memory" / "palace"
     return repo_root / ".umbrella" / "palace"
+
+
+def _provenance_fields_from_meta(meta: dict[str, Any]) -> dict[str, str]:
+    return {
+        "trust_level": str(meta.get("trust_level") or ""),
+        "evidence_refs_json": str(meta.get("evidence_refs_json") or "[]"),
+        "verify_run_id": str(meta.get("verify_run_id") or ""),
+    }
+
+
+def _normalize_store_for_write(
+    store: str,
+    *,
+    kind: str = "",
+    tags: list[str] | None = None,
+) -> str:
+    """palace.global is a logical alias only — never a physical Chroma collection."""
+    if store not in {"palace.global", "global", ""}:
+        return store
+    tag_set = {t.lower() for t in (tags or [])}
+    kind_l = str(kind or "").lower()
+    if kind_l in {"lesson", "failure_pattern"} or "lesson" in tag_set:
+        return "palace.lesson"
+    if kind_l in {"codeptr", "code_pointer"} or "codeptr" in tag_set:
+        return "palace.codeptr"
+    if kind_l in {"skill", "skill_index"} or "skill_index" in tag_set:
+        return "palace.skill_index"
+    if "failure_pattern" in tag_set:
+        return "palace.lesson"
+    return "palace.idea"
+
+
+def _expand_store_aliases(stores: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for store in stores:
+        if store in {"palace.global", "global", ""}:
+            expanded.extend(
+                ["palace.lesson", "palace.idea", "palace.codeptr", "palace.skill_index"]
+            )
+        else:
+            expanded.append(store)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for store in expanded:
+        if store not in seen:
+            seen.add(store)
+            ordered.append(store)
+    return ordered
 
 
 class MemPalace:
@@ -46,9 +106,13 @@ class MemPalace:
         run_id: str | None = None,
         links: Iterable[tuple[str, str]] = (),
         extra: dict[str, Any] | None = None,
+        kind: str = "",
     ) -> str:
-        node_id = str(uuid.uuid4())
         tags_list = list(tags)
+        store = _normalize_store_for_write(
+            store, kind=kind or str((extra or {}).get("type", "")), tags=tags_list
+        )
+        node_id = str(uuid.uuid4())
         metadata: dict[str, Any] = {
             "id": node_id,
             "store": store,
@@ -113,11 +177,7 @@ class MemPalace:
 
         Prefer this over ``search("")`` when you just want all stored nodes.
         """
-        target_stores = stores or [
-            "palace.charter", "palace.lesson", "palace.idea",
-            "palace.codeptr", "palace.skill_index", "palace.run",
-            "palace.phase", "palace.subtask",
-        ]
+        target_stores = _expand_store_aliases(stores or list(_DEFAULT_CHROMA_STORES))
         results: list[dict[str, Any]] = []
 
         for store in target_stores:
@@ -143,6 +203,7 @@ class MemPalace:
                         "workspace_id": meta.get("workspace_id", self._workspace_id),
                         "run_id": meta.get("run_id", ""),
                         "created_at": meta.get("created_at"),
+                        **_provenance_fields_from_meta(meta),
                     })
             except Exception:
                 pass
@@ -159,11 +220,7 @@ class MemPalace:
         node_id = str(node_id or "").strip()
         if not node_id:
             return None
-        target_stores = stores or [
-            "palace.charter", "palace.lesson", "palace.idea",
-            "palace.codeptr", "palace.skill_index", "palace.run",
-            "palace.phase", "palace.subtask",
-        ]
+        target_stores = _expand_store_aliases(stores or list(_DEFAULT_CHROMA_STORES))
         for store in target_stores:
             if store == "palace.transient":
                 continue
@@ -193,6 +250,7 @@ class MemPalace:
                 "workspace_id": meta.get("workspace_id", self._workspace_id),
                 "run_id": meta.get("run_id", ""),
                 "created_at": meta.get("created_at"),
+                **_provenance_fields_from_meta(meta),
             }
         return None
 
@@ -211,10 +269,7 @@ class MemPalace:
         hop: int = 0,
         n: int = 10,
     ) -> list[dict[str, Any]]:
-        target_stores = stores or [
-            "palace.charter", "palace.lesson", "palace.idea",
-            "palace.codeptr", "palace.skill_index", "palace.run",
-        ]
+        target_stores = _expand_store_aliases(stores or list(_DEFAULT_CHROMA_STORES))
         results: list[dict[str, Any]] = []
         per_store = max(1, n // len(target_stores) + 1)
 
@@ -232,15 +287,25 @@ class MemPalace:
                     meta = res["metadatas"][0][i] if res.get("metadatas") else {}
                     if filter_extra and not self._matches_extra_filter(meta, filter_extra):
                         continue
+                    if not self._matches_tags(meta, tags_any=tags_any, tags_all=tags_all):
+                        continue
                     results.append({
                         "id": doc_id,
                         "content": res["documents"][0][i] if res.get("documents") else "",
                         "store": store,
                         "tier": meta.get("tier", Tier.WARM),
+                        "scope": meta.get("scope", ""),
                         "tags": meta.get("tags", ""),
                         "verified": bool(meta.get("verified", 0)),
                         "phase": meta.get("phase", ""),
+                        "subtask_id": meta.get("subtask_id", ""),
+                        "run_id": meta.get("run_id", ""),
+                        "source_path": meta.get("source_path", ""),
+                        "workspace_id": meta.get("workspace_id", self._workspace_id),
+                        "created_at": meta.get("created_at"),
+                        "kind": meta.get("kind", meta.get("type", "")),
                         "score": 1 - (res["distances"][0][i] if res.get("distances") else 0.5),
+                        **_provenance_fields_from_meta(meta),
                     })
             except Exception:
                 pass
@@ -308,12 +373,36 @@ class MemPalace:
             return ["palace.lesson", "palace.idea", "palace.codeptr", "palace.skill_index"]
         return [store]
 
+    @classmethod
+    def _matches_tags(
+        cls,
+        meta: dict[str, Any],
+        *,
+        tags_any: list[str] | None = None,
+        tags_all: list[str] | None = None,
+    ) -> bool:
+        node_tags = cls._split_tags(meta.get("tags", ""))
+        if tags_any:
+            wanted = {t.strip() for t in tags_any if t.strip()}
+            if not node_tags.intersection(wanted):
+                return False
+        if tags_all:
+            required = {t.strip() for t in tags_all if t.strip()}
+            if not required.issubset(node_tags):
+                return False
+        return True
+
     @staticmethod
     def _matches_extra_filter(meta: dict[str, Any], filter_extra: dict[str, Any]) -> bool:
         for key, expected in filter_extra.items():
             if expected is None:
                 continue
-            actual = meta.get(str(key))
+            key_s = str(key)
+            actual = meta.get(key_s)
+            if actual is None and key_s == "type":
+                actual = meta.get("kind")
+            elif actual is None and key_s == "kind":
+                actual = meta.get("type")
             if isinstance(expected, (list, tuple, set, frozenset)):
                 if actual not in expected:
                     return False
@@ -416,6 +505,7 @@ class MemPalace:
         always_on_rules: Iterable[Any] | None = None,
         hot_rules: Iterable[Any] | None = None,
         warm_search_rules: Iterable[Any] | None = None,
+        graph_policy: Any | None = None,
     ) -> RecallBundle:
         bundle = RecallBundle()
         always_rules = list(always_on_rules or [{"store": "palace.charter", "tier": Tier.ALWAYS_ON}])
@@ -492,10 +582,12 @@ class MemPalace:
             warm_nodes: list[dict[str, Any]] = []
             seen_warm: set[str] = set()
             for rule in warm_policy:
+                warm_tags = list(self._rule_tags(rule))
                 for node in self.search(
                     query_seed,
                     stores=self._warm_rule_stores(rule),
                     tiers=[Tier.WARM],
+                    tags_any=warm_tags or None,
                     filter_extra=self._rule_filter(rule),
                     n=self._rule_n(rule, max(1, n // 2)),
                 ):
@@ -508,9 +600,18 @@ class MemPalace:
             bundle.warm = warm_nodes[:n]
 
         if include_graph and bundle.hot:
+            hops = 1
+            edge_types: list[str] | None = None
+            if graph_policy is not None:
+                hops = int(getattr(graph_policy, "hops", None) or 1)
+                raw_edges = getattr(graph_policy, "walk_edges", None)
+                if raw_edges:
+                    edge_types = list(raw_edges)
             top_hot = [n_["id"] for n_ in bundle.hot[:3]]
             for nid in top_hot:
-                edges = self._stores.graph.walk(nid, hops=1, limit=10)
+                edges = self._stores.graph.walk(
+                    nid, hops=hops, edge_types=edge_types, limit=20
+                )
                 for edge in edges:
                     bundle.graph_neighbours.append({
                         "id": edge.dst_id if edge.src_id == nid else edge.src_id,
@@ -554,7 +655,7 @@ class MemPalace:
                     content = res["documents"][0] if res.get("documents") else ""
                     meta = res["metadatas"][0] if res.get("metadatas") else {}
                     new_id = self.add(
-                        store=target_store,
+                        store=_normalize_store_for_write(target_store),
                         content=content,
                         tier=Tier.WARM,
                         scope=Scope.CROSS_RUN_DURABLE,
@@ -579,14 +680,28 @@ class MemPalace:
             "run": Scope.RUN_SCOPED,
         }
         scope_val = scope_map.get(scope_kind, scope_kind)
+        key = str(key or "").strip()
         for store in ["palace.phase", "palace.subtask", "palace.run"]:
             col = self._stores.chroma(store)
             try:
                 res = col.get(where={"scope": scope_val})
-                ids = res.get("ids", [])
-                if ids:
-                    col.delete(ids=ids)
-                    total += len(ids)
+                ids = res.get("ids") or []
+                metas = res.get("metadatas") or []
+                to_delete: list[str] = []
+                for i, doc_id in enumerate(ids):
+                    meta = metas[i] if i < len(metas) else {}
+                    if not key:
+                        to_delete.append(doc_id)
+                        continue
+                    if scope_kind == "run" and str(meta.get("run_id") or "") == key:
+                        to_delete.append(doc_id)
+                    elif scope_kind == "phase" and str(meta.get("phase") or "") == key:
+                        to_delete.append(doc_id)
+                    elif scope_kind == "subtask" and str(meta.get("subtask_id") or "") == key:
+                        to_delete.append(doc_id)
+                if to_delete:
+                    col.delete(ids=to_delete)
+                    total += len(to_delete)
             except Exception:
                 pass
         total += self._stores.transient.expire_ttl()

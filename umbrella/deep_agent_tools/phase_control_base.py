@@ -341,6 +341,9 @@ def _record_research_summary_artifact(
     architecture_id: str,
     findings_ids: list[str],
     notes: str = "",
+    coverage_status: str = "",
+    coverage_report: dict[str, Any] | None = None,
+    source_scarcity_reason: str = "",
 ) -> None:
     state = _drive_state(ctx)
     payload = {
@@ -352,6 +355,9 @@ def _record_research_summary_artifact(
         "architecture_id": architecture_id,
         "findings_ids": findings_ids,
         "notes": notes,
+        "coverage_status": coverage_status or "verified",
+        "coverage_report": coverage_report or {},
+        "source_scarcity_reason": source_scarcity_reason,
     }
     try:
         (state / "research_summary_latest.json").write_text(
@@ -698,27 +704,6 @@ def _is_phase_run_context(ctx: ToolContext) -> bool:
     return isinstance(overlays.get("phase_node"), dict)
 
 
-def _subtask_success_test_text(subtask: dict[str, Any]) -> str:
-    raw = subtask.get("success_test")
-    parts: list[str] = []
-    if isinstance(raw, dict):
-        for key in ("value", "command", "cmd", "check", "name"):
-            value = raw.get(key)
-            if isinstance(value, str) and value.strip():
-                parts.append(value)
-    elif isinstance(raw, str) and raw.strip():
-        parts.append(raw)
-    for key in ("verification", "success_check", "acceptance_command"):
-        value = subtask.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value)
-        elif isinstance(value, dict):
-            for nested in value.values():
-                if isinstance(nested, str) and nested.strip():
-                    parts.append(nested)
-    return "\n".join(parts)
-
-
 __all__ = [
     '_drive_state',
     '_read_phase_plan',
@@ -754,5 +739,4 @@ __all__ = [
     '_context_overlays',
     '_loop_state_view',
     '_is_phase_run_context',
-    '_subtask_success_test_text',
 ]

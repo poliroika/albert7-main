@@ -514,7 +514,9 @@ def build_llm_messages(
         dynamic_parts.append(prompt_governance)
 
     # Phase-manifest overlay: inject phase context from Umbrella PhaseRunner
-    phase_manifest_raw = _task_context_overlay(task, "phase_manifest")
+    phase_manifest_raw = ""
+    if not _umbrella_phase_prompt_owned_by_task(task):
+        phase_manifest_raw = _task_context_overlay(task, "phase_manifest")
     if phase_manifest_raw:
         try:
             import json as _json
@@ -536,7 +538,9 @@ def build_llm_messages(
         except Exception:
             pass
 
-    recall_bundle_raw = _task_context_overlay(task, "recall_bundle")
+    recall_bundle_raw = ""
+    if not _umbrella_phase_prompt_owned_by_task(task):
+        recall_bundle_raw = _task_context_overlay(task, "recall_bundle")
     if recall_bundle_raw:
         try:
             import json as _json
@@ -992,4 +996,15 @@ def _task_context_overlay(task: dict[str, Any], name: str) -> str:
     if not isinstance(overlays, dict):
         return ""
     value = overlays.get(name)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
     return str(value or "").strip()
+
+
+def _umbrella_phase_prompt_owned_by_task(task: dict[str, Any]) -> bool:
+    if str(task.get("type") or "") == "phase_run":
+        return True
+    overlays = task.get("context_overlays")
+    if not isinstance(overlays, dict):
+        return False
+    return bool(overlays.get("phase_prompt_rendered_by_umbrella"))

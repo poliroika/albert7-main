@@ -39,6 +39,7 @@ allowed_skills:
   - mcp-discovery
   - gmas-overview
   - architecture-author
+  - temp-tool-author
 
 memory:
   always_on:

@@ -32,12 +32,30 @@ const stepIcons = {
   thinking: Brain, tool_call: Terminal, response: MessageSquare,
 };
 
+const phaseStatusDot = {
+  done:    'bg-emerald-500',
+  passed:  'bg-emerald-500',
+  failed:  'bg-rose-500',
+  running: 'bg-blue-500 animate-pulse',
+  pending: 'bg-zinc-600',
+  skipped: 'bg-amber-500',
+};
+const phaseStatusLabel = {
+  done:    { text: 'done',    cls: 'text-emerald-400' },
+  passed:  { text: 'passed',  cls: 'text-emerald-400' },
+  failed:  { text: 'failed',  cls: 'text-rose-400' },
+  running: { text: 'running', cls: 'text-blue-400' },
+  pending: { text: 'pending', cls: 'text-zinc-500' },
+  skipped: { text: 'skipped', cls: 'text-amber-400' },
+};
+
 function PhaseTimeline({ timeline }) {
   if (!timeline || !Array.isArray(timeline.phases) || timeline.phases.length === 0) {
     return null;
   }
+  const isPhaseRunner = timeline.source === 'phase_plan';
   const fmtDuration = (ms) => {
-    if (!ms) return '0s';
+    if (!ms) return '—';
     const s = Math.round(ms / 1000);
     if (s < 60) return `${s}s`;
     const m = Math.floor(s / 60);
@@ -46,62 +64,77 @@ function PhaseTimeline({ timeline }) {
     const h = Math.floor(m / 60);
     return `${h}h ${m % 60}m`;
   };
-  const verifyClass = (s) => {
-    if (s === 'passed') return 'text-emerald-400';
-    if (s === 'failed') return 'text-rose-400';
-    if (s === 'skipped') return 'text-amber-400';
-    return 'text-muted-foreground';
-  };
+
   return (
     <div className="rounded-md border border-border/50 bg-secondary/20 p-3">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-          Phase Timeline
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Phase Timeline
+          </span>
+          {isPhaseRunner && (
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20 text-blue-400 font-mono uppercase">
+              phase runner
+            </span>
+          )}
+        </div>
         <span className="text-[10px] text-muted-foreground/70">
           {timeline.phases.length} phase{timeline.phases.length === 1 ? '' : 's'}
         </span>
       </div>
-      <div className="space-y-1.5">
-        {timeline.phases.map((phase, idx) => (
-          <div
-            key={`${phase.name}-${idx}`}
-            className="grid grid-cols-[140px_1fr_60px_60px_60px_70px_70px] gap-2 items-center text-[11px] py-1 border-b border-border/30 last:border-b-0"
-          >
-            <span className="font-medium truncate">{phase.label || phase.name}</span>
-            <span className="text-muted-foreground tabular-nums font-mono">
-              {fmtDuration(phase.duration_ms)}
-            </span>
-            <span className="tabular-nums text-right" title="rounds">
-              {phase.rounds || 0}r
-            </span>
-            <span className="tabular-nums text-right" title="tool calls">
-              {phase.tool_calls || 0}t
-            </span>
-            <span className="tabular-nums text-right text-emerald-400/80" title="write tool calls">
-              {phase.write_tool_calls || 0}w
-            </span>
-            <span
-              className="tabular-nums text-right text-rose-400/80"
-              title="preflight errors"
+      <div className="space-y-0">
+        {timeline.phases.map((phase, idx) => {
+          const rawStatus = phase.status || phase.verification_status || 'pending';
+          const dotCls = phaseStatusDot[rawStatus] || 'bg-zinc-600';
+          const labelInfo = phaseStatusLabel[rawStatus] || { text: rawStatus, cls: 'text-muted-foreground' };
+          return (
+            <div
+              key={`${phase.name}-${idx}`}
+              className="flex items-center gap-3 text-[11px] py-1.5 border-b border-border/20 last:border-b-0"
             >
-              {phase.preflight_errors ? `!${phase.preflight_errors}` : '-'}
-            </span>
-            <span
-              className={`text-right text-[10px] uppercase font-semibold ${verifyClass(phase.verification_status)}`}
-              title="verification status"
-            >
-              {phase.verification_status || ''}
-            </span>
-          </div>
-        ))}
+              {/* Status dot */}
+              <div className={`w-2 h-2 rounded-full shrink-0 ${dotCls}`} />
+              {/* Phase name */}
+              <span className="w-[130px] font-medium truncate shrink-0">
+                {phase.label || phase.name}
+              </span>
+              {/* Duration */}
+              <span className="w-16 text-muted-foreground tabular-nums font-mono text-right shrink-0">
+                {fmtDuration(phase.duration_ms)}
+              </span>
+              {/* Stats: only show for log-based phases */}
+              {!isPhaseRunner && (
+                <>
+                  <span className="w-10 tabular-nums text-right shrink-0" title="rounds">
+                    {phase.rounds || 0}r
+                  </span>
+                  <span className="w-10 tabular-nums text-right shrink-0" title="tool calls">
+                    {phase.tool_calls || 0}t
+                  </span>
+                  <span className="w-8 tabular-nums text-right text-emerald-400/80 shrink-0" title="writes">
+                    {phase.write_tool_calls || 0}w
+                  </span>
+                  <span className="w-8 tabular-nums text-right text-rose-400/80 shrink-0" title="preflight errors">
+                    {phase.preflight_errors ? `!${phase.preflight_errors}` : '—'}
+                  </span>
+                </>
+              )}
+              {/* Status label */}
+              <span className={`ml-auto text-[10px] uppercase font-semibold ${labelInfo.cls}`}>
+                {labelInfo.text}
+              </span>
+            </div>
+          );
+        })}
       </div>
-      <div className="mt-2 text-[10px] text-muted-foreground/70">
-        legend: <span className="font-mono">r</span>=rounds,
-        <span className="font-mono"> t</span>=tool calls,
-        <span className="font-mono text-emerald-400/80"> w</span>=writes,
-        <span className="font-mono text-rose-400/80"> !</span>=preflight errors
-      </div>
+      {!isPhaseRunner && (
+        <div className="mt-2 text-[10px] text-muted-foreground/70">
+          legend: <span className="font-mono">r</span>=rounds,
+          <span className="font-mono"> t</span>=tool calls,
+          <span className="font-mono text-emerald-400/80"> w</span>=writes,
+          <span className="font-mono text-rose-400/80"> !</span>=preflight errors
+        </div>
+      )}
     </div>
   );
 }

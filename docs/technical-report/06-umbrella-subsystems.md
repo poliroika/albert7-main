@@ -160,16 +160,6 @@ SQLite table `edges(src_id, dst_id, edge_type, weight, phase, created_at)`.
 
 Edge types: `derived_from`, `cites`, `tests`, `implements`, `supersedes`, `references_file`, `triggered_by_error`, `flagged_by`, `blocks`, `from_phase`.
 
-### Migration
-
-`migrators.py` one-shot migration:
-- `lessons.jsonl` -> `palace.lesson`
-- `ideas.jsonl` -> `palace.idea`
-- `gaps.jsonl` -> `palace.idea` (tag=gap)
-- `signals.jsonl` -> `palace.idea` (tag=signal)
-
-After migration, files renamed to `.migrated`.
-
 ## Permissions (`umbrella/permissions/`)
 
 ### Rule Evaluation

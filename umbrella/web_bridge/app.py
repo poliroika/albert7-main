@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -40,6 +41,17 @@ except Exception:  # pragma: no cover - optional in tiny test fixtures
     load_env = None  # type: ignore[assignment]
 
 
+def _ensure_repo_python_paths(repo_root: Path) -> None:
+    """Expose bundled editable packages when bridge is launched from source."""
+    for rel, package in (("ouroboros", "ouroboros"), ("gmas/src", "gmas")):
+        source_root = (repo_root / rel).resolve()
+        if not (source_root / package).exists():
+            continue
+        value = str(source_root)
+        if value not in sys.path:
+            sys.path.insert(0, value)
+
+
 def _filter_terminal_scrollback_for_run(text: str, run_id: str) -> str:
     """Return terminal scrollback blocks that belong to ``run_id``."""
 
@@ -70,6 +82,7 @@ def _filter_terminal_scrollback_for_run(text: str, run_id: str) -> str:
 class WebBridgeApp:
     def __init__(self, repo_root: Path | None = None) -> None:
         self.repo_root = (repo_root or REPO_ROOT).resolve()
+        _ensure_repo_python_paths(self.repo_root)
         self.workspaces_root = self.repo_root / "workspaces"
         self._run_lock = threading.Lock()
         self._run_threads: dict[str, threading.Thread] = {}
@@ -793,9 +806,6 @@ class WebBridgeApp:
         max_verify_retries: int | None = None,
     ) -> None:
         """Background worker: drives PhaseRunner and mirrors envelopes into the web run record."""
-        from umbrella.orchestrator.runner import PhaseRunner
-        from umbrella.utils.result_envelope import ResultEnvelope
-
         env_snapshot = self._snapshot_env()
         self._clear_stop_requests(ws_id)
         self._load_runtime_env()
@@ -816,6 +826,35 @@ class WebBridgeApp:
         tools_used: set[str] = set()
         final_status = "succeeded"
         final_error: str | None = None
+
+        try:
+            from umbrella.orchestrator.runner import PhaseRunner
+            from umbrella.utils.result_envelope import ResultEnvelope
+        except Exception as exc:
+            log.exception("PhaseRunner import failed for run %s", run_id)
+            final_run = self._upsert_web_run(
+                run_id,
+                {
+                    "status": "failed",
+                    "running": False,
+                    "total_steps": 0,
+                    "result_preview": str(exc),
+                    "error": str(exc),
+                    "finished_at": iso_utc(now_ts()),
+                    "updated_at": iso_utc(now_ts()),
+                },
+            )
+            thread_id = str(final_run.get("thread_id") or "").strip()
+            if thread_id:
+                try:
+                    self._append_thread_finalize_message(thread_id, run_id, final_run)
+                except Exception:
+                    log.debug("Failed to append import-failure message", exc_info=True)
+            with self._run_lock:
+                self._workers.pop(run_id, None)
+                self._run_threads.pop(run_id, None)
+            self._restore_env(env_snapshot)
+            return
 
         def on_env(env: ResultEnvelope) -> None:
             payload = env.to_dict()
@@ -941,26 +980,13 @@ class WebBridgeApp:
         "OUROBOROS_TOOL_PREFLIGHT_REPAIR_ROUNDS",
         "OUROBOROS_WEB_MAX_VERIFY_RETRIES",
         "OUROBOROS_DEEP_SEARCH_ENABLED",
+        "OUROBOROS_DEEP_SEARCH_ENGINE",
         "OUROBOROS_DEEP_SEARCH_PROVIDER",
         "OUROBOROS_DEEP_SEARCH_BUDGET",
-        "OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK",
-        "OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO",
-        "OUROBOROS_LEGACY_WEB_SEARCH_DISABLED",
         "OUROBOROS_GITHUB_DISCOVERY_BUDGET",
         "OUROBOROS_HARNESS_MAX_PARALLEL",
         "OUROBOROS_HARNESS_TIMEOUT_HOURS",
     )
-    _FAST_SEARCH_PROVIDER_ENV: tuple[str, ...] = (
-        "SERPER_API_KEY",
-        "TAVILY_API_KEY",
-        "BRAVE_API_KEY",
-        "BING_SEARCH_API_KEY",
-        "BING_API_KEY",
-        "GOOGLE_API_KEY",
-        "GOOGLE_CSE_ID",
-        "OPENAI_API_KEY",
-    )
-
     def _snapshot_env(self) -> dict[str, str | None]:
         return {key: os.environ.get(key) for key in self._ENV_KEYS_TO_RESTORE}
 
@@ -973,16 +999,8 @@ class WebBridgeApp:
                 os.environ[key] = value
 
     def _ensure_web_discovery_defaults(self) -> None:
-        """Let web UI phase runs use the built-in no-key web fallback."""
-        if os.environ.get("OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK"):
-            return
-        if os.environ.get("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO"):
-            return
-        if (os.environ.get("OUROBOROS_DEEP_SEARCH_PROVIDER") or "").strip():
-            return
-        if any((os.environ.get(name) or "").strip() for name in self._FAST_SEARCH_PROVIDER_ENV):
-            return
-        os.environ["OUROBOROS_DEEP_SEARCH_ALLOW_SLOW_FALLBACK"] = "1"
+        """Compatibility hook: GMAS DuckDuckGo is now the no-key default."""
+        return
 
     def _stop_was_requested(self, run_id: str, ws_id: str | None) -> bool:
         run = self._get_web_run(run_id) or {}

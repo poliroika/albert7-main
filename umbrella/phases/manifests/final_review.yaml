@@ -8,6 +8,8 @@ prompt_files:
 
 allowed_tools:
   - load_skill
+  - read_file
+  - list_files
   - palace_search
   - palace_link
   - run_real_e2e
@@ -27,6 +29,7 @@ forbidden_tools:
 allowed_skills:
   - e2e-test-author
   - goal-alignment-check
+  - verification-protocol
 
 memory:
   always_on:
@@ -40,7 +43,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [load_skill, palace_search, palace_link, run_real_e2e, loop_back_to, request_extra_subtask, submit_final_review]
+    - allow_tools: [load_skill, read_file, list_files, palace_search, palace_link, run_real_e2e, loop_back_to, request_extra_subtask, submit_final_review]
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
 
 exit_criteria:

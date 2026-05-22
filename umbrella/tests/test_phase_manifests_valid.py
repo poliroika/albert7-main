@@ -91,17 +91,15 @@ def test_phase_memory_routes_subtasks_to_subtask_store():
 def test_plan_prompt_documents_executable_leaf_payload_contract():
     prompt = (PROMPTS_DIR / "plan.system.md").read_text(encoding="utf-8")
 
-    assert "Every executable leaf subtask" in prompt
+    assert "Each executable subtask must include" in prompt
     assert '"goal"' in prompt
     assert '"files_to_create"' in prompt
-    assert '"success_test": "python -m pytest tests/test_game_state.py -q"' in prompt
-    assert "Do not use bare generic pass gates" in prompt
-    assert "not an array" in prompt
-    assert "Unix-only shell/process-control" in prompt
-    assert "deterministic/static/heuristic" in prompt
-    assert "10-14 flat leaves" in prompt
-    assert "wildcard shorthand" in prompt
-    assert "--skip-if-no-llm" in prompt
+    assert '"proof"' in prompt
+    assert '"command": ["python", "-m", "pytest"' in prompt
+    assert "shell=true" in prompt
+    assert "collect-only" in prompt
+    assert "input sensitivity" in prompt
+    assert "mock/fake/dry-run" in prompt
 
 
 def test_agent_facing_runtime_prompts_do_not_teach_unsupported_model_alias():
@@ -121,7 +119,7 @@ def test_agent_facing_runtime_prompts_do_not_teach_unsupported_model_alias():
 
 def test_execute_prompt_frontloads_conditional_gmas_pre_write_contract():
     prompt = (PROMPTS_DIR / "execute.system.md").read_text(encoding="utf-8")
-    gate = prompt.split("## What you must do", 1)[0]
+    gate = prompt.split("## Required Workflow", 1)[0]
 
     assert "Domain-specific GMAS/LLM-agent gate" in gate
     assert "Skip this section for ordinary non-agent, non-LLM workspaces" in gate

@@ -113,24 +113,54 @@ def _env_truthy(name: str) -> bool:
     return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _auto_recall_enabled(kind: str) -> bool:
+def _context_overlays(tools_ctx: Any | None) -> dict[str, Any]:
+    if tools_ctx is None:
+        return {}
+    overlays = getattr(tools_ctx, "context_overlays", None)
+    return overlays if isinstance(overlays, dict) else {}
+
+
+def _umbrella_overlay_already_compiled(tools_ctx: Any | None) -> bool:
+    overlays = _context_overlays(tools_ctx)
+    return bool(
+        overlays.get("prevent_ouroboros_auto_core_overlay")
+        or overlays.get("proactive_memory_rendered_in_task_input")
+        or overlays.get("memory_overlay_origin")
+        or overlays.get("proactive_memory")
+    )
+
+
+def _is_umbrella_managed(tools_ctx: Any) -> bool:
+    if getattr(tools_ctx, "umbrella_managed", False):
+        return True
+    overlays = _context_overlays(tools_ctx)
+    if overlays.get("umbrella_managed") or overlays.get("phase_manifest"):
+        return True
+    if overlays.get("proactive_memory") or overlays.get("llm_input_bundle"):
+        return True
+    phase = str(getattr(tools_ctx, "umbrella_phase_id", "") or "").strip()
+    if phase:
+        return True
+    manifest = getattr(tools_ctx, "phase_manifest", None)
+    return manifest is not None
+
+
+def _auto_recall_enabled(kind: str, *, tools_ctx: Any | None = None) -> bool:
     """Return whether the loop should inject recall without an explicit tool call.
 
-    Activation policy (Tier 1.4):
+    Activation policy:
     - ``OUROBOROS_AUTO_MEMORY_RECALL`` forces all kinds on (legacy switch).
-    - ``task_start`` defaults to **OFF**. Planner/subtask prompts and
-      discovery gates push the agent to call ``get_umbrella_memory``
-      explicitly when prior runs matter. Opt in via
-      ``OUROBOROS_TASK_START_RECALL=1``.
-    - ``periodic`` still requires an explicit env opt-in here because
-      ``maybe_inject_periodic_recall`` is the inner sampler. The
-      *per-phase* default is enabled in
-      ``_periodic_recall_enabled_for_phase`` so planner / subtask /
-      remediation get fresh recall mid-flight by default.
+    - Umbrella-managed runs: task_start core overlay ON by default.
+    - Standalone Ouroboros: task_start OFF unless ``OUROBOROS_TASK_START_RECALL=1``.
+    - Periodic recall still requires explicit env opt-in.
     """
     if _env_truthy("OUROBOROS_AUTO_MEMORY_RECALL"):
         return True
     if kind == "task_start":
+        if tools_ctx is not None and _umbrella_overlay_already_compiled(tools_ctx):
+            return False
+        if tools_ctx is not None and _is_umbrella_managed(tools_ctx):
+            return True
         raw = str(os.environ.get("OUROBOROS_TASK_START_RECALL") or "").strip().lower()
         return raw in {"1", "true", "yes", "on"}
     if kind == "periodic":
@@ -792,18 +822,72 @@ def init_loop_memory(
         or Path.cwd()
     )
     initial_ws = _guess_initial_workspace(messages)
-    if initial_ws and _auto_recall_enabled("task_start"):
+    if _umbrella_overlay_already_compiled(tools_ctx):
         try:
-            recall_text = recall_for_task_start(
+            from umbrella.memory.kernel.telemetry import record_memory_event
+
+            record_memory_event(
+                repo_root,
+                event_type="memory_overlay_duplicate_suppressed",
                 workspace_id=initial_ws,
-                task_input=_extract_task_brief(messages),
-                repo_root=repo_root,
+                status="ok",
+                data={
+                    "origin": _context_overlays(tools_ctx).get("memory_overlay_origin", "")
+                },
             )
+        except Exception:
+            log.debug("memory overlay suppression telemetry skipped", exc_info=True)
+        return repo_root, initial_ws
+    if _auto_recall_enabled("task_start", tools_ctx=tools_ctx):
+        try:
+            if _is_umbrella_managed(tools_ctx):
+                recall_text = recall_core_overlay_for_task_start(
+                    workspace_id=initial_ws,
+                    repo_root=repo_root,
+                    tools_ctx=tools_ctx,
+                )
+            elif initial_ws:
+                recall_text = recall_for_task_start(
+                    workspace_id=initial_ws,
+                    task_input=_extract_task_brief(messages),
+                    repo_root=repo_root,
+                )
+            else:
+                recall_text = recall_core_overlay_for_task_start(
+                    workspace_id="",
+                    repo_root=repo_root,
+                    tools_ctx=tools_ctx,
+                )
             if recall_text:
                 messages.append({"role": "system", "content": recall_text})
         except Exception:
             log.debug("Initial memory recall failed", exc_info=True)
     return repo_root, initial_ws
+
+
+def recall_core_overlay_for_task_start(
+    *,
+    workspace_id: str,
+    repo_root: Path,
+    tools_ctx: Any | None = None,
+) -> str:
+    """Inject proactive core overlay (not legacy palace semantic search)."""
+    try:
+        from umbrella.memory.proactive.compiler import ProactiveMemoryCompiler
+    except Exception:
+        return ""
+    phase_id = ""
+    if tools_ctx is not None:
+        phase_id = str(getattr(tools_ctx, "umbrella_phase_id", "") or "")
+    compiler = ProactiveMemoryCompiler()
+    overlay = compiler.build_minimal_overlay(
+        repo_root=repo_root,
+        workspace_id=workspace_id,
+        phase_id=phase_id or "task_start",
+    )
+    if not overlay.sections:
+        return ""
+    return overlay.render_markdown()
 
 
 def _guess_initial_workspace(messages: list[dict[str, Any]]) -> str:

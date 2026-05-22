@@ -94,13 +94,6 @@ class UmbrellaServices:
 
     def _init_memory(self) -> None:
         """Initialize memory service."""
-        try:
-            from umbrella.memory.migrations import migrate_to_per_workspace
-
-            migrate_to_per_workspace(self.repo_root)
-        except Exception as e:
-            log.warning("migrate_to_per_workspace skipped: %s", e)
-
         memory_dir = self.control_state_dir / "memory"
         config = MemoryConfig(memory_root=memory_dir)
         self.memory = MemoryStore(config)

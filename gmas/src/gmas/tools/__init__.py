@@ -67,7 +67,6 @@ from .llm_integration import (
     parse_openai_response,
 )
 from .shell import ShellTool
-from .vector_search import VectorIndexTool, VectorSearchTool
 from .web_search import (
     DuckDuckGoProvider,
     SearchProvider,
@@ -77,6 +76,12 @@ from .web_search import (
     URLFetcher,
     WebSearchTool,
 )
+
+try:
+    from .vector_search import VectorIndexTool, VectorSearchTool
+except ImportError:
+    VectorIndexTool = None  # type: ignore[assignment]
+    VectorSearchTool = None  # type: ignore[assignment]
 
 # MCP server support (optional — requires 'mcp' package)
 with contextlib.suppress(ImportError):

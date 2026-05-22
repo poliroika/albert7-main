@@ -27,7 +27,7 @@ albert7/                              # repository root (name is not fixed)
       envelope.py, loader.py, global.yaml, watcher_envelope.py, self_improvement.yaml
     memory/                           # Memory layer
       palace/                         # Unified facade
-        facade.py, stores.py, tiers.py, graph.py, recall.py, transient.py, migrators.py
+        facade.py, stores.py, tiers.py, graph.py, recall.py, transient.py
       store.py, lessons.py, competency.py, context_builder.py, ...
     prompts/phases/                   # Phase prompt files
       research.system.md, plan.system.md, execute.system.md, ...

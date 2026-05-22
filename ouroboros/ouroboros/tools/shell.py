@@ -94,7 +94,7 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", timeout_seconds: int = 120)
 def _run_claude_cli(
     work_dir: str, prompt: str, env: dict
 ) -> subprocess.CompletedProcess:
-    """Run Claude CLI with permission-mode fallback."""
+    """Run Claude CLI without permission-bypass fallbacks."""
     claude_bin = shutil.which("claude")
     cmd = [
         claude_bin,
@@ -108,12 +108,15 @@ def _run_claude_cli(
         "Read,Edit,Grep,Glob",
     ]
 
-    # Try --permission-mode first, fallback to --dangerously-skip-permissions
+    # Permission bypass is not a sandbox.  Use the CLI's normal/default
+    # permission mode, and if an older CLI does not support the flag, retry
+    # without it rather than falling back to dangerous skip-permissions.
     perm_mode = os.environ.get(
-        "OUROBOROS_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions"
+        "OUROBOROS_CLAUDE_CODE_PERMISSION_MODE", "default"
     ).strip()
+    if perm_mode.lower() in {"bypasspermissions", "dangerously-skip-permissions"}:
+        perm_mode = "default"
     primary_cmd = cmd + ["--permission-mode", perm_mode]
-    legacy_cmd = cmd + ["--dangerously-skip-permissions"]
 
     _enc = dict(encoding="utf-8", errors="replace")
     res = subprocess.run(
@@ -138,7 +141,7 @@ def _run_claude_cli(
             )
         ):
             res = subprocess.run(
-                legacy_cmd,
+                cmd,
                 cwd=work_dir,
                 capture_output=True,
                 text=True,

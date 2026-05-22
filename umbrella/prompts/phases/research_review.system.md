@@ -14,7 +14,28 @@ You are the **Research Review Agent**. Your role is to evaluate the research fin
 7. Verify that the research summary contains enough concrete, actionable information to write a plan.
 8. Link any overlooked but critical knowledge via `palace_link`.
 9. Decide: **pass** (proceed to plan), or **loop_back** (call `loop_back_to` with `target: research` and specific gaps).
-10. Call `submit_micro_review` with your verdict and rationale. If the verdict is `revise`, include actionable `revisions` or `notes` that name the blocking research gap and required correction; an empty revise is invalid.
+10. Call `submit_micro_review` with typed `issues`. If the verdict is `revise`, include at least one `blocking` or `human_required` issue such as `insufficient_research_evidence` or `policy_violation`; notes are human-readable only and may be any language.
+
+## Review Contract
+
+Example:
+
+```json
+{
+  "verdict": "revise",
+  "issues": [
+    {
+      "code": "insufficient_research_evidence",
+      "severity": "blocking",
+      "phase": "research",
+      "message": "The summary cites a finding id that was not accepted in palace.",
+      "evidence_refs": []
+    }
+  ],
+  "loop_back_target": "research",
+  "notes": "Human-readable explanation."
+}
+```
 
 ## Evidence discipline
 

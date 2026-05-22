@@ -30,17 +30,18 @@ Most AI agents execute tasks. Ouroboros **creates itself.**
 
 ---
 
-## Deep web search (optional)
+## Deep Web Search
 
-The Umbrella fork registers a `deep_search` tool that prefers GMAS’s `WebSearchTool` (caching, optional Playwright “deep” fetch). Install GMAS with web-search extras from this monorepo, then Playwright’s browser if you enable deep mode:
+The Umbrella fork registers a `deep_search` tool with pluggable engines. The default engine is GMAS `WebSearchTool` (provider routing, caching, deduplication, and Playwright page reading). DuckDuckGo is the default no-key provider; optional provider keys are only needed when you intentionally select providers such as Brave, Serper, Tavily, Exa, SearXNG, Bocha, or Google. Generic internet access does not depend on `OPENAI_API_KEY`.
+
+For stronger hosted deep-search engines, set `OUROBOROS_DEEP_SEARCH_ENGINE=firecrawl` with `FIRECRAWL_API_KEY`, or `OUROBOROS_DEEP_SEARCH_ENGINE=jina` with optional `JINA_API_KEY`. In `auto` mode, those engines are used only when their keys are configured; otherwise GMAS remains the no-key baseline.
 
 ```bash
 uv pip install -e ./gmas[web-search]
-# optional, for dynamic pages:
 pip install playwright && playwright install chromium
 ```
 
-Configure with `OUROBOROS_DEEP_SEARCH_ENABLED`, `OUROBOROS_DEEP_SEARCH_PROVIDER`, `OUROBOROS_DEEP_SEARCH_BUDGET`. Without GMAS, the tool falls back to the built-in DuckDuckGo path in `ouroboros/tools/search.py`.
+Configure with `OUROBOROS_DEEP_SEARCH_ENABLED`, `OUROBOROS_DEEP_SEARCH_ENGINE`, `OUROBOROS_DEEP_SEARCH_PROVIDER`, and `OUROBOROS_DEEP_SEARCH_BUDGET`. If Playwright is unavailable, `deep_search` falls back to GMAS HTTP content fetch and reports that fallback in the structured result.
 
 ## Architecture
 
@@ -106,7 +107,7 @@ When Ouroboros is launched through Umbrella, runtime memory is isolated per work
 | `TELEGRAM_BOT_TOKEN` | Yes | [@BotFather](https://t.me/BotFather) on Telegram (see Step 1) |
 | `TOTAL_BUDGET` | Yes | Your spending limit in USD (e.g. `50`) |
 | `GITHUB_TOKEN` | Yes | [github.com/settings/tokens](https://github.com/settings/tokens) -- Generate a classic token with `repo` scope |
-| `OPENAI_API_KEY` | No | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) -- Enables web search tool |
+| `OPENAI_API_KEY` | No | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) -- Optional provider key only when your chosen LLM backend is OpenAI |
 | `ANTHROPIC_API_KEY` | No | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) -- Enables Claude Code CLI |
 
 \* Set either `OPENROUTER_API_KEY` or `OUROBOROS_LLM_API_KEY`. If you use a custom API, also set `OUROBOROS_LLM_BASE_URL`.
@@ -216,7 +217,7 @@ Full text: [BIBLE.md](BIBLE.md)
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | Enables the `web_search` tool |
+| `OPENAI_API_KEY` | Optional provider key only when your chosen LLM backend is OpenAI |
 | `ANTHROPIC_API_KEY` | Enables Claude Code CLI for code editing |
 
 ### Optional Configuration (environment variables)

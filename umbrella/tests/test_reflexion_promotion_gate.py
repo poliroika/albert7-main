@@ -84,9 +84,20 @@ def test_submit_reflection_with_citations(tmp_path):
 
     result = _submit_reflection(
         ctx,
-        text="Migration failed [ev:tools_42] due to type mismatch [ev:events_38].",
+        text="Migration failed due to type mismatch.",
         applies_to_phase="execute",
-        evidence_refs=["tools_42", "events_38"],
+        evidence_refs=[
+            {
+                "ref_type": "ledger_event",
+                "ref_id": "tools_42",
+                "produced_by": "supervisor",
+            },
+            {
+                "ref_type": "ledger_event",
+                "ref_id": "events_38",
+                "produced_by": "verifier",
+            },
+        ],
     )
     assert "ERROR" not in result
     assert "execute" in result

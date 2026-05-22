@@ -169,8 +169,9 @@ CORE_TOOL_NAMES = {
     # payload from the very first round.
     "sandbox_self_edit",
     "delegate_to_ouroboros",
-    # Intent-aware research tool with per-run budget; preferred over the
-    # legacy ``web_search`` (which stays available as an escape hatch).
+    # Intent-aware research tool with per-run budget; preferred for external
+    # evidence. ``web_search`` remains available as a provider-independent
+    # GMAS adapter but is intentionally not core.
     "deep_search",
     # Project/tool discovery needs to be visible in the first planner
     # rounds. If these stay non-core, phase-filtered schemas mention them
@@ -182,23 +183,7 @@ CORE_TOOL_NAMES = {
 }
 
 
-# Web search is gated by env only when the operator explicitly asks for it.
-# ``deep_search`` stays core and preferred, while ``web_search`` remains a
-# non-core escape hatch that phase manifests may expose deliberately.
-def _legacy_web_search_disabled() -> bool:
-    raw = (
-        str(os.environ.get("OUROBOROS_LEGACY_WEB_SEARCH_DISABLED") or "")
-        .strip()
-        .lower()
-    )
-    if raw:
-        return raw in {"1", "true", "yes", "on"}
-    return False
-
-
 DISABLED_TOOL_NAMES: set[str] = set()
-if _legacy_web_search_disabled():
-    DISABLED_TOOL_NAMES.add("web_search")
 
 
 class ToolRegistry:

@@ -3,11 +3,15 @@
 from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.deep_agent_tools import phase_control_actions as _actions
 from umbrella.deep_agent_tools import phase_control_base as _base
-from umbrella.deep_agent_tools import phase_control_completion as _completion
 from umbrella.deep_agent_tools import phase_control_research as _research
-from umbrella.deep_agent_tools import phase_control_review as _review
+from umbrella.contracts.schemas import (
+    COMPLETION_CONTRACT_SCHEMA,
+    EVIDENCE_REF_SCHEMA,
+    REVIEW_ISSUE_SCHEMA,
+    VERIFICATION_REPORT_REF_SCHEMA,
+)
 
-_MODULES = (_base, _research, _review, _completion, _actions)
+_MODULES = (_base, _research, _actions)
 
 for _module in _MODULES:
     for _name in getattr(_module, "__all__", ()): 
@@ -22,10 +26,8 @@ def get_tools() -> list[ToolEntry]:
                 "name": "mutate_phase_plan",
                 "description": (
                     "Mutate the active PhasePlan (add/remove/reorder phases, "
-                    "update node status/subtask cards). For a generated test "
-                    "contract that is internally wrong, patch the current "
-                    "subtask with contract_migration_reason and "
-                    "contract_migration_files before editing that success-test file."
+                    "update node status/subtask cards). Subtask cards must "
+                    "continue to satisfy contract v1 typed proof validation."
                 ),
                 "parameters": {
                     "type": "object",
@@ -36,9 +38,9 @@ def get_tools() -> list[ToolEntry]:
                             "description": (
                                 "Key-value patch applied to PhasePlan. Example: "
                                 "{\"subtasks\":[{\"id\":\"subtask_1\","
-                                "\"contract_migration_reason\":\"why the generated "
-                                "test contract is wrong\","
-                                "\"contract_migration_files\":[\"tests/test_x.py\"]}]}"
+                                "\"proof\":{\"execution\":{\"kind\":\"pytest\","
+                                "\"command\":[\"python\",\"-m\",\"pytest\","
+                                "\"tests/test_x.py\",\"-q\"]}}}]}"
                             ),
                         }
                     },
@@ -91,6 +93,19 @@ def get_tools() -> list[ToolEntry]:
                         "architecture_id": {"type": "string"},
                         "findings_ids": {"type": "array", "items": {"type": "string"}},
                         "notes": {"type": "string"},
+                        "coverage_status": {
+                            "type": "string",
+                            "enum": ["complete", "source_scarce", "blocked"],
+                            "description": (
+                                "Optional. Use source_scarce only when all "
+                                "required discovery channels were attempted "
+                                "and fewer usable sources exist than the "
+                                "finding floor; do not use it to cite fake or "
+                                "duplicate findings."
+                            ),
+                        },
+                        "source_scarcity_reason": {"type": "string"},
+                        "evidence_refs": {"type": "array", "items": EVIDENCE_REF_SCHEMA},
                     },
                 },
             },
@@ -101,15 +116,16 @@ def get_tools() -> list[ToolEntry]:
             schema={
                 "name": "submit_micro_review",
                 "description": (
-                    "Submit the verdict of a mini review phase (ok/revise/abort). "
-                    "revise/abort must include actionable revisions or notes."
+                    "Submit a typed mini-review contract. Notes are human-only; "
+                    "machine decisions use issue codes/severities."
                 ),
                 "parameters": {
                     "type": "object",
-                    "required": ["verdict"],
+                    "required": ["verdict", "issues"],
                     "properties": {
                         "verdict": {"type": "string", "enum": ["ok", "revise", "abort"]},
-                        "revisions": {"type": "array", "items": {"type": "string"}},
+                        "issues": {"type": "array", "items": REVIEW_ISSUE_SCHEMA},
+                        "loop_back_target": {"type": "string"},
                         "notes": {"type": "string"},
                     },
                 },
@@ -162,12 +178,16 @@ def get_tools() -> list[ToolEntry]:
             name="submit_verification",
             schema={
                 "name": "submit_verification",
-                "description": "Submit verification result (pass/fail).",
+                "description": (
+                    "Submit verification result. pass requires a "
+                    "ledger-backed VerificationReportRef."
+                ),
                 "parameters": {
                     "type": "object",
                     "required": ["status"],
                     "properties": {
                         "status": {"type": "string", "enum": ["pass", "fail"]},
+                        "verification_report_ref": VERIFICATION_REPORT_REF_SCHEMA,
                         "details": {"type": "string"},
                     },
                 },
@@ -186,11 +206,33 @@ def get_tools() -> list[ToolEntry]:
                         "text": {"type": "string"},
                         "applies_to_phase": {"type": "string"},
                         "applies_to_subtask": {"type": "string"},
-                        "evidence_refs": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "evidence_refs": {"type": "array", "items": EVIDENCE_REF_SCHEMA, "minItems": 1},
+                        "proposed_bkb_rules": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                        },
                     },
                 },
             },
             handler=_submit_reflection,
+        ),
+        ToolEntry(
+            name="accept_bkb_proposal",
+            schema={
+                "name": "accept_bkb_proposal",
+                "description": (
+                    "Accept a proposed BKB patch written by submit_reflection "
+                    "(drive/state/proposed_bkb_patch.json) after evidence validation."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch_id": {"type": "string"},
+                        "workspace_id": {"type": "string"},
+                    },
+                },
+            },
+            handler=_accept_bkb_proposal,
         ),
         ToolEntry(
             name="submit_preflight_report",
@@ -216,7 +258,7 @@ def get_tools() -> list[ToolEntry]:
             name="edit_subtask_card",
             schema={
                 "name": "edit_subtask_card",
-                "description": "Patch a subtask card (goal, tools, test, etc.).",
+                "description": "Patch a subtask card (goal, files, proof, tools, etc.).",
                 "parameters": {
                     "type": "object",
                     "required": ["subtask_id", "patch"],
@@ -234,13 +276,14 @@ def get_tools() -> list[ToolEntry]:
                 "name": "mark_subtask_complete",
                 "description": (
                     "Mark the current internal Ouroboros subtask complete and "
-                    "emit the Umbrella phase signal. Also supports legacy "
-                    "PhasePlan-card completion by subtask_id."
+                    "emit the Umbrella phase signal. Phase-run completion "
+                    "requires a typed CompletionContract."
                 ),
                 "parameters": {
                     "type": "object",
                     "required": [],
                     "properties": {
+                        "completion_contract": COMPLETION_CONTRACT_SCHEMA,
                         "subtask_id": {"type": "string"},
                         "notes": {"type": "string"},
                         "status": {

@@ -1,7 +1,7 @@
 ---
 name: gmas-pattern-author
 status: active
-domains: ["planning", "multi_agent", "gmas"]
+domains: ["planning", "multi_agent_gmas", "multi_agent", "gmas"]
 phases: ["plan"]
 when_to_use: "When planning a task that includes LLM-backed or multi-agent behavior."
 ---

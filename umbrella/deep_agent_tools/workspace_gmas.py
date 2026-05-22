@@ -228,6 +228,9 @@ _REQUIRED_OUROBOROS_LLM_API_KEY_ALIAS_RE = re.compile(
 _REQUIRED_OUROBOROS_LLM_BASE_URL_ALIAS_RE = re.compile(
     r"(?i)\bOUROBOROS_LLM_BASE_URL\b|\bouroboros_llm_base_url\b"
 )
+_HOST_LLM_ENV_ALIAS_RE = re.compile(
+    r"(?i)\b(?:OUROBOROS_LLM_API_KEY|OUROBOROS_LLM_BASE_URL|OUROBOROS_MODEL)\b"
+)
 _LLM_RUNTIME_PROTECTIVE_DOC_RE = re.compile(
     r"(?i)\b(?:do\s+not|don't|never|without|no|avoid|reject|refuse|block|"
     r"forbid|forbidden|must\s+not|should\s+not|not\s+require|not\s+use|"
@@ -298,10 +301,10 @@ def _llm_runtime_contract_block(rel_path: str, content_text: str) -> dict[str, A
     ]
     narrow_openai_key = (
         "OPENAI_API_KEY" in text
-        and "OUROBOROS_LLM_API_KEY" not in text
         and "LLM_API_KEY" not in text
     )
     wrong_model_alias = "OUROBOROS_LLM_MODEL" in text
+    host_llm_aliases = sorted({match.group(0) for match in _HOST_LLM_ENV_ALIAS_RE.finditer(text)})
     obsolete_api_alias_only = (
         _OBSOLETE_OUROBOROS_API_KEY_ALIAS_RE.search(text) is not None
         and _REQUIRED_OUROBOROS_LLM_API_KEY_ALIAS_RE.search(text) is None
@@ -333,6 +336,7 @@ def _llm_runtime_contract_block(rel_path: str, content_text: str) -> dict[str, A
         not provider_defaults
         and not narrow_openai_key
         and not wrong_model_alias
+        and not host_llm_aliases
         and not obsolete_ouroboros_alias_only
     ):
         return None
@@ -340,6 +344,7 @@ def _llm_runtime_contract_block(rel_path: str, content_text: str) -> dict[str, A
         provider_defaults
         and not has_llm_runtime_signal
         and not wrong_model_alias
+        and not host_llm_aliases
         and not obsolete_ouroboros_alias_only
     ):
         return None
@@ -351,27 +356,33 @@ def _llm_runtime_contract_block(rel_path: str, content_text: str) -> dict[str, A
             + ", ".join(sorted(set(provider_defaults))[:8])
         )
     if narrow_openai_key:
-        issues.append("OPENAI_API_KEY is used without Umbrella/Ouroboros aliases")
+        issues.append("OPENAI_API_KEY is used without public LLM_API_KEY")
     if wrong_model_alias:
         issues.append("unsupported model env alias: OUROBOROS_LLM_MODEL")
+    if host_llm_aliases:
+        issues.append(
+            "host/control-plane LLM env alias(es) leaked into generated workspace: "
+            + ", ".join(host_llm_aliases)
+        )
     if obsolete_api_alias_only and has_llm_runtime_signal:
         issues.append(
             "obsolete API-key alias `OUROBOROS_API_KEY`/`ouroboros_api_key` "
-            "is used without `OUROBOROS_LLM_API_KEY`"
+            "is used; generated workspaces should use public `LLM_API_KEY`"
         )
     if obsolete_base_url_alias_only and has_llm_runtime_signal:
         issues.append(
             "obsolete base-url alias `OUROBOROS_BASE_URL`/`ouroboros_base_url` "
-            "is used without `OUROBOROS_LLM_BASE_URL`"
+            "is used; generated workspaces should use public `LLM_BASE_URL`"
         )
 
     next_step = (
         "Use a small runtime resolver that reads the project public aliases "
-        "LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL; when the project is launched "
-        "by Umbrella, it may also inherit OUROBOROS_LLM_API_KEY, "
-        "OUROBOROS_LLM_BASE_URL, and OUROBOROS_MODEL. If any required value is "
-        "missing, raise a clear configuration error or skip only the specific "
-        "live-LLM test with an explicit reason; do not fallback to "
+        "LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL. Umbrella maps any host "
+        "control-plane launch env into those public aliases before workspace "
+        "commands run, so generated code, docs, tests, and env examples should "
+        "not mention or require OUROBOROS_* LLM aliases. If any required value "
+        "is missing, raise a clear configuration error or skip only the "
+        "specific live-LLM test with an explicit reason; do not fallback to "
         "https://api.openai.com/v1, gpt-* defaults, or OPENAI_API_KEY as the "
         "only credential path."
     )
@@ -615,7 +626,7 @@ def _subtask_requires_gmas_context(subtask: dict[str, Any]) -> bool:
         "name",
         "goal",
         "description",
-        "success_test",
+        "proof",
         "files_to_create",
         "files_to_change",
         "files_affected",

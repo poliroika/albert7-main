@@ -41,7 +41,6 @@ When working on a subsystem, narrow the run:
 
     ```bash
     uv run pytest -q umbrella/tests/test_palace_facade.py
-    uv run pytest -q umbrella/tests/test_palace_migrators.py
     uv run pytest -q umbrella/tests/test_palace_backend_filter.py
     ```
 
@@ -89,7 +88,7 @@ The exact file list evolves; search for `test_*.py` next to the code you change.
 | `umbrella/phases/` | `test_phase_manifests_valid.py` |
 | `umbrella/orchestrator/` | `test_phase_runner.py` + affected orchestrator tests |
 | `umbrella/permissions/` | `test_permission_envelope.py` |
-| `umbrella/memory/palace/` | `test_palace_facade.py` (+ migrators if schema changes) |
+| `umbrella/memory/palace/` | `test_palace_facade.py` |
 | `umbrella/verification/` | `test_verification.py` + `test_app_ouroboros.py` |
 | `umbrella/web_bridge/` | web bridge tests under `umbrella/tests/` |
 | `ouroboros/ouroboros/loop.py` or `tools/` | `ouroboros/tests/` |

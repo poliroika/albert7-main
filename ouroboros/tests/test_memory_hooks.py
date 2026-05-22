@@ -285,6 +285,55 @@ class TestAutoRecallInjection(unittest.TestCase):
         self.assertEqual(ws, "JKX")
         self.assertEqual(messages[-1]["content"], "[MEMORY_RECALL] x")
 
+    def test_init_loop_memory_injects_core_overlay_for_umbrella_managed(self):
+        messages = [{"role": "user", "content": "Workspace: workspaces/JKX\nBuild it."}]
+        ctx = SimpleNamespace(
+            host_repo_root=Path("/tmp"),
+            repo_dir=Path("/tmp"),
+            umbrella_managed=True,
+            umbrella_phase_id="research",
+        )
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(
+                memory_hooks,
+                "recall_core_overlay_for_task_start",
+                return_value="## [ALWAYS-LOADED MEMORY]\n### BKB\n",
+            ) as core_recall,
+            patch.object(memory_hooks, "recall_for_task_start") as legacy_recall,
+        ):
+            _repo_root, ws = memory_hooks.init_loop_memory(messages, ctx)
+
+        self.assertEqual(ws, "JKX")
+        core_recall.assert_called_once()
+        legacy_recall.assert_not_called()
+        self.assertIn("[ALWAYS-LOADED MEMORY]", messages[-1]["content"])
+
+    def test_init_loop_memory_skips_core_overlay_when_umbrella_task_already_has_proactive_memory(
+        self,
+    ):
+        messages = [{"role": "user", "content": "Workspace: workspaces/JKX\nBuild it."}]
+        ctx = SimpleNamespace(
+            host_repo_root=Path("/tmp"),
+            repo_dir=Path("/tmp"),
+            umbrella_managed=True,
+            context_overlays={
+                "prevent_ouroboros_auto_core_overlay": True,
+                "proactive_memory_rendered_in_task_input": True,
+            },
+        )
+
+        with patch.object(
+            memory_hooks,
+            "recall_core_overlay_for_task_start",
+            return_value="## [ALWAYS-LOADED MEMORY]\n### BKB\n",
+        ) as core_recall:
+            _repo_root, ws = memory_hooks.init_loop_memory(messages, ctx)
+
+        core_recall.assert_not_called()
+        self.assertEqual(len(messages), 1)
+
     def test_periodic_recall_does_not_inject_by_default(self):
         messages: list[dict] = []
         with (

@@ -9,9 +9,9 @@ from umbrella.phases.base import (
     PhaseNode,
     PlanEdit,
     SubtaskCard,
-    SuccessTest,
     _json_ready,
 )
+from umbrella.contracts import ProofSpec
 
 _DEFAULT_PHASES = [
     "preflight",
@@ -95,60 +95,6 @@ def _plan_from_dict(data: dict[str, Any]) -> PhasePlan:
     )
 
 
-def _success_test_from_any(raw: Any) -> SuccessTest:
-    if isinstance(raw, dict):
-        kind = str(raw.get("kind") or "").strip() or "cmd"
-        if kind not in {"cmd", "pytest_id", "check_fn", "none"}:
-            kind = "cmd"
-        value = (
-            raw.get("value")
-            or raw.get("command")
-            or raw.get("commands")
-            or raw.get("cmd")
-            or raw.get("command_line")
-            or raw.get("pytest_id")
-            or raw.get("verification")
-            or raw.get("checks")
-            or raw.get("description")
-            or raw.get("text")
-            or ""
-        )
-        if isinstance(value, (dict, list, tuple, set, frozenset)):
-            value = _success_test_from_any(value).value
-        return SuccessTest(kind=kind, value=str(value or ""))
-    if isinstance(raw, (list, tuple, set, frozenset)):
-        parts: list[str] = []
-        for item in raw:
-            if isinstance(item, dict):
-                value = (
-                    item.get("value")
-                    or item.get("command")
-                    or item.get("commands")
-                    or item.get("cmd")
-                    or item.get("command_line")
-                    or item.get("pytest_id")
-                    or item.get("verification")
-                    or item.get("checks")
-                    or item.get("description")
-                    or item.get("text")
-                    or item.get("name")
-                    or ""
-                )
-                if isinstance(value, (dict, list, tuple, set, frozenset)):
-                    text = _success_test_from_any(value).value
-                else:
-                    text = str(value or "").strip()
-            else:
-                text = str(item).strip()
-            if text:
-                parts.append(text)
-        if parts:
-            return SuccessTest(kind="cmd", value="; ".join(parts))
-    if isinstance(raw, str) and raw.strip():
-        return SuccessTest(kind="cmd", value=raw.strip())
-    return SuccessTest(kind="none", value="")
-
-
 def _string_list_from_any(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -181,16 +127,10 @@ def _first_string_list(raw: dict[str, Any], *keys: str) -> list[str]:
 def _subtask_from_dict(raw: dict[str, Any], idx: int) -> SubtaskCard:
     title = str(raw.get("title") or raw.get("name") or f"Subtask {idx + 1}").strip()
     subtask_id = str(raw.get("id") or raw.get("subtask_id") or f"subtask_{idx + 1:02d}").strip()
-    success_test = _success_test_from_any(
-        raw.get("success_test")
-        or raw.get("acceptance_command")
-        or raw.get("verification_command")
-        or raw.get("verification_commands")
-        or raw.get("verification")
-        or raw.get("success_criteria")
-        or raw.get("acceptance_criteria")
-        or raw.get("test_strategy")
-        or raw.get("test")
+    proof = (
+        ProofSpec.from_mapping(raw["proof"])
+        if isinstance(raw.get("proof"), dict)
+        else None
     )
     return SubtaskCard(
         id=subtask_id,
@@ -198,7 +138,7 @@ def _subtask_from_dict(raw: dict[str, Any], idx: int) -> SubtaskCard:
         goal=str(raw.get("goal") or raw.get("description") or title),
         allowed_tools=frozenset(str(t) for t in (raw.get("allowed_tools") or []) if str(t).strip()),
         allowed_skills=frozenset(str(s) for s in (raw.get("allowed_skills") or []) if str(s).strip()),
-        success_test=success_test,
+        proof=proof,
         codeptr_refs=[str(x) for x in (raw.get("codeptr_refs") or [])],
         mcp_refs=[str(x) for x in (raw.get("mcp_refs") or [])],
         files_to_create=_first_string_list(
@@ -220,22 +160,6 @@ def _subtask_from_dict(raw: dict[str, Any], idx: int) -> SubtaskCard:
         ),
         files_affected=_first_string_list(raw, "files_affected", "files", "paths"),
         dependencies=_first_string_list(raw, "dependencies", "depends_on", "requires"),
-        contract_migration_reason=str(
-            raw.get("contract_migration_reason")
-            or raw.get("test_contract_migration_reason")
-            or raw.get("success_test_contract_migration_reason")
-            or raw.get("contract_migration")
-            or raw.get("test_contract_migration")
-            or raw.get("success_test_contract_migration")
-            or ""
-        ).strip()
-        or None,
-        contract_migration_files=_first_string_list(
-            raw,
-            "contract_migration_files",
-            "test_contract_migration_files",
-            "success_test_contract_migration_files",
-        ),
         status=raw.get("status") if raw.get("status") in {"pending", "running", "done", "failed"} else "pending",
         review_verdict=raw.get("review_verdict")
         if raw.get("review_verdict") in {"ok", "revise", "abort"}

@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Literal, Iterable
 
+from umbrella.contracts import ProofSpec
+
 
 def _json_ready(value: Any) -> Any:
     if isinstance(value, (frozenset, set, tuple)):
@@ -111,11 +113,6 @@ class PhaseManifest:
         return _json_ready(dataclasses.asdict(self))  # type: ignore[return-value]
 
 # ── Success test ──────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class SuccessTest:
-    kind: Literal["cmd", "pytest_id", "check_fn", "none"]
-    value: str = ""
-
 # ── Subtask card ──────────────────────────────────────────────────────────
 @dataclass
 class SubtaskCard:
@@ -124,15 +121,13 @@ class SubtaskCard:
     goal: str
     allowed_tools: frozenset[str]
     allowed_skills: frozenset[str]
-    success_test: SuccessTest
+    proof: ProofSpec | None = None
     codeptr_refs: list[str] = field(default_factory=list)
     mcp_refs: list[str] = field(default_factory=list)
     files_to_create: list[str] = field(default_factory=list)
     files_to_change: list[str] = field(default_factory=list)
     files_affected: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
-    contract_migration_reason: str | None = None
-    contract_migration_files: list[str] = field(default_factory=list)
     status: Literal["pending", "running", "done", "failed"] = "pending"
     review_verdict: Literal["ok", "revise", "abort"] | None = None
     completion: dict[str, Any] | None = None

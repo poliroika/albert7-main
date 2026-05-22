@@ -34,6 +34,24 @@ def manager_memory_root(repo_root: Path) -> Path:
     return (repo_root / ".umbrella" / "memory").resolve()
 
 
+def manager_core_root(repo_root: Path) -> Path:
+    """``repo_root/.umbrella/memory/core/`` — always-loaded manager core memory."""
+    return (manager_memory_root(repo_root) / "core").resolve()
+
+
+def workspace_core_root(repo_root: Path, workspace_id: str) -> Path:
+    """``workspaces/<id>/.memory/core/`` — always-loaded workspace core memory."""
+    return (workspace_memory_root(repo_root, workspace_id) / "core").resolve()
+
+
+def workspace_root(repo_root: Path, workspace_id: str) -> Path:
+    """``repo_root/workspaces/<id>/`` — workspace project root (not .memory)."""
+    seg = _safe_workspace_segment(workspace_id)
+    if not seg:
+        raise ValueError("workspace_id is required for workspace_root")
+    return (repo_root / "workspaces" / seg).resolve()
+
+
 def manager_palace_root(repo_root: Path) -> Path:
     """Cross-workspace MemPalace (Chroma) under ``.umbrella/palace/``."""
     return (repo_root / ".umbrella" / "palace").resolve()
@@ -83,8 +101,10 @@ def get_workspace_store(repo_root: Path, workspace_id: str) -> "MemoryStore":
 __all__ = [
     "get_workspace_store",
     "hierarchical_root_for_palace",
+    "manager_core_root",
     "manager_memory_root",
     "manager_palace_root",
     "palace_path_for",
+    "workspace_core_root",
     "workspace_memory_root",
 ]

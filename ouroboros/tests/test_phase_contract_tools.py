@@ -1,4 +1,4 @@
-import json
+﻿import json
 
 from ouroboros.tools.phase_contract import (
     _palace_add,
@@ -9,6 +9,12 @@ from ouroboros.tools.phase_contract import (
 )
 from ouroboros.tools import phase_control
 from ouroboros.tools.registry import ToolContext
+from umbrella.deep_agent_tools.research_provenance import (
+    SOURCE_ID_DESCRIPTION,
+    next_finding_source_hint,
+    research_finding_source_provenance_issue,
+)
+from umbrella.deep_agent_tools.phase_contract_tools import get_tools
 from umbrella.memory.palace.facade import MemPalace
 
 
@@ -34,6 +40,50 @@ def _append_phase_tool_row(
             )
             + "\n"
         )
+
+
+def test_research_provenance_contract_drives_schema_description():
+    palace_add = next(tool for tool in get_tools() if tool.name == "palace_add")
+
+    assert (
+        palace_add.schema["parameters"]["properties"]["source_id"]["description"]
+        == SOURCE_ID_DESCRIPTION
+    )
+
+
+def test_research_provenance_contract_rejects_truncated_fallback_gmas_handle():
+    query = "LLM agent decision making game AI economic diplomacy tools streaming"
+    rows = [
+        {
+            "task_id": "phase_web_6b78e406:research",
+            "tool": "get_gmas_context",
+            "args": {"query": query, "max_results": 5},
+            "result_preview": (
+                '{\n'
+                f'  "query": "{query}",\n'
+                '  "confidence": 0.78,\n'
+                '  "contexts": [\n'
+                "    {\n"
+                '      "source": "gmas/examples/streaming_example.py",\n'
+                "      ...\n"
+                '      "metadata": {"fallback": true}\n'
+                "    }\n"
+                "  ],\n"
+                '  "status": "ok"\n'
+                "}"
+            ),
+        }
+    ]
+
+    issue = research_finding_source_provenance_issue(
+        rows,
+        source_id=f"get_gmas_context:{query}",
+    )
+    hint = next_finding_source_hint(rows)
+
+    assert "fallback or low-confidence GMAS retrieval" in issue
+    assert f"get_gmas_context:{query}" not in hint
+    assert "run an allowed discovery tool" in hint
 
 
 def test_palace_search_works_during_phase_review_with_empty_memory(tmp_path):
@@ -210,7 +260,9 @@ def test_palace_add_rejects_research_finding_without_current_source(tmp_path):
     )
 
     assert result.startswith("ERROR:")
-    assert "requires a source_id tied to current discovery evidence" in result
+    assert "requires a source_id tied to current research-phase evidence" in result
+    assert "exact tool source such as" not in result
+    assert "`github_project_search:<exact query>`" in result
     assert "kind=observation" in result
 
 
@@ -343,6 +395,301 @@ def test_palace_add_rejects_tool_qualified_github_source_with_empty_results(tmp_
 
     assert result.startswith("ERROR:")
     assert "not a verifiable current discovery source" in result
+
+
+def test_palace_add_rejects_captured_bare_github_project_search_source(
+    tmp_path, monkeypatch
+):
+    called = False
+
+    def fake_save(ctx, **kwargs):
+        nonlocal called
+        called = True
+        return "OK: memory saved"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.phase_contract.umbrella_tools.save_umbrella_memory",
+        fake_save,
+    )
+    (tmp_path / "umbrella").mkdir()
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    drive.mkdir(parents=True)
+    _append_phase_tool_row(
+        drive,
+        task_id="phase_web_96995622:research",
+        tool="github_project_search",
+        args={"query": "python game web server websocket multiplayer"},
+        result={
+            "status": "ok",
+            "query": "python game web server websocket multiplayer",
+            "results": [
+                {
+                    "full_name": "kochj23/Web-Pennmush",
+                    "html_url": "https://github.com/kochj23/Web-Pennmush",
+                }
+            ],
+        },
+    )
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_96995622:research"
+    ctx.loop_state_view = {
+        "phase_label": "research",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _palace_add(
+        ctx,
+        title="GitHub Repository Patterns for Python Web Games",
+        content=(
+            "Found several GitHub repositories demonstrating Python web game "
+            "architecture with WebSocket updates."
+        ),
+        kind="research_finding",
+        tags="research_finding,github",
+        source_id="github_project_search",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "too broad for result-bearing discovery" in result
+    assert "github:owner/repo" in result
+    assert called is False
+
+
+def test_palace_add_rejects_captured_fallback_gmas_context_as_verified_finding(
+    tmp_path, monkeypatch
+):
+    called = False
+
+    def fake_save(ctx, **kwargs):
+        nonlocal called
+        called = True
+        return "OK: memory saved"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.phase_contract.umbrella_tools.save_umbrella_memory",
+        fake_save,
+    )
+    (tmp_path / "umbrella").mkdir()
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    drive.mkdir(parents=True)
+    _append_phase_tool_row(
+        drive,
+        task_id="phase_web_96995622:research",
+        tool="get_gmas_context",
+        args={"query": "multi-agent game AI bot opponent economy diplomacy"},
+        result={
+            "status": "ok",
+            "query": "multi-agent game AI bot opponent economy diplomacy",
+            "confidence": 0.16,
+            "contexts": [
+                {
+                    "source": "gmas/examples/multi_agent_tools_example.py",
+                    "metadata": {"fallback": True},
+                }
+            ],
+        },
+    )
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_96995622:research"
+    ctx.loop_state_view = {
+        "phase_label": "research",
+        "active_workspace_id": "civilization",
+    }
+
+    for source_id in (
+        "gmas:multi-agent game AI bot opponent economy diplomacy",
+        "get_gmas_context",
+        "get_gmas_context:multi-agent game AI bot opponent economy diplomacy",
+    ):
+        result = _palace_add(
+            ctx,
+            title="GMAS Multi-Agent Context",
+            content="GMAS framework provides the required multi-agent infrastructure.",
+            kind="research_finding",
+            tags="research_finding,gmas",
+            source_id=source_id,
+        )
+
+        assert result.startswith("ERROR:")
+        assert "fallback or low-confidence GMAS retrieval" in result
+        assert "kind=observation" in result
+    assert called is False
+
+
+def test_palace_add_rejects_captured_tool_qualified_low_confidence_gmas_source(
+    tmp_path, monkeypatch
+):
+    called = False
+
+    def fake_save(ctx, **kwargs):
+        nonlocal called
+        called = True
+        return "OK: memory saved"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.phase_contract.umbrella_tools.save_umbrella_memory",
+        fake_save,
+    )
+    (tmp_path / "umbrella").mkdir()
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    drive.mkdir(parents=True)
+    _append_phase_tool_row(
+        drive,
+        task_id="phase_web_30ea3d17:research",
+        tool="get_gmas_context",
+        args={"query": "multi-agent game simulation economy diplomacy negotiation strategy"},
+        result={
+            "status": "ok",
+            "query": "multi-agent game simulation economy diplomacy negotiation strategy",
+            "confidence": 0.21,
+            "contexts": [
+                {
+                    "source": "gmas/patterns/agent_orchestration.md",
+                    "metadata": {"fallback": False},
+                }
+            ],
+        },
+    )
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_30ea3d17:research"
+    ctx.loop_state_view = {
+        "phase_label": "research",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _palace_add(
+        ctx,
+        title="GMAS Multi-Agent Context",
+        content="GMAS context supports multi-agent strategy-game bots.",
+        kind="research_finding",
+        tags="research_finding,gmas",
+        source_id=(
+            "get_gmas_context:"
+            "multi-agent game simulation economy diplomacy negotiation strategy"
+        ),
+    )
+
+    assert result.startswith("ERROR:")
+    assert "fallback or low-confidence GMAS retrieval" in result
+    assert "kind=observation" in result
+    assert called is False
+
+
+def test_palace_add_rejects_truncated_fallback_gmas_preview_source(
+    tmp_path, monkeypatch
+):
+    called = False
+
+    def fake_save(ctx, **kwargs):
+        nonlocal called
+        called = True
+        return "OK: memory saved"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.phase_contract.umbrella_tools.save_umbrella_memory",
+        fake_save,
+    )
+    (tmp_path / "umbrella").mkdir()
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    query = "LLM agent decision making game AI economic diplomacy tools streaming"
+    logs.joinpath("tools.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": "phase_web_6b78e406:research",
+                "tool": "get_gmas_context",
+                "args": {"query": query, "max_results": 5},
+                "result_preview": (
+                    '{\n'
+                    f'  "query": "{query}",\n'
+                    '  "confidence": 0.78,\n'
+                    '  "contexts": [\n'
+                    "    {\n"
+                    '      "source": "gmas/examples/streaming_example.py",\n'
+                    "      ...\n"
+                    '      "metadata": {\n'
+                    '        "fallback": true\n'
+                    "      }\n"
+                    "    }\n"
+                    "  ],\n"
+                    '  "status": "ok"\n'
+                    "}"
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_6b78e406:research"
+    ctx.loop_state_view = {
+        "phase_label": "research",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _palace_add(
+        ctx,
+        title="GMAS Framework Pattern",
+        content="GMAS framework provides a multi-agent runtime for bot decisions.",
+        kind="research_finding",
+        tags="research_finding,gmas",
+        source_id=f"get_gmas_context:{query}",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "fallback or low-confidence GMAS retrieval" in result
+    assert "kind=observation" in result
+    assert called is False
+
+
+def test_palace_add_rejects_captured_empty_mcp_tool_qualified_source(
+    tmp_path, monkeypatch
+):
+    called = False
+
+    def fake_save(ctx, **kwargs):
+        nonlocal called
+        called = True
+        return "OK: memory saved"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.phase_contract.umbrella_tools.save_umbrella_memory",
+        fake_save,
+    )
+    (tmp_path / "umbrella").mkdir()
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    drive.mkdir(parents=True)
+    _append_phase_tool_row(
+        drive,
+        task_id="phase_web_30ea3d17:research",
+        tool="mcp_discover",
+        args={"query": "file data analysis web requests"},
+        result={
+            "status": "ok",
+            "query": "file data analysis web requests",
+            "results": [],
+        },
+    )
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_30ea3d17:research"
+    ctx.loop_state_view = {
+        "phase_label": "research",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _palace_add(
+        ctx,
+        title="MCP Discovery Finding",
+        content="MCP discovery found useful file and web-request servers.",
+        kind="research_finding",
+        tags="research_finding,mcp",
+        source_id="mcp_discover:file data analysis web requests",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "not a verifiable current discovery source" in result
+    assert called is False
 
 
 def test_palace_add_keeps_explicit_research_observation_as_untrusted_note(
@@ -860,9 +1207,9 @@ def test_propose_phase_plan_accepts_thirteen_narrow_greenfield_leaves(tmp_path):
             "title": "Initialize project structure",
             "goal": (
                 "Create package, docs, and tests. Generated LLM code must resolve "
-                "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL, then fail or skip clearly when real "
+                "LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL, then fail or skip clearly when real "
                 "credentials are absent."
             ),
             "files_to_create": [
@@ -926,8 +1273,8 @@ def test_propose_phase_plan_rejects_captured_broad_leaf_before_submit(tmp_path):
     plan = {
         "summary": (
             "FastAPI React TypeScript civilization game with GMAS/LLM bots. "
-            "Generated code must resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and OUROBOROS_MODEL/LLM_MODEL."
+            "Generated code must resolve LLM_API_KEY, "
+            "LLM_BASE_URL, and LLM_MODEL."
         ),
         "subtasks": [
             {
@@ -1045,9 +1392,9 @@ def test_propose_phase_plan_accepts_split_version_of_captured_broad_leaf(tmp_pat
             "title": "Initialize project structure",
             "goal": (
                 "Create package config and validate "
-                "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL."
+                "LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL."
             ),
             "files_to_create": [
                 "pyproject.toml",
@@ -1871,8 +2218,9 @@ def test_palace_add_rejects_verified_web_search_source_without_success(
                 "tool": "web_search",
                 "result_preview": json.dumps(
                     {
-                        "status": "provider_unavailable",
-                        "reason": "OPENAI_API_KEY is not configured",
+                        "status": "provider_error",
+                        "provider": "gmas_web_search",
+                        "error": "TimeoutError",
                     }
                 ),
             }
@@ -1914,7 +2262,73 @@ def test_palace_add_rejects_verified_web_search_source_without_success(
     assert called is False
 
 
-def test_palace_add_accepts_verified_mcp_source_after_success(
+def test_palace_add_accepts_web_search_source_with_sources_payload(
+    tmp_path, monkeypatch
+):
+    called = False
+
+    def fake_save(ctx, **kwargs):
+        nonlocal called
+        called = True
+        return "OK: memory saved"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.phase_contract.umbrella_tools.save_umbrella_memory",
+        fake_save,
+    )
+    (tmp_path / "umbrella").mkdir()
+    workspace = tmp_path / "workspaces" / "civilization"
+    drive = workspace / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    (logs / "tools.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": "phase_web_65835290:research",
+                "tool": "web_search",
+                "args": {"query": "websocket game architecture"},
+                "result_preview": json.dumps(
+                    {
+                        "provider": "gmas_web_search",
+                        "query": "websocket game architecture",
+                        "sources": [
+                            {
+                                "title": "WebSocket game architecture",
+                                "url": "https://example.test/ws-game",
+                            }
+                        ],
+                    }
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_65835290:research"
+    ctx.loop_state_view = {
+        "phase_label": "research",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _palace_add(
+        ctx,
+        title="WebSocket Game Architecture",
+        content="WebSocket game servers use a persistent bidirectional protocol.",
+        kind="research_finding",
+        workspace_id="civilization",
+        tags="research_finding,websocket",
+        source_id="web_search:websocket game architecture",
+        evidence_kind="verified_outcome",
+    )
+
+    payload = json.loads(result)
+    assert payload["saved"] is True
+    assert payload["source_path"] == "web_search:websocket game architecture"
+    assert called is True
+
+
+def test_palace_add_accepts_verified_mcp_source_after_nonempty_success(
     tmp_path, monkeypatch
 ):
     called = False
@@ -1938,7 +2352,19 @@ def test_palace_add_accepts_verified_mcp_source_after_success(
             {
                 "task_id": "phase_web_65835290:research",
                 "tool": "mcp_discover",
-                "result_preview": json.dumps({"status": "ok", "results": []}),
+                "args": {"query": "file data analysis web requests"},
+                "result_preview": json.dumps(
+                    {
+                        "status": "ok",
+                        "query": "file data analysis web requests",
+                        "results": [
+                            {
+                                "name": "filesystem-plus-fetch",
+                                "url": "https://example.test/mcp/files-web",
+                            }
+                        ],
+                    }
+                ),
             }
         )
         + "\n",
@@ -1958,13 +2384,13 @@ def test_palace_add_accepts_verified_mcp_source_after_success(
         kind="research_finding",
         workspace_id="civilization",
         tags="research_finding,mcp",
-        source_id="mcp_discover",
+        source_id="mcp_discover:file data analysis web requests",
         evidence_kind="verified_outcome",
     )
 
     payload = json.loads(result)
     assert payload["saved"] is True
-    assert payload["source_path"] == "mcp_discover"
+    assert payload["source_path"] == "mcp_discover:file data analysis web requests"
     assert called is True
 
 
@@ -2063,7 +2489,8 @@ def test_palace_add_rejects_research_llm_env_contract_without_ouroboros_alias(
     )
 
     assert result.startswith("ERROR:")
-    assert "OUROBOROS_LLM_API_KEY" in result
+    assert "LLM_BASE_URL" in result
+    assert "LLM_MODEL" in result
     assert "not saved" in result
     assert called is False
 
@@ -2102,8 +2529,8 @@ def test_palace_add_accepts_research_llm_env_contract_with_ouroboros_alias(
         ctx,
         title="LLM runtime",
         content=(
-            "The game bots resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and OUROBOROS_MODEL/LLM_MODEL "
+            "The game bots resolve LLM_API_KEY, "
+            "LLM_BASE_URL, and LLM_MODEL "
             "from the inherited Umbrella runtime."
         ),
         kind="research_finding",
@@ -3092,9 +3519,9 @@ def test_propose_phase_plan_accepts_env_revision_without_optional_wording(tmp_pa
                     "title": "Project setup and LLM environment contract",
                     "goal": (
                         "Create .env.example and config that resolves "
-                        "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL."
+                        "LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL."
                     ),
                     "files_to_create": [
                         ".env.example",
@@ -3515,9 +3942,7 @@ def test_propose_phase_plan_handles_add_subtask_after_reference_as_global(tmp_pa
                     "title": "Environment documentation and config",
                         "goal": (
                             "Create .env.example documenting credential requirements "
-                            "for OUROBOROS_LLM_API_KEY, OUROBOROS_LLM_BASE_URL, "
-                            "OUROBOROS_MODEL, LLM_API_KEY, LLM_BASE_URL, and "
-                            "LLM_MODEL aliases."
+                            "for LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL aliases."
                         ),
                     "files_to_create": [".env.example", "tests/test_env_docs.py"],
                     "success_test": "python -m pytest tests/test_env_docs.py -q",
@@ -3651,8 +4076,8 @@ def test_propose_phase_plan_accepts_space_separated_subtask_number_revision(tmp_
                             (
                                 "Add explicit LLM configuration section to subtask "
                                 "010: document how to set OUROBOROS_LLM_API_KEY/"
-                                "LLM_API_KEY, OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, "
-                                "OUROBOROS_MODEL/LLM_MODEL, and list supported providers"
+                                "LLM_API_KEY, LLM_BASE_URL, "
+                                "LLM_MODEL, and list supported providers"
                             )
                         ]
                     },
@@ -3673,9 +4098,9 @@ def test_propose_phase_plan_accepts_space_separated_subtask_number_revision(tmp_
                     "id": "subtask_010",
                     "title": "Document LLM configuration",
                     "goal": (
-                        "Document how to set OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, "
-                        "OUROBOROS_MODEL/LLM_MODEL, and supported providers."
+                        "Document how to set LLM_API_KEY, "
+                        "LLM_BASE_URL, "
+                        "LLM_MODEL, and supported providers."
                     ),
                     "files_to_create": [
                         "docs/llm-config.md",
@@ -4442,9 +4867,9 @@ def test_propose_phase_plan_rejects_captured_devnull_or_build_success_test(tmp_p
                 }
             ],
             "llm_runtime_contract": [
-                "Resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY",
-                "Resolve OUROBOROS_LLM_BASE_URL/LLM_BASE_URL",
-                "Resolve OUROBOROS_MODEL/LLM_MODEL",
+                "Resolve LLM_API_KEY",
+                "Resolve LLM_BASE_URL",
+                "Resolve LLM_MODEL",
             ],
         },
     )
@@ -5011,9 +5436,9 @@ def test_propose_phase_plan_rejects_captured_civilization_rule_based_ai_fallback
                     "title": "GMAS framework integration",
                     "goal": (
                         "Create GMAS agents for bot turns using "
-                        "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL."
+                        "LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL."
                     ),
                     "files_to_create": [
                         "src/test_ws/ai/gmas_setup.py",
@@ -5060,9 +5485,9 @@ def test_propose_phase_plan_rejects_captured_civilization_decision_caching(
                     "title": "GMAS framework integration",
                     "goal": (
                         "Create GMAS agents for bot turns using "
-                        "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL."
+                        "LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL."
                     ),
                     "files_to_create": [
                         "src/test_ws/ai/gmas_setup.py",
@@ -5075,7 +5500,7 @@ def test_propose_phase_plan_rejects_captured_civilization_decision_caching(
                 {
                     "risk": "LLM API costs could exceed budget during development",
                     "mitigation": (
-                        "Use model from OUROBOROS_MODEL/LLM_MODEL env var, "
+                        "Use model from LLM_MODEL env var, "
                         "implement caching stable, unchanging decisions, set "
                         "strict token limits per turn, track costs in game logs"
                     ),
@@ -5108,9 +5533,9 @@ def test_propose_phase_plan_rejects_key_context_llm_heuristic_fallback(
                     "id": "llm_runtime",
                     "title": "Wire real GMAS bot runtime",
                     "goal": (
-                        "GMAS bots resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL, then call real LLM decisions."
+                        "GMAS bots resolve LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL, then call real LLM decisions."
                     ),
                     "files_to_create": [
                         "docs/architecture.md",
@@ -5208,9 +5633,9 @@ def test_propose_phase_plan_rejects_key_context_llm_reasoning_cache(
                     "id": "llm_runtime",
                     "title": "Wire real GMAS bot runtime",
                     "goal": (
-                        "GMAS bots resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL, then call real LLM decisions."
+                        "GMAS bots resolve LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL, then call real LLM decisions."
                     ),
                     "files_to_create": [
                         "docs/architecture.md",
@@ -5294,9 +5719,9 @@ def test_propose_phase_plan_accepts_protective_no_fallback_policy(tmp_path):
             "llm_policy": (
                 "No fallback to hardcoded rules. LLM API errors surface as "
                 "exceptions and verification tests detect hardcoded fallback logic. "
-                "Runtime resolves OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL."
+                "Runtime resolves LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL."
             ),
         },
     )
@@ -5332,9 +5757,9 @@ def test_propose_phase_plan_allows_tests_that_fail_on_hardcoded_fallback(tmp_pat
             "llm_policy": (
                 "Verification tests fail if they catch any hardcoded fallback "
                 "for LLM bot decisions. LLM failures pause the turn and surface "
-                "an error. Runtime resolves OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL."
+                "an error. Runtime resolves LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL."
             ),
         },
     )
@@ -5368,9 +5793,9 @@ def test_propose_phase_plan_accepts_llm_env_alias_fallback_chain_with_defaults(t
                 }
             ],
             "llm_config": (
-                "Support OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL. Check OUROBOROS_* first, "
+                "Support LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL. Check OUROBOROS_* first, "
                 "fall back to LLM_* aliases."
             ),
             "bot_count": "Default to 3 AI civilizations for initial testing.",
@@ -5406,9 +5831,9 @@ def test_propose_phase_plan_accepts_llm_env_alias_parenthetical_fallback(tmp_pat
                 }
             ],
             "llm_config": (
-                "Priority: OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL. OUROBOROS aliases are checked "
+                "Priority: LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL. OUROBOROS aliases are checked "
                 "first, then LLM aliases (fallback). "
                 "LLM calls raise AgentExecutionError on timeout; no "
                 "replacement decisions are produced."
@@ -5471,9 +5896,9 @@ def test_propose_phase_plan_rejects_captured_root_scripts_verify_py(tmp_path):
             "workspace_id": "test_ws",
             "runtime_contract": (
                 "Generated LLM/GMAS code and tests must resolve "
-                "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL; missing values must surface a "
+                "LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL; missing values must surface a "
                 "clear error or explicit test skip."
             ),
             "phases": [
@@ -5599,9 +6024,9 @@ def test_propose_phase_plan_rejects_captured_bare_src_python_layout(tmp_path):
                     "id": "llm_env_config",
                     "title": "Configure LLM runtime environment",
                     "goal": (
-                        "Resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL; fail clearly when absent."
+                        "Resolve LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL; fail clearly when absent."
                     ),
                     "files_to_create": ["src/config/llm.py", ".env.example"],
                     "success_test": "pytest tests/test_llm_config.py -v",
@@ -5619,8 +6044,8 @@ def test_propose_phase_plan_rejects_captured_bare_src_python_layout(tmp_path):
             ],
             "llm_runtime_contract": (
                 "Generated code/tests must resolve OUROBOROS_LLM_API_KEY/"
-                "LLM_API_KEY, OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL, then fail or pause clearly when "
+                "LLM_API_KEY, LLM_BASE_URL, and "
+                "LLM_MODEL, then fail or pause clearly when "
                 "real credentials are absent."
             ),
         },
@@ -5850,9 +6275,9 @@ def test_propose_phase_plan_uses_nested_leaves_when_phase_has_test_strategy(tmp_
             "plan_id": "phase-wrapper-with-tests",
             "workspace_id": "test_ws",
             "llm_runtime_contract": (
-                "Generated code resolves OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL, and pauses/surfaces errors when "
+                "Generated code resolves LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL, and pauses/surfaces errors when "
                 "credentials are absent."
             ),
             "phases": [
@@ -6185,6 +6610,177 @@ def test_propose_phase_plan_accepts_e2e_pytest_target_when_declared(tmp_path):
     assert not result.startswith("ERROR:"), result
 
 
+def test_propose_phase_plan_rejects_control_plane_file_mutation(tmp_path):
+    workspace = tmp_path / "workspaces" / "civilization"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_883b9f7e:plan"
+    ctx.loop_state_view = {
+        "phase_label": "plan",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "captured-control-file-mutation",
+            "workspace_id": "civilization",
+            "subtasks": [
+                {
+                    "id": "project-setup",
+                    "title": "Initialize project setup",
+                    "goal": "Create package setup and configure workspace gates.",
+                    "files_to_create": [
+                        "pyproject.toml",
+                        "src/civilization/__init__.py",
+                        "tests/test_backend_setup.py",
+                    ],
+                    "files_to_change": ["workspace.toml"],
+                    "success_test": "python -m pytest tests/test_backend_setup.py -q",
+                }
+            ],
+        },
+    )
+
+    assert result.startswith("ERROR:"), result
+    assert "workspace.toml" in result
+    assert "control/evaluator" in result
+
+
+def test_propose_phase_plan_rejects_paths_outside_workspace_boundary(tmp_path):
+    workspace = tmp_path / "workspaces" / "civilization"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_883b9f7e:plan"
+    ctx.loop_state_view = {
+        "phase_label": "plan",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "captured-boundary-escape",
+            "workspace_id": "civilization",
+            "subtasks": [
+                {
+                    "id": "unsafe-host-edit",
+                    "title": "Patch host policy",
+                    "goal": "Modify host-side policy from the generated project.",
+                    "files_to_change": [
+                        "../umbrella/deep_agent_tools/phase_contract_paths.py",
+                        ".git/config",
+                    ],
+                    "success_test": "python -m pytest tests/test_backend_setup.py -q",
+                }
+            ],
+        },
+    )
+
+    assert result.startswith("ERROR:"), result
+    assert "../umbrella/deep_agent_tools/phase_contract_paths.py" in result
+    assert ".git/config" in result
+    assert "active candidate workspace" in result
+
+
+def test_propose_phase_plan_rejects_final_verification_reusing_prior_target(
+    tmp_path,
+):
+    workspace = tmp_path / "workspaces" / "civilization"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_883b9f7e:plan"
+    ctx.loop_state_view = {
+        "phase_label": "plan",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "captured-final-proof-reuse",
+            "workspace_id": "civilization",
+            "subtasks": [
+                {
+                    "id": "integration-e2e",
+                    "title": "Test full game loop",
+                    "goal": "Create integration proof for the game loop.",
+                    "files_to_create": ["tests/integration/test_game_loop.py"],
+                    "success_test": (
+                        "python -m pytest tests/integration/test_game_loop.py -q"
+                    ),
+                },
+                {
+                    "id": "final-verification",
+                    "title": "Verify localhost game deployment",
+                    "goal": (
+                        "Start FastAPI backend and React frontend locally, "
+                        "then verify WebSocket behavior."
+                    ),
+                    "success_test": (
+                        "python -m pytest tests/integration/test_game_loop.py -q"
+                    ),
+                },
+            ],
+        },
+    )
+
+    assert result.startswith("ERROR:"), result
+    assert "final-verification" in result
+    assert "distinct final proof artifact" in result
+
+
+def test_propose_phase_plan_accepts_final_verification_owned_target(tmp_path):
+    workspace = tmp_path / "workspaces" / "civilization"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_883b9f7e:plan"
+    ctx.loop_state_view = {
+        "phase_label": "plan",
+        "active_workspace_id": "civilization",
+    }
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "final-proof-owned",
+            "workspace_id": "civilization",
+            "subtasks": [
+                {
+                    "id": "integration-e2e",
+                    "title": "Test full game loop",
+                    "goal": "Create integration proof for the game loop.",
+                    "files_to_create": ["tests/integration/test_game_loop.py"],
+                    "success_test": (
+                        "python -m pytest tests/integration/test_game_loop.py -q"
+                    ),
+                },
+                {
+                    "id": "final-verification",
+                    "title": "Verify localhost game deployment",
+                    "goal": (
+                        "Start FastAPI backend and React frontend locally, "
+                        "then verify WebSocket behavior."
+                    ),
+                    "files_to_create": [
+                        "tests/integration/test_localhost_deployment.py"
+                    ],
+                    "success_test": (
+                        "python -m pytest "
+                        "tests/integration/test_localhost_deployment.py -q"
+                    ),
+                },
+            ],
+        },
+    )
+
+    assert not result.startswith("ERROR:"), result
+
+
 def test_propose_phase_plan_rejects_captured_docs_pytest_target_not_owned(tmp_path):
     (tmp_path / "umbrella").mkdir()
     workspace = tmp_path / "workspaces" / "civilization"
@@ -6403,8 +6999,8 @@ def test_propose_phase_plan_rejects_captured_dry_run_e2e_success_test(tmp_path):
                     "All AI agents must use real LLM calls.",
                     (
                         "Workspace code must resolve OUROBOROS_LLM_API_KEY/"
-                        "LLM_API_KEY, OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, "
-                        "and OUROBOROS_MODEL/LLM_MODEL at runtime."
+                        "LLM_API_KEY, LLM_BASE_URL, "
+                        "and LLM_MODEL at runtime."
                     ),
                 ]
             },
@@ -6452,9 +7048,9 @@ def test_propose_phase_plan_rejects_captured_llm_mock_env_success_test(tmp_path)
                 }
             ],
             "llm_config": (
-                "Resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL. Missing config fails explicitly; "
+                "Resolve LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL. Missing config fails explicitly; "
                 "no mock LLM behavior is accepted."
             ),
         },
@@ -6495,9 +7091,9 @@ def test_propose_phase_plan_rejects_captured_mock_env_decision_policy(tmp_path):
                 }
             ],
             "llm_config": (
-                "Resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL. Missing config fails explicitly."
+                "Resolve LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL. Missing config fails explicitly."
             ),
             "decision_policy": (
                 "Verify with pytest using mock env vars in CI, real LLM calls "
@@ -6608,8 +7204,8 @@ def test_propose_phase_plan_rejection_gives_llm_repair_recipe(tmp_path):
 
     assert result.startswith("ERROR:")
     assert "Repair recipe:" in result
-    assert "exact pairs" in result
-    assert "OUROBOROS_LLM_BASE_URL" in result
+    assert "public generated-project aliases" in result
+    assert "LLM_BASE_URL" in result
     assert "Remove mock/fake/dry-run" in result
 
 
@@ -6645,9 +7241,9 @@ def test_propose_phase_plan_allows_protective_no_mock_llm_language(tmp_path):
             "test_strategy": {
                 "integration": (
                     "Reject mock/fake LLM paths and require "
-                    "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                    "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                    "OUROBOROS_MODEL/LLM_MODEL. No mock LLM behavior is accepted."
+                    "LLM_API_KEY, "
+                    "LLM_BASE_URL, and "
+                    "LLM_MODEL. No mock LLM behavior is accepted."
                 )
             },
         },
@@ -6670,9 +7266,9 @@ def test_propose_phase_plan_allows_prohibited_dry_run_mock_language(tmp_path):
             "plan_id": "protective-prohibited-mocks",
             "workspace_id": "test_ws",
             "llm_runtime_contract": (
-                "All GMAS bot decisions use OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL. PROHIBITED: dry-run mocks of LLM "
+                "All GMAS bot decisions use LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL. PROHIBITED: dry-run mocks of LLM "
                 "decisions, cached substitutions, or silent fallbacks."
             ),
             "subtasks": [
@@ -6716,9 +7312,9 @@ def test_propose_phase_plan_allows_mock_terms_inside_anti_patterns(tmp_path):
                     "id": "bot_runtime",
                     "title": "Wire real GMAS bot runtime",
                     "goal": (
-                        "Resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL, then call the real "
+                        "Resolve LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL, then call the real "
                         "GMAS/LLM decision path."
                     ),
                     "files_to_create": [
@@ -6773,7 +7369,7 @@ def test_propose_phase_plan_rejects_openai_only_llm_env_contract(tmp_path):
     )
 
     assert result.startswith("ERROR:")
-    assert "OUROBOROS_LLM_API_KEY" in result
+    assert "LLM_API_KEY" in result
     assert "OPENAI_API_KEY" in result
 
 
@@ -6795,9 +7391,9 @@ def test_propose_phase_plan_accepts_ouroboros_llm_env_alias_contract(tmp_path):
                     "id": "llm_runtime",
                     "title": "Wire LLM bot runtime",
                     "goal": (
-                        "GMAS bots resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL from inherited env."
+                        "GMAS bots resolve LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL from inherited env."
                     ),
                     "files_to_create": [
                         "src/test_ws/llm_runtime.py",
@@ -6847,7 +7443,7 @@ def test_propose_phase_plan_rejects_captured_ouroboros_only_llm_env_contract(
     )
 
     assert result.startswith("ERROR:")
-    assert "standalone LLM runtime env contract" in result
+    assert "leaks Umbrella host LLM aliases" in result
     assert "LLM_API_KEY" in result
     assert "LLM_BASE_URL" in result
     assert "LLM_MODEL" in result
@@ -6871,9 +7467,9 @@ def test_propose_phase_plan_rejects_unsupported_ll_base_url_alias(tmp_path):
                     "id": "llm_runtime",
                     "title": "Wire LLM bot runtime",
                     "goal": (
-                        "GMAS bots resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL from inherited env."
+                        "GMAS bots resolve LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL from inherited env."
                     ),
                     "files_to_create": [
                         "src/test_ws/llm_runtime.py",
@@ -7009,6 +7605,47 @@ def test_propose_phase_plan_accepts_public_llm_alias_contract_without_ouroboros_
     assert not result.startswith("ERROR:"), result
 
 
+def test_propose_phase_plan_rejects_control_plane_llm_alias_contract(tmp_path):
+    workspace = tmp_path / "workspaces" / "test_ws"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "run-123:plan"
+    ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "leaked-host-alias",
+            "workspace_id": "test_ws",
+            "llm_runtime_contract": {
+                "api_key": "OUROBOROS_LLM_API_KEY/LLM_API_KEY",
+                "base_url": "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL",
+                "model": "OUROBOROS_MODEL/LLM_MODEL",
+            },
+            "subtasks": [
+                {
+                    "id": "llm_runtime",
+                    "title": "Wire LLM bot runtime",
+                    "goal": (
+                        "GMAS bots resolve public env but keep host aliases "
+                        "listed for compatibility."
+                    ),
+                    "files_to_create": [
+                        "src/test_ws/agents/llm_runtime.py",
+                        "tests/test_llm_runtime.py",
+                    ],
+                    "success_test": "python -m pytest tests/test_llm_runtime.py -q",
+                }
+            ],
+        },
+    )
+
+    assert result.startswith("ERROR:")
+    assert "leaks Umbrella host LLM aliases" in result
+    assert "LLM_API_KEY" in result
+
+
 def test_propose_phase_plan_rejects_unsupported_ouroboros_model_alias(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
@@ -7039,7 +7676,7 @@ def test_propose_phase_plan_rejects_unsupported_ouroboros_model_alias(tmp_path):
 
     assert result.startswith("ERROR:")
     assert "OUROBOROS_LLM_MODEL" in result
-    assert "OUROBOROS_MODEL" in result
+    assert "LLM_MODEL" in result
 
 
 def test_propose_phase_plan_rejects_protective_unsupported_model_alias_note(tmp_path):
@@ -7060,9 +7697,9 @@ def test_propose_phase_plan_rejects_protective_unsupported_model_alias_note(tmp_
                     "id": "llm_runtime",
                     "title": "Wire LLM bot runtime",
                     "goal": (
-                        "GMAS bots resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL. Do not use "
+                        "GMAS bots resolve LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL. Do not use "
                         "OUROBOROS_LLM_MODEL for model selection."
                     ),
                     "files_to_create": [
@@ -7098,9 +7735,9 @@ def test_propose_phase_plan_rejects_provider_specific_llm_model_default(tmp_path
                     "id": "llm_budget",
                     "title": "Add LLM budget guard",
                     "goal": (
-                        "GMAS bots use OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL. Estimate full-run cost "
+                        "GMAS bots use LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL. Estimate full-run cost "
                         "with gpt-4o-mini as the default model."
                     ),
                     "files_to_create": ["tests/test_llm_budget.py"],
@@ -7138,9 +7775,9 @@ def test_propose_phase_plan_rejects_captured_provider_default_next_to_no_policy(
                     "id": "llm_config",
                     "title": "Configure LLM runtime",
                     "goal": (
-                        "GMAS bots use OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL from inherited env."
+                        "GMAS bots use LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL from inherited env."
                     ),
                     "files_to_create": [
                         "docs/llm_configuration.md",
@@ -7257,10 +7894,8 @@ def test_propose_phase_plan_allows_captured_no_import_only_policy(tmp_path):
             ],
             "decision_policies": {
                 "llm_runtime_configuration": (
-                    "Resolve API key from OUROBOROS_LLM_API_KEY then "
-                    "LLM_API_KEY, base URL from OUROBOROS_LLM_BASE_URL then "
-                    "LLM_BASE_URL, and model from OUROBOROS_MODEL then "
-                    "LLM_MODEL."
+                    "Resolve API key from LLM_API_KEY, base URL from "
+                    "LLM_BASE_URL, and model from LLM_MODEL."
                 ),
                 "testing_authenticity": (
                     "No import-only tests. LLM-backed tests verify actual GMAS "
@@ -7380,9 +8015,9 @@ def test_propose_phase_plan_accepts_python_inline_assert_with_quoted_semicolons(
         ctx,
         plan={
             "llm_runtime_contract": (
-                "Generated code resolves OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL, and surfaces missing runtime "
+                "Generated code resolves LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL, and surfaces missing runtime "
                 "credentials as explicit errors."
             ),
             "subtasks": [
@@ -7446,9 +8081,9 @@ def test_propose_phase_plan_does_not_treat_llm_driven_real_time_as_signature_cla
         ctx,
         plan={
             "llm_runtime_contract": (
-                "Generated code resolves OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL, and surfaces missing runtime "
+                "Generated code resolves LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL, and surfaces missing runtime "
                 "credentials as explicit errors."
             ),
             "subtasks": [
@@ -7486,9 +8121,9 @@ def test_propose_phase_plan_does_not_treat_success_criteria_as_between_signature
         ctx,
         plan={
             "llm_runtime_contract": (
-                "Generated code resolves OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL, and pauses/surfaces errors when "
+                "Generated code resolves LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL, and pauses/surfaces errors when "
                 "credentials are absent."
             ),
             "success_criteria": [
@@ -7769,8 +8404,8 @@ def test_propose_phase_plan_rejects_captured_success_test_outcome_prose(tmp_path
                     "title": "Implement LLM environment configuration",
                     "goal": (
                         "Generated code resolves OUROBOROS_LLM_API_KEY/"
-                        "LLM_API_KEY, OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, "
-                        "and OUROBOROS_MODEL/LLM_MODEL, then surfaces clear "
+                        "LLM_API_KEY, LLM_BASE_URL, "
+                        "and LLM_MODEL, then surfaces clear "
                         "errors when real credentials are absent."
                     ),
                     "files_to_create": [
@@ -8201,9 +8836,9 @@ def test_propose_phase_plan_rejects_env_prefixed_sh_script_success_test(tmp_path
         ctx,
         plan={
             "llm_runtime_contract": (
-                "Use OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, "
-                "OUROBOROS_MODEL/LLM_MODEL."
+                "Use LLM_API_KEY, "
+                "LLM_BASE_URL, "
+                "LLM_MODEL."
             ),
             "subtasks": [
                 {
@@ -8915,3 +9550,4 @@ def test_propose_phase_plan_accepts_phase_mapping_containers(tmp_path):
     )
 
     assert not result.startswith("ERROR:"), result
+

@@ -10,20 +10,6 @@ import time
 import uuid
 from typing import Any
 from ouroboros.tools.registry import ToolContext, ToolEntry
-_RESEARCH_SUMMARY_PLACEHOLDER_RE = re.compile(
-    r"\b("
-    r"pending completion|preparing palace writes|placeholder|todo|tbd|fix later|"
-    r"research in progress|research progress|continuing to gather evidence|"
-    r"phase interrupted|incomplete coverage|"
-    r"did not complete all discovery requirements|"
-    r"missing mandatory discovery|missing required discovery|"
-    r"\d+\s*/\s*\d+\s+palace\s+findings?|"
-    r"need(?:s|ed)? minimum \d+ findings? before completion|"
-    r"need(?:s|ed)? at least \d+ findings? before completion|"
-    r"currently \d+ findings? persisted"
-    r")\b",
-    re.IGNORECASE,
-)
 _RESEARCH_ARCHITECTURE_ID_RE = re.compile(
     r"^(?:arch|architecture)-[A-Za-z0-9][A-Za-z0-9.-]*$",
     re.IGNORECASE,
@@ -88,95 +74,6 @@ _IMPLEMENTATION_OWNED_RESEARCH_REVISE_RE = re.compile(
     r"http\s+requests?|localhost\s+servers?|import\s+checks?"
     r")\b",
     re.IGNORECASE,
-)
-_PLAN_REVIEW_BLOCKING_REVISE_RE = re.compile(
-    r"\b("
-    r"missing\s+(?:mandatory|required|success[_\s-]?test|executable|tool|phase|subtask)|"
-    r"(?:malformed|invalid|non[-\s]?portable|windows[-\s]?incompatible)\s+success[_\s-]?test|"
-    r"success[_\s-]?test\s+(?:is\s+)?(?:malformed|invalid|non[-\s]?portable|windows[-\s]?incompatible)|"
-    r"success[_\s-]?test.{0,80}(?:shell\s+redirection|masks?\s+(?:command\s+)?failure)|"
-    r"without\s+(?:success[_\s-]?test|executable|verification|test)|"
-    r"no\s+(?:executable|success[_\s-]?test|verification|test|subtask|owner)|"
-    r"unavailable\s+tools?|tool\s+(?:is\s+)?not\s+available|legacy\s+alias|"
-    r"manual|user\s+reports?|ask\s+the\s+user|cannot\s+(?:run|execute|verify|pass)|"
-    r"unverifiable|unsafe|contradict(?:s|ion)?|violates?\s+(?:the\s+)?(?:charter|acceptance)|"
-    r"hardcoded|mock|fake|dry[-\s]?run|fallback|fall[-\s]?back|"
-    r"wrong\s+(?:path|layout|env|credential|provider|model)|"
-    r"requires?\s+openai_api_key|openai[-\s]?only"
-    r")\b",
-    re.IGNORECASE,
-)
-_PLAN_REVIEW_HARD_BLOCKING_REVISE_RE = re.compile(
-    r"\b("
-    r"missing\s+(?:mandatory|required|success[_\s-]?test|executable|tool|phase)|"
-    r"(?:malformed|invalid|non[-\s]?portable|windows[-\s]?incompatible)\s+success[_\s-]?test|"
-    r"success[_\s-]?test\s+(?:is\s+)?(?:malformed|invalid|non[-\s]?portable|windows[-\s]?incompatible)|"
-    r"success[_\s-]?test.{0,80}(?:shell\s+redirection|masks?\s+(?:command\s+)?failure)|"
-    r"without\s+(?:success[_\s-]?test|executable|verification|test)|"
-    r"no\s+(?:executable|success[_\s-]?test|verification|test|owner)|"
-    r"unavailable\s+tools?|tool\s+(?:is\s+)?not\s+available|legacy\s+alias|"
-    r"manual|user\s+reports?|ask\s+the\s+user|cannot\s+(?:run|execute|verify|pass)|"
-    r"unverifiable|unsafe|contradict(?:s|ion)?|violates?\s+(?:the\s+)?(?:charter|acceptance)|"
-    r"hardcoded|mock|fake|dry[-\s]?run|fallback|fall[-\s]?back|"
-    r"wrong\s+(?:path|layout|env|credential|provider|model)|"
-    r"requires?\s+openai_api_key|openai[-\s]?only|"
-    r"(?:acceptance\s+criterion|user\s+requirement|workspace\s+charter)\s+"
-    r"(?:is\s+)?(?:not\s+covered|uncovered|missing)"
-    r")\b",
-    re.IGNORECASE,
-)
-_PLAN_REVIEW_IMPLEMENTATION_DETAIL_RE = re.compile(
-    r"\b("
-    r"clarify|specify|document|docs?|examples?|implementation\s+details?|"
-    r"prompt\s+definition|prompt\s+templates?|personas?|specific\s+test\s+targets?|"
-    r"success[_\s-]?tests?|"
-    r"error\s+handling|retry\s+logic|timeout\s+handling|decision\s+variety|"
-    r"diplomatic\s+conflicts?|hex\s+grid\s+algorithm|coordinate\s+system|"
-    r"thread[-\s]?safety|state\s+mutation|"
-    r"exact\s+(?:class|function|field|schema|message|contract|constant|timeout|"
-    r"retry|polling|backoff|topology|dependency|package)|"
-    r"topolog(?:y|ies)|chain|parallel|hub[-\s]?and[-\s]?spoke|converge|"
-    r"websocket\s+(?:reconnection|client|error|boundary|message|fault)|"
-    r"reconnection|backoff|error\s+boundar(?:y|ies)|"
-    r"session\s+(?:persistence|management)|agentmemory|sharedmemorypool|"
-    r"react\s+testing|testing\s+setup|jest|react\s+testing\s+library|"
-    r"strategy\s+for\s+non[-\s]?deterministic|decision\s+verification|"
-    r"cost\s+(?:limit|budget|accounting|estimation)|"
-    r"localhost\s+(?:launcher|server|verification)|dual[-\s]?server\s+launcher|"
-    r"phased\s+verification|playability\s+verification|"
-    r"ai\s+autonomy|autonomous\s+(?:economic|diplomatic|military)?\s*decisions?|"
-    r"consider\s+adding|nice[-\s]?to[-\s]?have|non[-\s]?blocking|"
-    r"frontend\s+state|scenario\s+coverage|field\s+names?"
-    r")\b",
-    re.IGNORECASE,
-)
-_PLAN_REVIEW_BAD_SUCCESS_TEST_RE = re.compile(
-    r"(?is)("
-    r"(?:change|replace|switch|convert)\s+success[_\s-]?test"
-    r".{0,300}\bpython\s+-c\b|"
-    r"success[_\s-]?test.{0,300}\bpython\s+-c\b|"
-    r"\bpython\s+-c\b.{0,300}\b(?:success[_\s-]?test|"
-    r"verify|assert|import\s+successful)\b|"
-    r"circular\s+test\s+dependenc(?:y|ies)|"
-    r"testing\s+non[-\s]?existent\s+tests?|"
-    r"test\s+files?\s+created\s+in\s+the\s+same\s+subtask"
-    r")"
-)
-_PLAN_REVIEW_PROTECTIVE_FALLBACK_DETAIL_RE = re.compile(
-    r"(?is)\b("
-    r"clarif(?:y|ication)|explicit\s+note|prevent\s+(?:any\s+)?ambiguity|"
-    r"plan\s+(?:correctly\s+)?states|prohibit(?:s|ed)?|without\s+any|"
-    r"does\s+not\s+include\s+any|must\s+(?:always\s+)?call\s+(?:the\s+)?live\s+llm|"
-    r"no\s+caching|no\s+fallback|never\s+(?:silent\s+)?fallback|"
-    r"pause\s+(?:the\s+)?game|surface\s+(?:the\s+)?(?:llm\s+)?errors?"
-    r")\b"
-)
-_PLAN_REVIEW_DETAIL_TOPIC_GROUPS = (
-    ("gmas", "agent", "topology", "memory", "session", "runner", "llm"),
-    ("websocket", "reconnection", "streaming", "frontend", "client", "error"),
-    ("react", "frontend", "testing", "jest", "vitest", "component"),
-    ("llm", "env", "credential", "model", "provider", "decision"),
-    ("docs", "architecture", "topology", "example"),
 )
 _RESEARCH_SUMMARY_REL_PATH = ".memory/drive/state/research_summary_latest.json"
 _RESEARCH_GITHUB_DISCOVERY_TOOL = "github_project_search"
@@ -449,36 +346,12 @@ _DANGEROUS_FALLBACK_RE = re.compile(
     r"graceful\s+degradation|safe\s+minimal\s+actions?|ai\s+decisions?|"
     r"actions?|rules?|OPENAI_API_KEY|gpt-)"
 )
-_SUCCESS_TEST_TOOL_NAMES = (
-    "harness_run",
-    "run_workspace_verify",
-    "run_unit_tests",
-    "run_real_e2e",
-    "web_search",
-    "deep_search",
-    "github_project_search",
-    "mcp_discover",
-)
 _PYTEST_SKIP_ONLY_RE = re.compile(
     r"(?im)^=+\s*(?P<skipped>\d+)\s+skipped"
     r"(?:,\s*\d+\s+warnings?)?\s+in\s+[\d.]+s\s*=+\s*$"
 )
 _PYTEST_PASS_RE = re.compile(r"(?i)\b\d+\s+passed\b")
 _PYTEST_FAILURE_RE = re.compile(r"(?i)\b\d+\s+(?:failed|errors?|xfailed)\b")
-_SUCCESS_TEST_TRAILING_OUTCOME_RE = (
-    re.compile(
-        r"(?is)\s+"
-        r"(?:must\s+)?(?:exit|exits|return|returns)"
-        r"(?:\s+successfully)?(?:\s+with)?(?:\s+exit)?(?:\s+code)?\s+0\b.*$"
-    ),
-    re.compile(r"(?is)\s+(?:has|with)\s+exit\s+code\s+0\b.*$"),
-    re.compile(r"(?is)\s+(?:passes|succeeds|is\s+successful)\b.*$"),
-    re.compile(r"(?is)\s+prints?\s+[`'\"]?[A-Za-z0-9_.:/ -]{1,120}[`'\"]?\s*$"),
-    re.compile(r"(?is)\s+outputs?\s+[`'\"]?[A-Za-z0-9_.:/ -]{1,120}[`'\"]?\s*$"),
-)
-_SUCCESS_TEST_LEADING_COMMAND_LABEL_RE = re.compile(
-    r"(?is)^\s*(?:command|cmd|shell|terminal|run|success[_\s-]*test)\s*:\s*"
-)
 _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD = 3
 _PHASE_SUBTASK_COMMAND_TOOLS = {"shell", "run_workspace_command", "terminal_session"}
 _PHASE_SUBTASK_REPAIR_WRITE_TOOLS = {"apply_workspace_patch"}
@@ -548,12 +421,6 @@ __all__ = [
     '_PHASE_SUBTASK_COMMAND_TOOLS',
     '_PHASE_SUBTASK_REPAIR_WRITE_TOOLS',
     '_PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD',
-    '_PLAN_REVIEW_BLOCKING_REVISE_RE',
-    '_PLAN_REVIEW_BAD_SUCCESS_TEST_RE',
-    '_PLAN_REVIEW_DETAIL_TOPIC_GROUPS',
-    '_PLAN_REVIEW_HARD_BLOCKING_REVISE_RE',
-    '_PLAN_REVIEW_IMPLEMENTATION_DETAIL_RE',
-    '_PLAN_REVIEW_PROTECTIVE_FALLBACK_DETAIL_RE',
     '_POSITIVE_CLASS_CLAIM_RE',
     '_PREFLIGHT_IMPLEMENTATION_ISSUE_RE',
     '_PREFLIGHT_PLATFORM_BLOCKER_RE',
@@ -567,15 +434,11 @@ __all__ = [
     '_RESEARCH_MCP_DISCOVERY_TOOL',
     '_RESEARCH_PATH_RE',
     '_RESEARCH_REVIEW_CODE_CLAIM_RE',
-    '_RESEARCH_SUMMARY_PLACEHOLDER_RE',
     '_RESEARCH_SUMMARY_REL_PATH',
     '_SOURCE_FILE_EXTENSIONS',
     '_SOURCE_SCAN_SKIP_DIRS',
     '_STALE_CLAIM_CONTEXT_RE',
     '_STALE_CLAIM_NEGATION_RE',
-    '_SUCCESS_TEST_LEADING_COMMAND_LABEL_RE',
-    '_SUCCESS_TEST_TOOL_NAMES',
-    '_SUCCESS_TEST_TRAILING_OUTCOME_RE',
     '_SYMBOL_EXPECTATION_MISMATCH_RE',
     '_UNRESOLVED_PASS_BLOCKER_RE',
     '_WITHOUT_PARAM_CLAIM_RE',

@@ -75,8 +75,10 @@ def test_palace_add_observation_verified_outcome_stays_untrusted(tmp_path):
             include_unverified=True,
         )
     )
+    node_id = payload.get("id") or (payload.get("legacy") or {}).get("id")
+    assert node_id
     assert any(
-        hit["id"] == payload["legacy"]["id"]
+        hit["id"] == node_id
         for hit in unverified["unverified_candidates"]["palace_memory"]
     )
 

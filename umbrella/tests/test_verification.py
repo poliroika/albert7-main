@@ -49,6 +49,37 @@ class TestShellStep:
         assert report.results[0].exit_code == 0
         assert "hi" in report.results[0].stdout
 
+    def test_shell_bridges_host_llm_env_to_public_aliases(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_BASE_URL", raising=False)
+        monkeypatch.delenv("LLM_MODEL", raising=False)
+        monkeypatch.setenv("OUROBOROS_LLM_API_KEY", "host-key")
+        monkeypatch.setenv("OUROBOROS_LLM_BASE_URL", "https://host.example/v1")
+        monkeypatch.setenv("OUROBOROS_MODEL", "host/model")
+        step = VerificationStep(
+            kind=VerificationStepKind.SHELL,
+            name="env",
+            command=[
+                sys.executable,
+                "-c",
+                (
+                    "import os; print(os.environ.get('LLM_API_KEY')); "
+                    "print(os.environ.get('LLM_BASE_URL')); "
+                    "print(os.environ.get('LLM_MODEL'))"
+                ),
+            ],
+            timeout_seconds=10,
+        )
+
+        report = run_verification(tmp_path, [step])
+
+        assert report.passed, report.render_summary()
+        assert "host-key" in report.results[0].stdout
+        assert "https://host.example/v1" in report.results[0].stdout
+        assert "host/model" in report.results[0].stdout
+
     def test_workspace_uses_repo_venv_python_when_available(
         self, tmp_path: Path
     ) -> None:

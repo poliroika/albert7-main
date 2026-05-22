@@ -1,0 +1,33 @@
+{
+  "schema_name": "plan",
+  "schema_version": "1",
+  "run_id": "fixture",
+  "phase": "plan",
+  "actor": "agent",
+  "payload": {
+    "subtasks": [
+      {
+        "id": "s1",
+        "title": "Import only",
+        "goal": "Pretend import proves behavior",
+        "files_to_change": ["src/app.py"],
+        "proof": {
+          "execution": {
+            "kind": "import_check",
+            "command": ["python", "-c", "import app"],
+            "shell": false
+          },
+          "oracle": {
+            "oracle_type": "import",
+            "required_properties": []
+          },
+          "scope": {
+            "files_under_test": ["src/app.py"],
+            "changed_files_expected": ["src/app.py"]
+          },
+          "human_claims": ["Imports successfully, therefore done"]
+        }
+      }
+    ]
+  }
+}

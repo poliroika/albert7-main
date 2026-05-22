@@ -60,7 +60,6 @@ Unified memory facade with multiple Chroma stores, SQLite transient + graph, and
 | `graph.py` | SQLite edge table (src_id, dst_id, edge_type, weight, phase, created_at) |
 | `recall.py` | Tier-aware recall: always_on -> hot -> vector search -> 1-hop graph walk |
 | `transient.py` | SQLite transient store: events, tool I/O, terminal scrollback (TTL 24h) |
-| `migrators.py` | One-time migration: lessons.jsonl, ideas.jsonl, gaps.jsonl -> palace stores |
 
 **API surface:**
 

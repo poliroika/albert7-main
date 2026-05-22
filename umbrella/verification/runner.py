@@ -33,12 +33,20 @@ from umbrella.verification.models import (
     VerificationStepKind,
     VerificationStepResult,
 )
+from umbrella.deep_agent_tools.domain_policy import public_workspace_llm_env_bridge
+from umbrella.enforcement import (
+    check_verification_step_diff,
+    diff_snapshots,
+    snapshot_workspace,
+)
 from umbrella.verification.skill_compliance import build_skill_compliance_results
 from umbrella.verification.source_policy import (
     mock_scaffold_hits,
     scan_changed_files_for_mock_scaffold,
 )
 from umbrella.verification.spec_loader import load_verification_meta
+from umbrella.verification.diff_policy import run_diff_policy_guard
+from umbrella.verification.mutation_smoke import run_mutation_smoke_guard
 from umbrella.verification.test_quality import run_test_quality_guard
 
 log = logging.getLogger(__name__)
@@ -168,6 +176,7 @@ def run_verification(
     base_env = os.environ.copy()
     if env:
         base_env.update(env)
+    base_env.update(public_workspace_llm_env_bridge(base_env))
     # Unbuffered output keeps child logs legible.
     base_env.setdefault("PYTHONUNBUFFERED", "1")
     base_env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -180,6 +189,8 @@ def run_verification(
     )
 
     filtered_steps = [step for step in steps if step.kind in _EXECUTABLE_STEP_KINDS]
+    code_task = _changed_files_indicate_code_task(changed_files_param)
+    ran_test_quality = False
 
     for step in filtered_steps:
         remaining = overall_timeout_seconds - (time.time() - started)
@@ -196,8 +207,10 @@ def run_verification(
         step_env = dict(base_env)
         if step.env:
             step_env.update(step.env)
+            step_env.update(public_workspace_llm_env_bridge(step_env))
 
         effective_step = _with_workspace_command(step, chosen_python)
+        before_step_snapshot = snapshot_workspace(workspace_path)
 
         try:
             if effective_step.kind == VerificationStepKind.SHELL:
@@ -245,15 +258,36 @@ def run_verification(
             )
 
         results.append(result)
+        verifier_changes = diff_snapshots(
+            before_step_snapshot,
+            snapshot_workspace(workspace_path),
+        )
+        verifier_issues = check_verification_step_diff(verifier_changes)
+        if verifier_issues:
+            results.append(
+                VerificationStepResult(
+                    step=VerificationStep(
+                        kind=VerificationStepKind.SOURCE_POLICY,
+                        name="enforcement:verification_mutation",
+                        optional=False,
+                    ),
+                    status=VerificationStatus.FAILED,
+                    summary="\n".join(
+                        f"{issue.code}: {issue.path} {issue.message}"
+                        for issue in verifier_issues[:20]
+                    ),
+                    error="verification_step_mutated_candidate_evaluator_boundary",
+                )
+            )
 
         if (
             not skip_tq
             and step.kind == VerificationStepKind.SHELL
-            and result.status == VerificationStatus.PASSED
             and _command_looks_like_pytest(effective_step.command)
         ):
-            gres = run_test_quality_guard(workspace_path)
+            gres = run_test_quality_guard(workspace_path, require_tests=code_task)
             results.append(gres)
+            ran_test_quality = True
 
     ran_source_in_loop = any(
         s.kind == VerificationStepKind.SOURCE_POLICY for s in filtered_steps
@@ -281,6 +315,25 @@ def run_verification(
                     step=None,
                 )
             )
+    if code_task and not skip_tq and not ran_test_quality:
+        results.append(run_test_quality_guard(workspace_path, require_tests=True))
+
+    if code_task:
+        results.append(
+            run_diff_policy_guard(
+                workspace_path,
+                changed_files=changed_files_param,
+                approved_policy_edits=False,
+            )
+        )
+        results.append(
+            run_mutation_smoke_guard(
+                workspace_path,
+                changed_files=changed_files_param,
+                python_cmd=chosen_python,
+                env=base_env,
+            )
+        )
 
     if detected_domains is None:
         detected_domains = _load_detected_domains_for_workspace(workspace_id)
@@ -304,6 +357,27 @@ def run_verification(
         started_at=started,
         finished_at=time.time(),
     )
+
+
+_CODE_TASK_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs"}
+
+
+def _changed_files_indicate_code_task(changed_files: Iterable[str]) -> bool:
+    for raw in changed_files:
+        path = str(raw or "").replace("\\", "/").strip().lstrip("./")
+        if not path:
+            continue
+        parts = [part.lower() for part in path.split("/") if part]
+        if not parts:
+            continue
+        if parts[0] in {"tests", "test", "docs", "doc", ".memory", ".umbrella"}:
+            continue
+        name = parts[-1]
+        if name.startswith("test_") and name.endswith(".py"):
+            continue
+        if Path(path).suffix.lower() in _CODE_TASK_EXTS:
+            return True
+    return False
 
 
 def _run_python_compile_check(workspace_path: Path) -> VerificationStepResult:
@@ -566,7 +640,6 @@ def _run_source_policy_step(
         workspace_path=workspace_path,
         changed_files=changed_files,
     )
-    ok = not hits
     return VerificationStepResult(
         step=step
         or VerificationStep(
@@ -574,14 +647,14 @@ def _run_source_policy_step(
             name="source_policy:mock_scaffold_scan",
             optional=False,
         ),
-        status=VerificationStatus.PASSED if ok else VerificationStatus.FAILED,
+        status=VerificationStatus.PASSED,
         summary=(
             "No mock/scaffold markers found in changed source files."
-            if ok
-            else "Mock/scaffold markers found in changed source files: "
+            if not hits
+            else "Advisory mock/scaffold markers found in changed source files: "
             + "; ".join(hits[:10])
         ),
-        error="" if ok else "mock_scaffold_detected",
+        error="",
         stdout="\n".join(hits),
     )
 

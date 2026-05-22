@@ -13,7 +13,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from umbrella.deep_agent_tools.context import (
     _current_workspace_id_from_drive,
@@ -148,6 +148,48 @@ _UNVERIFIED_MEMORY_ROOMS = {
     "scratchpad",
     "terminal_scrollback",
 }
+
+_DURABLE_MEMORY_MARKERS = {
+    "architecture_decision",
+    "completion_memory",
+    "durable",
+    "durable_finding",
+    "verified_finding",
+    "manager_lesson",
+    "competency_gap",
+    "self_improvement_trigger",
+}
+_EVIDENCE_REF_KEYS = {
+    "evidence_ref",
+    "evidence_refs",
+    "source_id",
+    "source_ids",
+    "tool_call_id",
+    "tool_result_id",
+    "artifact_id",
+    "artifact_path",
+    "command_evidence_id",
+    "verify_run_id",
+    "verification_report_id",
+    "ledger_event_id",
+}
+_MEMORY_TRUST_LEVELS = {
+    "agent_claim": 0,
+    "observed_artifact": 1,
+    "public_verified": 2,
+    "mutation_verified": 3,
+    "hidden_verified": 4,
+    "adversarial_verified": 5,
+    "contradicted": -1,
+    "retracted": -2,
+}
+_VERIFIED_MEMORY_TRUST_LEVELS = {
+    "public_verified",
+    "mutation_verified",
+    "hidden_verified",
+    "adversarial_verified",
+}
+_SUPERVISOR_EVIDENCE_PRODUCERS = {"supervisor", "verifier", "watcher", "harness"}
 _RUN_SCOPED_MEMORY_ROOMS = {
     "phase",
     "phase_plan",
@@ -216,6 +258,86 @@ def _memory_kind(value: Any) -> str:
     return ""
 
 
+def memory_write_policy_issues(
+    *,
+    kind: str = "",
+    tags: Iterable[str] = (),
+    metadata: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return evidence-bound memory policy issues for durable writes."""
+
+    metadata = dict(metadata or {})
+    kind_norm = str(kind or "").strip().lower()
+    tag_set = {str(tag or "").strip().lower() for tag in tags if str(tag or "").strip()}
+    scope = str(metadata.get("scope") or "").strip().lower()
+    tier = str(metadata.get("tier") or "").strip().lower()
+    durable = bool(
+        {kind_norm, scope, tier, *tag_set} & _DURABLE_MEMORY_MARKERS
+        or scope in {"manager", "competency", "cross_run_durable"}
+        or tier in {"manager", "competency", "durable", "warm"}
+    )
+    if not durable:
+        return []
+    trust_level = str(metadata.get("trust_level") or "").strip().lower()
+    if trust_level not in _MEMORY_TRUST_LEVELS:
+        return [
+            (
+                "durable memory writes require trust_level "
+                "(public_verified/mutation_verified/hidden_verified/"
+                "adversarial_verified, contradicted, or retracted)"
+            )
+        ]
+    if trust_level not in _VERIFIED_MEMORY_TRUST_LEVELS:
+        return [
+            (
+                "durable memory writes require verified-or-higher trust; "
+                f"`{trust_level}` cannot be promoted as durable lesson evidence"
+            )
+        ]
+    has_typed_ref = False
+    has_untyped_ref = False
+    for key in _EVIDENCE_REF_KEYS:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            has_untyped_ref = True
+            continue
+        if isinstance(value, dict) and value.get("ref_id"):
+            producer = str(value.get("produced_by") or "").strip().lower()
+            if producer in _SUPERVISOR_EVIDENCE_PRODUCERS:
+                has_typed_ref = True
+            else:
+                has_untyped_ref = True
+            continue
+        if isinstance(value, (list, tuple, set, frozenset)) and any(
+            str(item).strip() for item in value
+        ):
+            for item in value:
+                if isinstance(item, dict) and item.get("ref_id"):
+                    producer = str(item.get("produced_by") or "").strip().lower()
+                    if producer in _SUPERVISOR_EVIDENCE_PRODUCERS:
+                        has_typed_ref = True
+                    else:
+                        has_untyped_ref = True
+                elif str(item).strip():
+                    has_untyped_ref = True
+    if has_typed_ref:
+        return []
+    if has_untyped_ref:
+        return [
+            (
+                "durable memory writes require typed EvidenceRef values "
+                "produced by supervisor/verifier/watcher/harness; string refs "
+                "are not sufficient"
+            )
+        ]
+    return [
+        (
+            "durable memory writes require typed EvidenceRef values with "
+            "ledger-backed supervisor/verifier/watcher/harness evidence"
+        )
+    ]
+
+
 def _memory_source_path(value: Any) -> str:
     if isinstance(value, dict):
         meta = value.get("metadata")
@@ -272,6 +394,10 @@ def _current_run_id_from_ctx(ctx: Any) -> str:
 
 
 def _memory_run_id(value: Any) -> str:
+    if isinstance(value, dict):
+        run_id = str(value.get("run_id") or "").strip()
+        if run_id:
+            return run_id
     meta = _memory_metadata(value)
     run_id = str(meta.get("run_id") or "").strip()
     if run_id:
@@ -279,11 +405,19 @@ def _memory_run_id(value: Any) -> str:
     return _run_id_from_task_id(_memory_task_id(value))
 
 
+def _is_run_scoped_memory(value: Any) -> bool:
+    if isinstance(value, dict):
+        scope = str(value.get("scope") or "").strip().lower()
+        if scope in {"run_scoped", "subtask_scoped"}:
+            return True
+    room = _memory_room(value)
+    return room in _RUN_SCOPED_MEMORY_ROOMS
+
+
 def _is_stale_run_scoped_memory(value: Any, current_run_id: str = "") -> bool:
     if not current_run_id:
         return False
-    room = _memory_room(value)
-    if room not in _RUN_SCOPED_MEMORY_ROOMS:
+    if not _is_run_scoped_memory(value):
         return False
     item_run_id = _memory_run_id(value)
     if not item_run_id:
@@ -386,6 +520,160 @@ def _canonical_mempalace_lookup(
             continue
         hits.append(node)
     return hits, missing
+
+
+def _canonical_mempalace_health(repo_root: Path, workspace_id: str) -> dict[str, Any]:
+    palace = MemPalace(repo_root, workspace_id or None)
+    try:
+        return palace.health()
+    finally:
+        palace.close()
+
+
+def _legacy_palace_available() -> bool:
+    try:
+        import mempalace  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def canonical_palace_add(
+    repo_root: Path,
+    *,
+    workspace_id: str,
+    content: str,
+    title: str = "",
+    kind: str = "observation",
+    store: str = "palace.idea",
+    tier: str = "warm",
+    scope: str = "run_scoped",
+    tags: list[str] | None = None,
+    phase: str = "",
+    run_id: str | None = None,
+    verified: bool = False,
+    source_path: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Canonical MemPalace write; optional legacy mirror when mempalace is installed."""
+    from umbrella.memory.palace.facade import MemPalace
+
+    tag_list = list(tags or [])
+    mem_body = content or title or ""
+    mem_content = f"[{title}]\n{mem_body}" if title else mem_body
+    canonical_id = ""
+    try:
+        palace = MemPalace(repo_root, workspace_id or None)
+        try:
+            canonical_id = palace.add(
+                store=store,
+                content=mem_content,
+                tier=tier,
+                scope=scope,
+                tags=tag_list,
+                phase=phase,
+                run_id=run_id,
+                source_path=source_path or "canonical_palace_add",
+                verified=verified,
+                kind=kind,
+                extra={"title": title, "type": kind, **(extra or {})},
+            )
+        finally:
+            palace.close()
+    except Exception:
+        log.debug("canonical_palace_add failed", exc_info=True)
+
+    result: dict[str, Any] = {
+        "saved": bool(canonical_id),
+        "canonical_id": canonical_id,
+        "store": store,
+    }
+    if canonical_id and _legacy_palace_available():
+        try:
+            legacy = _palace_backend(repo_root, workspace_id)
+            legacy_result = legacy.add(
+                workspace_id=workspace_id,
+                event_type=kind,
+                room=str((extra or {}).get("room") or ""),
+                title=title,
+                content=content,
+                kind=kind,
+                tags=tag_list or None,
+                metadata_extra=extra,
+            )
+            if isinstance(legacy_result, dict):
+                result["legacy_mirror"] = legacy_result
+        except Exception:
+            log.debug("canonical_palace_add legacy mirror skipped", exc_info=True)
+    return result
+
+
+def _empty_memory_response(
+    *,
+    include_unverified: bool,
+    source: str = "canonical_mempalace",
+    stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "palace_memory": [],
+        "lesson_memory": [],
+        "hierarchical_ideas": [],
+        "unverified_candidates": {
+            "palace_memory": [],
+            "lesson_memory": [],
+            "hierarchical_ideas": [],
+            "note": "No matching memory found.",
+        },
+        "include_unverified": bool(include_unverified),
+        "source": source,
+        "contrastive_lessons": {},
+        "stats": stats or {"ok": True, "backend": "canonical_mempalace"},
+    }
+
+
+def _canonical_mempalace_search(
+    repo_root: Path,
+    *,
+    workspace_id: str,
+    query: str,
+    limit: int,
+    include_unverified: bool,
+    current_run_id: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    palace = MemPalace(repo_root, workspace_id or None)
+    try:
+        health = palace.health()
+        if not health.get("ok"):
+            return [], health
+        if query.strip():
+            hits = palace.search(
+                query,
+                stores=[
+                    "palace.charter",
+                    "palace.lesson",
+                    "palace.idea",
+                    "palace.codeptr",
+                    "palace.skill_index",
+                    "palace.run",
+                    "palace.phase",
+                    "palace.subtask",
+                    "palace.durable",
+                ],
+                n=limit * 3,
+            )
+        else:
+            hits = palace.list_all(n=limit * 3)
+        filtered: list[dict[str, Any]] = []
+        for hit in hits:
+            if not include_unverified and _is_unverified_memory(hit):
+                continue
+            if _is_stale_run_scoped_memory(hit, current_run_id):
+                continue
+            filtered.append(hit)
+        return filtered[:limit], health
+    finally:
+        palace.close()
 
 
 def _palace_lookup(
@@ -660,8 +948,135 @@ def get_umbrella_memory(
                         "source": "canonical_mempalace",
                     },
                     "contrastive_lessons": {},
-                    "stats": _palace_backend(repo_root, workspace_id).stats(),
+                    "stats": _canonical_mempalace_health(repo_root, workspace_id),
                 }
+            )
+
+        try:
+            canonical_hits, search_health = _canonical_mempalace_search(
+                repo_root,
+                workspace_id=workspace_id,
+                query=query,
+                limit=limit,
+                include_unverified=include_unverified,
+                current_run_id=current_run_id,
+            )
+            if not search_health.get("ok"):
+                return _json(
+                    _empty_memory_response(
+                        include_unverified=include_unverified,
+                        stats=search_health,
+                    )
+                )
+            if canonical_hits:
+                trusted_hits, unverified_hits = _split_verified_first(
+                    canonical_hits, current_run_id=current_run_id
+                )
+                palace_hits = (
+                    (trusted_hits + unverified_hits)
+                    if include_unverified
+                    else trusted_hits
+                )
+                _publish_recall_state_to_ctx(
+                    ctx,
+                    palace_hits=palace_hits,
+                    lesson_hits=[],
+                    verified_ideas=[],
+                )
+                return _json(
+                    {
+                        "palace_memory": _canonical_memory_items(
+                            palace_hits[:limit], limit
+                        ),
+                        "lesson_memory": [],
+                        "hierarchical_ideas": [],
+                        "unverified_candidates": {
+                            "palace_memory": _canonical_memory_items(
+                                unverified_hits[: min(limit, 5)],
+                                min(limit, 5),
+                            ),
+                            "lesson_memory": [],
+                            "hierarchical_ideas": [],
+                            "note": (
+                                "These are candidates/hypotheses. Treat them as leads, "
+                                "not facts, unless you verify them in the current run."
+                            ),
+                        },
+                        "include_unverified": bool(include_unverified),
+                        "source": "canonical_mempalace",
+                        "contrastive_lessons": {},
+                        "stats": search_health,
+                    }
+                )
+        except Exception:
+            log.debug("canonical MemPalace search failed; falling back", exc_info=True)
+
+        store_for_contrastive, lesson_hits, unverified_lessons = _lessons_lookup(
+            repo_root,
+            workspace_id=workspace_id,
+            query=query,
+            limit=limit,
+            include_unverified=include_unverified,
+            phase=phase,
+        )
+        idea_hits, verified_ideas, unverified_ideas = _hierarchical_ideas_lookup(
+            repo_root,
+            workspace_id=workspace_id,
+            query=query,
+            palace_path=palace_path,
+            limit=limit,
+            include_unverified=include_unverified,
+        )
+        if lesson_hits or idea_hits:
+            contrastive = _contrastive_lessons_lookup(
+                store_for_contrastive,
+                query=query,
+                workspace_id=workspace_id,
+            )
+            _publish_recall_state_to_ctx(
+                ctx,
+                palace_hits=[],
+                lesson_hits=lesson_hits,
+                verified_ideas=verified_ideas,
+            )
+            return _json(
+                {
+                    "palace_memory": [],
+                    "lesson_memory": [
+                        {
+                            "id": lesson.id,
+                            "workspace_id": lesson.workspace_id,
+                            "change_summary": lesson.change_summary,
+                            "expected_effect": lesson.expected_effect,
+                            "observed_effect": lesson.observed_effect,
+                            "conclusion": lesson.conclusion,
+                            "tags": sorted(lesson.tags),
+                        }
+                        for lesson in lesson_hits[:limit]
+                    ],
+                    "hierarchical_ideas": idea_hits[: max(limit * 2, 20)],
+                    "unverified_candidates": {
+                        "palace_memory": [],
+                        "lesson_memory": [],
+                        "hierarchical_ideas": unverified_ideas[: min(max(limit, 5), 10)],
+                    },
+                    "include_unverified": bool(include_unverified),
+                    "source": "jsonl_fallback",
+                    "contrastive_lessons": contrastive,
+                    "stats": _canonical_mempalace_health(repo_root, workspace_id),
+                }
+            )
+
+        if not _legacy_palace_available():
+            _publish_recall_state_to_ctx(
+                ctx, palace_hits=[], lesson_hits=[], verified_ideas=[]
+            )
+            health = _canonical_mempalace_health(repo_root, workspace_id)
+            return _json(
+                _empty_memory_response(
+                    include_unverified=include_unverified,
+                    stats=health,
+                )
             )
 
         palace, palace_hits, unverified_hits = _palace_lookup(
@@ -814,7 +1229,7 @@ def save_umbrella_memory(
     tags: str = "",
     metadata_extra: dict[str, Any] | None = None,
 ) -> str:
-    """Save a memory entry via MemPalace (semantic ChromaDB storage)."""
+    """Save memory: canonical MemPalace first, legacy backend optional mirror."""
     try:
         repo_root = _resolve_umbrella_repo_root(ctx)
 
@@ -830,14 +1245,149 @@ def save_umbrella_memory(
             elif parts:
                 room = parts[-1]
                 event_type = parts[0] if len(parts) > 1 else kind
-        palace = _palace_backend(repo_root, workspace_id)
 
         task_id = str(getattr(ctx, "task_id", "") or "")
         metadata_extra = dict(metadata_extra or {})
         run_id = _run_id_from_task_id(task_id)
         if run_id:
             metadata_extra.setdefault("run_id", run_id)
+        tag_list = _split_tags(tags)
+        policy_issues = memory_write_policy_issues(
+            kind=kind,
+            tags=tag_list,
+            metadata=metadata_extra,
+        )
+        if policy_issues:
+            return _json(
+                {
+                    "saved": False,
+                    "status": "blocked",
+                    "reason": "evidence_bound_memory",
+                    "issues": policy_issues,
+                    "next_step": (
+                        "Record this as observation/candidate memory, or include "
+                        "evidence refs such as source_id, tool_result_id, "
+                        "artifact_id, verify_run_id, or ledger_event_id before "
+                        "promoting it to durable/manager/competency memory."
+                    ),
+                }
+            )
 
+        canonical_id = ""
+        store = "palace.durable" if str(kind or "").lower() == "durable" else "palace.idea"
+        existing_id = str(metadata_extra.get("canonical_id") or "").strip()
+        if existing_id:
+            try:
+                from umbrella.memory.palace.facade import MemPalace
+
+                palace = MemPalace(repo_root, workspace_id or None)
+                try:
+                    if palace.get(existing_id, stores=[store]):
+                        canonical_id = existing_id
+                finally:
+                    palace.close()
+            except Exception:
+                canonical_id = ""
+        if canonical_id:
+            from umbrella.memory.palace_backend import _workspace_to_wing
+
+            payload: dict[str, Any] = {
+                "saved": True,
+                "canonical_id": canonical_id,
+                "id": canonical_id,
+                "store": store,
+                "room": room,
+                "wing": _workspace_to_wing(workspace_id) if workspace_id else "",
+            }
+            if store == "palace.durable":
+                payload["durable_store"] = store
+                payload["durable_node_id"] = canonical_id
+            return _json(payload)
+        try:
+            from umbrella.memory.palace.facade import MemPalace
+
+            palace = MemPalace(repo_root, workspace_id or None)
+            try:
+                mem_body = content or title or ""
+                mem_content = f"[{title}]\n{mem_body}" if title else mem_body
+                node_extra: dict[str, Any] = {
+                    "title": title,
+                    "type": kind,
+                    "room": room,
+                }
+                if store == "palace.durable":
+                    node_extra["trust_level"] = str(
+                        metadata_extra.get("trust_level") or ""
+                    )
+                    node_extra["evidence_refs_json"] = json.dumps(
+                        metadata_extra.get("evidence_refs") or [],
+                        ensure_ascii=False,
+                    )
+                    node_extra["verify_run_id"] = str(
+                        metadata_extra.get("verify_run_id") or ""
+                    )
+                canonical_id = palace.add(
+                    store=store,
+                    content=mem_content,
+                    tier=str(metadata_extra.get("tier") or "warm"),
+                    scope=str(metadata_extra.get("scope") or "run_scoped"),
+                    tags=tag_list,
+                    phase=str(metadata_extra.get("phase") or ""),
+                    run_id=run_id or None,
+                    source_path=str(metadata_extra.get("source_path") or room or "save_umbrella_memory"),
+                    verified=bool(metadata_extra.get("verified", False)),
+                    kind=kind,
+                    extra=node_extra,
+                )
+            finally:
+                palace.close()
+        except Exception:
+            canonical_id = ""
+
+        if canonical_id:
+            from umbrella.memory.palace_backend import _workspace_to_wing
+
+            payload = {
+                "saved": True,
+                "canonical_id": canonical_id,
+                "id": canonical_id,
+                "store": store,
+                "room": room,
+                "wing": _workspace_to_wing(workspace_id) if workspace_id else "",
+            }
+            if store == "palace.durable":
+                payload["durable_store"] = store
+                payload["durable_node_id"] = canonical_id
+            if _legacy_palace_available():
+                try:
+                    legacy = _palace_backend(repo_root, workspace_id)
+                    legacy_result = legacy.add(
+                        workspace_id=workspace_id,
+                        event_type=event_type,
+                        room=room,
+                        title=title,
+                        content=content,
+                        kind=kind,
+                        tags=tag_list or None,
+                        task_id=task_id,
+                        metadata_extra=metadata_extra or None,
+                    )
+                    if isinstance(legacy_result, dict):
+                        payload["legacy_mirror"] = legacy_result
+                except Exception:
+                    pass
+            return _json(payload)
+
+        if not _legacy_palace_available():
+            return _json(
+                {
+                    "saved": False,
+                    "status": "error",
+                    "reason": "canonical_memory_unavailable",
+                }
+            )
+
+        palace = _palace_backend(repo_root, workspace_id)
         result = palace.add(
             workspace_id=workspace_id,
             event_type=event_type,
@@ -845,7 +1395,7 @@ def save_umbrella_memory(
             title=title,
             content=content,
             kind=kind,
-            tags=_split_tags(tags) or None,
+            tags=tag_list or None,
             task_id=task_id,
             metadata_extra=metadata_extra or None,
         )
@@ -997,16 +1547,21 @@ def record_idea(
         # don't pollute semantic recall.
         if evidence_kind_norm == "verified_outcome":
             try:
-                palace_result = _palace_backend(repo_root, ws).add(
+                palace_result = canonical_palace_add(
+                    repo_root,
                     workspace_id=ws,
-                    event_type=kind_norm,
-                    room=f"ideas-{kind_norm}",
-                    title=title_text,
                     content=idea_body,
+                    title=title_text,
                     kind=kind_norm,
+                    store="palace.idea",
                     tags=tag_list,
-                    task_id=str(getattr(ctx, "task_id", "") or ""),
-                    metadata_extra={
+                    phase=str(
+                        (getattr(ctx, "loop_state_view", None) or {}).get("phase_label", "")
+                    ),
+                    run_id=_run_id_from_task_id(str(getattr(ctx, "task_id", "") or "")) or None,
+                    source_path=hier_path,
+                    extra={
+                        "room": f"ideas-{kind_norm}",
                         "idea_id": record_id,
                         "palace_path": hier_path,
                         "evidence_kind": evidence_kind_norm,
@@ -1022,7 +1577,9 @@ def record_idea(
             "id": record_id,
             "palace_path": hier_path,
             "evidence_kind": evidence_kind_norm,
-            "mirrored_to_semantic": bool(palace_result),
+            "mirrored_to_semantic": bool(
+                palace_result.get("saved") or palace_result.get("canonical_id")
+            ),
             "semantic_memory": palace_result,
         }
         if warning:

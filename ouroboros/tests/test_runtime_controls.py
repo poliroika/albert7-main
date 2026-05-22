@@ -235,55 +235,184 @@ def test_llm_error_classification_marks_non_retryable() -> None:
     )
 
 
-def test_web_search_uses_duckduckgo_fallback(monkeypatch, tmp_path: Path):
+def test_web_search_uses_gmas_provider_stack(monkeypatch, tmp_path: Path):
     from ouroboros.tools.registry import ToolContext
     from ouroboros.tools import search as search_mod
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setenv("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO", "1")
-    requested_limits = []
+    calls = []
+
+    class FakeGmasSearchTool:
+        def _search_with_fallback(self, query, max_results, **kwargs):
+            calls.append((query, max_results, kwargs))
+            return (
+                [
+                    {
+                        "title": "Cursor",
+                        "url": "https://cursor.com",
+                        "snippet": f"Result for {query}",
+                    }
+                ],
+                [
+                    SimpleNamespace(
+                        provider="DuckDuckGoProvider",
+                        status="success",
+                        result_count=1,
+                        error=None,
+                    )
+                ],
+            )
+
+        def _prepare_results_for_output(self, results, **_kwargs):
+            return results
+
+        def _format_search_results(self, results, **_kwargs):
+            return "GMAS formatted answer"
+
+        def close(self):
+            pass
+
     monkeypatch.setattr(
-        search_mod,
-        "_duckduckgo_search_results",
-        lambda query, max_results=5: (
-            requested_limits.append(max_results)
-            or [
-                {
-                    "title": "Cursor",
-                    "url": "https://cursor.com",
-                    "snippet": f"Result for {query}",
-                }
-            ]
-        ),
-    )
-    monkeypatch.setattr(
-        search_mod,
-        "_summarize_results_with_llm",
-        lambda query, results: "Summarized answer",
+        "ouroboros.tools.web_search_adapter.create_gmas_web_search_tool",
+        lambda **_kwargs: FakeGmasSearchTool(),
     )
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     payload = json.loads(search_mod._web_search(ctx, "cursor", max_results=7))
 
-    assert payload["provider"] == "duckduckgo_plus_llm_summary"
-    assert payload["answer"] == "Summarized answer"
+    assert payload["provider"] == "gmas_web_search"
+    assert payload["status"] == "ok"
+    assert payload["answer"] == "GMAS formatted answer"
     assert payload["max_results"] == 7
-    assert requested_limits == [7]
+    assert calls == [("cursor", 7, {"provider": None, "intent": None})]
+    assert payload["attempts"][0]["provider"] == "DuckDuckGoProvider"
     assert payload["sources"][0]["url"] == "https://cursor.com"
 
 
-def test_web_search_fast_fails_without_provider(monkeypatch, tmp_path: Path):
+def test_web_search_uses_duckduckgo_fallback_without_openai_key(
+    monkeypatch, tmp_path: Path
+):
     from ouroboros.tools.registry import ToolContext
     from ouroboros.tools import search as search_mod
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO", raising=False)
+
+    class FakeGmasSearchTool:
+        def _search_with_fallback(self, query, max_results, **_kwargs):
+            return (
+                [
+                    {
+                        "title": "Cursor",
+                        "url": "https://cursor.com",
+                        "snippet": "AI editor",
+                    }
+                ],
+                [
+                    SimpleNamespace(
+                        provider="DuckDuckGoProvider",
+                        status="success",
+                        result_count=1,
+                        error=None,
+                    )
+                ],
+            )
+
+        def _prepare_results_for_output(self, results, **_kwargs):
+            return results
+
+        def _format_search_results(self, results, **_kwargs):
+            return "GMAS formatted answer"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "ouroboros.tools.web_search_adapter.create_gmas_web_search_tool",
+        lambda **_kwargs: FakeGmasSearchTool(),
+    )
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     payload = json.loads(search_mod._web_search(ctx, "cursor", max_results=7))
 
-    assert payload["status"] == "provider_unavailable"
-    assert "does not mean the workspace LLM runtime is unavailable" in payload["reason"]
+    assert payload.get("status") != "provider_unavailable"
+    assert payload["provider"] == "gmas_web_search"
+    assert payload["sources"][0]["url"] == "https://cursor.com"
+
+
+def test_web_search_has_no_disable_env_escape_hatch(
+    monkeypatch, tmp_path: Path
+):
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools import search as search_mod
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    class FakeGmasSearchTool:
+        def _search_with_fallback(self, query, max_results, **_kwargs):
+            return (
+                [{"title": "Result", "url": "https://example.com", "snippet": ""}],
+                [
+                    SimpleNamespace(
+                        provider="DuckDuckGoProvider",
+                        status="success",
+                        result_count=1,
+                        error=None,
+                    )
+                ],
+            )
+
+        def _prepare_results_for_output(self, results, **_kwargs):
+            return results
+
+        def _format_search_results(self, results, **_kwargs):
+            return "GMAS formatted answer"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "ouroboros.tools.web_search_adapter.create_gmas_web_search_tool",
+        lambda **_kwargs: FakeGmasSearchTool(),
+    )
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    payload = json.loads(search_mod._web_search(ctx, "cursor", max_results=7))
+
+    assert payload["status"] == "ok"
+    assert payload["provider"] == "gmas_web_search"
+
+
+def test_web_search_returns_structured_provider_error(
+    monkeypatch, tmp_path: Path
+):
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools import search as search_mod
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def raise_timeout(**_kwargs):
+        raise TimeoutError("handshake timed out")
+
+    monkeypatch.setattr(
+        "ouroboros.tools.web_search_adapter.create_gmas_web_search_tool",
+        raise_timeout,
+    )
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    payload = json.loads(
+        search_mod._web_search(
+            ctx,
+            "civilization strategy game python websockets",
+            max_results=5,
+            intent="planner_research",
+        )
+    )
+
+    assert payload["status"] == "provider_error"
+    assert payload["provider"] == "gmas_web_search"
+    assert payload["query"] == "civilization strategy game python websockets"
+    assert payload["intent"] == "planner_research"
+    assert payload["retryable"] is True
 
 
 def test_web_search_accepts_intent_metadata_from_capture(monkeypatch, tmp_path: Path):
@@ -291,7 +420,35 @@ def test_web_search_accepts_intent_metadata_from_capture(monkeypatch, tmp_path: 
     from ouroboros.tools import search as search_mod
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("OUROBOROS_WEB_SEARCH_ALLOW_DUCKDUCKGO", raising=False)
+
+    class FakeGmasSearchTool:
+        def _search_with_fallback(self, query, max_results, **kwargs):
+            assert kwargs["intent"] == "planner_research"
+            return (
+                [],
+                [
+                    SimpleNamespace(
+                        provider="DuckDuckGoProvider",
+                        status="no_results",
+                        result_count=0,
+                        error=None,
+                    )
+                ],
+            )
+
+        def _prepare_results_for_output(self, results, **_kwargs):
+            return results
+
+        def _format_search_results(self, results, **_kwargs):
+            return ""
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "ouroboros.tools.web_search_adapter.create_gmas_web_search_tool",
+        lambda **_kwargs: FakeGmasSearchTool(),
+    )
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     payload = json.loads(
@@ -303,8 +460,81 @@ def test_web_search_accepts_intent_metadata_from_capture(monkeypatch, tmp_path: 
         )
     )
 
-    assert payload["status"] == "provider_unavailable"
+    assert payload["status"] == "no_results"
     assert payload["intent"] == "planner_research"
+
+
+def test_web_search_does_not_select_openai_when_openai_key_exists(
+    monkeypatch, tmp_path: Path
+):
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools import search as search_mod
+
+    monkeypatch.setenv("OPENAI_API_KEY", "should-not-control-web-search")
+    created = []
+
+    class FakeGmasSearchTool:
+        def _search_with_fallback(self, query, max_results, **_kwargs):
+            return (
+                [{"title": "GMAS", "url": "https://example.com", "snippet": ""}],
+                [
+                    SimpleNamespace(
+                        provider="DuckDuckGoProvider",
+                        status="success",
+                        result_count=1,
+                        error=None,
+                    )
+                ],
+            )
+
+        def _prepare_results_for_output(self, results, **_kwargs):
+            return results
+
+        def _format_search_results(self, results, **_kwargs):
+            return "GMAS formatted answer"
+
+        def close(self):
+            pass
+
+    def create_fake(**kwargs):
+        created.append(kwargs)
+        return FakeGmasSearchTool()
+
+    monkeypatch.setattr(
+        "ouroboros.tools.web_search_adapter.create_gmas_web_search_tool",
+        create_fake,
+    )
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    payload = json.loads(search_mod._web_search(ctx, "web search"))
+
+    assert payload["provider"] == "gmas_web_search"
+    assert payload["status"] == "ok"
+    assert created and created[0]["max_results"] == 5
+
+
+def test_web_search_adapter_default_provider_is_gmas_duckduckgo(monkeypatch):
+    from gmas.tools.web_search import DuckDuckGoProvider
+    from ouroboros.tools import search as search_mod
+
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-affect-web-search")
+
+    tool = search_mod._create_gmas_web_search_tool(max_results=3)
+    try:
+        assert isinstance(tool._provider, DuckDuckGoProvider)
+    finally:
+        tool.close()
+
+
+def test_web_search_schema_does_not_mention_openai():
+    from ouroboros.tools import search as search_mod
+
+    schema = search_mod.get_tools()[0].schema
+    text = json.dumps(schema, ensure_ascii=False)
+
+    assert "OPENAI_API_KEY" not in text
+    assert "OpenAI" not in text
+    assert "DuckDuckGo" in text
 
 
 def test_web_tools_are_core_and_schema_is_unified(tmp_path: Path):

@@ -28,6 +28,65 @@ from umbrella.control_plane.sandbox_self_edit import (
 
 log = logging.getLogger(__name__)
 
+_WORKSPACE_SOURCE_SUFFIXES = {".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+_WORKSPACE_SOURCE_DIRS = {"src", "tests", "test", "frontend", "backend", "docs"}
+
+
+def _task_requires_product_self_edit_sandbox(task: dict[str, Any]) -> bool:
+    """Return True only for explicit product-code self-edit / isolation tasks.
+
+    Normal ``phase_run`` and generated-workspace execute must not enter rollback
+    sandbox (``git stash`` / ``git clean -fd``) or untracked workspace sources
+    under ``workspaces/<id>/`` can disappear between subtasks.
+    """
+    task_type = str(task.get("type") or "").strip().lower()
+    if task_type == "phase_run":
+        return False
+    if task.get("_is_direct_chat"):
+        return False
+    if task.get("product_self_edit") or task.get("umbrella_self_edit"):
+        return True
+    if task.get("self_improve") or task.get("self_improvement"):
+        return True
+    if task.get("candidate_isolation"):
+        return True
+    return False
+
+
+def _workspace_source_manifest(workspace_root: pathlib.Path) -> dict[str, int]:
+    """Map relative paths to file sizes for generated source-like files."""
+    if not workspace_root.is_dir():
+        return {}
+    manifest: dict[str, int] = {}
+    for path in workspace_root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(workspace_root).as_posix()
+        parts = rel.split("/")
+        if parts[0] in {".git", ".memory", ".umbrella", ".umbrella_scratch"}:
+            continue
+        if parts[0] not in _WORKSPACE_SOURCE_DIRS and path.suffix.lower() not in _WORKSPACE_SOURCE_SUFFIXES:
+            continue
+        try:
+            manifest[rel] = path.stat().st_size
+        except OSError:
+            continue
+    return manifest
+
+
+def _unlogged_workspace_source_loss(
+    before: dict[str, int], after: dict[str, int]
+) -> dict[str, Any] | None:
+    missing = sorted(path for path, size in before.items() if size > 0 and path not in after)
+    if not missing:
+        return None
+    return {
+        "status": "blocked",
+        "reason": "unlogged_workspace_source_loss",
+        "missing_files": missing[:50],
+        "recommended_action": "stop_run_and_investigate_sandbox_or_external_cleanup",
+    }
+
 
 def _task_artifact_stem(task_id: str | None, *, max_len: int = 120) -> str:
     raw = str(task_id or "").strip() or "task"
@@ -169,18 +228,25 @@ class OuroborosLauncher:
 
     def _enter_task_sandbox(
         self,
-        task_id: str,
+        task: dict[str, Any],
         *,
         force_snapshot_method: str | None = None,
         workspace_id: str = "",
     ) -> SandboxSession | None:
-        """Enter a no-rollback self-edit session.
+        """Enter a rollback self-edit session.
 
-        The session exists so ``sandbox_self_edit`` can authorize managed
-        self-edits, but it deliberately does not create a git stash, throwaway
-        branch, copy snapshot, or task-end rollback. Live fixes must remain on
-        disk after the run.
+        Persistent/no-rollback self-edit is reserved for explicit approved
+        self-improvement modes. Normal ``phase_run`` tasks must not enter
+        rollback sandbox.
         """
+        task_id = str(task.get("id") or "")
+        if not _task_requires_product_self_edit_sandbox(task):
+            log.info(
+                "Skipping product self-edit sandbox for task %s (type=%s)",
+                task_id,
+                task.get("type"),
+            )
+            return None
         try:
             from umbrella.policies.defaults import load_default_policy
 
@@ -208,7 +274,8 @@ class OuroborosLauncher:
             session = enter_sandbox(
                 repo_root=self.repo_root,
                 task_id=task_id,
-                snapshot_method="none",
+                snapshot_method=force_snapshot_method
+                or policy.sandbox_self_edit.snapshot_method,
                 workspace_id=workspace_id,
             )
             session.baseline_sha = baseline
@@ -219,13 +286,10 @@ class OuroborosLauncher:
             return None
 
     def _capture_and_exit_sandbox(self) -> tuple[str, list[str]]:
-        """Capture changed file names, then close the no-rollback session.
+        """Capture changed file names, then close the sandbox session.
 
         Returns ``(diff_text, changed_files)`` so the caller can attach
-        them to the result. We intentionally do not call
-        ``capture_candidate_diff`` here because that helper creates
-        ``candidate-snapshot`` commits; with rollback removed, those commits
-        would pollute the user's branch.
+        them to the result before rollback.
         """
         session = self._sandbox_session
         if session is None:
@@ -293,8 +357,19 @@ class OuroborosLauncher:
             if normalized_task.get("candidate_isolation"):
                 force_method = "git_branch"
 
+            workspace_root = (
+                (self.repo_root / "workspaces" / workspace_id).resolve()
+                if workspace_id
+                else None
+            )
+            workspace_manifest_before = (
+                _workspace_source_manifest(workspace_root)
+                if workspace_root is not None
+                else {}
+            )
+
             sandbox_session = self._enter_task_sandbox(
-                str(normalized_task.get("id", "")),
+                normalized_task,
                 force_snapshot_method=force_method,
                 workspace_id=workspace_id,
             )
@@ -437,7 +512,7 @@ class OuroborosLauncher:
             candidate_diff, candidate_changed = self._capture_and_exit_sandbox()
             exited = True
 
-            return {
+            result: dict[str, Any] = {
                 "task_id": normalized_task["id"],
                 "status": "complete",
                 "events": events,
@@ -447,6 +522,20 @@ class OuroborosLauncher:
                 "candidate_diff": candidate_diff,
                 "candidate_changed_files": candidate_changed,
             }
+            if workspace_root is not None:
+                loss = _unlogged_workspace_source_loss(
+                    workspace_manifest_before,
+                    _workspace_source_manifest(workspace_root),
+                )
+                if loss is not None:
+                    result["unlogged_workspace_source_loss"] = loss
+                    result["status"] = "blocked"
+                    log.error(
+                        "Unlogged workspace source loss for task %s: %s",
+                        normalized_task["id"],
+                        loss.get("missing_files"),
+                    )
+            return result
         except ImportError as e:
             log.error(f"Ouroboros ImportError: {e}", exc_info=True)
             import traceback

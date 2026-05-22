@@ -4,9 +4,9 @@ from umbrella.phases.base import (
     PhaseNode,
     PhaseResult,
     SubtaskCard,
-    SuccessTest,
     WatcherSignal,
 )
+from umbrella.contracts import ProofSpec
 
 __all__ = [
     "PhaseManifest",
@@ -14,6 +14,6 @@ __all__ = [
     "PhaseNode",
     "PhaseResult",
     "SubtaskCard",
-    "SuccessTest",
+    "ProofSpec",
     "WatcherSignal",
 ]

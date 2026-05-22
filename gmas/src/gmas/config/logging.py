@@ -1,7 +1,57 @@
 import os
 import sys
 
-from loguru import logger as _logger
+try:
+    from loguru import logger as _logger
+except ImportError:  # pragma: no cover - exercised when optional deps are absent
+    import logging as _stdlib_logging
+
+    class _StdlibLogger:
+        def _format(self, message: object, *args: object, **kwargs: object) -> str:
+            text = str(message)
+            if args or kwargs:
+                try:
+                    text = text.format(*args, **kwargs)
+                except Exception:
+                    suffix = " ".join(str(item) for item in args)
+                    text = f"{text} {suffix}".strip()
+            return text
+
+        def debug(self, message: object, *args: object, **kwargs: object) -> None:
+            _stdlib_logging.getLogger("gmas").debug(
+                self._format(message, *args, **kwargs)
+            )
+
+        def info(self, message: object, *args: object, **kwargs: object) -> None:
+            _stdlib_logging.getLogger("gmas").info(
+                self._format(message, *args, **kwargs)
+            )
+
+        def warning(self, message: object, *args: object, **kwargs: object) -> None:
+            _stdlib_logging.getLogger("gmas").warning(
+                self._format(message, *args, **kwargs)
+            )
+
+        def error(self, message: object, *args: object, **kwargs: object) -> None:
+            _stdlib_logging.getLogger("gmas").error(
+                self._format(message, *args, **kwargs)
+            )
+
+        def exception(self, message: object, *args: object, **kwargs: object) -> None:
+            _stdlib_logging.getLogger("gmas").exception(
+                self._format(message, *args, **kwargs)
+            )
+
+        def __getattr__(self, name: str):
+            return getattr(_stdlib_logging.getLogger("gmas"), name)
+
+        def add(self, *args, **kwargs) -> None:
+            return None
+
+        def remove(self, *args, **kwargs) -> None:
+            return None
+
+    _logger = _StdlibLogger()
 
 __all__ = ["logger", "setup_logging"]
 

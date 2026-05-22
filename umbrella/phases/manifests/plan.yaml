@@ -39,6 +39,9 @@ allowed_skills:
   - decision-policy
   - test-strategy-author
   - gmas-pattern-author
+  - gmas-overview
+  - architecture-author
+  - temp-tool-author
 
 memory:
   always_on:

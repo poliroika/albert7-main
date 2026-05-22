@@ -36,7 +36,7 @@ memory:
     - {store: palace.run, tags: [final_review_report, execution_artifact]}
   warm_search: []
   write_rules:
-    verification_report: {store: palace.durable, tier: always_on, scope: cross_run_durable, verified: true}
+    verification_report: {store: palace.durable, tier: warm, scope: cross_run_durable, verified: true}
 
 permissions:
   rules:

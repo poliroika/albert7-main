@@ -60,6 +60,9 @@ export const cancelRun = (id, options) => {
 };
 export const deleteRun = (id, params) => api.delete(`/runs/${id}`, { params }).then(r => r.data);
 
+export const getRunPhases = (id) =>
+  api.get(`/runs/${id}/phases`).then(r => r.data);
+
 // Logs
 export const listLogs = (params) => api.get('/logs', { params }).then(r => r.data);
 

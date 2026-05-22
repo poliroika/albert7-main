@@ -11,7 +11,6 @@ prompt_files:
 allowed_tools:
   - apply_workspace_patch
   - delete_workspace_file
-  - sandbox_self_edit
   - shell
   - terminal_session
   - read_file
@@ -24,11 +23,13 @@ allowed_tools:
   - palace_search
   - palace_add
   - palace_link
+  - mutate_phase_plan
   - mark_subtask_complete
   - harness_run
   - enable_tools
   - mcp_install
   - mcp_discover
+  - register_temp_tool
   - web_search
   - deep_search
   - request_watcher_review
@@ -36,7 +37,6 @@ allowed_tools:
   - search_gmas_knowledge
 
 forbidden_tools:
-  - mutate_phase_plan
   - add_phase
   - wipe_workspace
   - reset_palace
@@ -46,6 +46,8 @@ allowed_skills:
   - terminal-debugging
   - error-self-repair
   - mcp-bridge-author
+  - gmas-overview
+  - temp-tool-author
 
 memory:
   always_on:
@@ -60,8 +62,8 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [apply_workspace_patch, delete_workspace_file, sandbox_self_edit, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_unit_tests, palace_search, palace_add, palace_link, mark_subtask_complete, harness_run, enable_tools, mcp_install, mcp_discover, web_search, deep_search, request_watcher_review, get_gmas_context, search_gmas_knowledge]
-    - deny_tools: [mutate_phase_plan, add_phase, wipe_workspace, reset_palace]
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_unit_tests, palace_search, palace_add, palace_link, mutate_phase_plan, mark_subtask_complete, harness_run, enable_tools, mcp_install, mcp_discover, register_temp_tool, web_search, deep_search, request_watcher_review, get_gmas_context, search_gmas_knowledge]
+    - deny_tools: [add_phase, wipe_workspace, reset_palace]
     - deny_path: ["**/.env*", "**/secrets/**"]
 
 exit_criteria:

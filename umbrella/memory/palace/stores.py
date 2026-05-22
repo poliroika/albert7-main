@@ -14,6 +14,7 @@ _CHROMA_STORES = [
     "palace.run",
     "palace.phase",
     "palace.subtask",
+    "palace.durable",
 ]
 
 
@@ -40,8 +41,13 @@ class PalaceStores:
     def _open_chroma(self, store: str) -> Any:
         try:
             import chromadb
-        except ImportError:
-            return _NullChromaCollection(store)
+        except ImportError as exc:
+            if os.environ.get("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB") == "1":
+                return _NullChromaCollection(f"{self._root}:{store}")
+            raise RuntimeError(
+                "chromadb is not installed; persistent Palace memory is unavailable. "
+                "Install chromadb or set UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB=1 for tests only."
+            ) from exc
         collection_dir = self._root / _chroma_collection_name(store)
         collection_dir.mkdir(parents=True, exist_ok=True)
         client = chromadb.PersistentClient(path=str(collection_dir))
@@ -61,14 +67,26 @@ class PalaceStores:
     def health(self) -> dict[str, Any]:
         ok_stores = []
         bad_stores = []
+        volatile_stub = os.environ.get("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB") == "1"
         for s in _CHROMA_STORES:
             try:
                 col = self.chroma(s)
-                col.count()
-                ok_stores.append(s)
+                if isinstance(col, _NullChromaCollection):
+                    if not volatile_stub:
+                        bad_stores.append(f"{s}: volatile in-memory stub (chromadb missing)")
+                    else:
+                        ok_stores.append(f"{s}:volatile_stub")
+                else:
+                    col.count()
+                    ok_stores.append(s)
             except Exception as exc:
                 bad_stores.append(f"{s}: {exc}")
-        return {"ok": not bad_stores, "stores_ok": ok_stores, "stores_fail": bad_stores}
+        return {
+            "ok": not bad_stores,
+            "stores_ok": ok_stores,
+            "stores_fail": bad_stores,
+            "volatile_stub": volatile_stub,
+        }
 
     def close(self) -> None:
         for collection in list(self._chroma_clients.values()):
@@ -104,11 +122,18 @@ class PalaceStores:
 
 
 class _NullChromaCollection:
-    """Stub when chromadb not installed — allows imports without hard dep."""
+    """Process-global stub when chromadb is not installed (tests only)."""
 
-    def __init__(self, name: str) -> None:
-        self._name = name
-        self._items: list[dict] = []
+    _GLOBAL_ITEMS: dict[str, list[dict]] = {}
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+        if key not in self._GLOBAL_ITEMS:
+            self._GLOBAL_ITEMS[key] = []
+
+    @property
+    def _items(self) -> list[dict]:
+        return self._GLOBAL_ITEMS[self._key]
 
     def count(self) -> int:
         return len(self._items)

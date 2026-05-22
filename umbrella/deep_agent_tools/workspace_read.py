@@ -1,5 +1,7 @@
 """Workspace file listing, preview, and read-cache helpers."""
 
+import hashlib
+
 from umbrella.deep_agent_tools.workspace_common import *
 
 
@@ -70,7 +72,14 @@ def _read_cache_clear() -> None:
     _read_cache.clear()
 
 
-def _mark_workspace_file_read(ctx: Any, workspace_id: str, rel_path: str) -> None:
+def _mark_workspace_file_read(
+    ctx: Any,
+    workspace_id: str,
+    rel_path: str,
+    *,
+    sha256: str = "",
+    mtime_ns: int = 0,
+) -> None:
     try:
         view = getattr(ctx, "loop_state_view", None)
         if not isinstance(view, dict):
@@ -84,6 +93,16 @@ def _mark_workspace_file_read(ctx: Any, workspace_id: str, rel_path: str) -> Non
         norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
         if norm and norm not in ws_reads:
             ws_reads.append(norm)
+        digests = view.setdefault("file_read_digests", {})
+        if not isinstance(digests, dict):
+            digests = {}
+            view["file_read_digests"] = digests
+        ws_digests = digests.setdefault(str(workspace_id), {})
+        if norm:
+            ws_digests[norm] = {
+                "sha256": str(sha256 or ""),
+                "mtime_ns": int(mtime_ns or 0),
+            }
     except Exception:
         log.debug("Failed to mark workspace file read", exc_info=True)
 
@@ -139,9 +158,12 @@ def read_workspace_file(
         # ``update_workspace_seed`` (or any other path) invalidates the
         # cached content automatically — no manual invalidation needed.
         try:
-            mtime_ns = target.stat().st_mtime_ns
+            stat = target.stat()
+            mtime_ns = stat.st_mtime_ns
+            file_size = stat.st_size
         except OSError:
             mtime_ns = 0
+            file_size = 0
         cache_key = (
             str(workspace_id),
             str(target.resolve()),
@@ -228,12 +250,18 @@ def read_workspace_file(
             and content_kind == "text"
             and total_lines is not None
         )
+        content_sha256 = ""
+        if content_kind == "text" and isinstance(content, str):
+            content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         payload = _json(
             {
                 "workspace_id": workspace_id,
                 "file_path": file_path,
                 "resolved_name": target.name,
                 "content_kind": content_kind,
+                "content_sha256": content_sha256,
+                "mtime_ns": mtime_ns,
+                "file_size": file_size,
                 "truncated": truncated,
                 "offset": start,
                 "line_start": line_start_int,
@@ -256,7 +284,13 @@ def read_workspace_file(
             }
         )
         _read_cache_put(cache_key, payload)
-        _mark_workspace_file_read(ctx, workspace_id, file_path)
+        _mark_workspace_file_read(
+            ctx,
+            workspace_id,
+            file_path,
+            sha256=content_sha256,
+            mtime_ns=mtime_ns,
+        )
         return payload
     except Exception as e:
         return f"WARNING: workspace read error: {e}"

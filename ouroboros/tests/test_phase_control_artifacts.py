@@ -10,7 +10,25 @@ from ouroboros.tools.phase_control import (
     _submit_research_summary,
 )
 from ouroboros.tools.registry import ToolContext
+from umbrella.deep_agent_tools.phase_control_actions import (
+    _completion_llm_memory_claim_issue,
+)
 from umbrella.orchestrator.phase_plan import load_plan, save_plan
+
+
+def test_completion_memory_rejects_control_plane_llm_alias_leak() -> None:
+    issue = _completion_llm_memory_claim_issue(
+        subtask_id="docs-env",
+        summary=(
+            "Implemented docs that support LLM_API_KEY, LLM_BASE_URL, LLM_MODEL "
+            "and OUROBOROS_MODEL compatibility."
+        ),
+        evidence=[],
+    )
+
+    assert "ERROR: mark_subtask_complete rejected" in issue
+    assert "Generated workspace code/tests/docs must use the public aliases" in issue
+    assert "LLM_API_KEY" in issue
 
 
 def test_submit_research_summary_persists_latest_artifact(tmp_path):
@@ -316,7 +334,17 @@ def test_phase_control_signal_derives_phase_from_task_id_when_label_is_linear(
 ):
     drive = tmp_path / "workspaces" / "mini_game" / ".memory" / "drive"
     drive.mkdir(parents=True)
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_manifest": {
+                "exit_criteria": {
+                    "min_palace_writes": [{"store": "palace.run", "n": 3}]
+                }
+            }
+        },
+    )
     ctx.task_id = "run-1:plan_review"
     ctx.loop_state_view = {"phase_label": "linear"}
 
@@ -438,9 +466,9 @@ def test_submit_research_summary_accepts_domain_finding_when_env_contract_cited(
                 "title": "LLM Runtime Environment Contract",
                 "content": (
                     "Generated workspace code resolves "
-                    "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                    "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                    "OUROBOROS_MODEL/LLM_MODEL from the inherited runtime."
+                    "LLM_API_KEY, "
+                    "LLM_BASE_URL, and "
+                    "LLM_MODEL from the inherited runtime."
                 ),
                 "tags": "llm-contract,environment,gmas",
             },
@@ -606,8 +634,8 @@ def test_submit_research_summary_rejects_captured_human_only_fallback_mode(tmp_p
         findings_ids=["backend-1", "agents-1", "frontend-1"],
         notes=(
             "Research complete for LLM-driven civilization bots. Required env "
-            "vars: OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, OUROBOROS_MODEL/LLM_MODEL. "
+            "vars: LLM_API_KEY, "
+            "LLM_BASE_URL, LLM_MODEL. "
             "Failure handling: fail fast if credentials missing, support "
             "human-only fallback mode."
         ),
@@ -669,9 +697,9 @@ def test_submit_research_summary_rejects_captured_rule_based_degradation(tmp_pat
         notes=(
             "Revised research phase addressing all revision requirements. "
             "LLM runtime environment contract requires "
-            "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-            "OUROBOROS_MODEL/LLM_MODEL with graceful degradation to "
+            "LLM_API_KEY, "
+            "LLM_BASE_URL, and "
+            "LLM_MODEL with graceful degradation to "
             "rule-based AI when credentials missing."
         ),
     )
@@ -732,9 +760,9 @@ def test_submit_research_summary_rejects_captured_mock_llm_behavior_verification
             "Civilization-style strategy game architecture combining Python "
             "GMAS-based LLM bots with TypeScript/JSX frontend. All LLM bots "
             "must use inherited Umbrella runtime with "
-            "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-            "OUROBOROS_MODEL/LLM_MODEL. Testing strategy combines unit tests "
+            "LLM_API_KEY, "
+            "LLM_BASE_URL, and "
+            "LLM_MODEL. Testing strategy combines unit tests "
             "(tool logic, state transitions), integration tests (mock LLM for "
             "bot behavior verification), and runtime validation."
         ),
@@ -1298,9 +1326,9 @@ def test_mutate_phase_plan_accepts_watcher_proven_test_contract_contradiction(
                         "status": "pending",
                         "goal": (
                             "Document real LLM/GMAS runtime aliases "
-                            "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                            "OUROBOROS_MODEL/LLM_MODEL."
+                            "LLM_API_KEY, "
+                            "LLM_BASE_URL, and "
+                            "LLM_MODEL."
                         ),
                         "files_to_create": [
                             "README.md",
@@ -1723,7 +1751,7 @@ def test_mutate_phase_plan_accepts_wrong_alias_warning_context_capture(tmp_path)
                             "Document GMAS agent design and the real LLM "
                             "runtime env contract: OUROBOROS_LLM_API_KEY/"
                             "LLM_API_KEY, OUROBOROS_LLM_BASE_URL/"
-                            "LLM_BASE_URL, OUROBOROS_MODEL/LLM_MODEL, with "
+                            "LLM_BASE_URL, LLM_MODEL, with "
                             "clear fail/skip/pause behavior when real LLM "
                             "credentials are absent."
                         ),
@@ -1913,9 +1941,9 @@ def test_mutate_phase_plan_accepts_supported_llm_alias_memory(tmp_path):
                     "contract_migration_files": ["tests/test_agents.py"],
                     "contract_migration_reason": (
                         "Keep runtime env priority as "
-                        "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                        "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                        "OUROBOROS_MODEL/LLM_MODEL; missing credentials raise "
+                        "LLM_API_KEY, "
+                        "LLM_BASE_URL, and "
+                        "LLM_MODEL; missing credentials raise "
                         "clear errors."
                     ),
                 }
@@ -2198,6 +2226,731 @@ def test_submit_research_summary_requires_manifest_finding_floor(tmp_path):
 
     assert result.startswith("ERROR:")
     assert "at least 3 accepted palace_add" in result
+    assert not (drive / "state" / "research_summary_latest.json").exists()
+
+
+def test_submit_research_summary_accepts_source_scarce_after_exhausted_discovery(
+    tmp_path,
+):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "web_search",
+            "args": {
+                "query": "civilization strategy game python websockets architecture"
+            },
+            "result_preview": json.dumps(
+                {
+                    "status": "provider_error",
+                    "provider": "gmas_web_search",
+                    "query": "civilization strategy game python websockets architecture",
+                    "error": "TimeoutError",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "deep_search",
+            "args": {"query": "civilization strategy game websockets"},
+            "result_preview": json.dumps(
+                {
+                    "status": "no_results",
+                    "query": "civilization strategy game websockets",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "github_project_search",
+            "args": {"query": "python websockets game server real-time multiplayer"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "python websockets game server real-time multiplayer",
+                    "results": [{"full_name": "nav2991/connect4-multiplayer"}],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "mcp_discover",
+            "args": {"query": "websockets real-time communication game server"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "websockets real-time communication game server",
+                    "results": [],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "search_gmas_knowledge",
+            "args": {"query": "GraphBuilder MACPRunner game agents"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "GraphBuilder MACPRunner game agents",
+                    "confidence": 0.69,
+                    "metadata": {"fallback": True},
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-websocket",
+                    "kind": "research_finding",
+                    "source_path": (
+                        "github_project_search:"
+                        "python websockets game server real-time multiplayer"
+                    ),
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_manifest": {
+                "allowed_tools": [
+                    "github_project_search",
+                    "deep_search",
+                    "web_search",
+                    "mcp_discover",
+                    "submit_research_summary",
+                ],
+                "exit_criteria": {
+                    "min_palace_writes": [{"store": "palace.run", "n": 3}]
+                },
+            }
+        },
+    )
+    ctx.task_id = "phase_web_af37a8b6:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-gmas-web-v1",
+        findings_ids=["finding-websocket"],
+        notes=(
+            "Concrete low-evidence handoff. One accepted WebSocket server "
+            "finding is available. Other discovery attempts were empty, timed "
+            "out, or fallback-only. Generated project LLM runtime must use "
+            "LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL with no mock decisions."
+        ),
+        coverage_status="source_scarce",
+        source_scarcity_reason="Only one usable source row remained after discovery.",
+    )
+
+    assert result.startswith("OK:")
+    artifact = json.loads(
+        (drive / "state" / "research_summary_latest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert artifact["coverage_status"] == "source_scarce"
+    assert artifact["coverage_report"]["usable_source_count"] == 1
+    assert artifact["coverage_report"]["accepted_finding_count"] == 1
+
+
+def test_submit_research_summary_source_scarce_requires_deep_after_web_error(
+    tmp_path,
+):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_scarce:research",
+            "tool": "web_search",
+            "args": {"query": "civilization strategy game python websockets"},
+            "result_preview": json.dumps(
+                {
+                    "status": "provider_error",
+                    "provider": "gmas_web_search",
+                    "query": "civilization strategy game python websockets",
+                    "error": "TimeoutError",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_scarce:research",
+            "tool": "github_project_search",
+            "args": {"query": "python websockets game server"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "python websockets game server",
+                    "results": [{"full_name": "owner/server"}],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_scarce:research",
+            "tool": "mcp_discover",
+            "args": {"query": "websocket game server"},
+            "result_preview": json.dumps(
+                {"status": "ok", "query": "websocket game server", "results": []}
+            ),
+        },
+        {
+            "task_id": "phase_web_scarce:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-1",
+                    "kind": "research_finding",
+                    "source_path": "github_project_search:python websockets game server",
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_manifest": {
+                "exit_criteria": {
+                    "min_palace_writes": [{"store": "palace.run", "n": 3}]
+                }
+            }
+        },
+    )
+    ctx.task_id = "phase_web_scarce:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-source-scarce",
+        findings_ids=["finding-1"],
+        notes="One accepted source, web_search timed out, source scarce.",
+        coverage_status="source_scarce",
+        source_scarcity_reason="Only one usable source row remained after discovery.",
+    )
+
+    assert result.startswith("ERROR:")
+    assert 'deep_search(intent="planner_research")' in result
+    assert not (drive / "state" / "research_summary_latest.json").exists()
+
+
+def test_submit_research_summary_source_scarce_rejects_unharvested_usable_source(
+    tmp_path,
+):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "github_project_search",
+            "args": {"query": "python websockets game server"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "python websockets game server",
+                    "results": [{"full_name": "owner/server"}],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "web_search",
+            "args": {"query": "websocket game architecture"},
+            "result_preview": json.dumps(
+                {
+                    "provider": "gmas_web_search",
+                    "query": "websocket game architecture",
+                    "sources": [{"url": "https://example.test/ws"}],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "mcp_discover",
+            "args": {"query": "game server websocket"},
+            "result_preview": json.dumps(
+                {"status": "ok", "query": "game server websocket", "results": []}
+            ),
+        },
+        {
+            "task_id": "phase_web_af37a8b6:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-github",
+                    "kind": "research_finding",
+                    "source_path": "github_project_search:python websockets game server",
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_manifest": {
+                "allowed_tools": [
+                    "github_project_search",
+                    "web_search",
+                    "mcp_discover",
+                    "submit_research_summary",
+                ],
+                "exit_criteria": {
+                    "min_palace_writes": [{"store": "palace.run", "n": 3}]
+                },
+            }
+        },
+    )
+    ctx.task_id = "phase_web_af37a8b6:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-gmas-web-v1",
+        findings_ids=["finding-github"],
+        notes=(
+            "One accepted finding exists, but another web source is still "
+            "usable and should be saved before claiming scarcity. LLM_API_KEY, "
+            "LLM_BASE_URL, and LLM_MODEL are the public runtime aliases."
+        ),
+        coverage_status="source_scarce",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "unharvested usable source evidence" in result
+    assert not (drive / "state" / "research_summary_latest.json").exists()
+
+
+def test_submit_research_summary_shortfall_suggests_recent_discovery_source(tmp_path):
+    drive = tmp_path / "workspaces" / "mini_game" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "run-1:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {"saved": True, "id": "finding-1", "kind": "research_finding"}
+            ),
+        },
+        {
+            "task_id": "run-1:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {"saved": True, "id": "finding-2", "kind": "research_finding"}
+            ),
+        },
+        {
+            "task_id": "run-1:research",
+            "tool": "search_gmas_knowledge",
+            "args": {"query": "GMAS architecture patterns for game simulation"},
+            "result_preview": json.dumps(
+                {
+                    "query": "GMAS architecture patterns for game simulation",
+                    "recommended_pattern": "Use ToolRegistry for agent tools",
+                    "key_symbols": ["ToolRegistry"],
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_manifest": {
+                "exit_criteria": {
+                    "min_palace_writes": [{"store": "palace.run", "n": 3}]
+                }
+            }
+        },
+    )
+    ctx.task_id = "run-1:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-1",
+        findings_ids=["finding-1", "finding-2"],
+        notes="Concrete research notes with two accepted findings only.",
+    )
+
+    assert result.startswith("ERROR:")
+    assert (
+        "Recent usable discovery source candidate: "
+        "`search_gmas_knowledge:GMAS architecture patterns for game simulation`"
+    ) in result
+    assert "Before retrying `submit_research_summary`, call `palace_add`" in result
+
+
+def test_submit_research_summary_rejects_positive_empty_discovery_source_claims(
+    tmp_path,
+):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_b63586a5:research",
+            "tool": "github_project_search",
+            "args": {"query": "LLM civilization strategy game AI bots python"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "LLM civilization strategy game AI bots python",
+                    "results": [],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_b63586a5:research",
+            "tool": "mcp_discover",
+            "args": {"query": "game development simulation"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "game development simulation",
+                    "results": [],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_b63586a5:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-gmas-1",
+                    "kind": "research_finding",
+                    "source_path": "gmas:multi-agent game AI",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_b63586a5:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-gmas-2",
+                    "kind": "research_finding",
+                    "source_path": "search_gmas_knowledge:game tools",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_b63586a5:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-gmas-3",
+                    "kind": "research_finding",
+                    "source_path": "get_gmas_context:agents",
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_b63586a5:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-gmas-web-v1",
+        findings_ids=["finding-gmas-1", "finding-gmas-2", "finding-gmas-3"],
+        notes=(
+            "Architecture grounded in accepted GMAS findings. "
+            "MCP discovery returned docker and simulation-related servers. "
+            "GitHub results for strategy games inform turn-based state modeling."
+        ),
+    )
+
+    assert result.startswith("ERROR:")
+    assert "positive GitHub discovery evidence" in result
+    assert "none of the cited accepted research findings" in result
+    assert not (drive / "state" / "research_summary_latest.json").exists()
+
+
+def test_submit_research_summary_allows_positive_github_claim_with_matching_source(
+    tmp_path,
+):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "run-1:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-github",
+                    "kind": "research_finding",
+                    "source_path": "github:example/strategy-game",
+                }
+            ),
+        }
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "run-1:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-gmas-web-v1",
+        findings_ids=["finding-github"],
+        notes=(
+            "GitHub results for strategy games inform turn-based state modeling. "
+            "The cited finding carries matching GitHub source provenance."
+        ),
+    )
+
+    assert result.startswith("OK: Research summary submitted")
+
+
+def test_submit_research_summary_rejects_captured_unbacked_source_labels(
+    tmp_path,
+):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_779c6ad4:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-fastapi",
+                    "kind": "research_finding",
+                    "source_path": "deep_search:web game python fastapi typescript react tutorial",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_779c6ad4:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-webgame",
+                    "kind": "research_finding",
+                    "source_path": "deep_search:github isadri transcendence civilization strategy game",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_779c6ad4:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-llm",
+                    "kind": "research_finding",
+                    "source_path": "deep_search:LLM-powered game bot economy diplomacy framework",
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_779c6ad4:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-fastapi-gmas-react-v1",
+        findings_ids=["finding-fastapi", "finding-webgame", "finding-llm"],
+        notes=(
+            "Architecture uses public LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL. "
+            "\n**Source**: deep_search:fastapi react full stack tutorial"
+            "\n**Source**: deep_search:github isadri transcendence"
+            "\n**Source**: deep_search:GMAS early_stop_example.py"
+        ),
+    )
+
+    assert result.startswith("ERROR:")
+    assert "source label(s) not backed by the cited accepted findings" in result
+    assert "deep_search:fastapi react full stack tutorial" in result
+    assert not (drive / "state" / "research_summary_latest.json").exists()
+
+
+def test_submit_research_summary_accepts_exact_backed_source_labels(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    source = "deep_search:web game python fastapi typescript react tutorial"
+    rows = [
+        {
+            "task_id": "run-1:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-fastapi",
+                    "kind": "research_finding",
+                    "source_path": source,
+                }
+            ),
+        }
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "run-1:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-fastapi-gmas-react-v1",
+        findings_ids=["finding-fastapi"],
+        notes=(
+            "Architecture uses public LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL. "
+            f"\n**Source**: {source}"
+        ),
+    )
+
+    assert result.startswith("OK: Research summary submitted")
+
+
+def test_submit_research_summary_rejects_captured_bare_github_discovery_claim(
+    tmp_path,
+):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_96995622:research",
+            "tool": "github_project_search",
+            "args": {"query": "python game web server websocket multiplayer"},
+            "result_preview": json.dumps(
+                {
+                    "status": "ok",
+                    "query": "python game web server websocket multiplayer",
+                    "results": [
+                        {
+                            "full_name": "kochj23/Web-Pennmush",
+                            "html_url": "https://github.com/kochj23/Web-Pennmush",
+                        }
+                    ],
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_96995622:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-gmas",
+                    "kind": "research_finding",
+                    "source_path": "search_gmas_knowledge:agent tools",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_96995622:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-web",
+                    "kind": "research_finding",
+                    "source_path": "deep_search:web game python typescript frontend architecture",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_96995622:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-github",
+                    "kind": "research_finding",
+                    "source_path": "github_project_search",
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_96995622:research"
+    ctx.loop_state_view = {"phase_label": "research"}
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-gmas-web-py-ts-v1",
+        findings_ids=["finding-gmas", "finding-web", "finding-github"],
+        notes=(
+            "Architecture is grounded in GMAS and web research. "
+            "External Discovery: GitHub discovery executed - see finding "
+            "finding-github for Python web game architecture patterns."
+        ),
+    )
+
+    assert result.startswith("ERROR:")
+    assert "positive GitHub discovery evidence" in result
+    assert "usable current GitHub source" in result
     assert not (drive / "state" / "research_summary_latest.json").exists()
 
 
@@ -2553,8 +3306,8 @@ def test_submit_research_summary_rejects_captured_decision_caching_notes(tmp_pat
             "fa41be1a-8eea-4559-ad3a-8202938c4506",
         ],
         notes=(
-            "LLM/GMAS bot runtime uses OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and OUROBOROS_MODEL/LLM_MODEL. "
+            "LLM/GMAS bot runtime uses LLM_API_KEY, "
+            "LLM_BASE_URL, and LLM_MODEL. "
             "Missing credentials pause bot turns or surface explicit errors. "
             "Performance: LLM latency per bot per turn. Mitigate via parallel "
             "processing, early stopping for no-action bots, and caching stable, "
@@ -2583,7 +3336,7 @@ def test_submit_research_summary_rejects_duplicate_id_and_legacy_aliases(tmp_pat
             "tool": "web_search",
             "args": {"query": "LLM powered game AI civilization strategy bot"},
             "result_preview": json.dumps(
-                {"status": "provider_unavailable", "reason": "OPENAI_API_KEY missing"}
+                {"status": "provider_error", "provider": "gmas_web_search", "error": "TimeoutError"}
             ),
         },
         {
@@ -2681,7 +3434,7 @@ def test_submit_research_summary_normalises_legacy_alias_to_primary_id(tmp_path)
             "tool": "web_search",
             "args": {"query": "LLM powered game AI civilization strategy bot"},
             "result_preview": json.dumps(
-                {"status": "provider_unavailable", "reason": "OPENAI_API_KEY missing"}
+                {"status": "provider_error", "provider": "gmas_web_search", "error": "TimeoutError"}
             ),
         },
         {
@@ -2697,9 +3450,9 @@ def test_submit_research_summary_normalises_legacy_alias_to_primary_id(tmp_path)
                 "title": "Architecture finding",
                 "content": (
                     "Use GMAS agents and resolve "
-                    "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                    "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                    "OUROBOROS_MODEL/LLM_MODEL from the inherited runtime."
+                    "LLM_API_KEY, "
+                    "LLM_BASE_URL, and "
+                    "LLM_MODEL from the inherited runtime."
                 ),
                 "tags": "research_finding,architecture",
             },
@@ -3171,8 +3924,8 @@ def test_submit_research_summary_counts_incidental_placeholder_words_in_findings
         notes=(
             "Research complete: FastAPI/React architecture, GMAS real LLM bots, "
             "and greenfield setup requirements. LLM runtime must use "
-            "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and OUROBOROS_MODEL/LLM_MODEL."
+            "LLM_API_KEY, "
+            "LLM_BASE_URL, and LLM_MODEL."
         ),
     )
 
@@ -4301,9 +5054,9 @@ def test_research_review_ok_rejects_captured_rule_based_degradation_summary(tmp_
                 "findings_ids": ["agents-1"],
                 "notes": (
                     "LLM runtime environment contract requiring resolution of "
-                    "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                    "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                    "OUROBOROS_MODEL/LLM_MODEL with graceful degradation to "
+                    "LLM_API_KEY, "
+                    "LLM_BASE_URL, and "
+                    "LLM_MODEL with graceful degradation to "
                     "rule-based AI when credentials missing."
                 ),
             }
@@ -4368,9 +5121,9 @@ def test_research_review_ok_rejects_captured_mock_llm_behavior_summary(tmp_path)
                     "Civilization-style strategy game architecture combining "
                     "Python GMAS-based LLM bots with TypeScript/JSX frontend. "
                     "All LLM bots must use inherited Umbrella runtime with "
-                    "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                    "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                    "OUROBOROS_MODEL/LLM_MODEL. Testing strategy combines "
+                    "LLM_API_KEY, "
+                    "LLM_BASE_URL, and "
+                    "LLM_MODEL. Testing strategy combines "
                     "unit tests, integration tests (mock LLM for bot behavior "
                     "verification), and runtime validation."
                 ),
@@ -4637,6 +5390,90 @@ def test_plan_review_ok_rejects_captured_conservative_strategy_fallback_plan(
     assert "fallback" in result
 
 
+def test_plan_review_ok_rejects_captured_final_proof_gap_plan(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    (state / "phase_plan_submitted_latest.json").write_text(
+        json.dumps(
+            {
+                "created_at": 100.0,
+                "run_id": "phase_web_883b9f7e",
+                "plan_id": "phase_plan:docs-env",
+                "plan": {
+                    "subtasks": [
+                        {
+                            "id": "integration-e2e",
+                            "title": "Test full game loop with real AI decisions",
+                            "goal": (
+                                "Create integration proof that simulates player "
+                                "turn and AI decisions."
+                            ),
+                            "files_to_create": [
+                                "tests/integration/test_game_loop.py"
+                            ],
+                            "success_test": (
+                                "python -m pytest "
+                                "tests/integration/test_game_loop.py -q"
+                            ),
+                        },
+                        {
+                            "id": "final-verification",
+                            "title": "Verify localhost game deployment",
+                            "goal": (
+                                "Start FastAPI backend and React frontend "
+                                "locally, simulate a player turn, and verify "
+                                "WebSocket behavior."
+                            ),
+                            "files_to_change": ["workspace.toml"],
+                            "success_test": (
+                                "python -m pytest "
+                                "tests/integration/test_game_loop.py -q"
+                            ),
+                        },
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "ts": "1970-01-01T00:02:00Z",
+            "task_id": "phase_web_883b9f7e:plan_review",
+            "tool": "read_file",
+            "args": {
+                "file_path": ".memory/drive/state/phase_plan_submitted_latest.json"
+            },
+            "result_preview": "{}",
+        }
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_883b9f7e:plan_review"
+    ctx.loop_state_view = {"phase_label": "linear"}
+
+    result = _submit_micro_review(
+        ctx,
+        verdict="ok",
+        notes=(
+            "The only note is that final-verification shares the same "
+            "success_test as integration-e2e, but this is not a blocker."
+        ),
+    )
+
+    assert result.startswith("ERROR:"), result
+    assert "violates workspace policy" in result
+    assert "final-verification" in result
+    assert "distinct final proof artifact" in result
+
+
 def test_plan_review_rejects_nonblocking_detail_loop_for_executable_plan(tmp_path):
     drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
     state = drive / "state"
@@ -4737,6 +5574,80 @@ def test_plan_review_rejects_nonblocking_detail_loop_for_executable_plan(tmp_pat
     assert "verdict=ok notes" in result
 
 
+def test_plan_review_allows_revise_for_policy_detected_final_proof_gap(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    (state / "phase_plan_submitted_latest.json").write_text(
+        json.dumps(
+            {
+                "created_at": 100.0,
+                "run_id": "phase_web_883b9f7e",
+                "plan_id": "phase_plan:docs-env",
+                "plan": {
+                    "subtasks": [
+                        {
+                            "id": "integration-e2e",
+                            "title": "Test full game loop with real AI decisions",
+                            "goal": (
+                                "Create integration proof that simulates player "
+                                "turn and AI decisions."
+                            ),
+                            "files_to_create": [
+                                "tests/integration/test_game_loop.py"
+                            ],
+                            "success_test": (
+                                "python -m pytest "
+                                "tests/integration/test_game_loop.py -q"
+                            ),
+                        },
+                        {
+                            "id": "final-verification",
+                            "title": "Verify localhost game deployment",
+                            "goal": (
+                                "Start FastAPI backend and React frontend "
+                                "locally, simulate a player turn, and verify "
+                                "WebSocket behavior."
+                            ),
+                            "files_to_change": ["workspace.toml"],
+                            "success_test": (
+                                "python -m pytest "
+                                "tests/integration/test_game_loop.py -q"
+                            ),
+                        },
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (logs / "tools.jsonl").write_text("", encoding="utf-8")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_883b9f7e:plan_review"
+    ctx.loop_state_view = {"phase_label": "linear"}
+
+    result = _submit_micro_review(
+        ctx,
+        verdict="revise",
+        revisions=[
+            (
+                "In subtask final-verification, replace the repeated "
+                "success_test with a distinct localhost verification proof "
+                "owned by that leaf."
+            )
+        ],
+        notes=(
+            "The submitted plan is otherwise executable, but final-verification "
+            "does not prove its stated deployment goal."
+        ),
+    )
+
+    assert result.startswith("OK: Micro-review submitted: revise"), result
+
+
 def test_plan_review_rejects_protective_fallback_clarification_loop_with_linear_label(
     tmp_path,
 ):
@@ -4755,9 +5666,9 @@ def test_plan_review_rejects_protective_fallback_clarification_loop_with_linear_
                             "id": "llm_agents",
                             "title": "Implement live LLM agents",
                             "goal": (
-                                "Resolve OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                                "OUROBOROS_MODEL/LLM_MODEL, then call live LLM "
+                                "Resolve LLM_API_KEY, "
+                                "LLM_BASE_URL, and "
+                                "LLM_MODEL, then call live LLM "
                                 "agents for economic and diplomatic decisions. "
                                 "NEVER use deterministic fallback."
                             ),
@@ -4976,9 +5887,9 @@ def test_plan_review_rejects_captured_execution_detail_revise_for_sound_llm_plan
                     "decision_policy": {
                         "llm_intelligence": (
                             "Bots use real LLM via MACPRunner with "
-                            "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                            "OUROBOROS_MODEL/LLM_MODEL. No mock or fallback."
+                            "LLM_API_KEY, "
+                            "LLM_BASE_URL, and "
+                            "LLM_MODEL. No mock or fallback."
                         )
                     },
                 },
@@ -6290,9 +7201,9 @@ def test_mark_subtask_complete_accepts_supported_llm_alias_memory(tmp_path):
         subtask_id="llm_agent_system",
         summary=(
             "Created get_llm_runtime_config() supporting "
-            "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-            "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-            "OUROBOROS_MODEL/LLM_MODEL."
+            "LLM_API_KEY, "
+            "LLM_BASE_URL, and "
+            "LLM_MODEL."
         ),
         evidence=["All 11 tests in tests/test_agents.py passed."],
     )
@@ -6366,6 +7277,100 @@ def test_submit_micro_review_allows_never_fallback_static_decisions_notes(tmp_pa
     )
 
     assert result.startswith("OK: Micro-review submitted: ok")
+
+
+def test_research_review_rejects_summary_with_unbacked_source_labels(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    (state / "research_summary_latest.json").write_text(
+        json.dumps(
+            {
+                "created_at": 1779277577.3371508,
+                "run_id": "phase_web_779c6ad4",
+                "architecture_id": "arch-civilization-fastapi-gmas-react-v1",
+                "findings_ids": [
+                    "finding-fastapi",
+                    "finding-webgame",
+                    "finding-llm",
+                ],
+                "notes": (
+                    "Architecture uses public LLM_API_KEY, LLM_BASE_URL, and "
+                    "LLM_MODEL.\n"
+                    "**Source**: deep_search:fastapi react full stack tutorial\n"
+                    "**Source**: deep_search:github isadri transcendence\n"
+                    "**Source**: deep_search:GMAS early_stop_example.py"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "task_id": "phase_web_779c6ad4:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-fastapi",
+                    "kind": "research_finding",
+                    "source_path": "deep_search:web game python fastapi typescript react tutorial",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_779c6ad4:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-webgame",
+                    "kind": "research_finding",
+                    "source_path": "deep_search:github isadri transcendence civilization strategy game",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_779c6ad4:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-llm",
+                    "kind": "research_finding",
+                    "source_path": "deep_search:LLM-powered game bot economy diplomacy framework",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_779c6ad4:research_review",
+            "tool": "read_file",
+            "args": {"file_path": ".memory/drive/state/research_summary_latest.json"},
+            "result_preview": "{}",
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_779c6ad4:research_review"
+    ctx.loop_state_view = {"phase_label": "research_review"}
+
+    result = _submit_micro_review(
+        ctx,
+        verdict="ok",
+        notes="Research has viable architecture and should proceed.",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "source label(s) not backed by the cited accepted findings" in result
+    assert "Research review cannot accept ok" in result
 
 
 def test_submit_micro_review_allows_runtime_env_alias_fallback_notes(tmp_path):
@@ -6561,9 +7566,9 @@ def test_submit_micro_review_allows_captured_no_openai_no_gpt_review_checklist(
             (
                 "No required OPENAI_API_KEY, no gpt-* model defaults, and no "
                 "OpenAI-only recommendation. Require "
-                "OUROBOROS_LLM_API_KEY/LLM_API_KEY, "
-                "OUROBOROS_LLM_BASE_URL/LLM_BASE_URL, and "
-                "OUROBOROS_MODEL/LLM_MODEL instead."
+                "LLM_API_KEY, "
+                "LLM_BASE_URL, and "
+                "LLM_MODEL instead."
             )
         ],
         notes="This is provider-neutral runtime policy, not provider guidance.",
@@ -6585,7 +7590,7 @@ def test_submit_micro_review_allows_reject_gpt_default_revision(tmp_path):
         revisions=[
             (
                 "Add tests that reject gpt-4o-mini defaults and require the "
-                "configured runtime model from OUROBOROS_MODEL/LLM_MODEL."
+                "configured runtime model from LLM_MODEL."
             )
         ],
     )
@@ -7393,3 +8398,4 @@ def test_research_review_ok_accepts_reads_after_latest_summary(tmp_path):
     )
 
     assert result.startswith("OK: Micro-review submitted: ok")
+
