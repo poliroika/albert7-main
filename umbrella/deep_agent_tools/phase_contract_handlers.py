@@ -509,12 +509,21 @@ def _palace_add(
             "ERROR: palace_add cannot write core lessons directly. Use "
             "submit_reflection(proposed_bkb_rules=[...]) then accept_bkb_proposal."
         )
-    ws = workspace_id or _workspace_id(ctx)
+    from umbrella.memory.paths import normalize_workspace_id, parse_palace_path_hint
+
+    ws = normalize_workspace_id(workspace_id or _workspace_id(ctx))
     phase = _palace_add_guard_phase(ctx)
     phase_path = phase or "phase"
     if str(kind or "").strip().lower() == "subtask_card":
         phase_path = f"{phase_path}/subtasks"
-    path = palace_path or (f"workspaces/{ws}/{phase_path}" if ws else phase_path)
+    _ws_hint, _event, logical = parse_palace_path_hint(
+        palace_path,
+        workspace_id=ws,
+        default_kind=kind or "observation",
+    )
+    if _ws_hint:
+        ws = _ws_hint
+    path = logical or phase_path
     tag_list = _split_tag_string(tags)
     requested_kind_l = str(kind or "").strip().lower()
     requested_research_finding = (
@@ -725,74 +734,60 @@ def _palace_add(
         evidence_kind=evidence_kind,
     )
     mempalace_id = ""
+    legacy_payload: Any = None
     if ws:
-        try:
-            from umbrella.memory.palace.facade import MemPalace
+        from umbrella.deep_agent_tools.memory import _legacy_palace_available
+        from umbrella.memory.kernel.models import memory_event_from_tool_write
+        from umbrella.memory.kernel.writer import write_memory_event
 
-            repo_root = umbrella_tools._resolve_umbrella_repo_root(ctx)
-            palace = MemPalace(repo_root, ws)
-            mem_body = (
-                body
-                if isinstance(body, str)
-                else json.dumps(body, ensure_ascii=False, indent=2)
+        repo_root = umbrella_tools._resolve_umbrella_repo_root(ctx)
+        mem_body = (
+            body
+            if isinstance(body, str)
+            else json.dumps(body, ensure_ascii=False, indent=2)
+        )
+        mem_content = f"[{title}]\n{mem_body}" if title else mem_body
+        event = memory_event_from_tool_write(
+            content=mem_content,
+            title=title or kind or "phase note",
+            memory_kind=kind,
+            workspace_id=ws,
+            tags=tag_list,
+            scope=mem_scope,
+            tier=mem_tier,
+            phase_id=phase,
+            run_id=_run_id(ctx),
+            subtask_id=subtask_id,
+            source_path=source_id or "tool:palace_add",
+            verified=memory_verified,
+            palace_store=mem_store,
+            metadata={
+                "palace_path": palace_path,
+                "evidence_kind": evidence_kind,
+            },
+        )
+        try:
+            write_result = write_memory_event(
+                repo_root,
+                event,
+                workspace_id=ws,
+                mirror_legacy=_legacy_palace_available(),
             )
-            mem_content = f"[{title}]\n{mem_body}" if title else mem_body
-            try:
-                mempalace_id = palace.add(
-                    store=mem_store,
-                    content=mem_content,
-                    tier=mem_tier,
-                    scope=mem_scope,
-                    tags=tag_list,
-                    phase=phase,
-                    subtask_id=subtask_id or None,
-                    run_id=_run_id(ctx),
-                    source_path=source_id or "tool:palace_add",
-                    verified=memory_verified,
-                    extra={
-                        "palace_path": palace_path,
-                        "kind": kind,
-                        "type": kind,
-                    },
+            if write_result.saved:
+                mempalace_id = write_result.canonical_id
+            elif write_result.policy_issues:
+                return _json(
+                    {
+                        "saved": False,
+                        "status": "blocked",
+                        "reason": "evidence_bound_memory",
+                        "issues": list(write_result.policy_issues),
+                    }
                 )
-            finally:
-                palace.close()
         except Exception:
             mempalace_id = ""
 
-    legacy_result = _save_umbrella_memory(
-        ctx,
-        palace_path=path,
-        title=title or kind or "phase note",
-        content=body,
-        kind=kind,
-        workspace_id=ws,
-        tags=",".join(tag_list) if tag_list else tags,
-        metadata_extra={
-            "canonical_id": mempalace_id,
-            "verified": memory_verified,
-            "store": mem_store,
-            "tier": mem_tier,
-            "scope": mem_scope,
-            "phase": phase,
-            "run_id": _run_id(ctx),
-            "subtask_id": subtask_id,
-            "kind": kind,
-            "type": kind,
-            "source_path": source_id or "tool:palace_add",
-            "evidence_kind": evidence_kind,
-        },
-    )
-    legacy_payload: Any = legacy_result
-    try:
-        legacy_payload = json.loads(str(legacy_result))
-    except Exception:
-        pass
     saved = bool(mempalace_id)
-    if not saved and isinstance(legacy_payload, dict):
-        saved = bool(legacy_payload.get("saved"))
-    elif not saved:
-        saved = not str(legacy_result).startswith("WARNING:")
     payload = {
         "saved": saved,
         "id": mempalace_id,
@@ -806,8 +801,9 @@ def _palace_add(
         "subtask_id": subtask_id,
         "kind": kind,
         "tags": tag_list,
-        "legacy": legacy_payload,
     }
+    if legacy_payload is not None:
+        payload["legacy"] = legacy_payload
     if not mempalace_id and not saved:
         payload["status"] = "error"
     return _json(payload)

@@ -37,12 +37,48 @@ class _DualWriteBackend:
         if lesson.get("verified") and self._hindsight.health().get("ok"):
             try:
                 self._hindsight.retain_lesson(lesson)
-            except (NotImplementedError, RuntimeError):
-                pass
+            except (NotImplementedError, RuntimeError) as exc:
+                try:
+                    from umbrella.memory.kernel.telemetry import record_memory_event
+
+                    record_memory_event(
+                        self._canonical._repo_root,
+                        event_type="memory_dual_write_secondary_failed",
+                        workspace_id=self._canonical._workspace_id,
+                        status="failed",
+                        error=str(exc),
+                        data={"backend": "hindsight", "op": "retain_lesson"},
+                    )
+                except Exception:
+                    log.debug(
+                        "dual_write hindsight retain_lesson telemetry skipped",
+                        exc_info=True,
+                    )
         return node_id
 
     def retain_event(self, event: dict[str, Any]) -> str:
-        return self._canonical.retain_event(event)
+        node_id = self._canonical.retain_event(event)
+        if event.get("verified") and self._hindsight.health().get("ok"):
+            try:
+                self._hindsight.retain_event(event)
+            except (NotImplementedError, RuntimeError) as exc:
+                try:
+                    from umbrella.memory.kernel.telemetry import record_memory_event
+
+                    record_memory_event(
+                        self._canonical._repo_root,
+                        event_type="memory_dual_write_secondary_failed",
+                        workspace_id=self._canonical._workspace_id,
+                        status="failed",
+                        error=str(exc),
+                        data={"backend": "hindsight", "op": "retain_event"},
+                    )
+                except Exception:
+                    log.debug(
+                        "dual_write hindsight retain_event telemetry skipped",
+                        exc_info=True,
+                    )
+        return node_id
 
     def recall_evidence(self, query: dict[str, Any]) -> list[dict[str, Any]]:
         return self._canonical.recall_evidence(query)

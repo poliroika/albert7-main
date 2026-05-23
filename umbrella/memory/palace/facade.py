@@ -28,8 +28,12 @@ _DEFAULT_CHROMA_STORES = [
 
 
 def _palace_root(repo_root: pathlib.Path, workspace_id: str | None) -> pathlib.Path:
+    from umbrella.memory.paths import _safe_workspace_segment
+
     if workspace_id:
-        return repo_root / "workspaces" / workspace_id / ".memory" / "palace"
+        seg = _safe_workspace_segment(workspace_id)
+        if seg:
+            return repo_root / "workspaces" / seg / ".memory" / "palace"
     return repo_root / ".umbrella" / "palace"
 
 
@@ -38,6 +42,20 @@ def _provenance_fields_from_meta(meta: dict[str, Any]) -> dict[str, str]:
         "trust_level": str(meta.get("trust_level") or ""),
         "evidence_refs_json": str(meta.get("evidence_refs_json") or "[]"),
         "verify_run_id": str(meta.get("verify_run_id") or ""),
+    }
+
+
+def _kernel_fields_from_meta(meta: dict[str, Any]) -> dict[str, str]:
+    return {
+        **_provenance_fields_from_meta(meta),
+        "memory_kind": str(meta.get("kind") or meta.get("type") or ""),
+        "lifecycle": str(meta.get("lifecycle") or ""),
+        "surface": str(meta.get("surface") or ""),
+        "source_backend": str(meta.get("source_backend") or ""),
+        "external_refs_json": str(meta.get("external_refs_json") or "{}"),
+        "metadata_json": str(meta.get("metadata_json") or "{}"),
+        "producer": str(meta.get("producer") or ""),
+        "agent_kind": str(meta.get("agent_kind") or ""),
     }
 
 
@@ -107,12 +125,13 @@ class MemPalace:
         links: Iterable[tuple[str, str]] = (),
         extra: dict[str, Any] | None = None,
         kind: str = "",
+        node_id: str | None = None,
     ) -> str:
         tags_list = list(tags)
         store = _normalize_store_for_write(
             store, kind=kind or str((extra or {}).get("type", "")), tags=tags_list
         )
-        node_id = str(uuid.uuid4())
+        node_id = str(node_id or (extra or {}).get("id") or "").strip() or str(uuid.uuid4())
         metadata: dict[str, Any] = {
             "id": node_id,
             "store": store,
@@ -203,7 +222,7 @@ class MemPalace:
                         "workspace_id": meta.get("workspace_id", self._workspace_id),
                         "run_id": meta.get("run_id", ""),
                         "created_at": meta.get("created_at"),
-                        **_provenance_fields_from_meta(meta),
+                        **_kernel_fields_from_meta(meta),
                     })
             except Exception:
                 pass
@@ -250,7 +269,7 @@ class MemPalace:
                 "workspace_id": meta.get("workspace_id", self._workspace_id),
                 "run_id": meta.get("run_id", ""),
                 "created_at": meta.get("created_at"),
-                **_provenance_fields_from_meta(meta),
+                **_kernel_fields_from_meta(meta),
             }
         return None
 
@@ -305,7 +324,7 @@ class MemPalace:
                         "created_at": meta.get("created_at"),
                         "kind": meta.get("kind", meta.get("type", "")),
                         "score": 1 - (res["distances"][0][i] if res.get("distances") else 0.5),
-                        **_provenance_fields_from_meta(meta),
+                        **_kernel_fields_from_meta(meta),
                     })
             except Exception:
                 pass

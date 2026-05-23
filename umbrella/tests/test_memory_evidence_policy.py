@@ -34,6 +34,17 @@ def test_durable_memory_requires_typed_verified_evidence_ref() -> None:
     assert "typed EvidenceRef" in issues[0]
 
 
+def test_warm_tier_alone_is_not_durable() -> None:
+    assert (
+        memory_write_policy_issues(
+            kind="observation",
+            tags=["idea"],
+            metadata={"tier": "warm", "scope": "run_scoped"},
+        )
+        == []
+    )
+
+
 def test_durable_memory_allows_typed_verified_evidence_ref() -> None:
     assert (
         memory_write_policy_issues(

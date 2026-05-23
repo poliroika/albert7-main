@@ -60,6 +60,43 @@ def bundle_to_overlay_dict(bundle: LLMInputBundle) -> dict[str, Any]:
     return payload
 
 
+def persist_memory_injection_report(
+    bundle: LLMInputBundle,
+    drive_root: Path,
+    *,
+    proactive_overlay_hash: str = "",
+) -> Path:
+    state_dir = drive_root / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    included: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for item in bundle.memory_items:
+        row = {
+            "id": item.id,
+            "surface": item.surface,
+            "directive": item.directive,
+            "source_backend": getattr(item, "source_backend", ""),
+            "token_estimate": len(item.text or "") // 4,
+        }
+        if item.directive or item.surface == "directive":
+            included.append({**row, "reason": "directive_proactive"})
+        else:
+            included.append({**row, "reason": "supplemental_recall"})
+    payload = {
+        "schema_version": "1",
+        "run_id": bundle.run_id,
+        "workspace_id": bundle.workspace_id,
+        "phase_id": bundle.phase_id,
+        "included": included,
+        "skipped": skipped,
+        "proactive_overlay_hash": proactive_overlay_hash,
+        "llm_input_bundle_hash": bundle.input_hash,
+    }
+    path = state_dir / "memory_injection_report_latest.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def persist_llm_input_bundle(bundle: LLMInputBundle, drive_root: Path) -> Path:
     state_dir = drive_root / "state"
     state_dir.mkdir(parents=True, exist_ok=True)

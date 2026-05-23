@@ -265,77 +265,9 @@ def memory_write_policy_issues(
     metadata: dict[str, Any] | None = None,
 ) -> list[str]:
     """Return evidence-bound memory policy issues for durable writes."""
+    from umbrella.memory.kernel.policy import memory_write_policy_issues as _kernel_policy
 
-    metadata = dict(metadata or {})
-    kind_norm = str(kind or "").strip().lower()
-    tag_set = {str(tag or "").strip().lower() for tag in tags if str(tag or "").strip()}
-    scope = str(metadata.get("scope") or "").strip().lower()
-    tier = str(metadata.get("tier") or "").strip().lower()
-    durable = bool(
-        {kind_norm, scope, tier, *tag_set} & _DURABLE_MEMORY_MARKERS
-        or scope in {"manager", "competency", "cross_run_durable"}
-        or tier in {"manager", "competency", "durable", "warm"}
-    )
-    if not durable:
-        return []
-    trust_level = str(metadata.get("trust_level") or "").strip().lower()
-    if trust_level not in _MEMORY_TRUST_LEVELS:
-        return [
-            (
-                "durable memory writes require trust_level "
-                "(public_verified/mutation_verified/hidden_verified/"
-                "adversarial_verified, contradicted, or retracted)"
-            )
-        ]
-    if trust_level not in _VERIFIED_MEMORY_TRUST_LEVELS:
-        return [
-            (
-                "durable memory writes require verified-or-higher trust; "
-                f"`{trust_level}` cannot be promoted as durable lesson evidence"
-            )
-        ]
-    has_typed_ref = False
-    has_untyped_ref = False
-    for key in _EVIDENCE_REF_KEYS:
-        value = metadata.get(key)
-        if isinstance(value, str) and value.strip():
-            has_untyped_ref = True
-            continue
-        if isinstance(value, dict) and value.get("ref_id"):
-            producer = str(value.get("produced_by") or "").strip().lower()
-            if producer in _SUPERVISOR_EVIDENCE_PRODUCERS:
-                has_typed_ref = True
-            else:
-                has_untyped_ref = True
-            continue
-        if isinstance(value, (list, tuple, set, frozenset)) and any(
-            str(item).strip() for item in value
-        ):
-            for item in value:
-                if isinstance(item, dict) and item.get("ref_id"):
-                    producer = str(item.get("produced_by") or "").strip().lower()
-                    if producer in _SUPERVISOR_EVIDENCE_PRODUCERS:
-                        has_typed_ref = True
-                    else:
-                        has_untyped_ref = True
-                elif str(item).strip():
-                    has_untyped_ref = True
-    if has_typed_ref:
-        return []
-    if has_untyped_ref:
-        return [
-            (
-                "durable memory writes require typed EvidenceRef values "
-                "produced by supervisor/verifier/watcher/harness; string refs "
-                "are not sufficient"
-            )
-        ]
-    return [
-        (
-            "durable memory writes require typed EvidenceRef values with "
-            "ledger-backed supervisor/verifier/watcher/harness evidence"
-        )
-    ]
+    return _kernel_policy(kind=kind, tags=tags, metadata=metadata)
 
 
 def _memory_source_path(value: Any) -> str:
@@ -475,16 +407,10 @@ def _lesson_is_verified(lesson: Any) -> bool:
 
 
 def _resolve_memory_query_scope(palace_path: str, workspace_id: str) -> tuple[str, str]:
-    room = ""
-    if palace_path:
-        parts = palace_path.strip("/").split("/")
-        if len(parts) >= 2 and parts[0] == "workspaces":
-            workspace_id = workspace_id or parts[1]
-            if len(parts) >= 3:
-                room = parts[2]
-        elif parts:
-            room = parts[-1]
-    return workspace_id, room
+    from umbrella.memory.paths import parse_palace_path_hint
+
+    ws, _event_type, room = parse_palace_path_hint(palace_path, workspace_id=workspace_id)
+    return ws or workspace_id, room
 
 
 _UUID_TOKEN_RE = re.compile(
@@ -557,56 +483,47 @@ def canonical_palace_add(
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Canonical MemPalace write; optional legacy mirror when mempalace is installed."""
-    from umbrella.memory.palace.facade import MemPalace
+    from umbrella.memory.kernel.models import memory_event_from_tool_write
+    from umbrella.memory.kernel.writer import write_memory_event
 
     tag_list = list(tags or [])
     mem_body = content or title or ""
     mem_content = f"[{title}]\n{mem_body}" if title else mem_body
-    canonical_id = ""
+    meta = {"title": title, "type": kind, **(extra or {})}
+    event = memory_event_from_tool_write(
+        content=mem_content,
+        title=title,
+        memory_kind=kind,
+        workspace_id=workspace_id,
+        tags=tag_list,
+        scope=scope,
+        tier=tier,
+        phase_id=phase,
+        run_id=str(run_id or ""),
+        source_path=source_path or "canonical_palace_add",
+        verified=verified,
+        palace_store=store,
+        metadata=meta,
+    )
     try:
-        palace = MemPalace(repo_root, workspace_id or None)
-        try:
-            canonical_id = palace.add(
-                store=store,
-                content=mem_content,
-                tier=tier,
-                scope=scope,
-                tags=tag_list,
-                phase=phase,
-                run_id=run_id,
-                source_path=source_path or "canonical_palace_add",
-                verified=verified,
-                kind=kind,
-                extra={"title": title, "type": kind, **(extra or {})},
-            )
-        finally:
-            palace.close()
+        result = write_memory_event(
+            repo_root,
+            event,
+            workspace_id=workspace_id,
+            mirror_legacy=_legacy_palace_available(),
+        )
     except Exception:
         log.debug("canonical_palace_add failed", exc_info=True)
+        return {"saved": False, "canonical_id": "", "store": store}
 
-    result: dict[str, Any] = {
-        "saved": bool(canonical_id),
-        "canonical_id": canonical_id,
-        "store": store,
+    payload: dict[str, Any] = {
+        "saved": result.saved,
+        "canonical_id": result.canonical_id,
+        "store": result.store or store,
     }
-    if canonical_id and _legacy_palace_available():
-        try:
-            legacy = _palace_backend(repo_root, workspace_id)
-            legacy_result = legacy.add(
-                workspace_id=workspace_id,
-                event_type=kind,
-                room=str((extra or {}).get("room") or ""),
-                title=title,
-                content=content,
-                kind=kind,
-                tags=tag_list or None,
-                metadata_extra=extra,
-            )
-            if isinstance(legacy_result, dict):
-                result["legacy_mirror"] = legacy_result
-        except Exception:
-            log.debug("canonical_palace_add legacy mirror skipped", exc_info=True)
-    return result
+    if result.policy_issues:
+        payload["issues"] = list(result.policy_issues)
+    return payload
 
 
 def _empty_memory_response(
@@ -901,7 +818,10 @@ def get_umbrella_memory(
             }
         else:
             include_unverified = bool(include_unverified)
+        from umbrella.memory.paths import normalize_workspace_id
+
         repo_root = _resolve_umbrella_repo_root(ctx)
+        workspace_id = normalize_workspace_id(workspace_id)
         workspace_id, room = _resolve_memory_query_scope(palace_path, workspace_id)
         current_run_id = _current_run_id_from_ctx(ctx)
         phase = ""
@@ -1233,18 +1153,16 @@ def save_umbrella_memory(
     try:
         repo_root = _resolve_umbrella_repo_root(ctx)
 
-        room = ""
-        event_type = kind
-        if palace_path:
-            parts = palace_path.strip("/").split("/")
-            if len(parts) >= 2 and parts[0] == "workspaces":
-                workspace_id = workspace_id or parts[1]
-                if len(parts) >= 3:
-                    event_type = parts[2]
-                    room = "/".join(parts[2:])
-            elif parts:
-                room = parts[-1]
-                event_type = parts[0] if len(parts) > 1 else kind
+        from umbrella.memory.paths import normalize_workspace_id, parse_palace_path_hint
+
+        workspace_id = normalize_workspace_id(workspace_id)
+        ws_hint, event_type, room = parse_palace_path_hint(
+            palace_path,
+            workspace_id=workspace_id,
+            default_kind=kind,
+        )
+        if ws_hint:
+            workspace_id = ws_hint
 
         task_id = str(getattr(ctx, "task_id", "") or "")
         metadata_extra = dict(metadata_extra or {})
@@ -1273,29 +1191,54 @@ def save_umbrella_memory(
                 }
             )
 
-        canonical_id = ""
+        from umbrella.memory.kernel.models import memory_event_from_tool_write
+        from umbrella.memory.kernel.writer import write_memory_event
+
         store = "palace.durable" if str(kind or "").lower() == "durable" else "palace.idea"
         existing_id = str(metadata_extra.get("canonical_id") or "").strip()
+        mem_body = content or title or ""
+        mem_content = f"[{title}]\n{mem_body}" if title else mem_body
+        write_meta = {
+            **metadata_extra,
+            "room": room,
+            "palace_store": store,
+        }
         if existing_id:
-            try:
-                from umbrella.memory.palace.facade import MemPalace
-
-                palace = MemPalace(repo_root, workspace_id or None)
-                try:
-                    if palace.get(existing_id, stores=[store]):
-                        canonical_id = existing_id
-                finally:
-                    palace.close()
-            except Exception:
-                canonical_id = ""
-        if canonical_id:
+            write_meta["canonical_id"] = existing_id
+        event = memory_event_from_tool_write(
+            content=mem_content,
+            title=title,
+            memory_kind=kind,
+            workspace_id=workspace_id,
+            tags=tag_list,
+            scope=str(metadata_extra.get("scope") or "run_scoped"),
+            tier=str(metadata_extra.get("tier") or "warm"),
+            phase_id=str(metadata_extra.get("phase") or ""),
+            run_id=run_id or "",
+            source_path=str(
+                metadata_extra.get("source_path") or room or "save_umbrella_memory"
+            ),
+            trust_level=str(metadata_extra.get("trust_level") or "agent_claim"),
+            verified=bool(metadata_extra.get("verified", False)),
+            evidence_refs=metadata_extra.get("evidence_refs") or [],
+            metadata=write_meta,
+        )
+        write_result = write_memory_event(
+            repo_root,
+            event,
+            workspace_id=workspace_id,
+            skip_if_exists=bool(existing_id),
+            mirror_legacy=_legacy_palace_available(),
+        )
+        if write_result.skipped_duplicate or write_result.saved:
             from umbrella.memory.palace_backend import _workspace_to_wing
 
+            canonical_id = write_result.canonical_id
             payload: dict[str, Any] = {
                 "saved": True,
                 "canonical_id": canonical_id,
                 "id": canonical_id,
-                "store": store,
+                "store": write_result.store or store,
                 "room": room,
                 "wing": _workspace_to_wing(workspace_id) if workspace_id else "",
             }
@@ -1303,80 +1246,15 @@ def save_umbrella_memory(
                 payload["durable_store"] = store
                 payload["durable_node_id"] = canonical_id
             return _json(payload)
-        try:
-            from umbrella.memory.palace.facade import MemPalace
-
-            palace = MemPalace(repo_root, workspace_id or None)
-            try:
-                mem_body = content or title or ""
-                mem_content = f"[{title}]\n{mem_body}" if title else mem_body
-                node_extra: dict[str, Any] = {
-                    "title": title,
-                    "type": kind,
-                    "room": room,
+        if write_result.policy_issues:
+            return _json(
+                {
+                    "saved": False,
+                    "status": "blocked",
+                    "reason": "evidence_bound_memory",
+                    "issues": list(write_result.policy_issues),
                 }
-                if store == "palace.durable":
-                    node_extra["trust_level"] = str(
-                        metadata_extra.get("trust_level") or ""
-                    )
-                    node_extra["evidence_refs_json"] = json.dumps(
-                        metadata_extra.get("evidence_refs") or [],
-                        ensure_ascii=False,
-                    )
-                    node_extra["verify_run_id"] = str(
-                        metadata_extra.get("verify_run_id") or ""
-                    )
-                canonical_id = palace.add(
-                    store=store,
-                    content=mem_content,
-                    tier=str(metadata_extra.get("tier") or "warm"),
-                    scope=str(metadata_extra.get("scope") or "run_scoped"),
-                    tags=tag_list,
-                    phase=str(metadata_extra.get("phase") or ""),
-                    run_id=run_id or None,
-                    source_path=str(metadata_extra.get("source_path") or room or "save_umbrella_memory"),
-                    verified=bool(metadata_extra.get("verified", False)),
-                    kind=kind,
-                    extra=node_extra,
-                )
-            finally:
-                palace.close()
-        except Exception:
-            canonical_id = ""
-
-        if canonical_id:
-            from umbrella.memory.palace_backend import _workspace_to_wing
-
-            payload = {
-                "saved": True,
-                "canonical_id": canonical_id,
-                "id": canonical_id,
-                "store": store,
-                "room": room,
-                "wing": _workspace_to_wing(workspace_id) if workspace_id else "",
-            }
-            if store == "palace.durable":
-                payload["durable_store"] = store
-                payload["durable_node_id"] = canonical_id
-            if _legacy_palace_available():
-                try:
-                    legacy = _palace_backend(repo_root, workspace_id)
-                    legacy_result = legacy.add(
-                        workspace_id=workspace_id,
-                        event_type=event_type,
-                        room=room,
-                        title=title,
-                        content=content,
-                        kind=kind,
-                        tags=tag_list or None,
-                        task_id=task_id,
-                        metadata_extra=metadata_extra or None,
-                    )
-                    if isinstance(legacy_result, dict):
-                        payload["legacy_mirror"] = legacy_result
-                except Exception:
-                    pass
-            return _json(payload)
+            )
 
         if not _legacy_palace_available():
             return _json(
@@ -1460,8 +1338,12 @@ def record_idea(
     """
 
     try:
+        from umbrella.memory.paths import normalize_workspace_id, parse_palace_path_hint
+
         repo_root = _resolve_umbrella_repo_root(ctx)
-        ws = workspace_id or _current_workspace_id_from_drive(ctx)
+        ws = normalize_workspace_id(
+            workspace_id or _current_workspace_id_from_drive(ctx)
+        )
         if not ws:
             return "ERROR: workspace_id is required or must be present in drive state"
         root = _workspace_memory_root(repo_root, ws, ctx)
@@ -1514,9 +1396,14 @@ def record_idea(
                 if extra not in tag_list:
                     tag_list.append(extra)
 
-        hier_path = str(palace_path or "").strip().strip("/")
-        if not hier_path:
-            hier_path = f"workspaces/{ws}/ideas/{kind_norm}"
+        _ws_hint, _event, logical = parse_palace_path_hint(
+            palace_path,
+            workspace_id=ws,
+            default_kind=kind_norm,
+        )
+        if _ws_hint:
+            ws = _ws_hint
+        hier_path = logical or f"ideas/{kind_norm}"
 
         # Write directly to ideas.jsonl (replaces HierarchicalMemory.add)
         import uuid as _uuid_mod

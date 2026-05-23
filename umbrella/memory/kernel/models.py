@@ -1,6 +1,7 @@
 """Canonical MemoryEvent contract for Umbrella memory writes."""
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -260,6 +261,71 @@ def _store_for_kind(kind: str) -> str:
     return "palace.idea"
 
 
+def memory_event_from_tool_write(
+    *,
+    content: str,
+    title: str = "",
+    memory_kind: str = "observation",
+    workspace_id: str = "",
+    tags: Iterable[str] = (),
+    scope: str = "run_scoped",
+    tier: str = "warm",
+    phase_id: str = "",
+    run_id: str = "",
+    subtask_id: str = "",
+    source_path: str = "",
+    trust_level: str = "agent_claim",
+    verified: bool = False,
+    evidence_refs: Iterable[Any] = (),
+    lifecycle: str = "candidate",
+    surface: str = "supplemental_evidence",
+    source_backend: str = "umbrella",
+    palace_store: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> MemoryEvent:
+    """Build a MemoryEvent from tool-layer write parameters."""
+    refs: list[EvidenceRef] = []
+    for item in evidence_refs:
+        if isinstance(item, EvidenceRef):
+            refs.append(item)
+        elif isinstance(item, dict):
+            refs.append(EvidenceRef.from_mapping(item))
+    tag_tuple = tuple(
+        str(tag).strip()
+        for tag in (
+            tags.replace(";", ",").split(",")
+            if isinstance(tags, str)
+            else tags
+        )
+        if str(tag).strip()
+    )
+    meta = dict(metadata or {})
+    if palace_store:
+        meta["palace_store"] = palace_store
+    return normalize_memory_event(
+        {
+            "content": content,
+            "title": title,
+            "memory_kind": memory_kind,
+            "workspace_id": workspace_id,
+            "tags": tag_tuple,
+            "scope": scope,
+            "tier": tier,
+            "phase_id": phase_id,
+            "run_id": run_id,
+            "subtask_id": subtask_id,
+            "source_path": source_path,
+            "trust_level": trust_level,
+            "verified": verified,
+            "evidence_refs": refs,
+            "lifecycle": lifecycle,
+            "surface": surface,
+            "source_backend": source_backend,
+            "metadata": meta,
+        }
+    )
+
+
 def memory_event_to_palace_kwargs(event: MemoryEvent) -> dict[str, Any]:
     mem_body = event.content or event.title or ""
     mem_content = f"[{event.title}]\n{mem_body}" if event.title else mem_body
@@ -280,8 +346,11 @@ def memory_event_to_palace_kwargs(event: MemoryEvent) -> dict[str, Any]:
         "external_refs_json": json.dumps(event.external_refs, ensure_ascii=False),
         "metadata_json": json.dumps(event.metadata, ensure_ascii=False, default=str),
     }
+    store = str(event.metadata.get("palace_store") or "") or _store_for_kind(
+        event.memory_kind
+    )
     return {
-        "store": _store_for_kind(event.memory_kind),
+        "store": store,
         "content": mem_content,
         "tier": event.tier,
         "scope": event.scope,
@@ -300,10 +369,17 @@ def palace_node_to_memory_event(node: dict[str, Any]) -> dict[str, Any]:
     return {
         "canonical_id": node.get("id"),
         "content": node.get("content"),
-        "memory_kind": node.get("kind") or node.get("type"),
+        "memory_kind": node.get("memory_kind") or node.get("kind") or node.get("type"),
         "store": node.get("store"),
+        "lifecycle": node.get("lifecycle"),
+        "surface": node.get("surface"),
         "trust_level": node.get("trust_level"),
+        "source_backend": node.get("source_backend"),
         "evidence_refs_json": node.get("evidence_refs_json"),
+        "external_refs_json": node.get("external_refs_json"),
+        "metadata_json": node.get("metadata_json"),
+        "producer": node.get("producer"),
+        "agent_kind": node.get("agent_kind"),
         "scope": node.get("scope"),
         "tier": node.get("tier"),
         "tags": node.get("tags"),

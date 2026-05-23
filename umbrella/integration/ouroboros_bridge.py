@@ -38,13 +38,9 @@ def resolve_ouroboros_repo_root(repo_root: Path) -> Path:
 
 
 def safe_workspace_segment(workspace_id: str | None) -> str:
-    raw = (workspace_id or "").strip().replace("\\", "/").strip("/")
-    if not raw:
-        return ""
-    parts = Path(raw).parts
-    if ".." in parts or any(part in ("", ".", "..") for part in parts):
-        raise ValueError("workspace_id must be a safe workspace directory name")
-    return raw
+    from umbrella.memory.paths import _safe_workspace_segment
+
+    return _safe_workspace_segment(workspace_id or "")
 
 
 def workspace_drive_root(repo_root: Path, workspace_id: str | None) -> Path:

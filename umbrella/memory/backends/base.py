@@ -3,7 +3,7 @@
 from typing import Any, Protocol
 
 
-class MemoryEvent(Protocol):
+class BackendEventDict(Protocol):
     content: str
     metadata: dict[str, Any]
 

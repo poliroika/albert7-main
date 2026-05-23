@@ -338,6 +338,24 @@ def test_null_chroma_stub_shared_across_instances(tmp_path, monkeypatch):
     assert "shared stub memory" in str(node.get("content") or "")
 
 
+def test_null_chroma_stub_delete(tmp_path, monkeypatch):
+    monkeypatch.setenv("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", "1")
+    palace = MemPalace(tmp_path, "stub_ws")
+    try:
+        node_id = palace.add(
+            store="palace.idea",
+            content="delete me",
+            tags=["stub"],
+            kind="observation",
+        )
+        assert palace.get(node_id, stores=["palace.idea"]) is not None
+        col = palace._stores.chroma("palace.idea")
+        col.delete(ids=[node_id])
+        assert palace.get(node_id, stores=["palace.idea"]) is None
+    finally:
+        palace.close()
+
+
 def test_normalize_store_for_write_global_alias():
     assert _normalize_store_for_write("palace.global", kind="lesson") == "palace.lesson"
     assert _normalize_store_for_write("palace.global", tags=["failure_pattern"]) == "palace.lesson"

@@ -1556,7 +1556,7 @@ def test_palace_add_accepts_optional_metadata(tmp_path, monkeypatch):
     assert payload["verified"] is True
     assert payload["id"]
     assert captured["title"] == "Finding"
-    assert captured["palace_path"] == "workspaces/test_ws/research"
+    assert captured["palace_path"] == "research"
     assert "Concrete architecture note." in captured["content"]
     assert "github:example/civ-pattern" in captured["content"]
     assert "observation" in captured["content"]
@@ -1858,7 +1858,7 @@ def test_palace_add_routes_plan_subtask_card_to_subtask_store(tmp_path, monkeypa
     assert payload["store"] == "palace.subtask"
     assert payload["scope"] == "subtask_scoped"
     assert payload["subtask_id"] == "game-state"
-    assert captured["palace_path"] == "workspaces/test_ws/plan/subtasks"
+    assert captured["palace_path"] == "plan/subtasks"
     assert captured["kind"] == "subtask_card"
 
     memories = MemPalace(tmp_path, "test_ws").list_all(stores=["palace.subtask"], n=10)
@@ -1898,7 +1898,7 @@ def test_palace_add_defaults_plan_subtask_path_from_phase(tmp_path, monkeypatch)
 
     payload = json.loads(result)
     assert payload["saved"] is True
-    assert captured["palace_path"] == "workspaces/test_ws/plan/subtasks"
+    assert captured["palace_path"] == "plan/subtasks"
 
 
 def test_palace_add_defaults_linear_execute_task_to_execute_path(tmp_path, monkeypatch):
@@ -1930,7 +1930,7 @@ def test_palace_add_defaults_linear_execute_task_to_execute_path(tmp_path, monke
 
     payload = json.loads(result)
     assert payload["saved"] is True
-    assert captured["palace_path"] == "workspaces/test_ws/execute"
+    assert captured["palace_path"] == "execute"
 
 
 def test_palace_add_does_not_treat_missing_imports_plural_as_symbol_s(tmp_path, monkeypatch):

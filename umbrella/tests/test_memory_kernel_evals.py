@@ -27,6 +27,38 @@ def repo(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_memory_event_palace_roundtrip_full_metadata(repo):
+    from umbrella.memory.kernel.models import palace_node_to_memory_event
+
+    event = MemoryEvent(
+        content="metadata roundtrip body",
+        title="Meta",
+        memory_kind="observation",
+        lifecycle="candidate",
+        surface="supplemental_evidence",
+        source_backend="umbrella",
+        workspace_id="ws1",
+        tags=("observation",),
+    )
+    result = write_memory_event(repo, event, workspace_id="ws1")
+    assert result.saved
+
+    from umbrella.memory.palace.facade import MemPalace
+
+    palace = MemPalace(repo, "ws1")
+    try:
+        node = palace.get(result.canonical_id, stores=[result.store])
+    finally:
+        palace.close()
+    assert node is not None
+    assert node.get("lifecycle") == "candidate"
+    assert node.get("surface") == "supplemental_evidence"
+    assert node.get("source_backend") == "umbrella"
+    roundtrip = palace_node_to_memory_event(node)
+    assert roundtrip.get("lifecycle") == "candidate"
+    assert roundtrip.get("surface") == "supplemental_evidence"
+
+
 def test_memory_event_roundtrip(repo):
     from umbrella.enforcement.ledger import append_supervisor_ledger_event
 
@@ -234,9 +266,10 @@ def test_no_duplicate_canonical_write_from_palace_add(repo):
 
     from umbrella.memory.palace.facade import MemPalace
 
+    store = str(payload.get("store") or "palace.idea")
     palace = MemPalace(repo, "ws1")
     try:
-        hits = palace.list_all(n=200, stores=["palace.idea"])
+        hits = palace.list_all(n=200, stores=[store])
     finally:
         palace.close()
     matches = [

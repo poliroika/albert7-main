@@ -677,6 +677,17 @@ def build_phase_task(
         manifest=manifest,
         drive_root=drive_root,
     )
+    import hashlib
+
+    proactive_markdown = proactive_overlay.render_markdown()
+    proactive_overlay_hash = hashlib.sha256(
+        proactive_markdown.encode("utf-8")
+    ).hexdigest()
+    directive_sections = [
+        str(section.get("name") or "")
+        for section in proactive_overlay.to_payload().get("sections", [])
+        if isinstance(section, dict) and section.get("name")
+    ]
     graph_policy = getattr(manifest.memory, "graph", None)
     recall = palace.recall(
         phase_node.manifest_id,
@@ -770,6 +781,13 @@ def build_phase_task(
         )
         if drive_root is not None:
             persist_llm_input_bundle(bundle, drive_root)
+            from umbrella.context.render import persist_memory_injection_report
+
+            persist_memory_injection_report(
+                bundle,
+                drive_root,
+                proactive_overlay_hash=proactive_overlay_hash,
+            )
         overlays["llm_input_bundle"] = bundle_to_overlay_dict(bundle)
         overlays["llm_input_bundle_hash"] = bundle.input_hash
     except Exception as exc:
@@ -783,6 +801,18 @@ def build_phase_task(
         overlays["llm_input_bundle_warning"] = (
             f"LLM input bundle compile failed: {exc}"
         )
+    overlays["memory_injection_contract"] = {
+        "owner": "umbrella.phase_runner",
+        "mode": "umbrella_owned",
+        "proactive_overlay_injected": True,
+        "proactive_overlay_hash": proactive_overlay_hash,
+        "retrieval_is_supplemental_only": True,
+        "directive_surface": "task.input.proactive_memory",
+        "directive_sections": directive_sections or ["proactive_memory"],
+        "workspace_id": workspace_id,
+        "run_id": run_id,
+        "phase_id": phase_node.manifest_id,
+    }
     overlays["umbrella_managed"] = True
     overlays["memory_overlay_origin"] = "umbrella.orchestrator.worker.build_phase_task"
     overlays["proactive_memory_rendered_in_task_input"] = True

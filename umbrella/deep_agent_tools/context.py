@@ -64,8 +64,10 @@ def _split_tags(tags: str) -> list[str]:
 
 
 def _workspace_root(repo_root: Path, workspace_id: str, ctx: Any | None = None) -> Path:
-    clean = str(workspace_id or "").strip().replace("\\", "/").strip("/")
-    if not clean or ".." in Path(clean).parts:
+    from umbrella.memory.paths import _safe_workspace_segment
+
+    clean = _safe_workspace_segment(workspace_id)
+    if not clean:
         raise ValueError("workspace_id must be a safe workspace directory name")
     overrides = (
         getattr(ctx, "workspace_root_overrides", None) if ctx is not None else None

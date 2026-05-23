@@ -163,7 +163,15 @@ class _NullChromaCollection:
         return {"ids": [it["id"] for it in items], "documents": [it["document"] for it in items], "metadatas": [it["metadata"] for it in items]}
 
     def delete(self, ids=None, where=None, **kwargs) -> None:
+        items = self._items
         if ids:
-            self._items = [it for it in self._items if it["id"] not in ids]
+            kept = [it for it in items if it["id"] not in ids]
         elif where:
-            self._items = [it for it in self._items if not all(it["metadata"].get(k) == v for k, v in where.items())]
+            kept = [
+                it
+                for it in items
+                if not all(it["metadata"].get(k) == v for k, v in where.items())
+            ]
+        else:
+            kept = []
+        self._GLOBAL_ITEMS[self._key] = kept

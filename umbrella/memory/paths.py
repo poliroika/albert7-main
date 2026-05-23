@@ -13,12 +13,67 @@ if TYPE_CHECKING:
 
 
 def _safe_workspace_segment(workspace_id: str) -> str:
+    """Return a single workspace directory name (never ``workspaces/<id>``)."""
     raw = (workspace_id or "").strip().replace("\\", "/").strip("/")
-    if not raw:
+    while raw.casefold().startswith("./"):
+        raw = raw[2:].strip("/")
+    if raw.casefold().startswith(".workspaces/"):
+        raw = raw[1:].strip("/")
+    parts = [part for part in raw.split("/") if part]
+    if parts and parts[0].casefold() == "workspaces":
+        parts = parts[1:]
+    if not parts:
         return ""
-    if ".." in Path(raw).parts:
+    seg = parts[0]
+    if ".." in Path(seg).parts:
         raise ValueError("workspace_id must not contain path traversal")
-    return raw
+    return seg
+
+
+def normalize_workspace_id(workspace_id: str) -> str:
+    """Public alias for :func:`_safe_workspace_segment`."""
+    return _safe_workspace_segment(workspace_id)
+
+
+def parse_palace_path_hint(
+    palace_path: str,
+    *,
+    workspace_id: str = "",
+    default_kind: str = "observation",
+) -> tuple[str, str, str]:
+    """Parse ``palace_path`` into ``(workspace_id, event_type, room)``.
+
+    Accepts repo-relative ``workspaces/<id>/research``, workspace-relative
+    ``research/plan``, or mistaken ``workspaces/<id>/.memory/...`` without
+    treating those segments as extra on-disk directories under ``.memory``.
+    """
+    ws = _safe_workspace_segment(workspace_id)
+    text = str(palace_path or "").strip().replace("\\", "/").strip("/")
+    while text.startswith("./"):
+        text = text[2:].strip("/")
+    if text.casefold().startswith(".workspaces/"):
+        text = text[1:].strip("/")
+    if ws:
+        for prefix in (f"workspaces/{ws}/", f"{ws}/", "workspaces/"):
+            while text.casefold().startswith(prefix.casefold()):
+                text = text[len(prefix) :].strip("/")
+        while text.casefold().startswith(f"{ws}/".casefold()):
+            text = text[len(f"{ws}/") :].strip("/")
+    elif text.casefold().startswith("workspaces/"):
+        parts = text.split("/")
+        if len(parts) >= 2:
+            ws = _safe_workspace_segment(parts[1])
+            text = "/".join(parts[2:]).strip("/")
+    if text.casefold().startswith(".memory/"):
+        text = text[len(".memory/") :].strip("/")
+    elif text.casefold() == ".memory":
+        text = ""
+    if not text:
+        return ws, default_kind, ""
+    parts = text.split("/")
+    event_type = parts[0] or default_kind
+    room = "/".join(parts) if parts else ""
+    return ws, event_type, room
 
 
 def workspace_memory_root(repo_root: Path, workspace_id: str) -> Path:
@@ -104,7 +159,10 @@ __all__ = [
     "manager_core_root",
     "manager_memory_root",
     "manager_palace_root",
+    "normalize_workspace_id",
     "palace_path_for",
+    "parse_palace_path_hint",
     "workspace_core_root",
     "workspace_memory_root",
+    "workspace_root",
 ]

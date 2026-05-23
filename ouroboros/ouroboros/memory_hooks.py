@@ -122,6 +122,13 @@ def _context_overlays(tools_ctx: Any | None) -> dict[str, Any]:
 
 def _umbrella_overlay_already_compiled(tools_ctx: Any | None) -> bool:
     overlays = _context_overlays(tools_ctx)
+    contract = overlays.get("memory_injection_contract")
+    if isinstance(contract, dict):
+        if (
+            contract.get("mode") == "umbrella_owned"
+            and contract.get("proactive_overlay_injected")
+        ):
+            return True
     return bool(
         overlays.get("prevent_ouroboros_auto_core_overlay")
         or overlays.get("proactive_memory_rendered_in_task_input")
