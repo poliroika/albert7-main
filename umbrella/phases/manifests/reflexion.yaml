@@ -46,6 +46,17 @@ memory:
     # core_lesson: propose via submit_reflection(proposed_bkb_rules=[...]);
     # Umbrella supervisor post-phase hook accepts/rejects via BKB gate (not palace_add / not agent accept_bkb_proposal)
     core_lesson: {store: palace.lesson, tier: always_on, scope: cross_run_durable, verified: false}
+  promotion:
+    bkb_proposals:
+      mode: supervisor_post_phase
+      invalid_proposal: loop_back
+      no_proposal: allow
+      target_default: workspace
+    hindsight:
+      enabled_env: UMBRELLA_HINDSIGHT_REFLECT_ENABLED
+      mode: candidates_only
+      max_candidates_env: UMBRELLA_HINDSIGHT_MAX_CANDIDATES
+      auto_accept: false
 
 permissions:
   rules:

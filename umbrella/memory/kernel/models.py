@@ -174,6 +174,8 @@ class MemoryWriteResult:
     error: str = ""
     warnings: tuple[str, ...] = ()
     external_refs: dict[str, str] = field(default_factory=dict)
+    skipped_duplicate: bool = False
+    policy_issues: tuple[str, ...] = ()
 
 
 def normalize_memory_event(raw: dict[str, Any] | MemoryEvent) -> MemoryEvent:

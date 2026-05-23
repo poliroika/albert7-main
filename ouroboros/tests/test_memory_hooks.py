@@ -359,6 +359,83 @@ class TestAutoRecallInjection(unittest.TestCase):
         core_recall.assert_not_called()
         self.assertEqual(len(messages), 1)
 
+    def test_init_loop_memory_prefers_contract_workspace_over_memory_source_refs(self):
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "## [ALWAYS-LOADED MEMORY]\n"
+                    "### Workspace charter\n"
+                    "_Sources: core:workspace:00_workspace_charter.md_\n"
+                    "_Sources: core:workspace:30_workspace_antipatterns.md_"
+                ),
+            }
+        ]
+        ctx = SimpleNamespace(
+            host_repo_root=Path("/tmp"),
+            repo_dir=Path("/tmp"),
+            umbrella_managed=True,
+            context_overlays={
+                "memory_injection_contract": {
+                    "mode": "umbrella_owned",
+                    "proactive_overlay_injected": True,
+                    "proactive_overlay_hash": "abc123",
+                    "workspace_id": "civilization",
+                },
+            },
+        )
+
+        _repo_root, ws = memory_hooks.init_loop_memory(messages, ctx)
+
+        self.assertEqual(ws, "civilization")
+        self.assertEqual(len(messages), 1)
+
+    def test_guess_initial_workspace_ignores_core_workspace_source_refs(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "_Sources: core:workspace:00_workspace_charter.md_",
+            }
+        ]
+
+        self.assertEqual(memory_hooks._guess_initial_workspace(messages), "")
+
+    def test_guess_initial_workspace_ignores_system_workspace_id_examples(self):
+        messages = [
+            {
+                "role": "system",
+                "content": 'example: run_manager_task(workspace_id="agent_research")',
+            },
+            {"role": "user", "content": "Workspace: workspaces/JKX\nBuild it."},
+        ]
+
+        self.assertEqual(memory_hooks._guess_initial_workspace(messages), "JKX")
+
+    def test_init_loop_memory_can_infer_workspace_from_drive_root(self):
+        repo = Path("/tmp/repo")
+        ctx = SimpleNamespace(
+            host_repo_root=repo,
+            repo_dir=repo,
+            drive_root=repo / "workspaces" / "civilization" / ".memory" / "drive",
+        )
+
+        _repo_root, ws = memory_hooks.init_loop_memory([], ctx)
+
+        self.assertEqual(ws, "civilization")
+
+    def test_init_loop_memory_prefers_drive_root_over_stale_active_workspace(self):
+        repo = Path("/tmp/repo")
+        ctx = SimpleNamespace(
+            host_repo_root=repo,
+            repo_dir=repo,
+            drive_root=repo / "workspaces" / "civilization" / ".memory" / "drive",
+            active_workspace_id="00_workspace_ch",
+        )
+
+        _repo_root, ws = memory_hooks.init_loop_memory([], ctx)
+
+        self.assertEqual(ws, "civilization")
+
     def test_periodic_recall_does_not_inject_by_default(self):
         messages: list[dict] = []
         with (

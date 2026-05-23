@@ -1,132 +1,147 @@
-"""Dual-write durable memory to canonical + optional Hindsight."""
+"""Dual-write durable memory to canonical storage plus Hindsight mirror."""
 
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from umbrella.memory.backends.canonical import CanonicalMemoryBackend
 from umbrella.memory.backends.hindsight import HindsightBackend
+from umbrella.memory.kernel.telemetry import record_memory_event
+
+log = logging.getLogger(__name__)
 
 
-def create_durable_backend(
-    repo_root: Path,
-    *,
-    workspace_id: str = "",
-) -> Any:
-    """Select durable backend. Hindsight-only bypasses MemPalace unless explicitly opted in."""
-    mode = str(os.environ.get("UMBRELLA_MEMORY_DURABLE_BACKEND", "canonical")).strip().lower()
-    canonical = CanonicalMemoryBackend(repo_root, workspace_id)
-    if mode == "hindsight":
-        if str(os.environ.get("UMBRELLA_ALLOW_UNSAFE_HINDSIGHT_ONLY", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            log.warning(
-                "Using hindsight-only durable backend (unsafe; MemPalace is not source of truth)"
+def _ok(result: Any) -> bool:
+    if isinstance(result, dict):
+        return bool(result.get("ok") or result.get("saved"))
+    return bool(result)
+
+
+class DualWriteDurableBackend:
+    def __init__(
+        self,
+        *,
+        primary: CanonicalMemoryBackend,
+        secondary: HindsightBackend,
+        secondary_best_effort: bool = True,
+    ) -> None:
+        self._primary = primary
+        self._secondary = secondary
+        self._secondary_best_effort = secondary_best_effort
+
+    def _record_secondary_warning(
+        self,
+        *,
+        op: str,
+        error: str = "",
+        status: str = "unavailable",
+    ) -> None:
+        try:
+            record_memory_event(
+                self._primary._repo_root,
+                event_type="hindsight_backend_warnings",
+                workspace_id=self._primary._workspace_id,
+                backend="hindsight",
+                status=status,
+                error=error,
+                data={"op": op},
             )
-            return HindsightBackend(
-                bank_id=f"ub:workspace:{workspace_id}" if workspace_id else "ub:manager"
+        except Exception:
+            log.debug("dual-write telemetry skipped", exc_info=True)
+
+    def _secondary_available(self, *, op: str) -> bool:
+        health = self._secondary.health()
+        if health.get("ok"):
+            return True
+        if health.get("enabled"):
+            self._record_secondary_warning(
+                op=op,
+                error=str(health.get("error") or health.get("reason") or "unavailable"),
             )
-        log.warning(
-            "UMBRELLA_MEMORY_DURABLE_BACKEND=hindsight without "
-            "UMBRELLA_ALLOW_UNSAFE_HINDSIGHT_ONLY; falling back to canonical MemPalace"
-        )
-        return canonical
-    if mode == "dual":
-        return _DualWriteBackend(canonical, HindsightBackend(
-            bank_id=f"ub:workspace:{workspace_id}" if workspace_id else "ub:manager"
-        ))
-    return canonical
+        return False
 
+    def _mirror(self, op: str, payload: Any) -> dict[str, Any]:
+        if not self._secondary_available(op=op):
+            return {"ok": False, "skipped": True, "reason": "secondary_unavailable"}
+        try:
+            return getattr(self._secondary, op)(payload)
+        except Exception as exc:
+            if not self._secondary_best_effort:
+                raise
+            self._record_secondary_warning(op=op, error=str(exc), status="failed")
+            return {"ok": False, "error": str(exc), "best_effort": True}
 
-class _DualWriteBackend:
-    def __init__(self, canonical: CanonicalMemoryBackend, hindsight: HindsightBackend) -> None:
-        self._canonical = canonical
-        self._hindsight = hindsight
-
-    def retain_lesson(self, lesson: dict[str, Any] | Any) -> str:
-        node_id = self._canonical.retain_lesson(lesson)
-        if lesson.get("verified") and self._hindsight.health().get("ok"):
+    def ensure_banks(self, *, workspace_id: str = "") -> dict[str, Any]:
+        primary = self._primary.ensure_banks(workspace_id=workspace_id)
+        secondary = {}
+        if self._secondary_available(op="ensure_banks"):
             try:
-                self._hindsight.retain_lesson(lesson)
-            except (NotImplementedError, RuntimeError) as exc:
-                try:
-                    from umbrella.memory.kernel.telemetry import record_memory_event
+                secondary = self._secondary.ensure_banks(workspace_id=workspace_id)
+            except Exception as exc:
+                if not self._secondary_best_effort:
+                    raise
+                self._record_secondary_warning(op="ensure_banks", error=str(exc))
+        return {"ok": _ok(primary), "canonical": primary, "hindsight": secondary}
 
-                    record_memory_event(
-                        self._canonical._repo_root,
-                        event_type="memory_dual_write_secondary_failed",
-                        workspace_id=self._canonical._workspace_id,
-                        status="failed",
-                        error=str(exc),
-                        data={"backend": "hindsight", "op": "retain_lesson"},
-                    )
-                except Exception:
-                    log.debug(
-                        "dual_write hindsight retain_lesson telemetry skipped",
-                        exc_info=True,
-                    )
-        return node_id
+    def retain_lesson(self, lesson: Any) -> dict[str, Any]:
+        primary = self._primary.retain_lesson(lesson)
+        secondary: dict[str, Any] = {}
+        if _ok(primary):
+            secondary = self._mirror("retain_lesson", lesson)
+        return {
+            "ok": _ok(primary),
+            "backend": "dual",
+            "canonical": primary,
+            "hindsight": secondary,
+        }
 
-    def retain_event(self, event: dict[str, Any] | Any) -> str:
-        node_id = self._canonical.retain_event(event)
-        if event.get("verified") and self._hindsight.health().get("ok"):
-            try:
-                self._hindsight.retain_event(event)
-            except (NotImplementedError, RuntimeError) as exc:
-                try:
-                    from umbrella.memory.kernel.telemetry import record_memory_event
-
-                    record_memory_event(
-                        self._canonical._repo_root,
-                        event_type="memory_dual_write_secondary_failed",
-                        workspace_id=self._canonical._workspace_id,
-                        status="failed",
-                        error=str(exc),
-                        data={"backend": "hindsight", "op": "retain_event"},
-                    )
-                except Exception:
-                    log.debug(
-                        "dual_write hindsight retain_event telemetry skipped",
-                        exc_info=True,
-                    )
-        return node_id
+    def retain_event(self, event: Any) -> dict[str, Any]:
+        primary = self._primary.retain_event(event)
+        secondary: dict[str, Any] = {}
+        if _ok(primary):
+            secondary = self._mirror("retain_event", event)
+        return {
+            "ok": _ok(primary),
+            "backend": "dual",
+            "canonical": primary,
+            "hindsight": secondary,
+        }
 
     def recall_evidence(self, query: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._canonical.recall_evidence(query)
+        return self._primary.recall_evidence(query)
 
-    def reflect_candidates(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+    def reflect_candidates(self, query: Any) -> list[Any]:
+        if not self._secondary_available(op="reflect_candidates"):
+            return []
         try:
-            return self._hindsight.reflect_candidates(query)
+            return self._secondary.reflect_candidates(query)
         except Exception as exc:
-            try:
-                from umbrella.memory.kernel.telemetry import record_memory_event
-
-                record_memory_event(
-                    Path(str(query.get("repo_root") or ".")),
-                    event_type="memory_backend_unavailable",
-                    workspace_id=str(query.get("workspace_id") or ""),
-                    status="unavailable",
-                    error=str(exc),
-                    data={"backend": "hindsight", "op": "reflect_candidates"},
-                )
-            except Exception:
-                log.debug(
-                    "hindsight reflect_candidates telemetry skipped",
-                    exc_info=True,
-                )
+            if not self._secondary_best_effort:
+                raise
+            self._record_secondary_warning(
+                op="reflect_candidates", error=str(exc), status="failed"
+            )
             return []
 
     def health(self) -> dict[str, Any]:
+        canonical = self._primary.health()
+        hindsight = self._secondary.health()
         return {
-            "canonical": self._canonical.health(),
-            "hindsight": self._hindsight.health(),
+            "ok": bool(canonical.get("ok")),
+            "backend": "dual",
+            "canonical": canonical,
+            "hindsight": hindsight,
+            "warning": "" if hindsight.get("ok") else "hindsight unavailable",
         }
 
     def close(self) -> None:
-        self._canonical.close()
+        self._primary.close()
+
+
+def create_durable_backend(*args: Any, **kwargs: Any) -> Any:
+    from umbrella.memory.backends.factory import create_durable_backend as factory
+
+    return factory(*args, **kwargs)
+
+
+_DualWriteBackend = DualWriteDurableBackend

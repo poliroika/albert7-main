@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import pathlib
 import re
 import time
@@ -1694,6 +1695,35 @@ class PhaseRunner:
                 except Exception:
                     log.debug("Launcher stop failed", exc_info=True)
 
+        try:
+            from umbrella.memory.backends.base import DurableEvent
+            from umbrella.memory.backends.factory import retain_hindsight_event_best_effort
+
+            retain_hindsight_event_best_effort(
+                repo_root=self._repo_root,
+                workspace_id=self._workspace_id,
+                event=DurableEvent(
+                    event_id=f"run_summary:{run_id}",
+                    kind="run_summary",
+                    content=f"Umbrella run {run_id} completed for workspace {self._workspace_id}.",
+                    workspace_id=self._workspace_id,
+                    run_id=run_id,
+                    trust_level="supervisor_verified",
+                    tags=["kind:run_summary", "scope:workspace", "tier:durable"],
+                    metadata={
+                        "umbrella_id": f"run_summary:{run_id}",
+                        "workspace_id": self._workspace_id,
+                        "run_id": run_id,
+                        "kind": "run_summary",
+                        "trust_level": "supervisor_verified",
+                    },
+                ),
+                op="retain_run_summary",
+            )
+        except Exception:
+            if os.environ.get("UMBRELLA_HINDSIGHT_FAIL_CLOSED") == "1":
+                raise
+
         yield self._emit(ResultEnvelope.success(
             data={"run_id": run_id, "status": "complete"},
             run_id=run_id,
@@ -1986,6 +2016,7 @@ class PhaseRunner:
                     repo_root=self._repo_root,
                     drive_root=self._drive_root,
                     workspace_id=self._workspace_id,
+                    run_id=run_id,
                 )
                 if promotion_result and promotion_result.get("accepted") is False:
                     result, envelope = self._finish_phase_loop_back(

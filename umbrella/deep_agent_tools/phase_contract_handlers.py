@@ -916,7 +916,26 @@ def _palace_health(ctx: ToolContext) -> str:
         tree_payload = json.loads(tree)
     except Exception as exc:
         tree_payload = {"error": str(exc)}
-    return _json({"status": status, "health": health, "tree": tree_payload})
+    try:
+        from umbrella.memory.backends.hindsight import HindsightBackend
+
+        hindsight = HindsightBackend.from_env(repo_root=repo_root, workspace_id=ws).health()
+    except Exception as exc:
+        hindsight = {"ok": False, "enabled": False, "backend": "hindsight", "error": str(exc)}
+    mode = os.environ.get("UMBRELLA_MEMORY_DURABLE_BACKEND", "canonical")
+    return _json(
+        {
+            "status": status,
+            "health": health,
+            "tree": tree_payload,
+            "memory_backend": {
+                "canonical_mempalace": health,
+                "hindsight": hindsight,
+                "mode": mode,
+                "overall_ok": status == "ok",
+            },
+        }
+    )
 
 
 def _mcp_health(ctx: ToolContext) -> str:
@@ -1247,6 +1266,40 @@ def _promote_to_durable(
         payload["durable_store"] = "palace.durable"
         payload["durable_node_id"] = canonical_id
         payload["store"] = "palace.durable"
+        try:
+            from umbrella.memory.backends.base import DurableEvent
+            from umbrella.memory.backends.factory import retain_hindsight_event_best_effort
+
+            retain_hindsight_event_best_effort(
+                repo_root=repo_root,
+                workspace_id=ws,
+                event=DurableEvent(
+                    event_id=canonical_id,
+                    kind="verification_report",
+                    content=body,
+                    workspace_id=ws,
+                    run_id=_run_id(ctx),
+                    phase_id=phase,
+                    trust_level=trust_level,
+                    evidence_refs=typed_refs,
+                    tags=[
+                        "kind:verification_report",
+                        "phase:verify",
+                        f"trust:{trust_level}",
+                        "tier:durable",
+                    ],
+                    metadata={
+                        "umbrella_id": canonical_id,
+                        "palace_node_id": canonical_id,
+                        "kind": "verification_report",
+                        "trust_level": trust_level,
+                    },
+                ),
+                op="retain_verification_report",
+            )
+        except Exception:
+            if os.environ.get("UMBRELLA_HINDSIGHT_FAIL_CLOSED") == "1":
+                raise
     return _json(payload)
 
 

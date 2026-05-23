@@ -20,7 +20,7 @@ def repo(tmp_path, monkeypatch):
 def test_retain_lesson_without_trust_or_evidence_returns_empty_id(repo) -> None:
     backend = CanonicalMemoryBackend(repo, "ws1")
     try:
-        node_id = backend.retain_lesson(
+        result = backend.retain_lesson(
             {
                 "content": "lesson without evidence",
                 "trust_level": "agent_claim",
@@ -29,7 +29,7 @@ def test_retain_lesson_without_trust_or_evidence_returns_empty_id(repo) -> None:
         )
     finally:
         backend.close()
-    assert node_id == ""
+    assert result["saved"] is False
 
 
 def test_retain_lesson_with_ledger_evidence_succeeds(repo) -> None:
@@ -43,7 +43,7 @@ def test_retain_lesson_with_ledger_evidence_succeeds(repo) -> None:
     )
     backend = CanonicalMemoryBackend(repo, "ws1")
     try:
-        node_id = backend.retain_lesson(
+        result = backend.retain_lesson(
             {
                 "content": "Verified lesson body",
                 "title": "Lesson",
@@ -60,11 +60,11 @@ def test_retain_lesson_with_ledger_evidence_succeeds(repo) -> None:
         )
     finally:
         backend.close()
-    assert node_id
+    assert result["canonical_id"]
 
     palace = MemPalace(repo, "ws1")
     try:
-        node = palace.get(node_id, stores=["palace.lesson"])
+        node = palace.get(result["canonical_id"], stores=["palace.lesson"])
     finally:
         palace.close()
     assert node is not None
@@ -74,7 +74,7 @@ def test_retain_lesson_with_ledger_evidence_succeeds(repo) -> None:
 def test_retain_event_run_scoped_observation_succeeds(repo) -> None:
     backend = CanonicalMemoryBackend(repo, "ws1")
     try:
-        node_id = backend.retain_event(
+        result = backend.retain_event(
             {
                 "content": "Run-scoped observation",
                 "kind": "observation",
@@ -84,7 +84,7 @@ def test_retain_event_run_scoped_observation_succeeds(repo) -> None:
         )
     finally:
         backend.close()
-    assert node_id
+    assert result["canonical_id"]
 
 
 def test_retain_event_preserves_trust_and_evidence(repo) -> None:
@@ -98,7 +98,7 @@ def test_retain_event_preserves_trust_and_evidence(repo) -> None:
     )
     backend = CanonicalMemoryBackend(repo, "ws1")
     try:
-        node_id = backend.retain_event(
+        result = backend.retain_event(
             {
                 "content": "Durable-ish event",
                 "kind": "durable",
@@ -120,4 +120,4 @@ def test_retain_event_preserves_trust_and_evidence(repo) -> None:
         )
     finally:
         backend.close()
-    assert node_id
+    assert result["canonical_id"]

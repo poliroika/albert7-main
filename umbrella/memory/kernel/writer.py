@@ -1,12 +1,13 @@
 """Single write path for canonical memory events."""
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from umbrella.contracts.models import json_ready
 from umbrella.memory.kernel.models import (
     MemoryEvent,
+    MemoryWriteResult,
     memory_event_to_palace_kwargs,
     validate_memory_event_for_write,
 )
@@ -14,15 +15,6 @@ from umbrella.memory.kernel.policy import memory_write_policy_issues
 from umbrella.memory.kernel.telemetry import record_memory_event
 from umbrella.memory.palace.facade import MemPalace
 from umbrella.memory.paths import normalize_workspace_id
-
-
-@dataclass(frozen=True)
-class MemoryWriteResult:
-    canonical_id: str
-    store: str
-    saved: bool
-    skipped_duplicate: bool = False
-    policy_issues: tuple[str, ...] = ()
 
 
 def _preset_canonical_id(event: MemoryEvent) -> str:
@@ -116,9 +108,9 @@ def write_memory_event(
             },
         )
         return MemoryWriteResult(
+            saved=False,
             canonical_id=preset_id,
             store="",
-            saved=False,
             policy_issues=issues,
         )
 
@@ -138,20 +130,44 @@ def write_memory_event(
             data={"canonical_id": node_id, "store": store},
         )
         return MemoryWriteResult(
+            saved=False,
             canonical_id=node_id,
             store=store,
-            saved=False,
             skipped_duplicate=True,
         )
 
-    palace = MemPalace(repo_root, ws)
     try:
-        if node_id:
-            committed_id = palace.add(**kwargs, node_id=node_id)
-        else:
-            committed_id = palace.add(**kwargs)
-    finally:
-        palace.close()
+        palace = MemPalace(repo_root, ws)
+        try:
+            if node_id:
+                committed_id = palace.add(**kwargs, node_id=node_id)
+            else:
+                committed_id = palace.add(**kwargs)
+        finally:
+            palace.close()
+    except Exception as exc:
+        record_memory_event(
+            Path(repo_root),
+            event_type="memory_write_failed",
+            workspace_id=ws,
+            run_id=event.run_id,
+            phase_id=event.phase_id,
+            status="failed",
+            error=str(exc),
+            data={
+                "canonical_id": preset_id,
+                "store": store,
+                "memory_kind": event.memory_kind,
+                "surface": event.surface,
+            },
+        )
+        return MemoryWriteResult(
+            saved=False,
+            canonical_id=preset_id,
+            store=store,
+            error=str(exc),
+            policy_issues=(),
+        )
 
     record_memory_event(
         Path(repo_root),
@@ -180,7 +196,7 @@ def write_memory_event(
         )
 
     return MemoryWriteResult(
+        saved=True,
         canonical_id=committed_id,
         store=store,
-        saved=True,
     )

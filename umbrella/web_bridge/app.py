@@ -1019,7 +1019,10 @@ class WebBridgeApp:
         for entry in sorted(self.workspaces_root.iterdir()):
             if not entry.is_dir():
                 continue
-            toml = read_toml(entry / "workspace.toml")
+            toml_path = entry / "workspace.toml"
+            if not toml_path.is_file():
+                continue
+            toml = read_toml(toml_path)
             ws_section = toml.get("workspace") or {}
             ws_id = str(ws_section.get("id") or entry.name)
             override = overrides.get(ws_id, {})
@@ -2933,6 +2936,9 @@ class WebBridgeApp:
     ) -> list[dict[str, Any]]:
         if not ws_id:
             return []
+        workspace_root = self._workspace_path(ws_id)
+        if workspace_root is None:
+            return []
         selected_run_id = str(run_id or "").strip()
         if selected_run_id.lower() in {"all", "__all__", "workspace"}:
             selected_run_id = ""
@@ -2941,7 +2947,7 @@ class WebBridgeApp:
             if selected_run_id
             else set()
         )
-        memory_root = self.workspaces_root / ws_id / ".memory"
+        memory_root = workspace_root / ".memory"
         rows = read_jsonl(memory_root / "lessons.jsonl")
         ideas = read_jsonl(memory_root / "ideas.jsonl")
         task_results = self._list_task_results(ws_id)

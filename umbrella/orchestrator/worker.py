@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import logging
+import os
 import pathlib
 import re
 from typing import Any, Callable
@@ -734,6 +735,24 @@ def build_phase_task(
         "phase_node": _json_ready(dataclasses.asdict(phase_node)),
         "recall_bundle": recall.to_payload(),
         "proactive_memory": proactive_overlay.to_payload(),
+        "memory_backend": {
+            "canonical": {"ok": True, "source_of_truth": True},
+            "hindsight": {
+                "enabled": os.environ.get("UMBRELLA_HINDSIGHT_ENABLED", "0")
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"},
+                "mode": os.environ.get(
+                    "UMBRELLA_MEMORY_DURABLE_BACKEND", "canonical"
+                ),
+                "reflect_enabled": os.environ.get(
+                    "UMBRELLA_HINDSIGHT_REFLECT_ENABLED", "0"
+                )
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"},
+            },
+        },
         "detected_domains": sorted(detected_domains),
         "gmas_prewrite_required": gmas_prewrite_required,
         "phase_prompt_files_loaded": [

@@ -2,11 +2,22 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 from umbrella.contracts import EvidenceRef, VerificationReportRef, json_ready
 from umbrella.contracts.validators import validate_verification_report_ref
+from umbrella.memory.backends.base import DurableEvent, ReflectionQuery
+from umbrella.memory.backends.factory import (
+    create_durable_backend,
+    retain_hindsight_event_best_effort,
+)
+from umbrella.memory.hindsight.candidates import (
+    build_reflection_question,
+    proposal_queue_dir,
+    write_hindsight_candidates_as_pending_proposals,
+)
 from umbrella.memory.proactive.promotion import (
     ProposedBkbPatch,
     accept_bkb_patch,
@@ -177,6 +188,33 @@ def mirror_verify_durable_if_needed(
     except Exception as exc:
         log.warning("Auto durable mirror failed: %s", exc)
         return None
+    retain_hindsight_event_best_effort(
+        repo_root=repo_root,
+        workspace_id=workspace_id,
+        event=DurableEvent(
+            event_id=node_id,
+            kind="verification_report",
+            content=body,
+            workspace_id=workspace_id,
+            run_id=task_id.split(":", 1)[0] if ":" in task_id else task_id,
+            phase_id="verify",
+            trust_level="public_verified",
+            evidence_refs=[json_ready(evidence)],
+            tags=[
+                "kind:verification_report",
+                "phase:verify",
+                "trust:public_verified",
+                "tier:durable",
+            ],
+            metadata={
+                "umbrella_id": node_id,
+                "palace_node_id": node_id,
+                "kind": "verification_report",
+                "trust_level": "public_verified",
+            },
+        ),
+        op="retain_auto_verification_report",
+    )
     return node_id
 
 
@@ -185,55 +223,191 @@ def process_reflexion_bkb_patch(
     repo_root: Path,
     drive_root: Path,
     workspace_id: str,
+    run_id: str = "",
 ) -> dict[str, Any] | None:
     """Supervisor accept/reject of proposed_bkb_patch.json after reflexion."""
     patch_path = drive_root / "state" / "proposed_bkb_patch.json"
-    if not patch_path.is_file():
-        return None
+    result: dict[str, Any] | None = None
     try:
-        doc = json.loads(patch_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Invalid proposed_bkb_patch.json: %s", exc)
-        return None
-    if not isinstance(doc, dict):
-        return None
-    if str(doc.get("status") or "") != "candidate":
-        return None
-
-    ws = str(doc.get("workspace_id") or workspace_id or "")
-    patch = ProposedBkbPatch(
-        patch_id=str(doc.get("patch_id") or ""),
-        rules=list(doc.get("rules") or []),
-        source_evidence=list(doc.get("source_evidence") or []),
-        actor="supervisor",
-        run_id=str(doc.get("run_id") or ""),
-        phase_id=str(doc.get("phase_id") or "reflexion"),
-        workspace_id=ws,
-    )
-    target = "workspace" if ws else "manager"
-    try:
-        result = accept_bkb_patch(
-            repo_root,
-            patch,
-            target=target,
+        if patch_path.is_file():
+            try:
+                doc = json.loads(patch_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                log.warning("Invalid proposed_bkb_patch.json: %s", exc)
+                doc = None
+            if isinstance(doc, dict) and str(doc.get("status") or "") == "candidate":
+                ws = str(doc.get("workspace_id") or workspace_id or "")
+                patch = ProposedBkbPatch(
+                    patch_id=str(doc.get("patch_id") or ""),
+                    rules=list(doc.get("rules") or []),
+                    source_evidence=list(doc.get("source_evidence") or []),
+                    actor="supervisor",
+                    run_id=str(doc.get("run_id") or run_id or ""),
+                    phase_id=str(doc.get("phase_id") or "reflexion"),
+                    workspace_id=ws,
+                )
+                target = "workspace" if ws else "manager"
+                try:
+                    result = accept_bkb_patch(
+                        repo_root,
+                        patch,
+                        target=target,
+                        drive_root=drive_root,
+                    )
+                    doc["status"] = "accepted"
+                except ValueError as exc:
+                    reject_bkb_patch(
+                        repo_root,
+                        patch,
+                        reason=str(exc),
+                        target=target,
+                    )
+                    doc["status"] = "rejected"
+                    doc["reject_reason"] = str(exc)
+                    result = {"accepted": False, "reason": str(exc)}
+                try:
+                    patch_path.write_text(
+                        json.dumps(doc, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+    finally:
+        hindsight_result = _queue_hindsight_reflection_candidates(
+            repo_root=repo_root,
             drive_root=drive_root,
+            workspace_id=workspace_id,
+            run_id=run_id,
         )
-        doc["status"] = "accepted"
-    except ValueError as exc:
-        reject_bkb_patch(
-            repo_root,
-            patch,
-            reason=str(exc),
-            target=target,
-        )
-        doc["status"] = "rejected"
-        doc["reject_reason"] = str(exc)
-        result = {"accepted": False, "reason": str(exc)}
-    try:
-        patch_path.write_text(
-            json.dumps(doc, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+        if hindsight_result and result is not None:
+            result["hindsight_candidates"] = hindsight_result
+        elif hindsight_result:
+            result = {"accepted": None, "hindsight_candidates": hindsight_result}
     return result
+
+
+def _queue_hindsight_reflection_candidates(
+    *,
+    repo_root: Path,
+    drive_root: Path,
+    workspace_id: str,
+    run_id: str,
+) -> dict[str, Any] | None:
+    if os.getenv("UMBRELLA_HINDSIGHT_REFLECT_ENABLED", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    try:
+        max_candidates = int(os.getenv("UMBRELLA_HINDSIGHT_MAX_CANDIDATES", "3"))
+    except ValueError:
+        max_candidates = 3
+    max_candidates = max(1, min(20, max_candidates))
+    try:
+        backend = create_durable_backend(
+            repo_root=repo_root,
+            workspace_id=workspace_id,
+        )
+        candidates = backend.reflect_candidates(
+            ReflectionQuery(
+                question=build_reflection_question(max_candidates=max_candidates),
+                workspace_id=workspace_id,
+                run_id=run_id,
+                phase_id="reflexion",
+                tags=[
+                    f"workspace:{workspace_id}",
+                    "source:umbrella",
+                    "trust:supervisor_verified",
+                ]
+                if workspace_id
+                else ["source:umbrella", "trust:supervisor_verified"],
+                max_candidates=max_candidates,
+                budget="mid",
+            )
+        )
+    except Exception as exc:
+        log.warning("Hindsight reflection candidate generation failed: %s", exc)
+        return {"generated": 0, "queued": 0, "error": str(exc)}
+    if not candidates:
+        return {"generated": 0, "queued": 0}
+    result = write_hindsight_candidates_as_pending_proposals(
+        drive_root=drive_root,
+        repo_root=repo_root,
+        workspace_id=workspace_id,
+        run_id=run_id,
+        phase_id="reflexion",
+        candidates=list(candidates),
+    )
+    if os.getenv("UMBRELLA_HINDSIGHT_AUTO_ACCEPT_CANDIDATES", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        result["auto_accept"] = _auto_accept_hindsight_candidates(
+            repo_root=repo_root,
+            drive_root=drive_root,
+            workspace_id=workspace_id,
+            run_id=run_id,
+        )
+    return result
+
+
+def _auto_accept_hindsight_candidates(
+    *,
+    repo_root: Path,
+    drive_root: Path,
+    workspace_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    accepted = 0
+    rejected = 0
+    for path in proposal_queue_dir(drive_root).glob("*.candidate.json"):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        if str(doc.get("source") or "") != "hindsight":
+            continue
+        if run_id and str(doc.get("run_id") or "") != run_id:
+            continue
+        ws = str(doc.get("workspace_id") or workspace_id or "")
+        patch = ProposedBkbPatch(
+            patch_id=str(doc.get("patch_id") or path.stem),
+            rules=list(doc.get("rules") or []),
+            source_evidence=list(doc.get("source_evidence") or []),
+            actor="supervisor",
+            run_id=str(doc.get("run_id") or run_id or ""),
+            phase_id=str(doc.get("phase_id") or "reflexion"),
+            workspace_id=ws,
+        )
+        target = "workspace" if ws else "manager"
+        try:
+            accept_bkb_patch(
+                repo_root,
+                patch,
+                target=target,
+                drive_root=drive_root,
+            )
+            doc["status"] = "accepted"
+            accepted += 1
+            new_path = path.with_name(path.name.replace(".candidate.json", ".accepted.json"))
+        except ValueError as exc:
+            reject_bkb_patch(repo_root, patch, reason=str(exc), target=target)
+            doc["status"] = "rejected"
+            doc["reject_reason"] = str(exc)
+            rejected += 1
+            new_path = path.with_name(path.name.replace(".candidate.json", ".rejected.json"))
+        try:
+            new_path.write_text(
+                json.dumps(doc, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return {"accepted": accepted, "rejected": rejected}

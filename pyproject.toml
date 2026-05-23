@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "Umbrella - Policy-driven AI system with workspace-first approach"
 requires-python = ">=3.11"
 dependencies = [
+    "ddgs>=9.11.4",
     "fastapi>=0.136.1",
     "flask>=3.1.3",
     "flask-sse>=1.0.0",
+    "frontier-ai-gmas[web-search]>=0.0.0; python_version >= '3.12'",
     "mcp>=1.26.0",
     "mempalace>=3.2.0",
     "openai>=2.30.0",
@@ -22,10 +24,16 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0.0"]
 tb = ["terminal-bench>=0.2.13; python_version >= '3.12'"]
+hindsight = ["hindsight-client>=0.6,<0.7"]
+hindsight-local = ["hindsight-all>=0.6,<0.7"]
 
 [tool.pytest.ini_options]
 testpaths = ["umbrella/tests", "ouroboros/tests"]
 pythonpath = ["ouroboros"]
+markers = [
+    "workspace_live: fast integration using workspaces/test fixture",
+    "hindsight: optional real Hindsight server tests",
+]
 
 [project.scripts]
 # Операторский UI: после `yarn build` в `web/` — `uv run bridge` (см. README и docs/README.md).

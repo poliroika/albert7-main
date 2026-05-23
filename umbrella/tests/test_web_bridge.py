@@ -437,6 +437,9 @@ def test_run_log_summary_counts_phase_runner_rounds(tmp_path) -> None:
 def test_list_memory_nodes_matches_memory_graph_contract(tmp_path) -> None:
     repo = tmp_path
     ws = "ws_mem_graph"
+    workspace_dir = repo / "workspaces" / ws
+    workspace_dir.mkdir(parents=True)
+    (workspace_dir / "workspace.toml").write_text("[skills]\n", encoding="utf-8")
     lessons = repo / "workspaces" / ws / ".memory" / "lessons.jsonl"
     lessons.parent.mkdir(parents=True)
     line1 = json.dumps(
@@ -473,6 +476,9 @@ def test_list_memory_nodes_matches_memory_graph_contract(tmp_path) -> None:
 def test_list_memory_nodes_includes_ideas_jsonl(tmp_path) -> None:
     repo = tmp_path
     ws = "ws_ideas"
+    workspace_dir = repo / "workspaces" / ws
+    workspace_dir.mkdir(parents=True)
+    (workspace_dir / "workspace.toml").write_text("[skills]\n", encoding="utf-8")
     ideas = repo / "workspaces" / ws / ".memory" / "ideas.jsonl"
     ideas.parent.mkdir(parents=True)
     ideas.write_text(
@@ -511,6 +517,31 @@ def test_list_memory_nodes_includes_ideas_jsonl(tmp_path) -> None:
     assert by_id["a1"]["node_type"] == "subtask_result"
     assert by_id["a2"]["node_type"] == "subtask_result"
     assert any(n["node_type"] == "task" and n.get("task_id") == "task_x" for n in nodes)
+
+
+def test_list_workspaces_skips_memory_only_workspace_dir(tmp_path) -> None:
+    repo = tmp_path
+    valid = repo / "workspaces" / "valid_ws"
+    valid.mkdir(parents=True)
+    (valid / "workspace.toml").write_text("[skills]\n", encoding="utf-8")
+    bogus = repo / "workspaces" / "00_workspace_ch" / ".memory" / "palace"
+    bogus.mkdir(parents=True)
+
+    app = WebBridgeApp(repo)
+    ids = {row["id"] for row in app.list_workspaces()}
+
+    assert "valid_ws" in ids
+    assert "00_workspace_ch" not in ids
+
+
+def test_list_memory_nodes_unknown_workspace_does_not_create_palace(tmp_path) -> None:
+    repo = tmp_path
+    app = WebBridgeApp(repo)
+
+    nodes = app.list_memory_nodes("00_workspace_ch")
+
+    assert nodes == []
+    assert not (repo / "workspaces" / "00_workspace_ch").exists()
 
 
 def test_delete_run_wipes_verification_context_and_seed_backups(tmp_path) -> None:
@@ -1335,7 +1366,10 @@ def test_get_run_timeline_buckets_by_remediation_event(tmp_path) -> None:
 
     repo = tmp_path
     ws = "ws_timeline"
-    drive = repo / "workspaces" / ws / ".memory" / "drive"
+    workspace_dir = repo / "workspaces" / ws
+    workspace_dir.mkdir(parents=True)
+    (workspace_dir / "workspace.toml").write_text("[skills]\n", encoding="utf-8")
+    drive = workspace_dir / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
     (drive / "task_results").mkdir(parents=True)
 

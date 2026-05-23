@@ -12,6 +12,14 @@ import yaml
 from umbrella.contracts import EvidenceRef
 from umbrella.contracts.evidence import ALLOWED_EVIDENCE_REF_TYPES, EvidenceResolver
 from umbrella.contracts.models import WorkspaceContext
+from umbrella.memory.backends.base import DurableLesson
+from umbrella.memory.backends.factory import retain_hindsight_lesson_best_effort
+from umbrella.memory.hindsight.candidates import (
+    add_accepted_fingerprints,
+    candidate_fingerprint,
+)
+from umbrella.memory.hindsight.mapping import derived_tags, stable_hash
+from umbrella.memory.hindsight.payloads import render_bkb_rule_for_hindsight
 from umbrella.memory.paths import (
     manager_core_root,
     workspace_core_root,
@@ -259,6 +267,8 @@ def accept_bkb_patch(
         )
 
     _mirror_to_palace(repo_root, patch, proposed)
+    _mirror_accepted_bkb_to_hindsight(repo_root, patch, proposed, target=target)
+    _record_accepted_bkb_fingerprints(repo_root, patch, proposed)
 
     return {"accepted": True, "patch_id": patch.patch_id, "rules": [r.id for r in proposed]}
 
@@ -319,4 +329,104 @@ def _mirror_to_palace(
         finally:
             palace.close()
     except Exception:
+        return
+
+
+def _rule_dict(rule: BeliefRule) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "title": rule.title,
+        "scope": rule.scope,
+        "type": rule.rule_type,
+        "status": rule.status,
+        "trust": rule.trust,
+        "strength": rule.strength,
+        "rule": rule.rule,
+        "applies_to": rule.applies_to,
+        "source_evidence": rule.source_evidence,
+        "confidence": rule.confidence,
+        "support_count": rule.support_count,
+        "source_backend": rule.source_backend,
+    }
+
+
+def _mirror_accepted_bkb_to_hindsight(
+    repo_root: Path,
+    patch: ProposedBkbPatch,
+    rules: list[BeliefRule],
+    *,
+    target: str,
+) -> None:
+    for rule in rules:
+        raw_rule = _rule_dict(rule)
+        fingerprint = candidate_fingerprint(
+            {
+                "kind": rule.rule_type,
+                "scope": rule.scope,
+                "title": rule.title,
+                "content": rule.rule,
+                "source_evidence": patch.source_evidence,
+            }
+        )
+        lesson = DurableLesson(
+            lesson_id=rule.id,
+            kind="accepted_bkb_rule",
+            title=rule.title or rule.id,
+            content=render_bkb_rule_for_hindsight(raw_rule, patch),
+            workspace_id=patch.workspace_id,
+            run_id=patch.run_id,
+            phase_id=patch.phase_id,
+            trust_level="supervisor_verified",
+            evidence_refs=list(patch.source_evidence),
+            tags=derived_tags(
+                kind="bkb_rule",
+                workspace_id=patch.workspace_id,
+                run_id=patch.run_id,
+                phase_id=patch.phase_id,
+                trust_level="supervisor_verified",
+                scope=target,
+                store="bkb",
+            ),
+            metadata={
+                "bkb_rule_id": rule.id,
+                "patch_id": patch.patch_id,
+                "target": target,
+                "source_kind": "accepted_bkb_rule",
+                "candidate_fingerprint": fingerprint,
+                "source_hash": stable_hash(raw_rule),
+            },
+        )
+        retain_hindsight_lesson_best_effort(
+            repo_root=repo_root,
+            workspace_id=patch.workspace_id,
+            lesson=lesson,
+            op="retain_accepted_bkb_rule",
+        )
+
+
+def _record_accepted_bkb_fingerprints(
+    repo_root: Path,
+    patch: ProposedBkbPatch,
+    rules: list[BeliefRule],
+) -> None:
+    fingerprints: list[str] = []
+    for rule in rules:
+        fingerprints.append(
+            candidate_fingerprint(
+                {
+                    "kind": rule.rule_type,
+                    "scope": rule.scope,
+                    "title": rule.title,
+                    "content": rule.rule,
+                    "source_evidence": patch.source_evidence,
+                }
+            )
+        )
+    try:
+        add_accepted_fingerprints(
+            repo_root=repo_root,
+            workspace_id=patch.workspace_id,
+            fingerprints=fingerprints,
+        )
+    except OSError:
         return

@@ -43,7 +43,8 @@ doesn't crash. The same pattern is used in ``umbrella_tools.py``.
 import logging
 import os
 import re
-from pathlib import Path
+import shlex
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -150,6 +151,75 @@ def _is_umbrella_managed(tools_ctx: Any) -> bool:
         return True
     manifest = getattr(tools_ctx, "phase_manifest", None)
     return manifest is not None
+
+
+_WORKSPACE_SKIP_NAMES = {"", "auto", "registry", "_template"}
+_WORKSPACE_LABELS = frozenset({"workspace", "workspace path"})
+_WORKSPACE_ID_LABELS = frozenset({"workspace_id"})
+
+
+def _workspace_candidate(value: Any) -> str:
+    raw = str(value or "").strip().strip("`\"'.,:;)]}")
+    if not raw:
+        return ""
+    try:
+        from umbrella.memory.paths import normalize_workspace_id
+
+        candidate = normalize_workspace_id(raw)
+    except Exception:
+        parts = PurePosixPath(raw.replace("\\", "/").strip("/")).parts
+        if parts and parts[0].casefold() == "workspaces":
+            parts = parts[1:]
+        candidate = parts[0] if parts else ""
+    candidate = candidate.strip().strip("`\"'.,:;)]}")
+    if (
+        not candidate
+        or candidate.casefold() in _WORKSPACE_SKIP_NAMES
+        or Path(candidate).suffix
+        or ":" in candidate
+    ):
+        return ""
+    return candidate
+
+
+def _workspace_after_workspaces(parts: tuple[str, ...]) -> str:
+    folded = [part.casefold() for part in parts]
+    try:
+        idx = folded.index("workspaces")
+    except ValueError:
+        return ""
+    if idx + 1 >= len(parts):
+        return ""
+    return _workspace_candidate(parts[idx + 1])
+
+
+def _workspace_from_drive_root(tools_ctx: Any | None) -> str:
+    try:
+        drive_root = Path(str(getattr(tools_ctx, "drive_root", "") or "")).resolve()
+    except Exception:
+        return ""
+    return _workspace_after_workspaces(drive_root.parts)
+
+
+def _workspace_from_context(tools_ctx: Any | None) -> str:
+    overlays = _context_overlays(tools_ctx)
+    for source in (
+        overlays.get("memory_injection_contract"),
+        overlays.get("llm_input_bundle"),
+        overlays,
+    ):
+        if isinstance(source, dict):
+            candidate = _workspace_candidate(source.get("workspace_id"))
+            if candidate:
+                return candidate
+    for attr in ("workspace_id", "umbrella_workspace_id"):
+        candidate = _workspace_candidate(getattr(tools_ctx, attr, ""))
+        if candidate:
+            return candidate
+    drive_candidate = _workspace_from_drive_root(tools_ctx)
+    if drive_candidate:
+        return drive_candidate
+    return _workspace_candidate(getattr(tools_ctx, "active_workspace_id", ""))
 
 
 def _auto_recall_enabled(kind: str, *, tools_ctx: Any | None = None) -> bool:
@@ -828,7 +898,9 @@ def init_loop_memory(
         or getattr(tools_ctx, "repo_dir", None)
         or Path.cwd()
     )
-    initial_ws = _guess_initial_workspace(messages)
+    initial_ws = _workspace_from_context(tools_ctx) or _guess_initial_workspace(
+        messages
+    )
     if _umbrella_overlay_already_compiled(tools_ctx):
         try:
             from umbrella.memory.kernel.telemetry import record_memory_event
@@ -913,32 +985,57 @@ def _guess_initial_workspace(messages: list[dict[str, Any]]) -> str:
          but weaker than the launcher marker because environment snapshots may
          include unrelated workspace examples.
     """
-    import re
-
-    path_re = re.compile(r"workspaces[\\/]([\w\-]+)[\\/]")
-    label_re = re.compile(
-        r"[Ww]orkspace(?:\s+path)?\s*[:=]\s*[`\"']?(?:workspaces[\\/])?([\w\-]+)"
-    )
-    id_re = re.compile(r"workspace_id\s*[=:]\s*['\"]?([\w\-]+)")
-
-    skip_names = {"", "auto", "registry", "_template"}
-
     all_messages = [msg for msg in messages[:10] if isinstance(msg, dict)]
     non_system = [msg for msg in all_messages if msg.get("role") != "system"]
 
-    for pattern, candidates in (
-        (label_re, all_messages),
-        (id_re, non_system),
-        (path_re, all_messages),
-    ):
-        for msg in candidates:
-            content = msg.get("content")
-            if not isinstance(content, str):
-                continue
-            m = pattern.search(content)
-            if m and m.group(1) not in skip_names:
-                return m.group(1)
+    for msg in all_messages:
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        for line in content.splitlines():
+            candidate = _workspace_from_labeled_line(line)
+            if candidate:
+                return candidate
+
+    for msg in non_system:
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        for line in content.splitlines():
+            candidate = _workspace_from_labeled_line(line, labels=_WORKSPACE_ID_LABELS)
+            if candidate:
+                return candidate
+
+    for msg in all_messages:
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        for token in _shell_tokens(content):
+            candidate = _workspace_after_workspaces(
+                PurePosixPath(token.replace("\\", "/").strip("`\"'.,:;)]}")).parts
+            )
+            if candidate:
+                return candidate
     return ""
+
+
+def _workspace_from_labeled_line(
+    line: str,
+    *,
+    labels: set[str] | frozenset[str] = _WORKSPACE_LABELS,
+) -> str:
+    for sep in (":", "="):
+        key, found, value = line.partition(sep)
+        if found and key.strip().strip("`\"'").casefold() in labels:
+            return _workspace_candidate(value)
+    return ""
+
+
+def _shell_tokens(text: str) -> list[str]:
+    try:
+        return shlex.split(text, posix=False)
+    except ValueError:
+        return text.split()
 
 
 def _extract_task_brief(messages: list[dict[str, Any]]) -> str:

@@ -235,13 +235,17 @@ class WebBridgeHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/memory":
             result = app.list_memory_nodes(q.get("workspace_id"), q.get("run_id"))
-            if q.get("include_palace") == "1":
+            workspace_id = q.get("workspace_id") or ""
+            if (
+                q.get("include_palace") == "1"
+                and app._workspace_path(workspace_id) is not None
+            ):
                 try:
                     import os
                     import pathlib
                     from umbrella.memory.palace.facade import MemPalace
                     repo_root = pathlib.Path(os.environ.get("UMBRELLA_REPO_ROOT", "."))
-                    palace = MemPalace(repo_root, q.get("workspace_id") or "")
+                    palace = MemPalace(repo_root, workspace_id)
                     palace_nodes = palace.search("", n=100)
                     if isinstance(result, dict) and "nodes" in result:
                         result["palace_nodes"] = palace_nodes

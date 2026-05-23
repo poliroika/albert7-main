@@ -474,6 +474,45 @@ def test_live_ouroboros_dedup_with_injection_contract(test_workspace_copy) -> No
     )
 
 
+@pytest.mark.parametrize("phase_id", ["research", "plan", "execute", "verify"])
+def test_live_init_loop_uses_memory_contract_workspace_across_phases(
+    test_workspace_copy,
+    phase_id: str,
+) -> None:
+    from ouroboros.memory_hooks import init_loop_memory
+
+    repo, ws = test_workspace_copy
+    drive = _drive_root(repo, ws)
+    task = _build_task(
+        repo,
+        ws,
+        manifest_name=phase_id,
+        phase_id=phase_id,
+        run_id=f"run-test-contract-{phase_id}",
+        drive_root=drive,
+    )
+    prompt_with_source_refs = (
+        str(task["input"])
+        + "\n_Sources: core:workspace:00_workspace_charter.md_"
+        + "\n_Sources: core:workspace:30_workspace_antipatterns.md_"
+    )
+    messages = [{"role": "user", "content": prompt_with_source_refs}]
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        context_overlays=task.get("context_overlays") or {},
+        umbrella_managed=True,
+    )
+
+    _repo_root, detected_ws = init_loop_memory(messages, ctx)
+
+    assert detected_ws == ws
+    assert len(messages) == 1
+    assert not (repo / "workspaces" / "00_workspace_ch").exists()
+    assert not (repo / "workspaces" / "30_workspace_antipatterns").exists()
+
+
 def test_live_path_hints_no_nested_workspaces_memory(test_workspace_copy) -> None:
     from ouroboros.tools.phase_contract import _palace_add
     from ouroboros.tools.registry import ToolContext

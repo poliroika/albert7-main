@@ -278,3 +278,35 @@ def test_no_duplicate_canonical_write_from_palace_add(repo):
         if "Unique finding body for duplicate test" in str(h.get("content") or "")
     ]
     assert len(matches) == 1
+
+
+def test_write_memory_event_palace_failure_records_telemetry(repo, monkeypatch) -> None:
+    from unittest.mock import patch
+
+    from umbrella.memory.kernel.writer import write_memory_event
+
+    event = MemoryEvent(
+        content="failure body",
+        title="Fail",
+        memory_kind="observation",
+        workspace_id="ws1",
+    )
+    recorded: list[str] = []
+
+    def _capture(_repo_root, **kwargs):
+        recorded.append(str(kwargs.get("event_type") or ""))
+
+    monkeypatch.setattr(
+        "umbrella.memory.kernel.writer.record_memory_event",
+        _capture,
+    )
+
+    with patch(
+        "umbrella.memory.kernel.writer.MemPalace.add",
+        side_effect=RuntimeError("palace boom"),
+    ):
+        result = write_memory_event(repo, event, workspace_id="ws1")
+
+    assert result.saved is False
+    assert "palace boom" in result.error
+    assert "memory_write_failed" in recorded
