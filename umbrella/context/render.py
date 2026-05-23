@@ -65,11 +65,12 @@ def persist_memory_injection_report(
     drive_root: Path,
     *,
     proactive_overlay_hash: str = "",
+    skipped_items: list[dict[str, Any]] | None = None,
 ) -> Path:
     state_dir = drive_root / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     included: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = list(skipped_items or [])
     for item in bundle.memory_items:
         row = {
             "id": item.id,

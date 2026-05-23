@@ -121,6 +121,71 @@ def _rule_expired(rule: BeliefRule) -> bool:
         return False
 
 
+def _bkb_skip_reason(
+    rule: BeliefRule,
+    *,
+    workspace_id: str,
+    phase_id: str,
+    agent_name: str = "ouroboros",
+    require_verified: bool = True,
+) -> str | None:
+    status = str(rule.status or "").lower()
+    if status in {"quarantined", "superseded", "candidate", "retracted"}:
+        return f"status_{status}"
+    if status == "deprecated" and not _debug_inject_deprecated():
+        return "status_deprecated"
+    if status != "active":
+        return f"status_{status or 'unknown'}"
+    if _rule_expired(rule):
+        return "expired"
+    if (
+        rule.contradiction_count > rule.support_count
+        and str(rule.rule_type or "").lower() != "invariant"
+    ):
+        return "contradiction_heuristic"
+    if require_verified and rule.trust != "verified":
+        return "trust_not_verified"
+    if not _rule_applies(
+        rule, workspace_id=workspace_id, phase_id=phase_id, agent_name=agent_name
+    ):
+        return "phase_or_workspace_mismatch"
+    return None
+
+
+def partition_bkb_rules(
+    rules: list[BeliefRule],
+    *,
+    workspace_id: str,
+    phase_id: str,
+    agent_name: str = "ouroboros",
+    require_verified: bool = True,
+) -> tuple[list[BeliefRule], list[dict[str, Any]]]:
+    """Return active BKB rules and skipped entries with reasons for injection audit."""
+    active: list[BeliefRule] = []
+    skipped: list[dict[str, Any]] = []
+    for rule in rules:
+        reason = _bkb_skip_reason(
+            rule,
+            workspace_id=workspace_id,
+            phase_id=phase_id,
+            agent_name=agent_name,
+            require_verified=require_verified,
+        )
+        if reason:
+            skipped.append(
+                {
+                    "id": rule.id,
+                    "title": rule.title,
+                    "reason": reason,
+                    "surface": "directive",
+                    "source_backend": "bkb",
+                }
+            )
+            continue
+        active.append(rule)
+    return active, skipped
+
+
 def filter_active_rules(
     rules: list[BeliefRule],
     *,
@@ -129,28 +194,14 @@ def filter_active_rules(
     agent_name: str = "ouroboros",
     require_verified: bool = True,
 ) -> list[BeliefRule]:
-    selected: list[BeliefRule] = []
-    for rule in rules:
-        status = str(rule.status or "").lower()
-        if status in {"quarantined", "superseded", "candidate", "retracted"}:
-            continue
-        if status == "deprecated" and not _debug_inject_deprecated():
-            continue
-        if status != "active":
-            continue
-        if _rule_expired(rule):
-            continue
-        if (
-            rule.contradiction_count > rule.support_count
-            and str(rule.rule_type or "").lower() != "invariant"
-        ):
-            continue
-        if require_verified and rule.trust != "verified":
-            continue
-        if not _rule_applies(rule, workspace_id=workspace_id, phase_id=phase_id, agent_name=agent_name):
-            continue
-        selected.append(rule)
-    return selected
+    active, _skipped = partition_bkb_rules(
+        rules,
+        workspace_id=workspace_id,
+        phase_id=phase_id,
+        agent_name=agent_name,
+        require_verified=require_verified,
+    )
+    return active
 
 
 def _rules_conflict(a: BeliefRule, b: BeliefRule) -> bool:

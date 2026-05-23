@@ -47,3 +47,32 @@ def test_memory_injection_contract_present_in_phase_task(repo) -> None:
     assert contract.get("proactive_overlay_hash")
     assert contract.get("retrieval_is_supplemental_only") is True
     assert overlays.get("prevent_ouroboros_auto_core_overlay") is True
+
+
+def test_memory_injection_contract_directive_sections_from_fixture_workspace(
+    test_workspace_copy,
+) -> None:
+    from pathlib import Path
+
+    repo, ws = test_workspace_copy
+    manifest = load_manifest(Path("umbrella/phases/manifests/research.yaml"))
+    phase_node = PhaseNode(id="research-1", manifest_id="research")
+    palace = MemPalace(repo, ws)
+    try:
+        task = build_phase_task(
+            phase_node=phase_node,
+            manifest=manifest,
+            workspace_id=ws,
+            run_id="run-fixture-1",
+            palace=palace,
+            repo_root=repo,
+        )
+    finally:
+        palace.close()
+
+    contract = (task.get("context_overlays") or {}).get("memory_injection_contract") or {}
+    sections = contract.get("directive_sections") or []
+    assert sections
+    prompt = str(task.get("input") or "")
+    assert "provenance" in prompt.lower() or "source_id" in prompt.lower()
+    assert "inject me please" not in prompt

@@ -140,7 +140,9 @@ class _NullChromaCollection:
 
     def add(self, *, ids, documents, metadatas=None, embeddings=None) -> None:
         for i, (id_, doc) in enumerate(zip(ids, documents)):
-            self._items.append({"id": id_, "document": doc, "metadata": (metadatas or [{}])[i]})
+            items = self._items
+            items[:] = [it for it in items if it["id"] != id_]
+            items.append({"id": id_, "document": doc, "metadata": (metadatas or [{}])[i]})
 
     def query(self, query_texts=None, n_results=10, where=None, **kwargs) -> dict:
         items = self._items

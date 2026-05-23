@@ -16,10 +16,27 @@ def create_durable_backend(
     *,
     workspace_id: str = "",
 ) -> Any:
+    """Select durable backend. Hindsight-only bypasses MemPalace unless explicitly opted in."""
     mode = str(os.environ.get("UMBRELLA_MEMORY_DURABLE_BACKEND", "canonical")).strip().lower()
     canonical = CanonicalMemoryBackend(repo_root, workspace_id)
     if mode == "hindsight":
-        return HindsightBackend(bank_id=f"ub:workspace:{workspace_id}" if workspace_id else "ub:manager")
+        if str(os.environ.get("UMBRELLA_ALLOW_UNSAFE_HINDSIGHT_ONLY", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            log.warning(
+                "Using hindsight-only durable backend (unsafe; MemPalace is not source of truth)"
+            )
+            return HindsightBackend(
+                bank_id=f"ub:workspace:{workspace_id}" if workspace_id else "ub:manager"
+            )
+        log.warning(
+            "UMBRELLA_MEMORY_DURABLE_BACKEND=hindsight without "
+            "UMBRELLA_ALLOW_UNSAFE_HINDSIGHT_ONLY; falling back to canonical MemPalace"
+        )
+        return canonical
     if mode == "dual":
         return _DualWriteBackend(canonical, HindsightBackend(
             bank_id=f"ub:workspace:{workspace_id}" if workspace_id else "ub:manager"
@@ -32,7 +49,7 @@ class _DualWriteBackend:
         self._canonical = canonical
         self._hindsight = hindsight
 
-    def retain_lesson(self, lesson: dict[str, Any]) -> str:
+    def retain_lesson(self, lesson: dict[str, Any] | Any) -> str:
         node_id = self._canonical.retain_lesson(lesson)
         if lesson.get("verified") and self._hindsight.health().get("ok"):
             try:
@@ -56,7 +73,7 @@ class _DualWriteBackend:
                     )
         return node_id
 
-    def retain_event(self, event: dict[str, Any]) -> str:
+    def retain_event(self, event: dict[str, Any] | Any) -> str:
         node_id = self._canonical.retain_event(event)
         if event.get("verified") and self._hindsight.health().get("ok"):
             try:

@@ -787,7 +787,7 @@ def mirror_subtask_to_memory(
             },
         )
     except Exception:
-        pass
+        log.debug("subtask palace mirror failed", exc_info=True)
 
 
 def _subtask_has_verified_evidence(evidence: list[Any]) -> bool:

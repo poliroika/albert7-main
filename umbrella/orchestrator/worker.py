@@ -783,10 +783,17 @@ def build_phase_task(
             persist_llm_input_bundle(bundle, drive_root)
             from umbrella.context.render import persist_memory_injection_report
 
+            injection_audit = proactive_overlay.to_payload().get("injection_audit") or {}
+            skipped_bkb = (
+                injection_audit.get("skipped_bkb")
+                if isinstance(injection_audit, dict)
+                else []
+            )
             persist_memory_injection_report(
                 bundle,
                 drive_root,
                 proactive_overlay_hash=proactive_overlay_hash,
+                skipped_items=list(skipped_bkb) if isinstance(skipped_bkb, list) else [],
             )
         overlays["llm_input_bundle"] = bundle_to_overlay_dict(bundle)
         overlays["llm_input_bundle_hash"] = bundle.input_hash

@@ -76,9 +76,14 @@ class ProactiveMemoryOverlay:
         return "\n".join(lines).strip()
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        telemetry = dict(self.telemetry)
+        injection_audit = telemetry.get("injection_audit")
+        payload: dict[str, Any] = {
             "sections": [s.to_dict() for s in self.sections],
             "conflicts": list(self.conflicts),
             "archive_hints": list(self.archive_hints),
-            "telemetry": dict(self.telemetry),
+            "telemetry": telemetry,
         }
+        if isinstance(injection_audit, dict):
+            payload["injection_audit"] = injection_audit
+        return payload

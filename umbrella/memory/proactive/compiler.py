@@ -7,9 +7,9 @@ from typing import Any
 
 from umbrella.memory.paths import manager_core_root, workspace_core_root
 from umbrella.memory.proactive.bkb import (
-    filter_active_rules,
     format_bkb_section,
     load_bkb_rules,
+    partition_bkb_rules,
     resolve_bkb_conflicts,
 )
 from umbrella.memory.proactive.budget import (
@@ -65,7 +65,7 @@ class ProactiveMemoryCompiler:
         if workspace_id.strip():
             bkb_rules.extend(load_bkb_rules(workspace_core_root(repo_root, workspace_id) / "bkb.yaml"))
 
-        active = filter_active_rules(
+        active, skipped_bkb = partition_bkb_rules(
             bkb_rules,
             workspace_id=workspace_id,
             phase_id=phase_id,
@@ -141,6 +141,10 @@ class ProactiveMemoryCompiler:
                 "memory_overlay_conflicts_count": len(conflicts),
                 "phase_policy": policy,
                 "proactive_budget": budget,
+                "injection_audit": {
+                    "included_bkb_ids": [rule.id for rule in resolved if rule.id],
+                    "skipped_bkb": skipped_bkb,
+                },
             },
         )
         return overlay

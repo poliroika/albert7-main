@@ -8,7 +8,7 @@
 version = "0.1.0"
 
 # List of registered seed workspaces
-seeds = ["multi_agent_debate_graph"]
+seeds = ["multi_agent_debate_graph", "test"]
 
 # List of active task instances (populated at runtime)
 instances = []

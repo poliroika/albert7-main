@@ -334,6 +334,31 @@ class TestAutoRecallInjection(unittest.TestCase):
         core_recall.assert_not_called()
         self.assertEqual(len(messages), 1)
 
+    def test_init_loop_memory_skips_when_memory_injection_contract_present(self):
+        messages = [{"role": "user", "content": "Workspace: workspaces/test\nBuild it."}]
+        ctx = SimpleNamespace(
+            host_repo_root=Path("/tmp"),
+            repo_dir=Path("/tmp"),
+            umbrella_managed=True,
+            context_overlays={
+                "memory_injection_contract": {
+                    "mode": "umbrella_owned",
+                    "proactive_overlay_injected": True,
+                    "proactive_overlay_hash": "abc123",
+                },
+            },
+        )
+
+        with patch.object(
+            memory_hooks,
+            "recall_core_overlay_for_task_start",
+            return_value="## [ALWAYS-LOADED MEMORY]\n### BKB\n",
+        ) as core_recall:
+            _repo_root, ws = memory_hooks.init_loop_memory(messages, ctx)
+
+        core_recall.assert_not_called()
+        self.assertEqual(len(messages), 1)
+
     def test_periodic_recall_does_not_inject_by_default(self):
         messages: list[dict] = []
         with (
