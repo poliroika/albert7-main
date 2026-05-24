@@ -362,7 +362,7 @@ def summarize_domains(domains: set[Domain]) -> str:
             "multi_agent_gmas — task requires a multi-agent system; build "
             "on the in-repo gmas library and use get_gmas_context / "
             "search_gmas_knowledge with a concrete query before implementing "
-            "GMAS/LLM agent code."
+            "GMAS/LLM agent code. Context artifact: gmas_active_context.md."
         ),
     }
     lines = [labels.get(d, d.value) for d in sorted(domains, key=lambda x: x.value)]

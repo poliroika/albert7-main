@@ -184,9 +184,6 @@ class PhaseRunner:
         self._watcher.mark_processed(signal.signal_id)
         kind = signal.kind
         reason = signal.reason or f"watcher:{kind}"
-        if kind in {"force_verify", "mutate_phase_plan"}:
-            kind = "restart_phase"
-            reason = f"watcher:{signal.kind}: {signal.reason}".strip()
 
         if kind == "abort_phase":
             phase_node.status = "failed"
@@ -200,6 +197,45 @@ class PhaseRunner:
                     phase=phase_node.id,
                 )
             )
+
+        if kind == "force_verify":
+            result, envelope = self._finish_phase_loop_back(
+                phase_node=phase_node,
+                plan=plan,
+                run_id=run_id,
+                outcome=outcome,
+                loop_back_target=phase_node.id,
+                retry_reason=f"watcher:force_verify: {signal.reason}".strip(),
+            )
+            target = plan.get_node(result.loop_back_target or phase_node.id)
+            if target is not None:
+                overlay = dict(target.overlay or {})
+                overlay["watcher_force_verify"] = True
+                overlay["required_next_actions"] = [
+                    "run_subtask_proof",
+                    "run_workspace_verify",
+                ]
+                target.overlay = overlay
+                save_plan(plan, self._drive_root)
+            return result, envelope
+
+        if kind == "mutate_phase_plan":
+            target_id = "plan" if plan.get_node("plan") is not None else phase_node.id
+            result, envelope = self._finish_phase_loop_back(
+                phase_node=phase_node,
+                plan=plan,
+                run_id=run_id,
+                outcome=outcome,
+                loop_back_target=target_id,
+                retry_reason=f"watcher:mutate_phase_plan: {signal.reason}".strip(),
+            )
+            target = plan.get_node(target_id)
+            if target is not None:
+                overlay = dict(target.overlay or {})
+                overlay["watcher_mutate_phase_plan_request"] = signal.payload or {}
+                target.overlay = overlay
+                save_plan(plan, self._drive_root)
+            return result, envelope
 
         if kind in {"restart_phase", "inject_lesson"}:
             return self._finish_phase_loop_back(
@@ -1099,6 +1135,7 @@ class PhaseRunner:
         return {
             "research_review": "research",
             "plan_review": "plan",
+            "subtask_review": "execute",
             "final_review": "execute",
             "verify": "execute",
         }.get(phase_id, "")
@@ -1524,6 +1561,172 @@ class PhaseRunner:
             return []
         return [card for card in node.subtasks if card.status != "done"]
 
+    @staticmethod
+    def _phase_allows_workspace_writes(manifest: Any) -> bool:
+        write_tools = {
+            "apply_workspace_patch",
+            "delete_workspace_file",
+            "repo_write_commit",
+            "update_workspace_seed",
+            "update_workspace_from_instance",
+            "commit_workspace_changes",
+        }
+        allowed_tools = set(getattr(manifest, "allowed_tools", set()) or set())
+        return bool(allowed_tools & write_tools)
+
+    @staticmethod
+    def _safe_phase_id_part(value: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value or "").strip())
+        return normalized.strip("_") or "subtask"
+
+    def _latest_completed_subtask_from_phase(
+        self,
+        *,
+        phase_node: PhaseNode,
+        outcome: dict[str, Any],
+    ) -> SubtaskCard | None:
+        if phase_node.id != "execute" or not phase_node.subtasks:
+            return None
+        task_id = str(outcome.get("task_id") or "")
+        rows = self._read_phase_control_records(
+            task_id=task_id,
+            phase_started_at=phase_node.started_at,
+        )
+        by_id = {card.id: card for card in phase_node.subtasks}
+        for row in reversed(rows):
+            if str(row.get("kind") or "") != "mark_subtask_complete":
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            status = str((payload or {}).get("status") or "").strip().lower()
+            if status and status not in {"done", "ok", "complete", "completed"}:
+                continue
+            subtask_id = str((payload or {}).get("subtask_id") or "").strip()
+            if not subtask_id:
+                contract = payload.get("completion_contract")
+                if isinstance(contract, dict):
+                    subtask_id = str(contract.get("subtask_id") or "").strip()
+            card = by_id.get(subtask_id)
+            if card is not None and card.status == "done":
+                return card
+        return None
+
+    def _schedule_subtask_review(
+        self,
+        *,
+        plan: PhasePlan,
+        execute_node: PhaseNode,
+        completed_subtask: SubtaskCard,
+        review_manifest_id: str,
+        run_id: str,
+    ) -> str:
+        safe_id = self._safe_phase_id_part(completed_subtask.id)
+        review_node_id = f"{review_manifest_id}:{safe_id}"
+        existing = plan.get_node(review_node_id)
+        if existing is not None:
+            return existing.id
+        review_node = PhaseNode(
+            id=review_node_id,
+            manifest_id=review_manifest_id,
+            status="pending",
+            parent_phase_id=execute_node.id,
+            overlay={
+                "subtask_id": completed_subtask.id,
+                "review_target": "latest_completion_contract",
+                "execute_phase_id": execute_node.id,
+                "run_id": run_id,
+            },
+        )
+        try:
+            index = plan.nodes.index(execute_node)
+        except ValueError:
+            index = max(0, len(plan.nodes) - 1)
+        plan.nodes.insert(index + 1, review_node)
+        plan.version += 1
+        plan.edits_log.append(
+            PlanEdit(
+                timestamp=time.time(),
+                actor="runner",
+                patch={
+                    "insert_phase": review_node_id,
+                    "manifest_id": review_manifest_id,
+                    "after": execute_node.id,
+                    "subtask_id": completed_subtask.id,
+                },
+            )
+        )
+        return review_node_id
+
+    def _reviewed_subtask_id(self, phase_node: PhaseNode) -> str:
+        overlay = phase_node.overlay if isinstance(phase_node.overlay, dict) else {}
+        return str((overlay or {}).get("subtask_id") or "").strip()
+
+    def _set_reviewed_subtask_verdict(
+        self,
+        *,
+        plan: PhasePlan,
+        review_node: PhaseNode,
+        verdict: str,
+    ) -> None:
+        if verdict not in {"ok", "revise", "abort"}:
+            return
+        subtask_id = self._reviewed_subtask_id(review_node)
+        execute_id = ""
+        if isinstance(review_node.overlay, dict):
+            execute_id = str(review_node.overlay.get("execute_phase_id") or "").strip()
+        execute = plan.get_node(execute_id or review_node.parent_phase_id or "execute")
+        if not subtask_id or execute is None or not execute.subtasks:
+            return
+        for card in execute.subtasks:
+            if card.id != subtask_id:
+                continue
+            card.review_verdict = verdict
+            if verdict == "revise":
+                card.status = "pending"
+            plan.version += 1
+            plan.edits_log.append(
+                PlanEdit(
+                    timestamp=time.time(),
+                    actor="runner",
+                    patch={
+                        "subtask_review_verdict": verdict,
+                        "subtask_id": subtask_id,
+                        "review_phase": review_node.id,
+                    },
+                )
+            )
+            return
+
+    def _resume_execute_after_subtask_review(
+        self,
+        *,
+        plan: PhasePlan,
+        review_node: PhaseNode,
+    ) -> None:
+        execute_id = ""
+        if isinstance(review_node.overlay, dict):
+            execute_id = str(review_node.overlay.get("execute_phase_id") or "").strip()
+        execute = plan.get_node(execute_id or review_node.parent_phase_id or "execute")
+        if execute is None or not self._incomplete_subtasks(execute):
+            return
+        execute.status = "pending"
+        execute.started_at = None
+        execute.ended_at = None
+        overlay = dict(execute.overlay or {})
+        overlay["last_subtask_review_phase"] = review_node.id
+        overlay["last_reviewed_subtask_id"] = self._reviewed_subtask_id(review_node)
+        execute.overlay = overlay
+        plan.version += 1
+        plan.edits_log.append(
+            PlanEdit(
+                timestamp=time.time(),
+                actor="runner",
+                patch={
+                    "resume_phase": execute.id,
+                    "after_subtask_review": review_node.id,
+                },
+            )
+        )
+
     def _done_subtasks_materialization_failure(self, phase_node: PhaseNode) -> str:
         if phase_node.id != "execute" or not phase_node.subtasks:
             return ""
@@ -1793,7 +1996,10 @@ class PhaseRunner:
             )
         base_task["input"] = (base_task.get("input") or "") + f"\n\n## User task\n{task_input}\n"
 
-        if self._candidates_per_phase > 1:
+        if (
+            self._candidates_per_phase > 1
+            and not self._phase_allows_workspace_writes(manifest)
+        ):
             outcome = self._run_phase_with_harness(
                 base_task, phase_node, manifest, run_id=run_id
             )
@@ -1856,7 +2062,11 @@ class PhaseRunner:
         )
         if not completion_failure and manifest.id == "execute":
             incomplete = self._incomplete_subtasks(phase_node)
-            if incomplete:
+            completed = self._latest_completed_subtask_from_phase(
+                phase_node=phase_node,
+                outcome=outcome,
+            )
+            if incomplete and completed is None:
                 first = incomplete[0]
                 completion_failure = (
                     "execute phase still has incomplete subtask card(s): "
@@ -1884,6 +2094,12 @@ class PhaseRunner:
                 if not loop_back_target:
                     loop_back_target = "plan" if manifest.id == "plan_review" else phase_node.id
                 if loop_back_target and plan.get_node(loop_back_target) is not None:
+                    if manifest.id == "subtask_review" and loop_back_target == "execute":
+                        self._set_reviewed_subtask_verdict(
+                            plan=plan,
+                            review_node=phase_node,
+                            verdict="revise",
+                        )
                     result, envelope = self._finish_phase_loop_back(
                         phase_node=phase_node,
                         plan=plan,
@@ -2048,6 +2264,38 @@ class PhaseRunner:
                     yield envelope
                     return result
 
+            if manifest.id == "execute":
+                completed = self._latest_completed_subtask_from_phase(
+                    phase_node=phase_node,
+                    outcome=outcome,
+                )
+                review_manifest_id = str(
+                    getattr(manifest, "mini_review_after", "") or ""
+                ).strip()
+                if completed is not None and review_manifest_id:
+                    scheduled = self._schedule_subtask_review(
+                        plan=plan,
+                        execute_node=phase_node,
+                        completed_subtask=completed,
+                        review_manifest_id=review_manifest_id,
+                        run_id=run_id,
+                    )
+                    result = PhaseResult(
+                        phase_id=phase_node.id,
+                        outcome="done",
+                        artifacts={"scheduled_phase": scheduled},
+                    )
+            elif manifest.id == "subtask_review":
+                self._set_reviewed_subtask_verdict(
+                    plan=plan,
+                    review_node=phase_node,
+                    verdict="ok",
+                )
+                self._resume_execute_after_subtask_review(
+                    plan=plan,
+                    review_node=phase_node,
+                )
+
         phase_node.status = "done"
         phase_node.ended_at = time.time()
         phase_node.overlay = None
@@ -2078,6 +2326,11 @@ class PhaseRunner:
             if handle is None:
                 return {"status": "error", "error": "launcher.submit_task returned None"}
             phase_started_at = float(phase_node.started_at or time.time())
+            worker_pid = (
+                getattr(handle, "worker_pid", None)
+                or getattr(handle, "process_pid", None)
+                or getattr(handle, "pid", None)
+            )
             poll_sec = max(1, int(self._watcher._poll_sec))
             while True:
                 outcome = handle.wait(timeout=float(poll_sec))
@@ -2087,6 +2340,7 @@ class PhaseRunner:
                 self._watcher.tick(
                     phase=phase_node.id,
                     phase_started_at=phase_started_at,
+                    worker_pid=worker_pid,
                 )
                 pending = self._watcher.read_pending_signal()
                 if pending is not None:
@@ -2134,7 +2388,8 @@ class PhaseRunner:
             max_workers=min(self._candidates_per_phase, 4)
         ) as executor:
             futures = {
-                executor.submit(self._submit_candidate, launcher, c): c for c in candidates
+                executor.submit(self._submit_candidate, launcher, c, phase_node): c
+                for c in candidates
             }
             for fut in concurrent.futures.as_completed(futures):
                 cand = futures[fut]
@@ -2152,9 +2407,37 @@ class PhaseRunner:
         ]
         return winner
 
-    def _submit_candidate(self, launcher: Any, task: dict[str, Any]) -> dict[str, Any]:
+    def _submit_candidate(
+        self,
+        launcher: Any,
+        task: dict[str, Any],
+        phase_node: PhaseNode,
+    ) -> dict[str, Any]:
         handle = launcher.submit_task(task, timeout=self._phase_timeout_seconds)
-        return handle.wait()
+        worker_pid = (
+            getattr(handle, "worker_pid", None)
+            or getattr(handle, "process_pid", None)
+            or getattr(handle, "pid", None)
+        )
+        phase_started_at = float(phase_node.started_at or time.time())
+        poll_sec = max(1, int(self._watcher._poll_sec))
+        while True:
+            outcome = handle.wait(timeout=float(poll_sec))
+            if outcome is not None:
+                return outcome
+            self._watcher.tick(
+                phase=phase_node.id,
+                phase_started_at=phase_started_at,
+                worker_pid=worker_pid,
+            )
+            pending = self._watcher.read_pending_signal()
+            if pending is not None:
+                return {
+                    "status": "watcher",
+                    "task_id": task.get("id"),
+                    "watcher_signal": pending.kind,
+                    "watcher_signal_id": pending.signal_id,
+                }
 
     def _pick_candidate_winner(
         self, results: list[dict[str, Any]], *, phase_id: str, run_id: str

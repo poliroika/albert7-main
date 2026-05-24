@@ -11,20 +11,20 @@ when_to_use: "When building or reviewing a PhasePlan and need to decide how to d
 ### Task decomposition
 1. Read `palace.run.architecture_draft` to understand scope
 2. Break into subtasks ≤ 200 LOC each where possible
-3. Each subtask must have a concrete, runnable success_test
+3. Each subtask must have a concrete, typed proof contract
 4. Avoid subtasks that can only be verified manually
 
 ### Choosing between approaches
 - Prefer existing code (palace.codeptr) over writing from scratch
 - Prefer MCP tools over custom shell scripts
-- Choose the approach with the clearest success test
+- Choose the approach with the clearest verifier-backed proof
 
 ### Plan quality checklist
-- [ ] Every subtask has a `success_test` (cmd or pytest id)
+- [ ] Every subtask has a typed `proof` contract
 - [ ] Tool/skill list per subtask is minimal (no unused tools)
 - [ ] Subtasks ordered by dependency (no circular deps)
 - [ ] Final subtask validates the whole feature end-to-end
-- [ ] Risky subtasks marked for harness_run if determinism unclear
+- [ ] Risky subtasks marked for reviewer/watcher escalation if determinism is unclear
 
 ## Anti-patterns
 

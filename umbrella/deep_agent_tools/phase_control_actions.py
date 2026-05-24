@@ -5,6 +5,7 @@ from umbrella.deep_agent_tools.phase_control_base import *
 from umbrella.deep_agent_tools.phase_control_legacy import _subtask_success_test_text
 from umbrella.deep_agent_tools.phase_control_research import *
 from umbrella.deep_agent_tools.phase_control_retry import (
+    _final_review_e2e_gate,
     _phase_control_signal_rows_for_task,
     _phase_subtask_retry_escalation_block,
     _phase_subtask_retry_state,
@@ -154,10 +155,6 @@ def _first_incomplete_subtask(subtasks: list[dict[str, Any]]) -> dict[str, Any] 
         if str(subtask.get("status") or "pending").lower() != "done":
             return subtask
     return None
-
-
-def _final_review_e2e_gate(_ctx: ToolContext) -> str:
-    return ""
 
 
 def _completion_llm_memory_claim_issue(**_kwargs: Any) -> str:

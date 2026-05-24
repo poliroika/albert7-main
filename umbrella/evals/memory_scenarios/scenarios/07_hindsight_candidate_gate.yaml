@@ -1,0 +1,12 @@
+id: hindsight_candidate_gate
+description: Fake Hindsight reflect queues candidate; BKB not auto-accepted.
+workspace: test
+mode: promotion_flow
+
+steps:
+  - id: reflect_queue
+    action: fake_hindsight_reflect
+    phase: reflexion
+    run_id: run-hind-1
+
+assert: {}

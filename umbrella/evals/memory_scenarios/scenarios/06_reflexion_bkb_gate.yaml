@@ -1,0 +1,13 @@
+id: reflexion_bkb_gate
+description: Hindsight/reflect candidates queue as proposals; BKB unchanged until accept gate.
+workspace: test
+mode: promotion_flow
+
+steps:
+  - id: fake_reflect
+    action: fake_hindsight_reflect
+    phase: reflexion
+    run_id: run-refl-1
+
+assert:
+  fake_reflect: {}

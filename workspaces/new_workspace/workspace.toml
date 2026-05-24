@@ -1,0 +1,8 @@
+[skills]
+multi_agent_gmas = true
+[skill_decisions.multi_agent_gmas]
+enabled = true
+detected_by = "umbrella.skill_detector"
+source = "TASK_MAIN.md"
+reason = "Umbrella detected LLM/model/agent/prompt work in the workspace task; LLM-backed agents in this repo should use GMAS."
+updated_at = "2026-05-24T10:54:55.062433+00:00"

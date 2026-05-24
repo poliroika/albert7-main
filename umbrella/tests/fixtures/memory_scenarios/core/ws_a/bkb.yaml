@@ -1,0 +1,13 @@
+rules:
+  - id: ws_a_api_rule
+    title: API A required
+    type: behavior
+    scope: workspace
+    status: active
+    trust: verified
+    applies_to:
+      phases: ["*"]
+      workspaces: ["ws_a"]
+      agents: ["*"]
+    rule:
+      behavior: "Use API A endpoints only."

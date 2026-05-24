@@ -94,6 +94,86 @@ def test_abort_phase_signal_uses_watcher_abort_code(tmp_path: Path) -> None:
     assert envelope.errors[0].code == ErrorCode.WATCHER_ABORT
 
 
+def test_force_verify_signal_sets_verification_overlay(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    drive.mkdir(parents=True)
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+    signal = WatcherSignal(
+        signal_id="force-1",
+        created_at=time.time(),
+        kind="force_verify",
+        reason="proof is stale",
+        trigger="stall",
+        payload={},
+    )
+    phase_node = PhaseNode(id="execute", manifest_id="execute", status="running")
+    phase_node.started_at = time.time()
+    plan = PhasePlan(
+        plan_id="p1",
+        workspace_id="demo",
+        run_id="run-1",
+        nodes=[phase_node],
+    )
+
+    result, envelope = runner._apply_pending_watcher_signal(
+        signal=signal,
+        phase_node=phase_node,
+        plan=plan,
+        run_id="run-1",
+        outcome={"status": "watcher", "task_id": "task-1"},
+    )
+
+    assert result is not None
+    assert result.outcome == "loop_back"
+    assert result.loop_back_target == "execute"
+    assert envelope is not None
+    assert envelope.ok is True
+    assert phase_node.overlay["watcher_force_verify"] is True
+    assert "run_subtask_proof" in phase_node.overlay["required_next_actions"]
+
+
+def test_mutate_phase_plan_signal_routes_to_plan_overlay(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    drive.mkdir(parents=True)
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+    execute = PhaseNode(id="execute", manifest_id="execute", status="running")
+    execute.started_at = time.time()
+    plan_node = PhaseNode(id="plan", manifest_id="plan", status="done")
+    plan = PhasePlan(
+        plan_id="p1",
+        workspace_id="demo",
+        run_id="run-1",
+        nodes=[plan_node, execute],
+    )
+    signal = WatcherSignal(
+        signal_id="mutate-1",
+        created_at=time.time(),
+        kind="mutate_phase_plan",
+        reason="subtask proof contract is invalid",
+        trigger="repeat_semantic_failure",
+        payload={"issue": "proof_contract"},
+    )
+
+    result, envelope = runner._apply_pending_watcher_signal(
+        signal=signal,
+        phase_node=execute,
+        plan=plan,
+        run_id="run-1",
+        outcome={"status": "watcher", "task_id": "task-1"},
+    )
+
+    assert result is not None
+    assert result.outcome == "loop_back"
+    assert result.loop_back_target == "plan"
+    assert envelope is not None
+    assert envelope.ok is True
+    assert plan_node.overlay["watcher_mutate_phase_plan_request"] == {
+        "issue": "proof_contract"
+    }
+
+
 def test_write_phase_budget_file_skipped_when_watcher_budget_disabled(
     tmp_path: Path, monkeypatch
 ) -> None:

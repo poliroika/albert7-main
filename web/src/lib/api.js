@@ -78,6 +78,16 @@ export const updateMemoryNode = (id, data) => api.patch(`/memory/${id}`, data).t
 export const deleteMemoryNode = (id, params) =>
   api.delete(`/memory/${id}`, { params }).then(r => r.data);
 
+// Memory Lab (scenario harness)
+export const listMemoryScenarios = () =>
+  api.get('/memory/scenarios').then((r) => r.data || { scenarios: [] });
+export const runMemoryScenarios = (body) =>
+  api.post('/memory/scenarios/run', body).then((r) => r.data);
+export const getMemoryScenarioReport = (id) =>
+  api.get(`/memory/scenarios/${encodeURIComponent(id)}/report`).then((r) => r.data);
+export const getMemoryScenariosLatest = () =>
+  api.get('/memory/scenarios/latest').then((r) => r.data);
+
 // Settings
 export const getSettings = (workspaceId) => api.get(`/settings?workspace_id=${workspaceId}`).then(r => r.data);
 export const updateSettings = (workspaceId, data) => api.patch(`/settings?workspace_id=${workspaceId}`, data).then(r => r.data);

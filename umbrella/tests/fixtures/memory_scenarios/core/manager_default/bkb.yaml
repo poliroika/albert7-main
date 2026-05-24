@@ -1,0 +1,13 @@
+rules:
+  - id: manager_test_rule
+    title: Manager verified rule for harness
+    scope: manager
+    type: behavior
+    status: active
+    trust: verified
+    applies_to:
+      phases: ["*"]
+      workspaces: ["*"]
+      agents: ["*"]
+    rule:
+      behavior: cite ledger events for durable promotion

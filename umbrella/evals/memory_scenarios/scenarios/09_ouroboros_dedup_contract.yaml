@@ -1,0 +1,23 @@
+id: ouroboros_dedup_contract
+description: Ouroboros must not duplicate Umbrella-injected always-loaded memory.
+workspace: test
+mode: phase_prompt
+
+steps:
+  - id: verify_task
+    action: build_phase_task
+    phase: verify
+    run_id: run-dedup-1
+
+  - id: ouroboros_dedup
+    action: init_ouroboros_memory
+    phase: verify
+    run_id: run-dedup-1
+    args:
+      task_step_id: verify_task
+
+assert:
+  verify_task:
+    single_always_loaded: true
+    contract:
+      present: true

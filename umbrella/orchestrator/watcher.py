@@ -197,16 +197,23 @@ class WatcherPollLoop:
         return (
             "You are the Watcher agent monitoring a running phase. "
             "When a trigger fires, decide whether to intervene. "
-            'Respond with JSON: {"signal": "ok"|"abort_phase"|"restart_phase"|"force_verify", "reason": "..."}. '
+            'Respond with JSON: {"kind": "ok"|"abort_phase"|"restart_phase"|"force_verify", "reason": "..."}. '
             "Only intervene if clearly needed. Prefer \"ok\" when in doubt."
         )
 
     def _parse_watcher_response(self, content: str, trigger: TriggerEvent) -> tuple[str, str]:
         try:
             data = json.loads(content)
-            return data.get("signal", "ok"), data.get("reason", "")
+            kind = data.get("kind") or data.get("signal") or "ok"
+            return kind, data.get("reason", "")
         except Exception:
-            for keyword in ("abort_phase", "restart_phase", "force_verify", "inject_lesson"):
+            for keyword in (
+                "abort_phase",
+                "restart_phase",
+                "force_verify",
+                "mutate_phase_plan",
+                "inject_lesson",
+            ):
                 if keyword in content.lower():
                     return keyword, content[:200]
             return "ok", ""

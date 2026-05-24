@@ -63,6 +63,8 @@ permissions:
 exit_criteria:
   required_calls: [mark_subtask_complete]
 
+mini_review_after: subtask_review
+
 temp_tools_allowed: false
 
 budgets:

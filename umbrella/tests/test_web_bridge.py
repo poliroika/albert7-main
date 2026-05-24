@@ -1796,3 +1796,35 @@ def test_normalize_run_status_keeps_verified_completed_mapping() -> None:
     assert WebBridgeApp._normalize_run_status("completed") == "completed"
     assert WebBridgeApp._normalize_run_status("running") == "running"
     assert WebBridgeApp._normalize_run_status("cancelled") == "cancelled"
+
+
+def test_memory_scenarios_api_list(httpd) -> None:
+    host, port = "127.0.0.1", httpd
+    status, data = _get_json(host, port, "/api/memory/scenarios")
+    assert status == 200
+    assert isinstance(data, dict)
+    assert "scenarios" in data
+    assert any(s.get("id") == "bkb_research_provenance_matrix" for s in data["scenarios"])
+
+
+def test_memory_scenarios_api_run_mock(httpd, monkeypatch) -> None:
+    from umbrella.web_bridge import memory_lab
+
+    monkeypatch.setattr(
+        memory_lab,
+        "run_scenarios",
+        lambda repo_root, **kw: {"ok": True, "scenario_id": kw.get("scenario_id"), "mock": True},
+    )
+    conn = HTTPConnection("127.0.0.1", httpd, timeout=5)
+    body = json.dumps({"scenario_id": "01_bkb_filtering"}).encode("utf-8")
+    conn.request(
+        "POST",
+        "/api/memory/scenarios/run",
+        body=body,
+        headers={"Content-Type": "application/json"},
+    )
+    r = conn.getresponse()
+    payload = json.loads(r.read().decode("utf-8"))
+    conn.close()
+    assert r.status == 200
+    assert payload.get("mock") is True

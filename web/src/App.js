@@ -7,6 +7,7 @@ import AppShell from './components/layout/AppShell';
 import Landing from './pages/Landing';
 import Chat from './pages/Chat';
 import MemoryGraph from './pages/MemoryGraph';
+import MemoryLab from './pages/MemoryLab';
 import Runs from './pages/Runs';
 import Logs from './pages/Logs';
 import Dashboard from './pages/Dashboard';
@@ -57,6 +58,7 @@ function App() {
                 <Route path="/chat" element={<Chat />} />
                 <Route path="/chat/:threadId" element={<Chat />} />
                 <Route path="/memory" element={<MemoryGraph />} />
+                <Route path="/memory-lab" element={<MemoryLab />} />
                 <Route path="/runs" element={<Runs />} />
                 <Route path="/runs/:runId" element={<Runs />} />
                 <Route path="/logs" element={<Logs />} />

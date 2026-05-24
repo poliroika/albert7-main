@@ -41,7 +41,8 @@ memory:
   always_on:
     - {store: palace.charter, tier: always_on}
   hot:
-    - {store: palace.run, tags: [final_review_report, execution_artifact]}
+    - {store: palace.run, tags: [final_review_report, execution_artifact, subtask_verdict]}
+    - {store: palace.subtask, tags: [subtask_complete, execution_artifact, execution_failure]}
   warm_search: []
   write_rules:
     verification_report: {store: palace.durable, tier: warm, scope: cross_run_durable, verified: true}

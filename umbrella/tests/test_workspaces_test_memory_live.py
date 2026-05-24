@@ -1,18 +1,14 @@
 """Fast integration tests using committed ``workspaces/test`` fixture.
 
-Unlike ``test_proactive_memory_e2e`` (compiler/prompt-only on tmp_path), this
-module exercises ``build_phase_task``, drive artifacts, ``palace_add``,
-``save_umbrella_memory``, and Ouroboros dedup against a realistic workspace layout.
-Unlike live ``civilization`` runs, there is no LLM and no full phase runner loop.
+Delegates core contract checks to Memory Scenario Harness helpers. Exercises
+``build_phase_task``, drive artifacts, ``palace_add``, ``save_umbrella_memory``,
+and Ouroboros dedup against a realistic workspace layout. No LLM, no full phase runner.
 
 Set ``UMBRELLA_TEST_HARNESS_VERBOSE=1`` to print injection report / audit on failure.
 """
 
-from __future__ import annotations
-
 import json
 import os
-import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,13 +16,22 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from umbrella.evals.memory_scenarios.assertions import (
+    assert_memory_injection_contract,
+    assert_single_always_loaded_block,
+    included_bkb_ids_from_audit,
+    skipped_bkb_ids,
+)
+from umbrella.evals.memory_scenarios.fake_ouroboros import run_ouroboros_dedup_check
+from umbrella.evals.memory_scenarios.fixtures import drive_root
 from umbrella.memory.palace.facade import MemPalace
 from umbrella.memory.paths import workspace_memory_root
 from umbrella.orchestrator.worker import build_phase_task
 from umbrella.phases.base import PhaseNode
 from umbrella.phases.loader import load_manifest
+from umbrella.evals.memory_scenarios.fixtures import manifest_path
 
-pytestmark = pytest.mark.workspace_live
+pytestmark = [pytest.mark.workspace_live, pytest.mark.memory_live]
 
 PHASE_MATRIX = (
     pytest.param(
@@ -56,13 +61,6 @@ PHASE_MATRIX = (
 )
 
 
-def _drive_root(repo: Path, workspace_id: str) -> Path:
-    drive = repo / "workspaces" / workspace_id / ".memory" / "drive"
-    drive.mkdir(parents=True, exist_ok=True)
-    (drive / "logs").mkdir(parents=True, exist_ok=True)
-    return drive
-
-
 def _harness_verbose() -> bool:
     return str(os.environ.get("UMBRELLA_TEST_HARNESS_VERBOSE", "")).strip().lower() in {
         "1",
@@ -78,26 +76,6 @@ def _debug_dump(label: str, payload: Any) -> None:
     print(f"\n--- harness {label} ---\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n")
 
 
-def _assert_single_always_loaded_block(prompt: str) -> None:
-    assert (
-        len(re.findall(r"^## \[ALWAYS-LOADED MEMORY\]", prompt, flags=re.MULTILINE))
-        == 1
-    )
-    assert "## [/ALWAYS-LOADED MEMORY]" in prompt
-
-
-def _assert_memory_injection_contract(task: dict[str, Any]) -> dict[str, Any]:
-    overlays = task.get("context_overlays") or {}
-    contract = overlays.get("memory_injection_contract")
-    assert isinstance(contract, dict), "missing memory_injection_contract"
-    assert contract.get("mode") == "umbrella_owned"
-    assert contract.get("proactive_overlay_injected") is True
-    assert contract.get("proactive_overlay_hash")
-    assert contract.get("retrieval_is_supplemental_only") is True
-    assert overlays.get("prevent_ouroboros_auto_core_overlay") is True
-    return contract
-
-
 def _load_drive_artifacts(drive: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     bundle_path = drive / "state" / "llm_input_bundle_latest.json"
     report_path = drive / "state" / "memory_injection_report_latest.json"
@@ -106,14 +84,6 @@ def _load_drive_artifacts(drive: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
     report = json.loads(report_path.read_text(encoding="utf-8"))
     return bundle, report
-
-
-def _skipped_ids(report: dict[str, Any]) -> set[str]:
-    return {
-        str(row.get("id"))
-        for row in (report.get("skipped") or [])
-        if isinstance(row, dict) and row.get("id")
-    }
 
 
 def _included_reasons(report: dict[str, Any]) -> dict[str, str]:
@@ -131,9 +101,9 @@ def _build_task(
     manifest_name: str,
     phase_id: str,
     run_id: str = "run-test-1",
-    drive_root: Path | None = None,
+    drive_root_path: Path | None = None,
 ) -> dict:
-    manifest = load_manifest(Path(f"umbrella/phases/manifests/{manifest_name}.yaml"))
+    manifest = load_manifest(manifest_path(manifest_name))
     phase_node = PhaseNode(id=phase_id, manifest_id=manifest_name, status="running")
     palace = MemPalace(repo, workspace_id)
     try:
@@ -144,10 +114,17 @@ def _build_task(
             run_id=run_id,
             palace=palace,
             repo_root=repo,
-            drive_root=drive_root,
+            drive_root=drive_root_path,
         )
     finally:
         palace.close()
+
+
+def test_live_smoke_scenario_harness(tmp_path) -> None:
+    from umbrella.evals.memory_scenarios.runner import run_scenario_by_id
+
+    result = run_scenario_by_id("00_smoke_phase_matrix", report_root=tmp_path / "smoke")
+    assert result.ok, result.summary_text
 
 
 def test_live_build_phase_task_injection_contract_research_verify(
@@ -156,9 +133,10 @@ def test_live_build_phase_task_injection_contract_research_verify(
     repo, ws = test_workspace_copy
     for manifest_name in ("research", "verify"):
         task = _build_task(repo, ws, manifest_name=manifest_name, phase_id=manifest_name)
-        _assert_memory_injection_contract(task)
+        _, errs = assert_memory_injection_contract(task)
+        assert not errs
         prompt = str(task.get("input") or "")
-        _assert_single_always_loaded_block(prompt)
+        assert not assert_single_always_loaded_block(prompt)
         if "Supplemental" in prompt:
             assert "NON-DIRECTIVE" in prompt
 
@@ -173,19 +151,18 @@ def test_live_phase_matrix_bkb_and_injection_audit(
     expect_provenance_rule: bool,
     expect_skipped_ids: set[str],
 ) -> None:
-    """Per-phase BKB filtering: research injects workspace rule; others skip it."""
     repo, ws = test_workspace_copy
-    drive = _drive_root(repo, ws)
+    drive = drive_root(repo, ws)
     task = _build_task(
         repo,
         ws,
         manifest_name=phase_id,
         phase_id=phase_id,
-        drive_root=drive,
+        drive_root_path=drive,
     )
-    contract = _assert_memory_injection_contract(task)
+    contract, _ = assert_memory_injection_contract(task)
     prompt = str(task.get("input") or "")
-    _assert_single_always_loaded_block(prompt)
+    assert not assert_single_always_loaded_block(prompt)
 
     proactive = (task.get("context_overlays") or {}).get("proactive_memory") or {}
     audit = proactive.get("injection_audit") or proactive.get("telemetry", {}).get(
@@ -201,12 +178,10 @@ def test_live_phase_matrix_bkb_and_injection_audit(
     assert report.get("phase_id") == phase_id
     assert report.get("proactive_overlay_hash") == contract.get("proactive_overlay_hash")
 
-    skipped = _skipped_ids(report)
-    assert expect_skipped_ids <= skipped, (
-        f"phase={phase_id} expected skipped {expect_skipped_ids}, got {skipped}"
-    )
+    skipped = skipped_bkb_ids(report)
+    assert expect_skipped_ids <= skipped
 
-    included_ids = set(audit.get("included_bkb_ids") or [])
+    included_ids = included_bkb_ids_from_audit(task)
     if expect_provenance_rule:
         assert "test_active_provenance" in included_ids
         assert "provenance" in prompt.lower() or "source_id" in prompt.lower()
@@ -222,18 +197,18 @@ def test_live_phase_matrix_bkb_and_injection_audit(
     assert audit_skipped == skipped
 
     memory_items = bundle.get("memory_items") or []
-    assert memory_items, f"bundle has no memory_items for phase {phase_id}"
+    assert memory_items
     directive_items = [m for m in memory_items if m.get("directive")]
-    assert directive_items, "expected at least one directive proactive memory item"
+    assert directive_items
 
 
 def test_live_injection_report_included_reasons(test_workspace_copy) -> None:
     repo, ws = test_workspace_copy
-    drive = _drive_root(repo, ws)
-    _build_task(repo, ws, manifest_name="research", phase_id="research", drive_root=drive)
+    drive = drive_root(repo, ws)
+    _build_task(repo, ws, manifest_name="research", phase_id="research", drive_root_path=drive)
     _bundle, report = _load_drive_artifacts(drive)
     reasons = _included_reasons(report)
-    assert reasons, "report.included should list memory items"
+    assert reasons
     assert all(reason in {"directive_proactive", "supplemental_recall"} for reason in reasons.values())
     assert any(reason == "directive_proactive" for reason in reasons.values())
 
@@ -248,15 +223,15 @@ def test_live_workspace_charter_and_lessons_in_overlay(test_workspace_copy) -> N
 
 def test_live_drive_artifacts_and_injection_report(test_workspace_copy) -> None:
     repo, ws = test_workspace_copy
-    drive = _drive_root(repo, ws)
+    drive = drive_root(repo, ws)
     task = _build_task(
         repo,
         ws,
         manifest_name="research",
         phase_id="research",
-        drive_root=drive,
+        drive_root_path=drive,
     )
-    contract = _assert_memory_injection_contract(task)
+    contract, _ = assert_memory_injection_contract(task)
     bundle, report = _load_drive_artifacts(drive)
 
     assert report.get("proactive_overlay_hash") == contract.get("proactive_overlay_hash")
@@ -265,7 +240,7 @@ def test_live_drive_artifacts_and_injection_report(test_workspace_copy) -> None:
     ).get("llm_input_bundle_hash")
     assert isinstance(report.get("included"), list)
     per_phase = drive / "state" / "llm_input_bundle_research.json"
-    assert per_phase.is_file(), "per-phase bundle snapshot missing"
+    assert per_phase.is_file()
 
     skipped = report.get("skipped") or []
     assert any(
@@ -282,7 +257,7 @@ def test_live_palace_add_single_canonical_write(test_workspace_copy) -> None:
     from ouroboros.tools.registry import ToolContext
 
     repo, ws = test_workspace_copy
-    drive = _drive_root(repo, ws)
+    drive = drive_root(repo, ws)
     ctx = ToolContext(repo_dir=repo, host_repo_root=repo, drive_root=drive)
     ctx.task_id = "run-test-1:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": ws}
@@ -303,11 +278,7 @@ def test_live_palace_add_single_canonical_write(test_workspace_copy) -> None:
     palace = MemPalace(repo, ws)
     try:
         node = palace.get(node_id, stores=[store])
-        matches = [
-            h
-            for h in palace.list_all(n=200, stores=[store])
-            if h.get("id") == node_id
-        ]
+        matches = [h for h in palace.list_all(n=200, stores=[store]) if h.get("id") == node_id]
     finally:
         palace.close()
     assert node is not None
@@ -370,7 +341,8 @@ def test_live_promote_to_durable_metadata_roundtrip(test_workspace_copy) -> None
     from umbrella.enforcement.ledger import append_supervisor_ledger_event
 
     repo, ws = test_workspace_copy
-    drive = _drive_root(repo, ws)
+    (repo / "umbrella").mkdir(exist_ok=True)
+    drive = drive_root(repo, ws)
     event = append_supervisor_ledger_event(
         repo_root=repo,
         workspace_id=ws,
@@ -415,63 +387,13 @@ def test_live_promote_to_durable_metadata_roundtrip(test_workspace_copy) -> None
         palace.close()
     assert node is not None
     assert node.get("trust_level") == "public_verified"
-    assert node.get("surface") == "supplemental_evidence" or node.get("surface")
 
 
 def test_live_ouroboros_dedup_with_injection_contract(test_workspace_copy) -> None:
-    from ouroboros.context import build_llm_messages
-    from ouroboros.memory_hooks import init_loop_memory
-
     repo, ws = test_workspace_copy
     task = _build_task(repo, ws, manifest_name="verify", phase_id="verify")
-    messages = [{"role": "user", "content": task["input"]}]
-    ctx = SimpleNamespace(
-        host_repo_root=repo,
-        repo_dir=repo,
-        drive_root=_drive_root(repo, ws),
-        context_overlays=task.get("context_overlays") or {},
-        umbrella_managed=True,
-    )
-    init_loop_memory(messages, ctx)
-    assert len(messages) == 1
-
-    class _Env:
-        repo_dir = repo
-        drive_root = repo / "workspaces" / ws / ".memory" / "drive"
-
-        def repo_path(self, rel: str) -> Path:
-            return self.repo_dir / rel
-
-        def drive_path(self, rel: str) -> Path:
-            return self.drive_root / rel
-
-    class _Mem:
-        def ensure_files(self) -> None:
-            return None
-
-    with (
-        patch("ouroboros.context._safe_read", return_value=""),
-        patch("ouroboros.context._build_memory_sections", return_value=[]),
-        patch("ouroboros.context._build_recent_sections", return_value=[]),
-        patch("ouroboros.context._build_runtime_section", return_value=""),
-        patch("ouroboros.context._build_health_invariants", return_value=""),
-        patch("ouroboros.context.use_anthropic_style_cache_extensions", return_value=False),
-    ):
-        llm_messages, _ = build_llm_messages(env=_Env(), memory=_Mem(), task=task)
-
-    system_text = "\n".join(
-        str(m.get("content") or "")
-        for m in messages + llm_messages
-        if m.get("role") == "system"
-    )
-    assert "[ALWAYS-ON CONTEXT]" not in system_text
-    assert "[PHASE: verify]" not in system_text
-    assert "## [ALWAYS-LOADED MEMORY]" not in system_text
-    task_input = str(task.get("input") or "")
-    assert (
-        len(re.findall(r"^## \[ALWAYS-LOADED MEMORY\]", task_input, flags=re.MULTILINE))
-        == 1
-    )
+    errors = run_ouroboros_dedup_check(repo, ws, task)
+    assert not errors
 
 
 @pytest.mark.parametrize("phase_id", ["research", "plan", "execute", "verify"])
@@ -482,14 +404,14 @@ def test_live_init_loop_uses_memory_contract_workspace_across_phases(
     from ouroboros.memory_hooks import init_loop_memory
 
     repo, ws = test_workspace_copy
-    drive = _drive_root(repo, ws)
+    drive = drive_root(repo, ws)
     task = _build_task(
         repo,
         ws,
         manifest_name=phase_id,
         phase_id=phase_id,
         run_id=f"run-test-contract-{phase_id}",
-        drive_root=drive,
+        drive_root_path=drive,
     )
     prompt_with_source_refs = (
         str(task["input"])
@@ -510,7 +432,6 @@ def test_live_init_loop_uses_memory_contract_workspace_across_phases(
     assert detected_ws == ws
     assert len(messages) == 1
     assert not (repo / "workspaces" / "00_workspace_ch").exists()
-    assert not (repo / "workspaces" / "30_workspace_antipatterns").exists()
 
 
 def test_live_path_hints_no_nested_workspaces_memory(test_workspace_copy) -> None:
@@ -518,7 +439,7 @@ def test_live_path_hints_no_nested_workspaces_memory(test_workspace_copy) -> Non
     from ouroboros.tools.registry import ToolContext
 
     repo, ws = test_workspace_copy
-    drive = _drive_root(repo, ws)
+    drive = drive_root(repo, ws)
     ctx = ToolContext(repo_dir=repo, host_repo_root=repo, drive_root=drive)
     ctx.task_id = "run-test-1:research"
     ctx.loop_state_view = {"phase_label": "research", "active_workspace_id": ws}

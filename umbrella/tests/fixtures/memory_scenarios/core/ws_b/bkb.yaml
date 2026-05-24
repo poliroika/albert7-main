@@ -1,0 +1,13 @@
+rules:
+  - id: ws_b_api_rule
+    title: API B required
+    type: behavior
+    scope: workspace
+    status: active
+    trust: verified
+    applies_to:
+      phases: ["*"]
+      workspaces: ["ws_b"]
+      agents: ["*"]
+    rule:
+      behavior: "Use API B endpoints only."

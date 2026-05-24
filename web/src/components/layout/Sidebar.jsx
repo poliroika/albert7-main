@@ -19,6 +19,7 @@ import {
 const navItems = [
   { path: '/chat', label: 'Chat', icon: MessageSquare },
   { path: '/memory', label: 'Memory Graph', icon: GitBranch },
+  { path: '/memory-lab', label: 'Memory Lab', icon: Zap },
   { path: '/runs', label: 'Runs', icon: Play },
   { path: '/logs', label: 'Logs', icon: FileText },
   { path: '/dashboard', label: 'Dashboard', icon: BarChart3 },

@@ -821,19 +821,36 @@ def build_phase_task(
         from umbrella.context.compiler import compile_phase_context
         from umbrella.context.render import bundle_to_overlay_dict, persist_llm_input_bundle
 
+        allowed_tools = set(manifest.allowed_tools or ())
+        shell_allowed = bool(
+            allowed_tools
+            & {"shell", "terminal_session", "run_shell", "run_workspace_command"}
+        )
+        workspace_write_allowed = bool(
+            allowed_tools
+            & {
+                "apply_workspace_patch",
+                "delete_workspace_file",
+                "repo_write_commit",
+                "update_workspace_seed",
+                "update_workspace_from_instance",
+                "commit_workspace_changes",
+            }
+        )
         capability_envelope = {
             "phase": manifest.id,
             "workspace_write": {
+                "allowed": workspace_write_allowed,
                 "allowed_paths": "declared_subtask_scope",
                 "forbidden_paths": [".git/", ".memory/", "workspace.toml"],
             },
-            "shell": {"allowed": True},
+            "shell": {"allowed": shell_allowed},
             "memory_write": {
                 "allowed_kinds": ["observation", "completion_memory"],
                 "durable_requires_verified_evidence": True,
             },
             "verification": {
-                "candidate_workspace_writable": True,
+                "candidate_workspace_writable": workspace_write_allowed,
                 "evaluator_writable": False,
             },
         }

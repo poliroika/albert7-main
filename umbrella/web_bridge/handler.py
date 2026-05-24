@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from umbrella.web_bridge import memory_lab
 from umbrella.web_bridge.app import WebBridgeApp
 from umbrella.web_bridge.util import (
     WEB_BUILD_DIR,
@@ -233,6 +234,16 @@ class WebBridgeHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if path == "/api/memory/scenarios/latest":
+            self._send_json(memory_lab.latest_dashboard(app.repo_root))
+            return
+        if path == "/api/memory/scenarios":
+            self._send_json(memory_lab.list_scenarios(app.repo_root))
+            return
+        m = re.fullmatch(r"/api/memory/scenarios/([^/]+)/report", path)
+        if m:
+            self._send_json(memory_lab.scenario_report(app.repo_root, m.group(1)))
+            return
         if path == "/api/memory":
             result = app.list_memory_nodes(q.get("workspace_id"), q.get("run_id"))
             workspace_id = q.get("workspace_id") or ""
@@ -318,6 +329,15 @@ class WebBridgeHandler(BaseHTTPRequestHandler):
     def _dispatch_post(self, payload: dict[str, Any]) -> None:
         path = self._path()
         app = self.app
+        if path == "/api/memory/scenarios/run":
+            self._send_json(
+                memory_lab.run_scenarios(
+                    app.repo_root,
+                    scenario_id=str(payload.get("scenario_id") or "") or None,
+                    run_all=bool(payload.get("all")),
+                )
+            )
+            return
         if path == "/api/workspaces":
             self._send_json(app.create_workspace(payload), status=HTTPStatus.CREATED)
             return

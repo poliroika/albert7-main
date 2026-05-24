@@ -74,6 +74,15 @@ def test_plan_phase_requires_authoritative_plan_artifact():
     assert "submit_phase_plan" in manifest.exit_criteria.required_calls
     assert "loop_back_to" in manifest.allowed_tools
     assert "harness_run" not in manifest.allowed_tools
+    assert "enable_tools" not in manifest.allowed_tools
+    assert "register_temp_tool" not in manifest.allowed_tools
+
+
+def test_execute_schedules_subtask_review_manifest():
+    from umbrella.phases.loader import load_manifest
+
+    manifest = load_manifest(MANIFESTS_DIR / "execute.yaml")
+    assert manifest.mini_review_after == "subtask_review"
 
 
 def test_phase_memory_routes_subtasks_to_subtask_store():

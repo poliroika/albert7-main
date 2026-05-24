@@ -1,0 +1,28 @@
+rules:
+  - id: test_active_provenance
+    title: Require provenance in research
+    type: behavior
+    scope: workspace
+    status: active
+    trust: verified
+    strength: 0.9
+    applies_to:
+      phases: ["research"]
+      workspaces: ["*"]
+      agents: ["*"]
+    rule:
+      behavior: "Require source_id before saving research findings."
+
+  - id: test_candidate_only
+    title: Candidate must not inject
+    type: behavior
+    scope: workspace
+    status: candidate
+    trust: candidate
+    strength: 0.5
+    applies_to:
+      phases: ["*"]
+      workspaces: ["*"]
+      agents: ["*"]
+    rule:
+      behavior: "inject me please"

@@ -4,6 +4,7 @@ import time
 import pytest
 from umbrella.phases.base import WatcherSignal
 from umbrella.orchestrator.watcher import WatcherPollLoop
+from umbrella.orchestrator.watcher_triggers import TriggerEvent
 
 
 @pytest.fixture
@@ -51,6 +52,16 @@ def test_mark_processed_deduplicates(tmp_drive):
 def test_no_signal_when_no_file(tmp_drive):
     watcher = WatcherPollLoop(tmp_drive)
     assert watcher.read_pending_signal() is None
+
+
+def test_parse_watcher_response_accepts_kind_field(tmp_drive):
+    watcher = WatcherPollLoop(tmp_drive)
+    kind, reason = watcher._parse_watcher_response(
+        '{"kind": "force_verify", "reason": "fresh proof required"}',
+        TriggerEvent("stall", {}),
+    )
+    assert kind == "force_verify"
+    assert reason == "fresh proof required"
 
 
 def test_tick_no_trigger(tmp_drive):
