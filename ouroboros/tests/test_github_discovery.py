@@ -220,6 +220,36 @@ def test_github_extract_snippets_includes_body_for_permissive(tmp_path: Path) ->
     assert "def hello" in text
 
 
+def test_github_extract_snippets_accepts_query_alias(tmp_path: Path) -> None:
+    gd.reset_budget("task_gh_query_alias")
+    ctx = _ctx(tmp_path, "task_gh_query_alias")
+    with (
+        patch.object(
+            gd,
+            "_fetch_repo_meta",
+            return_value={"license": {"spdx_id": "MIT", "key": "mit"}},
+        ),
+        patch.object(
+            gd,
+            "_github_search_code_in_repo",
+            return_value=[{"path": "src/server.py"}, {"path": "src/extra.py"}],
+        ),
+        patch.object(gd, "_fetch_file_raw", return_value="def serve():\n    pass\n"),
+    ):
+        out = gd._github_extract_snippets(
+            ctx,
+            repo_full_name="some/mit-repo",
+            query="websocket",
+            intent="planner_research",
+            max_results=1,
+        )
+    payload = json.loads(out)
+    assert payload["status"] == "ok"
+    assert payload["intent"] == "planner_research"
+    assert len(payload["extracted"]) == 1
+    assert payload["extracted"][0]["path"] == "src/extra.py"
+
+
 def test_github_extract_snippets_expands_dirs_and_globs_preferring_code(
     tmp_path: Path,
 ) -> None:

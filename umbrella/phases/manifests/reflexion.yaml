@@ -35,6 +35,7 @@ memory:
     - {store: palace.charter, tier: always_on}
   hot:
     - {store: palace.run, tags: [execution_error, subtask_verdict, final_review_report, verification_report]}
+    - {store: palace.durable, tags: [verification_report]}
   warm_search:
     - {store: palace.global, n: 8, filter: {type: lesson}}
   graph:

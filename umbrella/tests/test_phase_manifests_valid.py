@@ -72,6 +72,8 @@ def test_plan_phase_requires_authoritative_plan_artifact():
     manifest = load_manifest(MANIFESTS_DIR / "plan.yaml")
     assert "propose_phase_plan" in manifest.exit_criteria.required_calls
     assert "submit_phase_plan" in manifest.exit_criteria.required_calls
+    assert "loop_back_to" in manifest.allowed_tools
+    assert "harness_run" not in manifest.allowed_tools
 
 
 def test_phase_memory_routes_subtasks_to_subtask_store():
@@ -147,6 +149,24 @@ def test_workspace_execution_manifests_do_not_delegate_code_edits_to_claude():
         for rule in manifest.permissions.rules:
             if rule.action == "allow":
                 assert "claude_code_edit" not in set(rule.tools or [])
+
+
+def test_review_and_verify_manifests_have_read_only_diagnostics():
+    from umbrella.phases.loader import load_manifest
+
+    for name in ("subtask_review", "final_review", "verify"):
+        manifest = load_manifest(MANIFESTS_DIR / f"{name}.yaml")
+        assert "read_file" in manifest.allowed_tools
+        assert "list_files" in manifest.allowed_tools
+        assert "read_drive_log" in manifest.allowed_tools
+        assert "read_terminal_scrollback" in manifest.allowed_tools
+
+    final_review = load_manifest(MANIFESTS_DIR / "final_review.yaml")
+    assert "run_workspace_verify" in final_review.allowed_tools
+    assert "submit_verification" not in final_review.allowed_tools
+    assert "promote_to_durable" not in final_review.allowed_tools
+    assert "verification-protocol" not in final_review.allowed_skills
+    assert "final-review-verification" in final_review.allowed_skills
 
 
 def test_phase_manifest_tools_exist_in_ouroboros_registry():

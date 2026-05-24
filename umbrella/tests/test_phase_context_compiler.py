@@ -104,3 +104,20 @@ def test_llm_input_bundle_persists_source_refs_and_hash(tmp_path: Path) -> None:
     assert payload["phase_id"] == "plan"
     overlay = bundle_to_overlay_dict(bundle)
     assert overlay["allowed_tools"] == []
+
+
+def test_phase_context_compiler_accepts_prompt_content_key(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo" / "workspaces" / "demo"
+    workspace.mkdir(parents=True)
+    bundle = compile_phase_context(
+        workspace_root=workspace,
+        workspace_id="demo",
+        run_id="run-3",
+        task_id="run-3:plan",
+        manifest=_manifest("plan"),
+        phase_node=PhaseNode(id="plan", manifest_id="plan"),
+        phase_prompt_sections=[
+            {"path": "umbrella/prompts/phases/plan.system.md", "content": "Plan prompt from worker"}
+        ],
+    )
+    assert bundle.system_sections[0].text == "Plan prompt from worker"

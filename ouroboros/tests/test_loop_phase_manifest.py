@@ -762,8 +762,86 @@ def test_required_phase_completion_nudge_forces_mark_after_success_test(tmp_path
     )
 
     assert forced == "mark_subtask_complete"
-    assert "declared success test has already passed" in messages[-1]["content"]
-    assert 'mark_subtask_complete(subtask_id="st-005"' in messages[-1]["content"]
+    assert "completion_contract" in messages[-1]["content"]
+    assert "completion_contract_hint" in messages[-1]["content"]
+    assert "summary=..., evidence=" not in messages[-1]["content"]
+
+
+def test_required_phase_completion_nudge_forces_mark_after_typed_proof(tmp_path):
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import (
+        _maybe_force_required_phase_completion,
+        _may_force_mark_subtask_complete,
+    )
+
+    drive_root = tmp_path / "drive"
+    state_dir = drive_root / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "subtasks": [
+                            {
+                                "id": "project-setup",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "bool",
+                                        "command": [
+                                            "python",
+                                            "-c",
+                                            "import demoapp",
+                                        ],
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace_tool_calls = [
+        {
+            "tool": "run_subtask_proof",
+            "args": {"subtask_id": "project-setup"},
+            "result": json.dumps(
+                {
+                    "passed": True,
+                    "completion_contract_hint": {
+                        "subtask_id": "project-setup",
+                        "status": "done",
+                    },
+                }
+            ),
+            "is_error": False,
+        }
+    ]
+    assert _may_force_mark_subtask_complete(
+        drive_root=drive_root,
+        trace_tool_calls=trace_tool_calls,
+        phase_write_tool_calls=1,
+    )
+    messages = []
+    forced = _maybe_force_required_phase_completion(
+        terminating_tools=frozenset({"mark_subtask_complete"}),
+        tool_calls=[{"function": {"name": "read_file"}}],
+        messages=messages,
+        rounds_in_phase=8,
+        forced_progress_tool_choice=None,
+        drive_root=drive_root,
+        phase_write_tool_calls=1,
+        trace_tool_calls=trace_tool_calls,
+    )
+    assert forced == "mark_subtask_complete"
+    assert "completion_contract_hint" in messages[-1]["content"]
 
 
 def test_phase_required_tools_are_part_of_phase_filter():

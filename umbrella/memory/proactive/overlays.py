@@ -34,6 +34,39 @@ _PHASE_ALWAYS: dict[str, list[str]] = {
         "failure patterns",
         "promotion rules",
     ],
+    "preflight": [
+        "workspace charter",
+        "BKB",
+        "active risks",
+    ],
+    "research_review": [
+        "workspace charter",
+        "BKB",
+        "research anti-patterns",
+        "phase commitments",
+    ],
+    "plan_review": [
+        "workspace charter",
+        "current strategy",
+        "BKB",
+        "implementation anti-patterns",
+        "phase commitments",
+    ],
+    "subtask_review": [
+        "accepted plan",
+        "verification contract",
+        "implementation anti-patterns",
+        "BKB",
+        "active risks",
+    ],
+    "final_review": [
+        "accepted plan",
+        "verification contract",
+        "current strategy",
+        "BKB",
+        "active risks",
+        "failure patterns",
+    ],
 }
 
 _MANDATORY_CORE_KEYWORDS = ("identity", "constitution", "bkb", "phase commitments")

@@ -55,15 +55,22 @@ def _read_repo_prompt_file(
     rel = str(rel_path or "").replace("\\", "/").strip()
     if not rel:
         return {"path": rel, "content": "MISSING: empty prompt path."}
+    root_for_check = repo_root.resolve()
     path = (repo_root / rel).resolve()
+    if not path.is_file():
+        package_root = pathlib.Path(__file__).resolve().parents[2]
+        fallback = (package_root / rel).resolve()
+        if fallback.is_file():
+            path = fallback
+            root_for_check = package_root.resolve()
     try:
-        if not path.is_relative_to(repo_root.resolve()):
+        if not path.is_relative_to(root_for_check):
             return {
                 "path": rel,
                 "content": "MISSING: prompt path resolves outside the repository.",
             }
     except AttributeError:  # pragma: no cover - Python <3.9 compatibility
-        root_text = str(repo_root.resolve())
+        root_text = str(root_for_check)
         if not str(path).startswith(root_text):
             return {
                 "path": rel,
@@ -228,7 +235,13 @@ def authoritative_artifacts_for_phase(
     if drive_root is None:
         return []
     artifacts: list[dict[str, str]] = []
-    if manifest_id in {"execute", "final_review", "verify"}:
+    if manifest_id in {
+        "execute",
+        "final_review",
+        "verify",
+        "subtask_review",
+        "reflexion",
+    }:
         path = drive_root / "state" / "phase_plan.json"
         content = _read_text_artifact(path)
         if not _phase_plan_json_matches_run(content, run_id):
@@ -256,7 +269,7 @@ def authoritative_artifacts_for_phase(
                 "format": "json",
             }
         )
-    if manifest_id == "research_review":
+    if manifest_id in {"research_review", "plan_review"}:
         path = drive_root / "state" / "research_summary_latest.json"
         content = _read_text_artifact(path)
         if not _artifact_matches_run(content, run_id):
@@ -288,12 +301,21 @@ def render_phase_user_prompt(
     workspace_id: str = "",
     phase_node: PhaseNode | None = None,
     gmas_prewrite_required: bool = False,
+    research_depth: str = "",
     proactive_overlay: ProactiveMemoryOverlay | None = None,
 ) -> str:
     bundle = recall_bundle
     lines: list[str] = [f"# Phase: {manifest.id}", f"## Goal", manifest.description, ""]
     if proactive_overlay is not None and proactive_overlay.sections:
         lines.append(proactive_overlay.render_markdown())
+        lines.append("")
+    if manifest.id == "research" and research_depth:
+        lines.append("## Research depth")
+        lines.append(
+            f"Umbrella selected `{research_depth}` for this phase. Follow the "
+            "phase prompt's depth rules before deciding whether external "
+            "GitHub/web/deep-search/MCP discovery is mandatory."
+        )
         lines.append("")
     if domain_policy_sections:
         lines.append("## Umbrella domain policy capsules")
@@ -589,6 +611,36 @@ def _phase_node_needs_gmas_prewrite(
     return False
 
 
+_RESEARCH_FULL_DEPTH_RE = re.compile(
+    r"\b("
+    r"greenfield|from\s+scratch|new\s+(?:app|project|service|workspace)|"
+    r"tooling\s+integration|"
+    r"external\s+(?:api|library|framework)|current\s+(?:api|docs|library)|"
+    r"gmas|llm|multi[-_\s]?agent|agent|bot|model[-_\s]?driven|web\s+ui|browser"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _research_depth_for_phase(
+    phase_node: PhaseNode,
+    *,
+    detected_domains: set[str],
+    query_seed: str,
+) -> str:
+    if phase_node.manifest_id != "research":
+        return ""
+    if isinstance(phase_node.overlay, dict):
+        requested = str(phase_node.overlay.get("research_depth") or "").strip().lower()
+        if requested in {"none", "light", "full"}:
+            return requested
+    if "multi_agent_gmas" in {domain.lower() for domain in detected_domains}:
+        return "full"
+    if _RESEARCH_FULL_DEPTH_RE.search(str(query_seed or "")):
+        return "full"
+    return "light"
+
+
 def _phase_recall_query_seed(
     *, manifest: PhaseManifest, phase_node: PhaseNode, drive_root: pathlib.Path | None
 ) -> str:
@@ -659,6 +711,11 @@ def build_phase_task(
         manifest=manifest,
         phase_node=phase_node,
         drive_root=drive_root,
+    )
+    research_depth = _research_depth_for_phase(
+        phase_node,
+        detected_domains=detected_domains,
+        query_seed=query_seed,
     )
     active_subtask_id: str | None = None
     if manifest.id == "execute" and phase_node.subtasks:
@@ -751,6 +808,7 @@ def build_phase_task(
             },
         },
         "detected_domains": sorted(detected_domains),
+        **({"research_depth": research_depth} if research_depth else {}),
         "gmas_prewrite_required": gmas_prewrite_required,
         "phase_prompt_files_loaded": [
             section.get("path", "") for section in phase_prompt_sections
@@ -855,6 +913,7 @@ def build_phase_task(
             workspace_id=workspace_id,
             phase_node=phase_node,
             gmas_prewrite_required=gmas_prewrite_required,
+            research_depth=research_depth,
             proactive_overlay=proactive_overlay,
         ),
         "workspace_id": workspace_id,

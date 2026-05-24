@@ -10,6 +10,21 @@ DEFAULT_CODE_ANALYZER_MODEL = "claude-opus-4"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
+WATCHER_BUDGET_ENABLED_ENV = "UMBRELLA_WATCHER_BUDGET_ENABLED"
+
+
+def env_truthy(name: str) -> bool:
+    """Return whether ``os.environ[name]`` is a truthy flag (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def watcher_budget_enforcement_enabled() -> bool:
+    """Whether watcher enforces phase ``{id}.budget.json`` time/tool-call limits.
+
+    Configure via ``UMBRELLA_WATCHER_BUDGET_ENABLED`` in repo ``.env`` (see ``load_env``).
+    """
+    return env_truthy(WATCHER_BUDGET_ENABLED_ENV)
+
 
 def _iter_env_candidates(
     *,

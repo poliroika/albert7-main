@@ -91,3 +91,54 @@ def test_repeat_semantic_failure_auto_aborts(tmp_drive):
     assert signal.trigger == "repeat_semantic_failure"
     assert "research_memory_provenance_error" in signal.reason
     assert watcher.read_pending_signal() is not None
+
+
+@pytest.mark.parametrize(
+    ("category", "expected_kind"),
+    [
+        ("proof_not_passing", "restart_phase"),
+        ("proof_runtime_import_error", "restart_phase"),
+        ("completion_contract_invalid", "inject_lesson"),
+        ("fake_evidence_ref", "abort_phase"),
+    ],
+)
+def test_repeat_semantic_failure_category_mapping(
+    tmp_drive, category: str, expected_kind: str
+) -> None:
+    tools = tmp_drive / "logs" / "tools.jsonl"
+    row = {
+        "tool": "run_subtask_proof",
+        "result_preview": json.dumps({"passed": False, "category": category}),
+    }
+    if category == "completion_contract_invalid":
+        row = {
+            "tool": "mark_subtask_complete",
+            "result_preview": (
+                "ERROR: mark_subtask_complete contract rejected: "
+                "missing completion_contract"
+            ),
+        }
+    elif category == "fake_evidence_ref":
+        row = {
+            "tool": "mark_subtask_complete",
+            "result_preview": "ERROR: fake_evidence_ref in completion contract",
+        }
+    elif category.startswith("proof_runtime_"):
+        row = {
+            "tool": "run_subtask_proof",
+            "result_preview": json.dumps(
+                {
+                    "passed": False,
+                    "shell_result": {"stderr": "ModuleNotFoundError: demo"},
+                }
+            ),
+        }
+    tools.write_text(
+        "\n".join(json.dumps(row) for _ in range(3)) + "\n",
+        encoding="utf-8",
+    )
+    watcher = WatcherPollLoop(tmp_drive, poll_sec=1)
+    signal = watcher.tick(phase="execute", phase_started_at=time.time() - 5)
+    assert signal is not None
+    assert signal.kind == expected_kind
+    assert signal.trigger == "repeat_semantic_failure"

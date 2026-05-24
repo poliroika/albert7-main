@@ -240,7 +240,7 @@ def compile_phase_context(
                 id=f"prompt.{idx}",
                 role="phase_instruction",
                 title=path or "phase prompt",
-                text=str(section.get("text") or "")[:8000],
+                text=str(section.get("text") or section.get("content") or "")[:8000],
                 source=ref,
                 trust="system",
             )

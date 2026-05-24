@@ -11,6 +11,33 @@ from umbrella.orchestrator.watcher_triggers import WatcherTriggers, TriggerEvent
 
 log = logging.getLogger(__name__)
 
+_REPEAT_SEMANTIC_RESTART_CATEGORIES = frozenset({
+    "proof_not_passing",
+})
+_REPEAT_SEMANTIC_INJECT_LESSON_CATEGORIES = frozenset({
+    "completion_contract_invalid",
+    "materialization_missing",
+    "completion_with_failed_proof",
+    "patch_hunk_mismatch",
+    "completion_hash_mismatch",
+})
+_REPEAT_SEMANTIC_ABORT_CATEGORIES = frozenset({
+    "fake_evidence_ref",
+})
+
+
+def _repeat_semantic_failure_signal_kind(category: str) -> str:
+    normalized = str(category or "").strip()
+    if not normalized:
+        return "abort_phase"
+    if normalized in _REPEAT_SEMANTIC_ABORT_CATEGORIES:
+        return "abort_phase"
+    if normalized.startswith("proof_runtime_") or normalized in _REPEAT_SEMANTIC_RESTART_CATEGORIES:
+        return "restart_phase"
+    if normalized in _REPEAT_SEMANTIC_INJECT_LESSON_CATEGORIES:
+        return "inject_lesson"
+    return "abort_phase"
+
 
 class WatcherPollLoop:
     """Idle-by-default watcher. Polls trigger heuristics and calls the LLM
@@ -37,6 +64,23 @@ class WatcherPollLoop:
         self._processed: set[str] = set()
         self._signal_path = drive_root / "state" / "watcher_signal.json"
         self._processed_path = drive_root / "state" / "watcher_signals.processed.jsonl"
+        self._load_processed_signal_ids()
+
+    def _load_processed_signal_ids(self) -> None:
+        if not self._processed_path.exists():
+            return
+        try:
+            with self._processed_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    sid = str(row.get("signal_id") or "").strip()
+                    if sid:
+                        self._processed.add(sid)
+        except Exception:
+            log.debug("Failed to load watcher processed signal ids", exc_info=True)
 
     def write_signal(self, signal: WatcherSignal) -> None:
         self._signal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,19 +216,25 @@ class WatcherPollLoop:
     ) -> WatcherSignal | None:
         if trigger.kind == "repeat_semantic_failure":
             category = str((trigger.context or {}).get("category") or "").strip()
+            kind = _repeat_semantic_failure_signal_kind(category)
             reason = (
                 "Repeated semantic tool failure"
                 + (f" ({category})" if category else "")
+                + f" during phase `{phase}`. "
                 + (
-                    f" during phase `{phase}`. Abort the phase so the runner can "
-                    "repair the missing evidence/context instead of spending more "
-                    "rounds on the same rejected contract."
+                    "Restart the phase with a fresh repair loop."
+                    if kind == "restart_phase"
+                    else (
+                        "Inject the lesson into the next attempt before retrying completion."
+                        if kind == "inject_lesson"
+                        else "Abort the phase; the runner cannot recover safely in-place."
+                    )
                 )
             )
             return WatcherSignal(
                 signal_id=str(uuid.uuid4()),
                 created_at=time.time(),
-                kind="abort_phase",
+                kind=kind,
                 reason=reason,
                 trigger=trigger.kind,
                 payload=trigger.context,
@@ -193,10 +243,10 @@ class WatcherPollLoop:
             return WatcherSignal(
                 signal_id=str(uuid.uuid4()),
                 created_at=time.time(),
-                kind="abort_phase",
+                kind="restart_phase",
                 reason=(
-                    "Repeated structural layout block during execute; aborting "
-                    "phase so the next attempt can inspect the declared layout "
+                    "Repeated structural layout block during execute; restart "
+                    "the phase so the next attempt can inspect the declared layout "
                     "policy and repair the file placement."
                 ),
                 trigger=trigger.kind,

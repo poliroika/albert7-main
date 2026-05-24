@@ -10,6 +10,13 @@ allowed_tools:
   - load_skill
   - run_workspace_verify
   - run_real_e2e
+  - read_file
+  - list_files
+  - read_drive_log
+  - read_terminal_scrollback
+  - get_workspace_logs
+  - git_status
+  - git_diff
   - palace_search
   - submit_verification
   - request_human_checkpoint
@@ -27,6 +34,7 @@ forbidden_tools:
 
 allowed_skills:
   - verification-protocol
+  - strict-verification-sync
   - human-checkpoint-author
 
 memory:
@@ -40,7 +48,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [load_skill, run_workspace_verify, run_real_e2e, palace_search, submit_verification, request_human_checkpoint, loop_back_to, promote_to_durable]
+    - allow_tools: [load_skill, run_workspace_verify, run_real_e2e, read_file, list_files, read_drive_log, read_terminal_scrollback, get_workspace_logs, git_status, git_diff, palace_search, submit_verification, request_human_checkpoint, loop_back_to, promote_to_durable]
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
 
 exit_criteria:

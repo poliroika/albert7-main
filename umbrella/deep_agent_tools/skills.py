@@ -24,6 +24,17 @@ def _umbrella_tools():
     return umbrella_tools
 
 
+def _manifest_allowed_skills(ctx: Any) -> set[str] | None:
+    overlays = getattr(ctx, "context_overlays", None)
+    manifest = overlays.get("phase_manifest") if isinstance(overlays, dict) else None
+    if not isinstance(manifest, dict) or "allowed_skills" not in manifest:
+        return None
+    raw = manifest.get("allowed_skills") or []
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return set()
+    return {str(item).strip() for item in raw if str(item).strip()}
+
+
 def load_skill(
     ctx: Any,
     slug: str,
@@ -34,13 +45,24 @@ def load_skill(
     try:
         from umbrella.skills.loader import load_skill_text
 
+        requested_slug = slug.strip()
+        allowed = _manifest_allowed_skills(ctx)
+        if allowed is not None and requested_slug not in allowed:
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": "skill_not_allowed_for_phase",
+                    "slug": requested_slug,
+                    "allowed_skills": sorted(allowed),
+                }
+            )
         repo_root = _umbrella_tools()._resolve_umbrella_repo_root(ctx)
-        text = load_skill_text(repo_root, slug.strip())
+        text = load_skill_text(repo_root, requested_slug)
         if not text:
             return _json(
                 {
                     "status": "not_found",
-                    "slug": slug,
+                    "slug": requested_slug,
                     "hint": "Skill not found in umbrella/skills/library/<slug>/SKILL.md",
                 }
             )
@@ -48,7 +70,7 @@ def load_skill(
         return _json(
             {
                 "status": "ok",
-                "slug": slug,
+                "slug": requested_slug,
                 "truncated": len(limited) < len(text),
                 "content": limited,
             }

@@ -12,7 +12,11 @@ allowed_tools:
   - list_files
   - palace_search
   - palace_link
+  - run_workspace_verify
   - run_real_e2e
+  - read_drive_log
+  - read_terminal_scrollback
+  - get_workspace_logs
   - loop_back_to
   - request_extra_subtask
   - submit_final_review
@@ -29,13 +33,14 @@ forbidden_tools:
 allowed_skills:
   - e2e-test-author
   - goal-alignment-check
-  - verification-protocol
+  - final-review-verification
 
 memory:
   always_on:
     - {store: palace.charter, tier: always_on}
   hot:
-    - {store: palace.run, tags: [phase_plan, subtask_card, execution_artifact]}
+    - {store: palace.run, tags: [phase_plan, execution_artifact, subtask_verdict, plan_review_verdict, final_review_report]}
+    - {store: palace.subtask, tags: [subtask_card, subtask_complete, execution_artifact, execution_failure]}
   warm_search:
     - {store: palace.global, n: 6, filter: {type: lesson}}
   write_rules:
@@ -43,7 +48,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [load_skill, read_file, list_files, palace_search, palace_link, run_real_e2e, loop_back_to, request_extra_subtask, submit_final_review]
+    - allow_tools: [load_skill, read_file, list_files, palace_search, palace_link, run_workspace_verify, run_real_e2e, read_drive_log, read_terminal_scrollback, get_workspace_logs, loop_back_to, request_extra_subtask, submit_final_review]
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
 
 exit_criteria:

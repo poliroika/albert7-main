@@ -23,17 +23,9 @@ allowed_tools:
   - palace_add
   - palace_link
   - mutate_phase_plan
-  - add_phase
   - loop_back_to
   - request_extra_subtask
   - mark_subtask_complete
-  - harness_run
-  - enable_tools
-  - mcp_install
-  - mcp_discover
-  - register_temp_tool
-  - web_search
-  - deep_search
   - request_watcher_review
   - get_gmas_context
   - search_gmas_knowledge
@@ -46,35 +38,32 @@ allowed_skills:
   - patch-discipline
   - terminal-debugging
   - error-self-repair
-  - mcp-bridge-author
-  - harness-strategy
+  - strict-verification-sync
   - gmas-overview
-  - temp-tool-author
 
 memory:
   always_on:
     - {store: palace.charter, tier: always_on}
   hot:
-    - {store: palace.run, tags: [phase_plan, execution_error, patch_applied]}
+    - {store: palace.run, tags: [phase_plan, plan_review_verdict, review_verdict, execution_error, patch_applied, execution_artifact]}
     - {store: palace.subtask, tags: [subtask_card, phase_plan_mutation, phase_retry, execution_failure]}
   warm_search:
-    - {store: palace.global, n: 6}
+    - {store: palace.lesson, n: 4}
+    - {store: palace.codeptr, n: 2}
   write_rules:
     execution_artifact: {store: palace.run, tier: hot, scope: run_scoped}
     error_record: {store: palace.subtask, tier: hot, scope: subtask_scoped}
 
 permissions:
   rules:
-    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, run_unit_tests, palace_search, palace_add, palace_link, mutate_phase_plan, add_phase, loop_back_to, request_extra_subtask, mark_subtask_complete, harness_run, enable_tools, mcp_install, mcp_discover, register_temp_tool, web_search, deep_search, request_watcher_review, get_gmas_context, search_gmas_knowledge]
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, run_unit_tests, palace_search, palace_add, palace_link, mutate_phase_plan, loop_back_to, request_extra_subtask, mark_subtask_complete, request_watcher_review, get_gmas_context, search_gmas_knowledge]
     - deny_tools: [wipe_workspace, reset_palace]
     - deny_path: ["**/.env*", "**/secrets/**"]
 
 exit_criteria:
   required_calls: [mark_subtask_complete]
 
-mini_review_after: subtask_review
-
-temp_tools_allowed: true
+temp_tools_allowed: false
 
 budgets:
   max_tokens: 60000

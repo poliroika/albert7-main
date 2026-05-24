@@ -1121,6 +1121,12 @@ def _phase_manifest_payload(ctx: ToolContext) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _research_depth(ctx: ToolContext) -> str:
+    overlays = _context_overlays(ctx)
+    value = str(overlays.get("research_depth") or "").strip().lower()
+    return value if value in {"none", "light", "full"} else "full"
+
+
 def _research_summary_min_valid_findings(ctx: ToolContext) -> int:
     manifest = _phase_manifest_payload(ctx)
     criteria = (
@@ -1151,6 +1157,8 @@ def _research_summary_min_valid_findings(ctx: ToolContext) -> int:
 def _research_discovery_validation_issue(
     ctx: ToolContext, rows: list[dict[str, Any]]
 ) -> str:
+    if _research_depth(ctx) != "full":
+        return ""
     manifest = _phase_manifest_payload(ctx)
     allowed = manifest.get("allowed_tools") if isinstance(manifest, dict) else []
     if not isinstance(allowed, list):
@@ -1678,7 +1686,67 @@ def _research_tool_row_succeeded(row: dict[str, Any]) -> bool:
     if row.get("exit_code", 0) not in (0, None):
         return False
     raw = str(row.get("result_preview") or row.get("result") or "").strip()
-    return not raw.lower().startswith("error:")
+    lower = raw.lower()
+    if lower.startswith(("error:", "warning:")):
+        return False
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return True
+    if not isinstance(payload, dict):
+        return True
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {
+        "blocked",
+        "budget_exhausted",
+        "error",
+        "failed",
+        "provider_error",
+        "rate_limited",
+        "tool_error",
+        "warning",
+    }:
+        return False
+    if payload.get("error"):
+        return False
+    if payload.get("passed") is False:
+        return False
+    return True
+
+
+def _research_gmas_tool_row_succeeded(row: dict[str, Any]) -> bool:
+    if not _research_tool_row_succeeded(row):
+        return False
+    raw = str(row.get("result_preview") or row.get("result") or "").strip()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    results = payload.get("results") if isinstance(payload.get("results"), list) else []
+    has_non_fallback_result = False
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        source_type = str(item.get("source_type") or "").strip().lower()
+        if metadata.get("fallback") is True or source_type == "gmas_fallback":
+            continue
+        has_non_fallback_result = True
+        break
+    has_card_signal = any(
+        payload.get(key)
+        for key in (
+            "recommended_pattern",
+            "key_files",
+            "key_symbols",
+            "example_usage",
+            "doc_references",
+            "retrieval_excerpt",
+        )
+    )
+    return bool(has_non_fallback_result or has_card_signal)
 
 
 def _research_summary_skill_coverage_issue(
@@ -1733,7 +1801,7 @@ def _research_summary_gmas_coverage_issue(
     gmas_tools = {"get_gmas_context", "search_gmas_knowledge"}
     attempted = any(
         str(row.get("tool") or "") in gmas_tools
-        and _research_tool_row_succeeded(row)
+        and _research_gmas_tool_row_succeeded(row)
         for row in rows
     )
     if attempted:
@@ -1795,6 +1863,7 @@ __all__ = [
     '_research_summary_source_claim_issue',
     '_research_summary_unread_path_issue',
     '_phase_manifest_payload',
+    '_research_depth',
     '_research_summary_min_valid_findings',
     '_research_source_coverage_report',
     '_research_discovery_validation_issue',

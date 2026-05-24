@@ -52,7 +52,7 @@ For revise/abort, include typed issue objects:
 ```
 
 Allowed issue codes include:
-`missing_proof`, `weak_proof`, `manual_proof`, `unavailable_proof_target`, `test_tampering_risk`, `scope_mismatch`, `policy_violation`, `insufficient_research_evidence`, `requires_human_checkpoint`, `stale_proof_ref`, `fake_evidence_ref`, `proof_after_patch_missing`, `proof_scope_mismatch`, `claim_without_proof`, `test_tampering_detected`, `verifier_mutation_attempt`, `memory_without_verified_evidence`, `legacy_contract_used`, `llm_judge_only_evidence`.
+`missing_proof`, `weak_proof`, `manual_proof`, `unavailable_proof_target`, `test_tampering_risk`, `scope_mismatch`, `policy_violation`, `insufficient_research_evidence`, `requires_human_checkpoint`, `stale_proof_ref`, `fake_evidence_ref`, `invalid_evidence_ref`, `invalid_python_c_proof`, `non_ledger_evidence_ref`, `shell_operator_in_argv`, `proof_after_patch_missing`, `proof_scope_mismatch`, `claim_without_proof`, `test_tampering_detected`, `verifier_mutation_attempt`, `memory_without_verified_evidence`, `legacy_contract_used`, `llm_judge_only_evidence`, `greenfield_python_src_layout_policy`.
 
 Severity values:
 `info`, `warning`, `error`, `blocking`, `human_required`.

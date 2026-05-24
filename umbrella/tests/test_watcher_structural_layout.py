@@ -71,3 +71,30 @@ def test_repeat_research_memory_error_trigger_reads_result_preview(tmp_path) -> 
     assert event is not None
     assert event.kind == "repeat_semantic_failure"
     assert event.context["category"] == "research_memory_provenance_error"
+
+
+def test_repeat_semantic_failure_ignores_errors_separated_by_progress(tmp_path) -> None:
+    drive = tmp_path / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    tools = logs / "tools.jsonl"
+    error_row = {
+        "tool": "palace_add",
+        "result_preview": (
+            "ERROR: palace_add research_finding requires a source_id tied "
+            "to current research-phase evidence."
+        ),
+    }
+    progress_row = {
+        "tool": "deep_search",
+        "result_preview": '{"status": "ok", "sources": [{"url": "https://example.com"}]}',
+    }
+    with tools.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(error_row) + "\n")
+        handle.write(json.dumps(progress_row) + "\n")
+        handle.write(json.dumps(error_row) + "\n")
+        handle.write(json.dumps(progress_row) + "\n")
+        handle.write(json.dumps(error_row) + "\n")
+    triggers = WatcherTriggers(drive, repeat_m=3)
+    event = triggers.check(phase="research", phase_started_at=time.time() - 5)
+    assert event is None

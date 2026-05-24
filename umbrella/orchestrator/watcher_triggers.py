@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from umbrella.env import watcher_budget_enforcement_enabled
+
 
 @dataclass
 class TriggerEvent:
@@ -104,6 +106,8 @@ class WatcherTriggers:
         return None
 
     def _check_budget(self, phase: str, started_at: float) -> dict[str, Any] | None:
+        if not watcher_budget_enforcement_enabled():
+            return None
         elapsed = time.time() - started_at
         budget_path = self._drive / "state" / f"{phase}.budget.json"
         if budget_path.exists():
@@ -112,6 +116,15 @@ class WatcherTriggers:
                 max_sec = budget.get("max_seconds")
                 if max_sec and elapsed > max_sec:
                     return {"elapsed_sec": elapsed, "max_seconds": max_sec}
+                max_calls = budget.get("max_tool_calls")
+                if max_calls:
+                    tools_path = self._drive / "logs" / "tools.jsonl"
+                    tool_calls = _count_lines(tools_path)
+                    if tool_calls > max_calls:
+                        return {
+                            "tool_calls": tool_calls,
+                            "max_tool_calls": max_calls,
+                        }
             except Exception:
                 pass
         return None
@@ -231,6 +244,8 @@ def _recent_semantic_error_signatures(
             continue
         code = _semantic_error_code(row)
         if not code:
+            if _tool_row_is_successful_progress(row):
+                break
             continue
         tool = str(row.get("tool") or "")
         payload = _json_obj_from_preview(
@@ -246,6 +261,17 @@ def _recent_semantic_error_signatures(
         if len(sigs) >= n:
             break
     return list(reversed(sigs))
+
+
+def _tool_row_is_successful_progress(row: dict[str, Any]) -> bool:
+    if row.get("error"):
+        return False
+    if row.get("exit_code", 0) not in (0, None):
+        return False
+    raw = str(row.get("result_preview") or row.get("result") or row.get("output") or "")
+    if raw.strip().lower().startswith("error:"):
+        return False
+    return bool(str(row.get("tool") or "").strip())
 
 
 def _recent_structural_layout_signatures(tools_path: pathlib.Path, *, n: int) -> list[str]:

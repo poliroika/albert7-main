@@ -1,5 +1,8 @@
+import json
 from pathlib import Path
 
+from ouroboros.tools.registry import ToolContext
+from umbrella.deep_agent_tools.skills import load_skill
 from umbrella.skills.loader import render_l1, render_l2
 from umbrella.skills.registry import discover_skills, filter_by_domain, match_for_task
 
@@ -51,3 +54,41 @@ def test_discover_filter_match_skills(tmp_path: Path) -> None:
     assert matched[0].slug == "gmas-rolegraph"
     assert "gmas-rolegraph" in render_l1(matched[0])
     assert "when_to_use" in render_l2(matched[0])
+
+
+def test_load_skill_rejects_slug_outside_phase_allowlist(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "workspaces").mkdir(parents=True)
+    _write_skill(repo / "umbrella" / "skills" / "library", "allowed", "active", "Use it.")
+    _write_skill(repo / "umbrella" / "skills" / "library", "blocked", "active", "Use it.")
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=repo / ".memory" / "drive",
+        context_overlays={
+            "phase_manifest": {"allowed_skills": ["allowed"]},
+        },
+    )
+
+    payload = json.loads(load_skill(ctx, "blocked"))
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "skill_not_allowed_for_phase"
+    assert payload["allowed_skills"] == ["allowed"]
+
+
+def test_load_skill_allows_manifest_skill(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "workspaces").mkdir(parents=True)
+    _write_skill(repo / "umbrella" / "skills" / "library", "allowed", "active", "Use it.")
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=repo / ".memory" / "drive",
+        context_overlays={
+            "phase_manifest": {"allowed_skills": ["allowed"]},
+        },
+    )
+
+    payload = json.loads(load_skill(ctx, "allowed"))
+
+    assert payload["status"] == "ok"
+    assert payload["slug"] == "allowed"

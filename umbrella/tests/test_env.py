@@ -2,9 +2,11 @@ import os
 from pathlib import Path
 
 from umbrella.env import (
+    WATCHER_BUDGET_ENABLED_ENV,
     get_llm_env_config,
     load_env,
     read_default_llm_model_from_repo_dotenv,
+    watcher_budget_enforcement_enabled,
 )
 
 
@@ -67,6 +69,26 @@ def test_read_default_llm_model_from_repo_dotenv(tmp_path: Path) -> None:
 
     (repo / ".env").write_text("LLM_MODEL=only-llm\n", encoding="utf-8")
     assert read_default_llm_model_from_repo_dotenv(repo) == "only-llm"
+
+
+def test_watcher_budget_flag_from_repo_dotenv(monkeypatch, tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".env").write_text(
+        f"{WATCHER_BUDGET_ENABLED_ENV}=0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv(WATCHER_BUDGET_ENABLED_ENV, raising=False)
+    load_env(repo_root=repo_root)
+    assert watcher_budget_enforcement_enabled() is False
+
+    (repo_root / ".env").write_text(
+        f"{WATCHER_BUDGET_ENABLED_ENV}=1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv(WATCHER_BUDGET_ENABLED_ENV, raising=False)
+    load_env(repo_root=repo_root, override=True)
+    assert watcher_budget_enforcement_enabled() is True
 
 
 def test_get_llm_env_config_falls_back_to_openai_key(monkeypatch):

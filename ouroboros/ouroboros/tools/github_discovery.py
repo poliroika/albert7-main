@@ -601,6 +601,9 @@ def _github_extract_snippets(
     repo_full_name: str = "",
     paths: list[str] | None = None,
     queries: list[str] | None = None,
+    query: str = "",
+    intent: str = "",
+    max_results: int | None = None,
 ) -> str:
     try:
         from ouroboros.tools.umbrella_tools import _record_subtask_discovery_tool_call
@@ -619,6 +622,9 @@ def _github_extract_snippets(
         )
     paths = list(paths or [])
     queries = [q for q in (queries or []) if str(q or "").strip()]
+    query = str(query or "").strip()
+    if query:
+        queries.append(query)
     if not paths and not queries:
         return json.dumps(
             {
@@ -651,9 +657,13 @@ def _github_extract_snippets(
                 if p and p not in discovered_paths:
                     discovered_paths.append(p)
 
+    try:
+        path_limit = max(1, min(int(max_results or 12), 12))
+    except (TypeError, ValueError):
+        path_limit = 12
     discovered_paths = sorted(
         list(dict.fromkeys(discovered_paths)), key=_snippet_path_score
-    )[:12]
+    )[:path_limit]
 
     extracted: list[dict] = []
     mirrored_count = 0
@@ -729,6 +739,7 @@ def _github_extract_snippets(
         {
             "status": "ok",
             "repo": repo_full_name,
+            "intent": str(intent or "").strip(),
             "license": licence_norm,
             "license_permissive": licence_permissive,
             "extracted": extracted,
@@ -809,6 +820,22 @@ def get_tools() -> list[ToolEntry]:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Optional code-search queries to discover paths.",
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Alias for a single entry in `queries`.",
+                        },
+                        "intent": {
+                            "type": "string",
+                            "default": "",
+                            "description": "Optional audit metadata describing why snippets are needed.",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "default": 12,
+                            "minimum": 1,
+                            "maximum": 12,
+                            "description": "Maximum number of discovered paths to extract.",
                         },
                     },
                     "required": ["repo_full_name"],

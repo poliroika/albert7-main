@@ -2,7 +2,7 @@
 name: verification-protocol
 status: active
 domains: ["verification", "testing"]
-phases: ["verify", "final_review"]
+phases: ["verify"]
 when_to_use: "In the verify phase when checking if all tests pass and the task goal is met."
 ---
 

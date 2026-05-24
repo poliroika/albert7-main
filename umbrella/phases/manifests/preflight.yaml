@@ -13,7 +13,6 @@ allowed_tools:
   - skill_audit
   - read_workspace_charter
   - load_skill
-  - mcp_install
   - submit_preflight_report
   - request_human_checkpoint
 
@@ -24,10 +23,12 @@ forbidden_tools:
   - repo_write_commit
   - claude_code_edit
   - sandbox_self_edit
+  - mcp_install
 
 allowed_skills:
   - env-readiness
   - permission-envelope-author
+  - human-checkpoint-author
 
 memory:
   always_on:
@@ -41,8 +42,6 @@ memory:
 permissions:
   rules:
     - allow_tools: [env_check, palace_health, mcp_health, skill_audit, read_workspace_charter, load_skill, submit_preflight_report, request_human_checkpoint]
-    - allow_tool: mcp_install
-      args: {}
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, claude_code_edit, sandbox_self_edit]
     - deny_path: ["**/.env*", "**/secrets/**"]
 

@@ -308,7 +308,11 @@ def get_tools() -> list[ToolEntry]:
             name="request_watcher_review",
             schema={
                 "name": "request_watcher_review",
-                "description": "Ask the Watcher agent to review the current phase state.",
+                "description": (
+                    "Record a watcher review request/control signal for the "
+                    "current phase; the handler may return an existing retry "
+                    "diagnosis but does not synchronously run a separate LLM."
+                ),
                 "parameters": {
                     "type": "object",
                     "required": ["reason"],
@@ -321,7 +325,11 @@ def get_tools() -> list[ToolEntry]:
             name="harness_run",
             schema={
                 "name": "harness_run",
-                "description": "Run N parallel candidates for a subtask and return the winner.",
+                "description": (
+                    "Record a harness run request/control signal for a subtask. "
+                    "Candidate execution and winner selection are handled by "
+                    "the phase runner, not synchronously by this tool call."
+                ),
                 "parameters": {
                     "type": "object",
                     "required": ["subtask_id"],

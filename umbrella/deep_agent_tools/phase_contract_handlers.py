@@ -301,6 +301,8 @@ _RESEARCH_NON_FINDING_EVIDENCE_KINDS = {
     "draft",
     "hypothesis",
     "lead",
+    "observation",
+    "progress",
     "unverified",
 }
 

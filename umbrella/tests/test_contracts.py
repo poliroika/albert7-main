@@ -29,6 +29,8 @@ from umbrella.contracts import (
 )
 from umbrella.contracts.compiler import ContractCompiler
 from umbrella.contracts.plan_ir import compile_phase_plan
+from umbrella.contracts.schemas import REVIEW_ISSUE_SCHEMA, VALID_REVIEW_CODES
+from umbrella.contracts.validators import VALID_REVIEW_CODES as VALIDATOR_REVIEW_CODES
 from umbrella.enforcement.ledger import append_supervisor_ledger_event
 
 
@@ -72,6 +74,13 @@ def _valid_pytest_proof() -> ProofSpec:
 
 def _codes(issues) -> set[str]:
     return {issue.code for issue in issues}
+
+
+def test_review_issue_schema_enum_matches_validator_codes():
+    schema_codes = set(REVIEW_ISSUE_SCHEMA["properties"]["code"]["enum"])
+    assert schema_codes == set(VALID_REVIEW_CODES)
+    assert schema_codes == set(VALIDATOR_REVIEW_CODES)
+    assert "greenfield_python_src_layout_policy" in schema_codes
 
 
 def test_unknown_contract_version_fails():

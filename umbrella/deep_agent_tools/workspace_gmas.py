@@ -21,7 +21,7 @@ def search_gmas_knowledge(
         repo_root = _resolve_umbrella_repo_root(ctx)
         active = _active_execute_subtask_info(ctx)
         subtask_id = str(active.get("id") or "").strip() if active else ""
-        if issue := _gmas_context_query_specificity_issue(query, active):
+        if issue := _gmas_context_query_specificity_issue(query, active, ctx=ctx):
             return _json(
                 {
                     "status": "blocked",
@@ -65,14 +65,24 @@ _GMAS_GENERIC_QUERY_WORDS = {
     "about",
     "agent",
     "agents",
+    "ai",
     "api",
+    "based",
     "bot",
     "bots",
+    "civilization",
     "code",
     "context",
+    "decision",
+    "decisions",
+    "diplomacy",
     "docs",
+    "economics",
+    "economy",
     "example",
     "examples",
+    "game",
+    "games",
     "gmas",
     "help",
     "how",
@@ -86,6 +96,8 @@ _GMAS_GENERIC_QUERY_WORDS = {
     "pattern",
     "patterns",
     "please",
+    "strategy",
+    "turn",
     "use",
     "using",
     "with",
@@ -97,13 +109,13 @@ _GMAS_SYMBOL_OR_PATH_RE = re.compile(
 
 
 def _gmas_context_query_specificity_issue(
-    query: str, active_subtask: dict[str, Any] | None
+    query: str, active_subtask: dict[str, Any] | None, *, ctx: Any | None = None
 ) -> str:
-    if not active_subtask or not _subtask_requires_gmas_context(active_subtask):
+    if not _gmas_context_specificity_required(active_subtask, ctx=ctx):
         return ""
     text = str(query or "").strip()
     if not text:
-        return "GMAS context query is empty for an active LLM/GMAS subtask."
+        return "GMAS context query is empty for active LLM/GMAS work."
     if _GMAS_SYMBOL_OR_PATH_RE.search(text):
         return ""
     words = [
@@ -116,8 +128,39 @@ def _gmas_context_query_specificity_issue(
     return (
         "GMAS context query is too generic to audit external API usage. "
         "A placeholder lookup does not establish the real imports, classes, "
-        "constructors, or graph wiring for the active subtask."
+        "constructors, or graph wiring for active LLM/GMAS work. If the "
+        "symbols are not known yet, load the relevant GMAS skill first, then "
+        "retry with names such as AgentProfile, MACPRunner, tools, or "
+        "LLMCallerFactory."
     )
+
+
+def _gmas_context_specificity_required(
+    active_subtask: dict[str, Any] | None, *, ctx: Any | None = None
+) -> bool:
+    if active_subtask and _subtask_requires_gmas_context(active_subtask):
+        return True
+    overlays = getattr(ctx, "context_overlays", None) if ctx is not None else None
+    if isinstance(overlays, dict):
+        if bool(overlays.get("gmas_prewrite_required")):
+            return True
+        domains = overlays.get("detected_domains") or []
+        if isinstance(domains, list) and any(
+            str(item).strip().lower() == "multi_agent_gmas" for item in domains
+        ):
+            return True
+    drive_root = getattr(ctx, "drive_root", None) if ctx is not None else None
+    if not drive_root:
+        return False
+    try:
+        drive_path = Path(drive_root)
+        workspace_root = drive_path.parent.parent if drive_path.name == "drive" else None
+        if workspace_root is None:
+            return False
+        text = (workspace_root / "workspace.toml").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r"(?im)^\s*multi_agent_gmas\s*=\s*true\s*$", text))
 
 
 def get_gmas_context(

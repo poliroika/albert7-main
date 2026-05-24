@@ -1,6 +1,6 @@
 ---
-name: Strict_Verification_Sync
-status: candidate
+name: strict-verification-sync
+status: active
 domains: ["workflow_orchestration", "debugging"]
 phases: ["execute", "verify", "subtask_review"]
 when_to_use: "Immediately after executing shell commands or test suites that determine task completion."

@@ -3677,9 +3677,13 @@ def _current_execute_success_test_text(drive_root: pathlib.Path | None) -> str:
             value = raw.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-    if isinstance(raw, str):
+    if isinstance(raw, str) and raw.strip():
         return raw.strip()
-    return ""
+    from umbrella.deep_agent_tools.phase_control_retry import (
+        _subtask_typed_proof_command_text,
+    )
+
+    return _subtask_typed_proof_command_text(subtask)
 
 
 def _current_execute_subtask_id(drive_root: pathlib.Path | None) -> str:
@@ -3732,6 +3736,7 @@ def _execute_success_test_observed(
         for tool in (
             "run_workspace_verify",
             "run_unit_tests",
+            "run_subtask_proof",
             "harness_run",
             "shell",
         )
@@ -3741,6 +3746,8 @@ def _execute_success_test_observed(
         if not _tool_trace_entry_succeeded(item):
             continue
         tool_name = str(item.get("tool") or "")
+        if tool_name == "run_subtask_proof":
+            return True
         if tool_name in explicit_tools and tool_name != "shell":
             return True
         if tool_name == "shell":
@@ -3758,6 +3765,8 @@ def _may_force_mark_subtask_complete(
 ) -> bool:
     if phase_write_tool_calls <= 0:
         return False
+    if _trace_has_passing_subtask_proof(trace_tool_calls):
+        return True
     success_text = _current_execute_success_test_text(drive_root)
     return _execute_success_test_observed(
         success_text=success_text,
@@ -3774,6 +3783,59 @@ def _trace_json_payload(item: dict[str, Any]) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _latest_passing_subtask_proof_hint(
+    trace_tool_calls: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for item in reversed(trace_tool_calls or []):
+        if str(item.get("tool") or "") != "run_subtask_proof":
+            continue
+        if not _tool_trace_entry_succeeded(item):
+            continue
+        payload = _trace_json_payload(item)
+        if payload.get("passed") is not True:
+            continue
+        hint = payload.get("completion_contract_hint")
+        if isinstance(hint, dict) and hint:
+            return hint
+    return None
+
+
+def _trace_has_passing_subtask_proof(trace_tool_calls: list[dict[str, Any]]) -> bool:
+    return _latest_passing_subtask_proof_hint(trace_tool_calls) is not None
+
+
+def _mark_subtask_complete_forced_nudge_extra(
+    *,
+    drive_root: pathlib.Path | None,
+    trace_tool_calls: list[dict[str, Any]] | None,
+) -> str:
+    hint = _latest_passing_subtask_proof_hint(list(trace_tool_calls or []))
+    subtask_id = _current_execute_subtask_id(drive_root)
+    if hint:
+        hint_subtask = str(hint.get("subtask_id") or subtask_id or "").strip()
+        return (
+            "\nThe active execute subtask proof has already passed. "
+            "Call `mark_subtask_complete(completion_contract=...)` using the "
+            "`completion_contract_hint` object from your latest passing "
+            "`run_subtask_proof` result"
+            + (f" for subtask `{hint_subtask}`" if hint_subtask else "")
+            + ". Do not rewrite `changed_files` or `verification_report`."
+        )
+    if subtask_id:
+        return (
+            "\nRun `run_subtask_proof(subtask_id="
+            f'"{subtask_id}")` if you do not already have a passing proof. '
+            "When `passed` is true, call `mark_subtask_complete(completion_contract=...)` "
+            "with that result's `completion_contract_hint`. "
+            "Do not use legacy `summary`/`evidence` completion."
+        )
+    return (
+        "\nRun `run_subtask_proof` for the active subtask if proof is not already passing. "
+        "Then call `mark_subtask_complete(completion_contract=...)` with "
+        "`completion_contract_hint` from that tool result."
+    )
 
 
 def _trace_tool_tags(item: dict[str, Any]) -> set[str]:
@@ -4056,11 +4118,12 @@ def _maybe_force_required_phase_completion(
         return tool_hint or forced_progress_tool_choice
     if forced_progress_tool_choice == chosen:
         return forced_progress_tool_choice
-    current_subtask_id = (
-        _current_execute_subtask_id(drive_root)
-        if chosen == "mark_subtask_complete"
-        else ""
-    )
+    mark_nudge = ""
+    if chosen == "mark_subtask_complete":
+        mark_nudge = _mark_subtask_complete_forced_nudge_extra(
+            drive_root=drive_root,
+            trace_tool_calls=trace_tool_calls,
+        )
     messages.append(
         {
             "role": "system",
@@ -4070,18 +4133,7 @@ def _maybe_force_required_phase_completion(
                 f"calling the required phase-completion tool. Your next tool call "
                 f"is forced to `{chosen}`. Summarize the evidence you already have; "
                 "do not inspect unrelated tools or workspaces first."
-                + (
-                    "\nThe active execute subtask's declared success test has already passed. "
-                    + (
-                        "Call `mark_subtask_complete("
-                        f"subtask_id=\"{current_subtask_id}\", summary=..., evidence=[...])` now; "
-                        "put non-blocking extra checks in evidence/notes."
-                        if current_subtask_id
-                        else "Call `mark_subtask_complete` now; put non-blocking extra checks in evidence/notes."
-                    )
-                    if chosen == "mark_subtask_complete"
-                    else ""
-                )
+                + mark_nudge
             ),
         }
     )

@@ -8,15 +8,18 @@ import uuid
 from typing import Any, Callable, Iterator
 
 from umbrella.phases.base import (
+    Budgets,
     PhasePlan,
     PhaseNode,
     PhaseResult,
     PlanEdit,
     SubtaskCard,
+    WatcherSignal,
 )
 from umbrella.phases.registry import get_registry
 from umbrella.orchestrator.phase_plan import build_default_plan, save_plan, load_plan
 from umbrella.orchestrator.watcher import WatcherPollLoop
+from umbrella.env import watcher_budget_enforcement_enabled
 from umbrella.orchestrator.worker import build_phase_task
 from umbrella.memory.palace.facade import MemPalace
 from umbrella.utils.result_envelope import ResultEnvelope, ErrorCode
@@ -133,6 +136,82 @@ class PhaseRunner:
             )
         except OSError:
             log.debug("Failed to clear stale phase control signal", exc_info=True)
+
+    def _write_phase_budget_file(self, phase_id: str, budgets: Budgets) -> None:
+        import dataclasses
+
+        budget_path = self._drive_root / "state" / f"{phase_id}.budget.json"
+        if not watcher_budget_enforcement_enabled():
+            try:
+                budget_path.unlink(missing_ok=True)
+            except OSError:
+                log.debug(
+                    "Failed to remove watcher budget file for %s",
+                    phase_id,
+                    exc_info=True,
+                )
+            return
+
+        payload = {
+            key: value
+            for key, value in dataclasses.asdict(budgets).items()
+            if value is not None
+        }
+        if not payload:
+            try:
+                budget_path.unlink(missing_ok=True)
+            except OSError:
+                log.debug(
+                    "Failed to remove empty watcher budget file for %s",
+                    phase_id,
+                    exc_info=True,
+                )
+            return
+        budget_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = budget_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, budget_path)
+
+    def _apply_pending_watcher_signal(
+        self,
+        *,
+        signal: WatcherSignal,
+        phase_node: PhaseNode,
+        plan: PhasePlan,
+        run_id: str,
+        outcome: dict[str, Any],
+    ) -> tuple[PhaseResult | None, ResultEnvelope | None]:
+        self._watcher.mark_processed(signal.signal_id)
+        kind = signal.kind
+        reason = signal.reason or f"watcher:{kind}"
+        if kind in {"force_verify", "mutate_phase_plan"}:
+            kind = "restart_phase"
+            reason = f"watcher:{signal.kind}: {signal.reason}".strip()
+
+        if kind == "abort_phase":
+            phase_node.status = "failed"
+            phase_node.ended_at = time.time()
+            save_plan(plan, self._drive_root)
+            return None, self._emit(
+                ResultEnvelope.failure(
+                    ErrorCode.WATCHER_ABORT,
+                    signal.reason,
+                    run_id=run_id,
+                    phase=phase_node.id,
+                )
+            )
+
+        if kind in {"restart_phase", "inject_lesson"}:
+            return self._finish_phase_loop_back(
+                phase_node=phase_node,
+                plan=plan,
+                run_id=run_id,
+                outcome=outcome,
+                loop_back_target=phase_node.id,
+                retry_reason=reason,
+            )
+
+        return None, None
 
     @staticmethod
     def _tool_row_json_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -1663,6 +1742,7 @@ class PhaseRunner:
 
         phase_node.status = "running"
         phase_node.started_at = time.time()
+        self._write_phase_budget_file(phase_node.id, manifest.budgets)
         self._clear_pending_phase_signal()
         save_plan(plan, self._drive_root)
 
@@ -1722,6 +1802,22 @@ class PhaseRunner:
 
         self._merge_persisted_plan_state(plan)
         phase_node = plan.get_node(phase_node.id) or phase_node
+
+        pending_signal = self._watcher.read_pending_signal()
+        if outcome.get("status") == "watcher" or pending_signal is not None:
+            if pending_signal is not None:
+                result, envelope = self._apply_pending_watcher_signal(
+                    signal=pending_signal,
+                    phase_node=phase_node,
+                    plan=plan,
+                    run_id=run_id,
+                    outcome=outcome,
+                )
+                if envelope is not None:
+                    yield envelope
+                if result is not None:
+                    return result
+                return None
 
         if outcome.get("status") == "error":
             phase_node.status = "failed"
@@ -1884,15 +1980,19 @@ class PhaseRunner:
                     loop_back_target=loop_back_target,
                 )
 
-        signal = self._watcher.read_pending_signal()
-        if signal and signal.kind == "abort_phase":
-            self._watcher.mark_processed(signal.signal_id)
-            phase_node.status = "failed"
-            phase_node.ended_at = time.time()
-            save_plan(plan, self._drive_root)
-            yield self._emit(ResultEnvelope.failure(
-                ErrorCode.WATCHER_ABORT, signal.reason, run_id=run_id, phase=phase_node.id
-            ))
+        pending_signal = self._watcher.read_pending_signal()
+        if pending_signal is not None:
+            result, envelope = self._apply_pending_watcher_signal(
+                signal=pending_signal,
+                phase_node=phase_node,
+                plan=plan,
+                run_id=run_id,
+                outcome=outcome,
+            )
+            if envelope is not None:
+                yield envelope
+            if result is not None:
+                return result
             return None
 
         if self._stop_requested():
@@ -1989,12 +2089,12 @@ class PhaseRunner:
                     phase_started_at=phase_started_at,
                 )
                 pending = self._watcher.read_pending_signal()
-                if pending and pending.kind == "abort_phase":
+                if pending is not None:
                     return {
-                        "status": "error",
-                        "error": pending.reason or "watcher abort_phase",
+                        "status": "watcher",
                         "task_id": task.get("id"),
                         "watcher_signal": pending.kind,
+                        "watcher_signal_id": pending.signal_id,
                     }
         except Exception as exc:
             log.error("Phase %s launcher invocation failed", phase_node.id, exc_info=True)

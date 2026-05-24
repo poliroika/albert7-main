@@ -76,3 +76,79 @@ def test_memory_injection_contract_directive_sections_from_fixture_workspace(
     prompt = str(task.get("input") or "")
     assert "provenance" in prompt.lower() or "source_id" in prompt.lower()
     assert "inject me please" not in prompt
+
+
+def test_research_phase_defaults_to_light_depth(repo) -> None:
+    from pathlib import Path
+
+    manifest = load_manifest(Path("umbrella/phases/manifests/research.yaml"))
+    phase_node = PhaseNode(id="research-1", manifest_id="research")
+    palace = MemPalace(repo, "ws1")
+    try:
+        task = build_phase_task(
+            phase_node=phase_node,
+            manifest=manifest,
+            workspace_id="ws1",
+            run_id="run-research-light",
+            palace=palace,
+            repo_root=repo,
+        )
+    finally:
+        palace.close()
+
+    overlays = task.get("context_overlays") or {}
+    assert overlays.get("research_depth") == "light"
+    assert "Umbrella selected `light`" in str(task.get("input") or "")
+
+
+def test_research_phase_respects_explicit_full_depth(repo) -> None:
+    from pathlib import Path
+
+    manifest = load_manifest(Path("umbrella/phases/manifests/research.yaml"))
+    phase_node = PhaseNode(
+        id="research-1",
+        manifest_id="research",
+        overlay={"research_depth": "full"},
+    )
+    palace = MemPalace(repo, "ws1")
+    try:
+        task = build_phase_task(
+            phase_node=phase_node,
+            manifest=manifest,
+            workspace_id="ws1",
+            run_id="run-research-full",
+            palace=palace,
+            repo_root=repo,
+        )
+    finally:
+        palace.close()
+
+    overlays = task.get("context_overlays") or {}
+    assert overlays.get("research_depth") == "full"
+
+
+@pytest.mark.parametrize("manifest_id", ["preflight", "verify"])
+def test_gate_phase_recall_bundle_has_no_warm_when_manifest_disables_it(
+    repo, manifest_id: str
+) -> None:
+    from pathlib import Path
+
+    manifest = load_manifest(
+        Path(f"umbrella/phases/manifests/{manifest_id}.yaml")
+    )
+    phase_node = PhaseNode(id=f"{manifest_id}-1", manifest_id=manifest_id)
+    palace = MemPalace(repo, "ws1")
+    try:
+        task = build_phase_task(
+            phase_node=phase_node,
+            manifest=manifest,
+            workspace_id="ws1",
+            run_id="run-gate-1",
+            palace=palace,
+            repo_root=repo,
+        )
+    finally:
+        palace.close()
+
+    recall = (task.get("context_overlays") or {}).get("recall_bundle") or {}
+    assert recall.get("warm") == []

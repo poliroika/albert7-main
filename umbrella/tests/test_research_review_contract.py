@@ -649,6 +649,80 @@ def test_research_summary_requires_gmas_context_for_gmas_workspace(tmp_path):
     assert "get_gmas_context" in result
 
 
+def test_research_summary_rejects_blocked_gmas_context_for_gmas_workspace(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    (drive / "state").mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_gmas_blocked:research",
+            "tool": "get_gmas_context",
+            "args": {"query": "multi-agent LLM bot strategy game"},
+            "result_preview": json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "gmas_context_query_too_generic",
+                    "query": "multi-agent LLM bot strategy game",
+                }
+            ),
+        },
+        {
+            "task_id": "phase_web_gmas_blocked:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-1",
+                    "kind": "research_finding",
+                    "source_path": "web_search:LLM game architecture",
+                }
+            ),
+        },
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_gmas_blocked:research"
+    ctx.context_overlays = {
+        "phase_manifest": {"allowed_skills": []},
+        "gmas_prewrite_required": True,
+        "detected_domains": ["multi_agent_gmas"],
+    }
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-gmas-web-v1",
+        findings_ids=["finding-1"],
+        coverage_status="complete",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "missing GMAS context coverage" in result
+
+
+def test_research_palace_add_evidence_kind_observation_stays_observation(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    (drive / "state").mkdir(parents=True)
+    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_obs:research"
+    ctx.context_overlays = {"phase_node": {"id": "research", "manifest_id": "research"}}
+
+    result = phase_contract_handlers._palace_add(
+        ctx,
+        content="This is a research note, not a counted finding.",
+        evidence_kind="observation",
+    )
+
+    payload = json.loads(result)
+    assert payload["saved"] is True
+    assert payload["kind"] == "observation"
+
+
 def test_research_summary_source_scarce_counts_truncated_github_rows(tmp_path):
     drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
     logs = drive / "logs"

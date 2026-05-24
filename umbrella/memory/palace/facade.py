@@ -560,8 +560,9 @@ class MemPalace:
             if not store:
                 continue
             col = self._stores.chroma(store)
+            recall_tier = Tier.WARM if store == "palace.durable" else Tier.HOT
             try:
-                res = col.get(where={"tier": Tier.HOT})
+                res = col.get(where={"tier": recall_tier})
                 ids = res.get("ids") or []
                 docs = res.get("documents") or ([""] * len(ids))
                 metas = res.get("metadatas") or ([{}] * len(ids))
@@ -576,7 +577,7 @@ class MemPalace:
                         "id": doc_id,
                         "content": docs[i] if i < len(docs) else "",
                         "store": store,
-                        "tier": Tier.HOT,
+                        "tier": recall_tier,
                         "scope": meta.get("scope", ""),
                         "tags": meta.get("tags", ""),
                         "phase": meta.get("phase", ""),
@@ -595,28 +596,35 @@ class MemPalace:
         bundle.hot = hot_candidates[:n]
 
         if query_seed:
-            warm_policy = list(warm_search_rules or [])
-            if not warm_policy:
-                warm_policy = [{"store": "palace.global", "n": max(1, n // 2)}]
-            warm_nodes: list[dict[str, Any]] = []
-            seen_warm: set[str] = set()
-            for rule in warm_policy:
-                warm_tags = list(self._rule_tags(rule))
-                for node in self.search(
-                    query_seed,
-                    stores=self._warm_rule_stores(rule),
-                    tiers=[Tier.WARM],
-                    tags_any=warm_tags or None,
-                    filter_extra=self._rule_filter(rule),
-                    n=self._rule_n(rule, max(1, n // 2)),
-                ):
-                    node_id = str(node.get("id") or "")
-                    if node_id and node_id in seen_warm:
-                        continue
-                    if node_id:
-                        seen_warm.add(node_id)
-                    warm_nodes.append(node)
-            bundle.warm = warm_nodes[:n]
+            if warm_search_rules is None:
+                warm_policy: list[Any] | None = [
+                    {"store": "palace.global", "n": max(1, n // 2)}
+                ]
+            elif not list(warm_search_rules):
+                bundle.warm = []
+                warm_policy = None
+            else:
+                warm_policy = list(warm_search_rules)
+            if warm_policy:
+                warm_nodes: list[dict[str, Any]] = []
+                seen_warm: set[str] = set()
+                for rule in warm_policy:
+                    warm_tags = list(self._rule_tags(rule))
+                    for node in self.search(
+                        query_seed,
+                        stores=self._warm_rule_stores(rule),
+                        tiers=[Tier.WARM],
+                        tags_any=warm_tags or None,
+                        filter_extra=self._rule_filter(rule),
+                        n=self._rule_n(rule, max(1, n // 2)),
+                    ):
+                        node_id = str(node.get("id") or "")
+                        if node_id and node_id in seen_warm:
+                            continue
+                        if node_id:
+                            seen_warm.add(node_id)
+                        warm_nodes.append(node)
+                bundle.warm = warm_nodes[:n]
 
         if include_graph and bundle.hot:
             hops = 1
@@ -627,16 +635,30 @@ class MemPalace:
                 if raw_edges:
                     edge_types = list(raw_edges)
             top_hot = [n_["id"] for n_ in bundle.hot[:3]]
+            graph_limit = 8
             for nid in top_hot:
                 edges = self._stores.graph.walk(
                     nid, hops=hops, edge_types=edge_types, limit=20
                 )
                 for edge in edges:
+                    if len(bundle.graph_neighbours) >= graph_limit:
+                        break
+                    neighbour_id = (
+                        edge.dst_id if edge.src_id == nid else edge.src_id
+                    )
+                    resolved = self.get(neighbour_id)
+                    if resolved is None:
+                        continue
                     bundle.graph_neighbours.append({
-                        "id": edge.dst_id if edge.src_id == nid else edge.src_id,
+                        "id": neighbour_id,
                         "via_edge": edge.edge_type,
-                        "store": "graph_walk",
+                        "store": str(resolved.get("store") or "graph_walk"),
+                        "content": resolved.get("content") or "",
+                        "tags": resolved.get("tags", ""),
+                        "phase": resolved.get("phase", ""),
                     })
+                if len(bundle.graph_neighbours) >= graph_limit:
+                    break
 
         return bundle
 

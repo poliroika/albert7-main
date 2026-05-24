@@ -33,7 +33,7 @@ memory:
   always_on:
     - {store: palace.charter, tier: always_on}
   hot:
-    - {store: palace.run, tags: [phase_plan, subtask_card]}
+    - {store: palace.run, tags: [phase_plan, subtask_card, review_verdict]}
   warm_search: []
   write_rules:
     plan_review_verdict: {store: palace.run, tier: hot, scope: phase_scoped}

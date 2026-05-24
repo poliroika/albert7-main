@@ -183,6 +183,45 @@ def test_recall_drops_unsubmitted_plan_memory_after_plan_phase(palace):
     assert contents == ["research finding stays available"]
 
 
+def test_recall_hot_includes_palace_durable_verification_report(palace):
+    palace.add(
+        store="palace.durable",
+        content="verification report body for reflexion",
+        tier=Tier.WARM,
+        scope=Scope.CROSS_RUN_DURABLE,
+        tags=["verification_report", "durable"],
+        verified=True,
+    )
+
+    bundle = palace.recall(
+        "reflexion",
+        hot_rules=[{"store": "palace.durable", "tags": ["verification_report"]}],
+    )
+
+    assert [node["content"] for node in bundle.hot] == [
+        "verification report body for reflexion"
+    ]
+
+
+def test_recall_empty_warm_search_rules_skips_warm_with_query_seed(palace):
+    palace.add(
+        store="palace.idea",
+        content="Global warm lesson that must not load when warm_search is empty.",
+        tier=Tier.WARM,
+        scope=Scope.CROSS_RUN_DURABLE,
+        tags=["lesson"],
+        extra={"type": "lesson"},
+    )
+
+    bundle = palace.recall(
+        "preflight",
+        query_seed="environment readiness gate",
+        warm_search_rules=[],
+    )
+
+    assert bundle.warm == []
+
+
 def test_recall_uses_manifest_warm_search_rules(palace):
     palace.add(
         store="palace.idea",
