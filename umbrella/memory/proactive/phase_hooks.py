@@ -167,24 +167,39 @@ def mirror_verify_durable_if_needed(
 
     evidence = report_ref.evidence_ref(phase="verify")
     body = details.strip() or f"Verification report {report_ref.report_id}"
+    run_id = task_id.split(":", 1)[0] if ":" in task_id else task_id
     try:
-        from umbrella.memory.palace.facade import MemPalace
+        from umbrella.memory.kernel.models import memory_event_from_tool_write
+        from umbrella.memory.kernel.writer import write_memory_event
 
-        palace = MemPalace(repo_root, workspace_id or None)
-        try:
-            node_id = palace.add(
-                store="palace.durable",
-                content=body,
-                tier="warm",
-                scope="cross_run_durable",
-                tags=["durable", "verification_report"],
-                phase="verify",
-                verified=True,
-                kind="verification_report",
-                extra={"title": "Verification report", "trust_level": "public_verified"},
+        event = memory_event_from_tool_write(
+            content=body,
+            title="Verification report",
+            memory_kind="verification_report",
+            workspace_id=workspace_id,
+            tags=["durable", "verification_report"],
+            scope="cross_run_durable",
+            tier="warm",
+            trust_level="public_verified",
+            evidence_refs=[evidence],
+            lifecycle="active",
+            surface="supplemental_evidence",
+            source_backend="umbrella.auto_mirror",
+            verified=True,
+            phase_id="verify",
+            run_id=run_id,
+            palace_store="palace.durable",
+        )
+        result = write_memory_event(repo_root, event, workspace_id=workspace_id)
+        if not result.saved:
+            detail = (
+                list(result.policy_issues)
+                if result.policy_issues
+                else [result.error or "write rejected"]
             )
-        finally:
-            palace.close()
+            log.warning("Auto durable mirror blocked: %s", detail)
+            return None
+        node_id = result.canonical_id
     except Exception as exc:
         log.warning("Auto durable mirror failed: %s", exc)
         return None

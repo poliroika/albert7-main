@@ -98,7 +98,16 @@ def test_mcp_discover_tool_uses_github_search(tmp_path: Path) -> None:
             "topics": ["mcp-server"],
         },
     ]
-    with patch.object(discovery, "discover_servers", return_value=fake):
+    with patch.object(
+        discovery,
+        "discover_servers",
+        return_value={
+            "results": fake,
+            "warnings": [],
+            "search_queries": ["topic:mcp-server foo"],
+            "status": "ok",
+        },
+    ):
         out = discovery._mcp_discover(
             ctx, query="foo", max_results=5, intent="mcp_discovery"
         )

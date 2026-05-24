@@ -92,7 +92,13 @@ def test_factory_modes(repo, monkeypatch) -> None:
     assert isinstance(backend, CanonicalMemoryBackend)
     backend.close()
 
+    monkeypatch.delenv("UMBRELLA_ALLOW_HINDSIGHT_ONLY", raising=False)
     monkeypatch.setenv("UMBRELLA_MEMORY_DURABLE_BACKEND", "hindsight")
+    backend = create_durable_backend(repo, workspace_id="ws1")
+    assert isinstance(backend, CanonicalMemoryBackend)
+    backend.close()
+
+    monkeypatch.setenv("UMBRELLA_ALLOW_HINDSIGHT_ONLY", "1")
     backend = create_durable_backend(repo, workspace_id="ws1")
     assert isinstance(backend, HindsightBackend)
 

@@ -473,7 +473,7 @@ def build_llm_messages(
     semi_stable_parts.extend(_build_memory_sections(memory))
 
     kb_index_path = env.drive_path("memory/knowledge/_index.md")
-    if kb_index_path.exists():
+    if kb_index_path.exists() and not _umbrella_phase_prompt_owned_by_task(task):
         kb_index = kb_index_path.read_text(encoding="utf-8")
         if kb_index.strip():
             semi_stable_parts.append(

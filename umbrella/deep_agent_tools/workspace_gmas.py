@@ -19,14 +19,29 @@ def search_gmas_knowledge(
         if limit is not None:
             max_results = limit
         repo_root = _resolve_umbrella_repo_root(ctx)
+        active = _active_execute_subtask_info(ctx)
+        subtask_id = str(active.get("id") or "").strip() if active else ""
+        if issue := _gmas_context_query_specificity_issue(query, active):
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": "gmas_context_query_too_generic",
+                    "active_subtask_id": subtask_id,
+                    "query": str(query or ""),
+                    "message": issue,
+                    "next_step": (
+                        "Retry the GMAS lookup with the active subtask goal plus "
+                        "the concrete API symbols, import paths, class names, "
+                        "or behavior you are about to implement."
+                    ),
+                }
+            )
         result = build_gmas_context(
             repo_root,
             query,
             max_results=max(1, min(int(max_results), 12)),
             max_chars_per_hit=max(1000, min(int(max_chars_per_hit), 30000)),
         )
-        active = _active_execute_subtask_info(ctx)
-        subtask_id = str(active.get("id") or "").strip() if active else ""
         if isinstance(result, dict):
             result = dict(result)
             result.setdefault("status", "ok")
@@ -43,6 +58,66 @@ def search_gmas_knowledge(
     except Exception as e:
         log.error("GMAS search failed: %s", e, exc_info=True)
         return f"WARNING: GMAS search error: {e}"
+
+
+_GMAS_GENERIC_QUERY_WORDS = {
+    "a",
+    "about",
+    "agent",
+    "agents",
+    "api",
+    "bot",
+    "bots",
+    "code",
+    "context",
+    "docs",
+    "example",
+    "examples",
+    "gmas",
+    "help",
+    "how",
+    "implement",
+    "implementation",
+    "info",
+    "knowledge",
+    "llm",
+    "multi",
+    "need",
+    "pattern",
+    "patterns",
+    "please",
+    "use",
+    "using",
+    "with",
+}
+_GMAS_SYMBOL_OR_PATH_RE = re.compile(
+    r"(?:\b[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*\b|"
+    r"[A-Za-z_]\w*\.[A-Za-z_]\w+|[/\\]|::)"
+)
+
+
+def _gmas_context_query_specificity_issue(
+    query: str, active_subtask: dict[str, Any] | None
+) -> str:
+    if not active_subtask or not _subtask_requires_gmas_context(active_subtask):
+        return ""
+    text = str(query or "").strip()
+    if not text:
+        return "GMAS context query is empty for an active LLM/GMAS subtask."
+    if _GMAS_SYMBOL_OR_PATH_RE.search(text):
+        return ""
+    words = [
+        item.lower()
+        for item in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text)
+        if item.lower() not in _GMAS_GENERIC_QUERY_WORDS
+    ]
+    if len(set(words)) >= 3:
+        return ""
+    return (
+        "GMAS context query is too generic to audit external API usage. "
+        "A placeholder lookup does not establish the real imports, classes, "
+        "constructors, or graph wiring for the active subtask."
+    )
 
 
 def get_gmas_context(

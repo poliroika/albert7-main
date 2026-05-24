@@ -740,10 +740,12 @@ class OuroborosAgent:
                 or str(os.environ.get("OUROBOROS_MODEL") or "").strip()
                 or str(os.environ.get("LLM_MODEL") or "").strip()
             )
+            from ouroboros.model_failure import is_model_response_failure
+
             result_data = {
                 "task_id": task.get("id"),
                 "parent_task_id": task.get("parent_task_id"),
-                "status": "completed",
+                "status": "failed" if is_model_response_failure(text) else "completed",
                 "result": text[:4000] if text else "",  # Truncate to avoid huge files
                 "cost_usd": round(float(usage.get("cost") or 0), 6),
                 "total_rounds": int(usage.get("rounds") or 0),

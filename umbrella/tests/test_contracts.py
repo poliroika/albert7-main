@@ -862,3 +862,17 @@ def test_ast_analyzers_catch_python_and_jsts_tampering():
 
     assert {"pytest_skip_or_xfail", "assert_true", "target_behavior_mock"} <= _codes(py_issues)
     assert {"js_test_skip", "js_expect_true", "js_target_mock"} <= _codes(js_issues)
+
+
+def test_workspace_hash_ignores_dot_memory(tmp_path: Path) -> None:
+    _repo, workspace, _workspace_id = _workspace(tmp_path)
+    before = workspace_hash(workspace)
+    memory_dir = workspace / ".memory" / "drive" / "state"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "note.json").write_text('{"x": 1}', encoding="utf-8")
+    assert workspace_hash(workspace) == before
+    (workspace / "src" / "app.py").write_text(
+        "def add(a, b):\n    return a + b + 1\n",
+        encoding="utf-8",
+    )
+    assert workspace_hash(workspace) != before

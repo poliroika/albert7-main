@@ -1020,13 +1020,13 @@ class WebBridgeApp:
             if not entry.is_dir():
                 continue
             toml_path = entry / "workspace.toml"
-            if not toml_path.is_file():
+            task_main = entry / "TASK_MAIN.md"
+            if not toml_path.is_file() and not task_main.is_file():
                 continue
-            toml = read_toml(toml_path)
+            toml = read_toml(toml_path) if toml_path.is_file() else {}
             ws_section = toml.get("workspace") or {}
             ws_id = str(ws_section.get("id") or entry.name)
             override = overrides.get(ws_id, {})
-            task_main = entry / "TASK_MAIN.md"
             description = ""
             if task_main.exists():
                 try:
@@ -1069,21 +1069,35 @@ class WebBridgeApp:
             raise ValueError("name is required")
         ws_id = slug_workspace_name(name)
         target = self.workspaces_root / ws_id
-        target.mkdir(parents=True, exist_ok=True)
-        toml_path = target / "workspace.toml"
-        if not toml_path.exists():
-            toml_path.write_text(
+        if target.exists() and any(target.iterdir()):
+            raise ValueError(f"workspace '{ws_id}' already exists")
+        import shutil
+        import tempfile
+
+        if target.exists():
+            shutil.rmtree(target)
+        self.workspaces_root.mkdir(parents=True, exist_ok=True)
+        desc = (payload.get("description") or "").strip()
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".workspace-create-{ws_id}-", dir=self.workspaces_root)
+        )
+        try:
+            (staging / "workspace.toml").write_text(
                 f'[workspace]\nid = "{ws_id}"\nname = "{name}"\nlanguage = "python"\n\n'
                 "[verification]\nskip_behavioral = true\n",
                 encoding="utf-8",
             )
-        task_path = target / "TASK_MAIN.md"
-        if not task_path.exists():
-            desc = (payload.get("description") or "").strip()
-            task_path.write_text(
+            (staging / "TASK_MAIN.md").write_text(
                 f"# TASK: {name}\n\n## Goal\n{desc or 'Опишите задачу.'}\n",
                 encoding="utf-8",
             )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging.replace(target)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            if target.exists() and not any(target.iterdir()):
+                shutil.rmtree(target, ignore_errors=True)
+            raise
         overrides = load_store("workspace_overrides.json", {})
         if payload.get("description"):
             overrides[ws_id] = {
@@ -1941,6 +1955,10 @@ class WebBridgeApp:
                     or head.startswith("stop_requested")
                 ):
                     status = "cancelled"
+                elif "failed to get a response from model" in head or (
+                    "failed to get a response from the model" in head
+                ):
+                    status = "failed"
         ts_raw = task.get("ts")
         try:
             if isinstance(ts_raw, str) and ts_raw:
@@ -4667,7 +4685,18 @@ class WebBridgeApp:
         if not query:
             return {"ok": False, "reason": "query is required", "results": []}
         try:
-            results = discover_servers(query, max_results=max_results)
+            discovery = discover_servers(query, max_results=max_results)
         except Exception as exc:
             return {"ok": False, "reason": str(exc), "results": []}
-        return {"ok": True, "query": query, "results": results}
+        if isinstance(discovery, dict):
+            results = list(discovery.get("results") or [])
+            return {
+                "ok": discovery.get("status") not in {"error", "rate_limited"}
+                or bool(results),
+                "query": query,
+                "results": results,
+                "warnings": list(discovery.get("warnings") or []),
+                "search_queries": list(discovery.get("search_queries") or []),
+                "status": discovery.get("status"),
+            }
+        return {"ok": True, "query": query, "results": list(discovery or [])}

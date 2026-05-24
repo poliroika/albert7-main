@@ -10,6 +10,7 @@ prompt_files:
 
 allowed_tools:
   - github_project_search
+  - github_extract_snippets
   - deep_search
   - web_search
   - mcp_discover
@@ -54,7 +55,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [github_project_search, deep_search, web_search, mcp_discover, mcp_install, palace_search, palace_add, palace_link, load_skill, list_available_tools, enable_tools, read_file, list_files, register_temp_tool, get_gmas_context, search_gmas_knowledge, submit_research_summary]
+    - allow_tools: [github_project_search, github_extract_snippets, deep_search, web_search, mcp_discover, mcp_install, palace_search, palace_add, palace_link, load_skill, list_available_tools, enable_tools, read_file, list_files, register_temp_tool, get_gmas_context, search_gmas_knowledge, submit_research_summary]
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit]
 
 exit_criteria:

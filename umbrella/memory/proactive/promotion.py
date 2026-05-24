@@ -307,29 +307,50 @@ def _mirror_to_palace(
     patch: ProposedBkbPatch,
     rules: list[BeliefRule],
 ) -> None:
-    try:
-        from umbrella.memory.palace.facade import MemPalace
-        from umbrella.memory.palace.tiers import Scope, Tier
+    import logging
 
-        palace = MemPalace(repo_root, patch.workspace_id or None)
+    from umbrella.memory.kernel.models import memory_event_from_tool_write
+    from umbrella.memory.kernel.writer import write_memory_event
+    from umbrella.memory.palace.tiers import Tier
+
+    log = logging.getLogger(__name__)
+    ws = patch.workspace_id or ""
+    for rule in rules:
+        content = f"{rule.title}\n\n{json.dumps(rule.rule, ensure_ascii=False)}"
+        tier = (
+            Tier.ALWAYS_ON
+            if rule.rule_type in {"invariant", "behavior"}
+            else Tier.WARM
+        )
         try:
-            for rule in rules:
-                tags = ["core_lesson", "bkb", rule.rule_type]
-                palace.add(
-                    store="palace.lesson",
-                    content=f"{rule.title}\n\n{json.dumps(rule.rule, ensure_ascii=False)}",
-                    tier=Tier.ALWAYS_ON if rule.rule_type in {"invariant", "behavior"} else Tier.WARM,
-                    scope=Scope.CROSS_RUN_DURABLE,
-                    tags=tags,
-                    verified=True,
-                    phase=patch.phase_id,
-                    run_id=patch.run_id,
-                    kind="lesson",
+            event = memory_event_from_tool_write(
+                content=content,
+                title=rule.title,
+                memory_kind="lesson",
+                workspace_id=ws,
+                tags=["core_lesson", "bkb", rule.rule_type],
+                scope="cross_run_durable",
+                tier=tier,
+                trust_level="public_verified",
+                evidence_refs=list(patch.source_evidence or []),
+                lifecycle="active",
+                surface="supplemental_evidence",
+                source_backend="bkb_promotion",
+                verified=True,
+                phase_id=patch.phase_id,
+                run_id=patch.run_id,
+                palace_store="palace.lesson",
+                metadata={"bkb_rule_id": rule.id, "patch_id": patch.patch_id},
+            )
+            result = write_memory_event(repo_root, event, workspace_id=ws)
+            if not result.saved:
+                log.debug(
+                    "BKB palace mirror skipped for %s: %s",
+                    rule.id,
+                    list(result.policy_issues) or result.error,
                 )
-        finally:
-            palace.close()
-    except Exception:
-        return
+        except Exception:
+            log.debug("BKB palace mirror failed for %s", rule.id, exc_info=True)
 
 
 def _rule_dict(rule: BeliefRule) -> dict[str, Any]:

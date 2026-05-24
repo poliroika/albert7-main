@@ -190,6 +190,12 @@ JSONL format is:
 - Simple to inspect/debug
 - Compatible with Unix tools
 
+## Durable memory backends
+
+Environment variables: **[docs/memory-durable-backends.md](../../docs/memory-durable-backends.md)**.
+
+Workspace vs manager isolation (what is shared across projects): **[docs/workspaces.md#memory-layout-per-workspace-vs-manager](../../docs/workspaces.md#memory-layout-per-workspace-vs-manager)**.
+
 ## Configuration
 
 ```python

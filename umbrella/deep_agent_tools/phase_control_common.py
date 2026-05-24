@@ -352,9 +352,37 @@ _PYTEST_SKIP_ONLY_RE = re.compile(
 )
 _PYTEST_PASS_RE = re.compile(r"(?i)\b\d+\s+passed\b")
 _PYTEST_FAILURE_RE = re.compile(r"(?i)\b\d+\s+(?:failed|errors?|xfailed)\b")
+_SUCCESS_TEST_TOOL_NAMES = (
+    "harness_run",
+    "run_workspace_verify",
+    "run_unit_tests",
+    "run_real_e2e",
+    "web_search",
+    "deep_search",
+    "github_project_search",
+    "mcp_discover",
+)
+_SUCCESS_TEST_TRAILING_OUTCOME_RE = (
+    re.compile(
+        r"(?is)\s+"
+        r"(?:must\s+)?(?:exit|exits|return|returns)"
+        r"(?:\s+successfully)?(?:\s+with)?(?:\s+exit)?(?:\s+code)?\s+0\b.*$"
+    ),
+    re.compile(r"(?is)\s+(?:has|with)\s+exit\s+code\s+0\b.*$"),
+    re.compile(r"(?is)\s+(?:passes|succeeds|is\s+successful)\b.*$"),
+    re.compile(r"(?is)\s+prints?\s+[`'\"]?[A-Za-z0-9_.:/ -]{1,120}[`'\"]?\s*$"),
+)
+_SUCCESS_TEST_LEADING_COMMAND_LABEL_RE = re.compile(
+    r"(?is)^\s*(?:command|cmd|shell|terminal|run|success[_\s-]*test)\s*:\s*"
+)
 _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD = 3
-_PHASE_SUBTASK_COMMAND_TOOLS = {"shell", "run_workspace_command", "terminal_session"}
-_PHASE_SUBTASK_REPAIR_WRITE_TOOLS = {"apply_workspace_patch"}
+_PHASE_SUBTASK_COMMAND_TOOLS = {
+    "shell",
+    "run_workspace_command",
+    "terminal_session",
+    "run_subtask_proof",
+}
+_PHASE_SUBTASK_REPAIR_WRITE_TOOLS = {"apply_workspace_patch", "update_workspace_seed"}
 _PREFLIGHT_PLATFORM_BLOCKER_RE = re.compile(
     r"\b("
     r"api[-_ ]?key|credential|secret|token|env(?:ironment)? variable|"
@@ -427,6 +455,9 @@ __all__ = [
     '_PYTEST_FAILURE_RE',
     '_PYTEST_PASS_RE',
     '_PYTEST_SKIP_ONLY_RE',
+    '_SUCCESS_TEST_LEADING_COMMAND_LABEL_RE',
+    '_SUCCESS_TEST_TOOL_NAMES',
+    '_SUCCESS_TEST_TRAILING_OUTCOME_RE',
     '_RESEARCH_ARCHITECTURE_ID_BAD_TOKEN_RE',
     '_RESEARCH_ARCHITECTURE_ID_RE',
     '_RESEARCH_GITHUB_DISCOVERY_TOOL',

@@ -563,6 +563,92 @@ def test_research_summary_source_scarce_requires_each_usable_github_row(
     assert ok.startswith("OK:")
 
 
+def test_research_summary_requires_declared_skill_load(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    (drive / "state").mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_skill:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-1",
+                    "kind": "research_finding",
+                    "source_path": "web_search:LLM game architecture",
+                }
+            ),
+        }
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_skill:research"
+    ctx.context_overlays = {
+        "phase_manifest": {"allowed_skills": ["research-strategy", "architecture-author"]}
+    }
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-llm-game-v1",
+        findings_ids=["finding-1"],
+        coverage_status="complete",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "missing required skill coverage" in result
+    assert "load_skill" in result
+
+
+def test_research_summary_requires_gmas_context_for_gmas_workspace(tmp_path):
+    drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
+    logs = drive / "logs"
+    logs.mkdir(parents=True)
+    (drive / "state").mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "phase_web_gmas:research",
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-1",
+                    "kind": "research_finding",
+                    "source_path": "web_search:LLM game architecture",
+                }
+            ),
+        }
+    ]
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx.task_id = "phase_web_gmas:research"
+    ctx.context_overlays = {
+        "phase_manifest": {"allowed_skills": []},
+        "gmas_prewrite_required": True,
+        "detected_domains": ["multi_agent_gmas"],
+    }
+
+    result = _submit_research_summary(
+        ctx,
+        architecture_id="arch-civilization-gmas-web-v1",
+        findings_ids=["finding-1"],
+        coverage_status="complete",
+    )
+
+    assert result.startswith("ERROR:")
+    assert "missing GMAS context coverage" in result
+    assert "get_gmas_context" in result
+
+
 def test_research_summary_source_scarce_counts_truncated_github_rows(tmp_path):
     drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
     logs = drive / "logs"

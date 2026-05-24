@@ -2,7 +2,16 @@
 
 from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.deep_agent_tools.phase_control_base import *
+from umbrella.deep_agent_tools.phase_control_legacy import _subtask_success_test_text
 from umbrella.deep_agent_tools.phase_control_research import *
+from umbrella.deep_agent_tools.phase_control_retry import (
+    _phase_control_signal_rows_for_task,
+    _phase_subtask_retry_escalation_block,
+    _phase_subtask_retry_state,
+    _phase_subtask_retry_watcher_review_payload,
+    _supported_llm_alias_memory_claim_issue,
+    _tool_row_result_payload,
+)
 from umbrella.deep_agent_tools.phase_contract_base import _json, _state_dir, _umbrella_phase_id
 from umbrella.contracts import (
     CompletionContract,
@@ -15,6 +24,7 @@ from umbrella.contracts import (
     VerificationReportRef,
     build_workspace_context,
     compile_phase_plan,
+    diff_hash,
     hash_value,
     json_ready,
     validate_completion_materialization,
@@ -22,7 +32,7 @@ from umbrella.contracts import (
     validate_verification_report_ref,
     workspace_hash,
 )
-from umbrella.deep_agent_tools.phase_control_legacy import _phase_subtask_completion_issue
+from umbrella.deep_agent_tools.phase_control_retry import _phase_subtask_completion_issue
 
 
 def _phase_plan_execute_node(plan: dict[str, Any]) -> dict[str, Any] | None:
@@ -182,6 +192,50 @@ def _phase_plan_subtask_contract_issues(
     )
 
 
+def _completion_contract_payload_is_valid(
+    ctx: ToolContext,
+    *,
+    completion_contract: Any,
+    active_subtask: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    if not isinstance(completion_contract, dict):
+        return False, "missing completion_contract"
+    try:
+        typed = CompletionContract.from_mapping(completion_contract)
+    except Exception as exc:
+        return False, f"invalid completion_contract: {exc}"
+    if typed.verification_report is None:
+        return False, "completion_contract.verification_report is required"
+    workspace_id = _workspace_id_from_drive(ctx)
+    context = build_workspace_context(
+        repo_root=_repo_root_from_phase_ctx(ctx),
+        workspace_root=_workspace_root_from_phase_ctx(ctx, workspace_id),
+        workspace_id=workspace_id,
+        changed_files=typed.changed_files,
+    )
+    issues = ContractValidator.validate(
+        ContractBundle(
+            run_id=_run_id(ctx),
+            workspace_id=workspace_id,
+            completions=(typed,),
+        ),
+        context=context,
+    )
+    issues.extend(
+        validate_completion_materialization(
+            typed,
+            active_subtask=active_subtask,
+            workspace_root=str(context.workspace_root),
+            raw_completion=completion_contract,
+            phase=_phase_control_phase_id(ctx),
+        )
+    )
+    blocking = [issue for issue in issues if issue.severity in {"error", "blocking", "human_required"}]
+    if blocking:
+        return False, _contract_issue_message("invalid completion_contract", blocking)
+    return True, ""
+
+
 def _apply_phase_plan_subtask_patch(
     ctx: ToolContext, plan: dict[str, Any], subtask_patches: Any
 ) -> tuple[list[str], str | None]:
@@ -212,17 +266,33 @@ def _apply_phase_plan_subtask_patch(
         target = by_id.get(subtask_id)
         if target is None:
             return [], f"subtask '{subtask_id}' not found in execute phase"
-        forbidden = [
-            key
-            for key in item
-            if key == "success_test" or key.startswith("contract_migration")
-        ]
-        if forbidden:
-            return [], (
-                "contract v1 rejects legacy subtask patch fields: "
-                + ", ".join(sorted(forbidden))
-                + "; update the typed `proof` object instead"
+        requested_status = str(item.get("status") or "").strip().lower()
+        if requested_status in {"done", "ok", "complete", "completed"}:
+            contract_payload = item.get("completion_contract")
+            if not isinstance(contract_payload, dict):
+                completion = target.get("completion")
+                if isinstance(completion, dict):
+                    contract_payload = completion.get("completion_contract")
+            ok, issue = _completion_contract_payload_is_valid(
+                ctx,
+                completion_contract=contract_payload,
+                active_subtask=target,
             )
+            if not ok:
+                return [], (
+                    "mutate_phase_plan cannot mark execute subtask "
+                    f"`{subtask_id}` done without a valid verifier-backed "
+                    f"CompletionContract: {issue}"
+                )
+        migration_issue = _active_success_test_contract_migration_issue(
+            ctx,
+            plan=plan,
+            subtask=target,
+            subtask_id=subtask_id,
+            item=item,
+        )
+        if migration_issue:
+            return [], migration_issue
         validated.append((item, target, subtask_id))
 
     list_patch_ops = _phase_plan_list_patch_key_ops()
@@ -244,7 +314,24 @@ def _apply_phase_plan_subtask_patch(
         for key, value in item.items():
             if key == "id" or key in list_patch_ops:
                 continue
-            if key in _PHASE_PLAN_MERGE_LIST_KEYS:
+            if key == "success_test":
+                target[key] = _patched_success_test(target.get(key), value)
+            elif key in _CONTRACT_MIGRATION_REASON_KEYS:
+                reason = _contract_migration_reason_from_patch(item)
+                if reason:
+                    alias_issue = _supported_llm_alias_memory_claim_issue(reason)
+                    if alias_issue:
+                        return (
+                            [],
+                            "contract_migration_reason for subtask "
+                            f"'{subtask_id}' {alias_issue}",
+                        )
+                    target["contract_migration_reason"] = reason
+            elif key in _CONTRACT_MIGRATION_FILE_KEYS:
+                target["contract_migration_files"] = _contract_migration_files_from_patch(
+                    item
+                )
+            elif key in _PHASE_PLAN_MERGE_LIST_KEYS:
                 target[key] = _merge_phase_plan_string_list(target.get(key), value)
             else:
                 target[key] = value
@@ -280,15 +367,34 @@ def _mutate_phase_plan(ctx: ToolContext, *, patch: dict[str, Any]) -> str:
         )
     if not applied:
         return "ERROR: mutate_phase_plan patch did not apply any changes"
-    contract_issues = [
-        issue
-        for issue in _phase_plan_subtask_contract_issues(ctx, plan)
-        if issue.severity in {"error", "blocking", "human_required"}
-    ]
-    if contract_issues:
-        return _contract_issue_message(
-            "cannot mutate phase plan because the typed contract is invalid",
-            contract_issues,
+    touched_subtask_ids = {
+        item.removeprefix("subtasks.")
+        for item in applied
+        if item.startswith("subtasks.")
+    }
+    subtask_patch_fields_by_id = {
+        str(item.get("id") or "").strip(): item
+        for item in patch.get("subtasks", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    try:
+        from umbrella.deep_agent_tools.phase_contract_tools import _phase_plan_policy_issues
+
+        policy_issues = _phase_plan_policy_issues(
+            _phase_plan_policy_payload(
+                plan,
+                touched_subtask_ids=touched_subtask_ids,
+                subtask_patch_fields_by_id=subtask_patch_fields_by_id,
+            ),
+            ctx=ctx,
+        )
+    except Exception:
+        policy_issues = []
+    if policy_issues:
+        return (
+            "ERROR: cannot mutate phase plan: mutation would violate workspace "
+            "policy: "
+            + "; ".join(policy_issues)
         )
     plan["version"] = int(plan.get("version") or 0) + 1
     if "edits_log" not in plan or not isinstance(plan.get("edits_log"), list):
@@ -981,24 +1087,18 @@ def _edit_subtask_card(
 def _request_watcher_review(ctx: ToolContext, *, reason: str) -> str:
     if stop := _stop_requested_message(ctx, "request_watcher_review"):
         return stop
-    plan = _read_phase_plan(ctx) or {}
-    current = _current_phase_node(ctx, plan) if isinstance(plan, dict) else {}
-    first = _first_incomplete_subtask(_phase_subtasks(current))
-    review = {
-        "status": "review_recorded",
-        "reviewer": "umbrella",
-        "review_kind": "watcher",
-        "subtask_id": str((first or {}).get("id") or ""),
-        "operator_reason": reason,
-        "recommendation": (
-            "Use typed ReviewIssue/CompletionContract evidence; do not edit "
-            "phase state based on free-text review notes."
-        ),
-    }
+    from umbrella.deep_agent_tools.phase_control_retry import (
+        _phase_subtask_retry_watcher_review_payload,
+    )
+
+    review = _phase_subtask_retry_watcher_review_payload(ctx, reason=reason)
+    if review.get("status") not in {"review_recorded", "review_not_required"}:
+        return json.dumps(review, ensure_ascii=False, indent=2)
     signal_id = _write_control_signal(ctx, "request_watcher_review", review)
     review = dict(review)
     review["signal_id"] = signal_id
-    _mirror_watcher_review_to_palace(ctx, review=review)
+    if review.get("status") == "review_recorded":
+        _mirror_watcher_review_to_palace(ctx, review=review)
     return json.dumps(review, ensure_ascii=False, indent=2)
 
 
@@ -1097,6 +1197,238 @@ def _harness_run(
     return f"Harness run requested for subtask '{subtask_id}' with {n_candidates} candidates, strategy={strategy} (signal: {signal_id})"
 
 
+def _proof_scope_changed_files(subtask: dict[str, Any], proof: Any) -> list[str]:
+    paths: list[str] = []
+    for key in ("files_to_create", "files_to_change", "files_affected"):
+        raw = subtask.get(key)
+        if isinstance(raw, str) and raw.strip():
+            paths.append(raw.strip().replace("\\", "/").lstrip("/"))
+        elif isinstance(raw, (list, tuple)):
+            for item in raw:
+                norm = str(item or "").strip().replace("\\", "/").lstrip("/")
+                if norm:
+                    paths.append(norm)
+    scope = getattr(proof, "scope", None)
+    if scope is not None:
+        for key in ("files_under_test", "changed_files_expected"):
+            values = getattr(scope, key, ()) or ()
+            for item in values:
+                norm = str(item or "").strip().replace("\\", "/").lstrip("/")
+                if norm:
+                    paths.append(norm)
+    return list(dict.fromkeys(paths))
+
+
+def _proof_payload_is_pytest_skip_only(payload: dict[str, Any]) -> bool:
+    text = "\n".join(
+        str(payload.get(key) or "")
+        for key in ("output", "stdout", "stderr", "result", "result_preview")
+    )
+    if not text.strip():
+        return False
+    return bool(_PYTEST_SKIP_ONLY_RE.search(text)) and not (
+        _PYTEST_PASS_RE.search(text) or _PYTEST_FAILURE_RE.search(text)
+    )
+
+
+def _resolve_execute_subtask(
+    plan: dict[str, Any], subtask_id: str
+) -> dict[str, Any] | None:
+    execute = _phase_plan_execute_node(plan)
+    if not isinstance(execute, dict):
+        return None
+    subtasks = execute.get("subtasks")
+    if not isinstance(subtasks, list):
+        return None
+    wanted = str(subtask_id or "").strip()
+    if wanted:
+        for item in subtasks:
+            if isinstance(item, dict) and str(item.get("id") or "") == wanted:
+                return item
+        return None
+    for item in subtasks:
+        if isinstance(item, dict) and str(item.get("status") or "pending") == "pending":
+            return item
+    return None
+
+
+def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
+    """Run the active subtask's typed proof and return ledger-backed completion refs."""
+
+    if stop := _stop_requested_message(ctx, "run_subtask_proof"):
+        return stop
+    if not _is_phase_run_context(ctx):
+        return "ERROR: run_subtask_proof is only available during Umbrella phase runs."
+
+    workspace_id = _workspace_id_from_drive(ctx)
+    repo_root = _repo_root_from_phase_ctx(ctx)
+    workspace_root = _workspace_root_from_phase_ctx(ctx, workspace_id)
+    phase = _phase_control_phase_id(ctx) or "execute"
+    plan = _read_phase_plan(ctx)
+    if plan is None:
+        return "ERROR: phase_plan.json is missing; cannot resolve subtask proof."
+
+    subtask = _resolve_execute_subtask(plan, subtask_id)
+    if subtask is None:
+        return (
+            "ERROR: subtask not found or no pending subtask remains "
+            f"(requested={subtask_id!r})."
+        )
+    if retry_block := _phase_subtask_retry_escalation_block(
+        ctx, tool_name="run_subtask_proof"
+    ):
+        return _json(retry_block)
+    resolved_id = str(subtask.get("id") or "").strip()
+    proof_raw = subtask.get("proof")
+    if not isinstance(proof_raw, dict):
+        return f"ERROR: subtask `{resolved_id}` has no typed proof contract."
+
+    from umbrella.contracts import ProofSpec
+    from umbrella.deep_agent_tools import workspace_commands as workspace_commands
+    from umbrella.enforcement.ledger import (
+        append_supervisor_ledger_event,
+        latest_ledger_event_id,
+        supervisor_ledger_ref,
+    )
+
+    proof = ProofSpec.from_mapping(proof_raw)
+    command = list(proof.execution.command)
+    if not command:
+        return f"ERROR: subtask `{resolved_id}` proof has an empty command."
+
+    raw = workspace_commands.run_workspace_command(
+        ctx,
+        workspace_id=workspace_id,
+        command=command,
+        timeout_seconds=max(10, int(proof.execution.timeout_sec or 120)),
+        allow_dependency_install=proof.execution.kind in {"build", "command"},
+    )
+    try:
+        import json as json_module
+
+        payload = json_module.loads(str(raw or "{}"))
+    except Exception:
+        return (
+            "ERROR: proof command did not return JSON; use shell only for exploration. "
+            f"Output tail: {str(raw or '')[-800:]}"
+        )
+    if not isinstance(payload, dict):
+        return "ERROR: proof command returned non-object JSON."
+
+    exit_code = int(payload.get("exit_code", 1))
+    skip_only = _proof_payload_is_pytest_skip_only(payload)
+    if skip_only and proof.anti_gaming.requires_real_runtime:
+        skip_only = True
+    passed = (
+        exit_code == 0
+        and str(payload.get("status") or "") != "blocked"
+        and not skip_only
+    )
+    after_patch_event = latest_ledger_event_id(
+        repo_root=repo_root,
+        workspace_id=workspace_id,
+        tool="apply_workspace_patch",
+    )
+    ws_hash = workspace_hash(workspace_root)
+    changed_files = _proof_scope_changed_files(subtask, proof)
+    diff_h = diff_hash(workspace_root, changed_files)
+    report_hash = hash_value(
+        {
+            "subtask_id": resolved_id,
+            "passed": passed,
+            "exit_code": exit_code,
+            "proof_kind": proof.execution.kind,
+            "workspace_hash": ws_hash,
+            "diff_hash": diff_h,
+            "skip_only": skip_only,
+        }
+    )
+    ledger_result = {
+        "report_hash": report_hash,
+        "passed": passed,
+        "workspace_hash": ws_hash,
+        "diff_hash": diff_h,
+    }
+    try:
+        proof_ledger = append_supervisor_ledger_event(
+            repo_root=repo_root,
+            workspace_id=workspace_id,
+            actor="verifier",
+            phase=phase,
+            tool="run_subtask_proof",
+            args={
+                "subtask_id": resolved_id,
+                "command": command,
+                "proof_kind": proof.execution.kind,
+            },
+            result=ledger_result,
+            touched_files=[],
+        )
+    except Exception:
+        log.debug("supervisor ledger append failed for run_subtask_proof", exc_info=True)
+        return "ERROR: failed to record verifier ledger event for subtask proof."
+
+    verification_report = {
+        "report_id": proof_ledger.event_id,
+        "report_hash": report_hash,
+        "workspace_hash": ws_hash,
+        "diff_hash": diff_h,
+        "produced_after_event_id": after_patch_event,
+        "verifier_id": "run_subtask_proof",
+        "passed": passed,
+        "ledger_hash": proof_ledger.event_hash,
+    }
+    proof_ref = {
+        "ref_type": "ledger_event",
+        "ref_id": proof_ledger.event_id,
+        "hash": proof_ledger.event_hash,
+        "produced_by": "verifier",
+        "phase": phase,
+        "subtask_id": resolved_id,
+    }
+    if after_patch_event:
+        proof_ref["created_after_event"] = after_patch_event
+
+    completion_hint = {
+        "subtask_id": resolved_id,
+        "status": "done" if passed else "failed",
+        "changed_files": changed_files,
+        "deleted_files": [],
+        "completed_claims": [
+            {
+                "claim_id": f"{resolved_id}.proof",
+                "text": (
+                    f"Subtask proof `{proof.execution.kind}` "
+                    f"{'passed' if passed else 'failed'} (exit {exit_code})."
+                ),
+                "proof_refs": [proof_ref],
+            }
+        ],
+        "evidence_refs": [proof_ref],
+        "verification_report": verification_report,
+        "notes": "Copy verification_report and proof_refs into mark_subtask_complete.",
+    }
+    return _json(
+        {
+            "passed": passed,
+            "exit_code": exit_code,
+            "skip_only": skip_only,
+            "subtask_id": resolved_id,
+            "command": command,
+            "shell_result": payload,
+            **supervisor_ledger_ref(proof_ledger),
+            "verification_report": verification_report,
+            "proof_ref": proof_ref,
+            "completion_contract_hint": completion_hint,
+            "next_step": (
+                "If passed, call mark_subtask_complete(completion_contract=completion_contract_hint). "
+                "Do not rewrite completion_contract_hint.changed_files; it is the exact diff-hash input "
+                "used by this verifier report."
+            ),
+        }
+    )
+
+
 def _trim_completion_text(value: Any, *, limit: int = 1600) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -1161,11 +1493,34 @@ def _mark_subtask_complete(
     typed_completion: CompletionContract | None = None
     if _is_phase_run_context(ctx):
         if not isinstance(completion_contract, dict):
+            plan = _read_phase_plan(ctx)
+            legacy_issue = _phase_subtask_completion_issue(
+                ctx,
+                current_phase=_current_phase_node(ctx, plan) if plan else None,
+                subtask_id=subtask_id,
+            )
+            if legacy_issue:
+                return legacy_issue
             return (
                 "ERROR: mark_subtask_complete contract rejected: "
                 "`completion_contract` is required in phase-run context."
             )
         typed_completion = CompletionContract.from_mapping(completion_contract)
+        if typed_completion.verification_report is None:
+            return (
+                "ERROR: mark_subtask_complete contract rejected: "
+                "`completion_contract.verification_report` is required in "
+                "phase-run context. Run `run_subtask_proof` and copy its "
+                "verifier-backed report instead of closing from shell/debug "
+                "evidence alone."
+            )
+        if typed_completion.verification_report.passed is not True:
+            return (
+                "ERROR: mark_subtask_complete contract rejected: "
+                "verification_report.passed must be true. Rerun "
+                "`run_subtask_proof` after fixing the implementation; "
+                "skip-only or failed proof output cannot close the subtask."
+            )
         workspace_id = _workspace_id_from_drive(ctx)
         context = build_workspace_context(
             repo_root=_repo_root_from_phase_ctx(ctx),
@@ -1543,6 +1898,465 @@ def _mirror_phase_subtask_completion_to_palace(
         pass
 
 
+def _patched_success_test(existing: Any, replacement: Any) -> Any:
+    if isinstance(replacement, dict):
+        return dict(replacement)
+    value = str(replacement or "")
+    if isinstance(existing, dict):
+        updated = dict(existing)
+        updated.setdefault("kind", "cmd")
+        updated["value"] = value
+        return updated
+    return value
+
+
+_CONTRACT_MIGRATION_REASON_KEYS = (
+    "contract_migration_reason",
+    "test_contract_migration_reason",
+    "success_test_contract_migration_reason",
+    "contract_migration",
+    "test_contract_migration",
+    "success_test_contract_migration",
+)
+
+_CONTRACT_MIGRATION_FILE_KEYS = (
+    "contract_migration_files",
+    "test_contract_migration_files",
+    "success_test_contract_migration_files",
+)
+
+_PHASE_PLAN_POLICY_AUDIT_KEYS = {
+    "completion",
+    "edits_log",
+    "overlay",
+    *_CONTRACT_MIGRATION_REASON_KEYS,
+    *_CONTRACT_MIGRATION_FILE_KEYS,
+}
+
+
+def _contract_migration_files_from_patch(item: Any) -> list[str]:
+    if not isinstance(item, dict):
+        return []
+    raw_files: Any = None
+    for key in _CONTRACT_MIGRATION_FILE_KEYS:
+        if item.get(key) is not None:
+            raw_files = item.get(key)
+            break
+    if raw_files is None:
+        raw_files = item.get("files") or item.get("file_paths")
+    if isinstance(raw_files, str):
+        values = [raw_files]
+    elif isinstance(raw_files, (list, tuple, set, frozenset)):
+        values = list(raw_files)
+    else:
+        values = []
+    return [
+        str(file_path or "").replace("\\", "/").strip().lstrip("/")
+        for file_path in values
+        if str(file_path or "").strip()
+    ]
+
+
+_ACTIVE_TEST_MIGRATION_BAD_REASON_FRAGMENTS = (
+    "clean architecture",
+    "clean architectural",
+    "differs from a clean",
+    "differs from the implementation",
+    "differs from implementation",
+    "different public api",
+    "generated test expectations",
+    "match generated test",
+    "match the generated test",
+    "rewriting the implementation",
+    "rewrite the implementation",
+    "line ending",
+    "crlf",
+    "truncation",
+    "truncated",
+    "import failure",
+    "import failures",
+)
+
+_ACTIVE_TEST_MIGRATION_EVIDENCE_FRAGMENTS = (
+    "contradiction",
+    "contradicts",
+    "contradictory",
+    "self-contradictory",
+    "self-inconsistent",
+    "self-consistent failure",
+    "self-match",
+    "self matches",
+    "self-matches",
+    "matches itself",
+    "test scans itself",
+    "violates its own",
+    "sample violates",
+    "warning context",
+    "warning contexts",
+    "correctly warns",
+    "warns not to use",
+    "not to use that alias",
+    "negative warning",
+    "forbidden pattern",
+    "forbidden_patterns",
+    "internally inconsistent",
+    "structurally impossible",
+    "cannot be satisfied",
+    "cannot satisfy",
+    "no valid",
+    "flat key",
+    "nested dictionaries",
+    "impossible assertion",
+    "wrong assertion",
+    "assertion must be",
+    "expected",
+    "even though",
+    "setup computes",
+    "miscomputed",
+    "miscalculated",
+    "typo",
+    "misspelled",
+    "accepted plan",
+    "declared plan",
+)
+
+
+def _phase_plan_policy_payload(
+    plan: dict[str, Any],
+    *,
+    touched_subtask_ids: set[str] | None = None,
+    subtask_patch_fields_by_id: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: scrub(child)
+                for key, child in value.items()
+                if key not in _PHASE_PLAN_POLICY_AUDIT_KEYS
+            }
+        if isinstance(value, list):
+            return [scrub(child) for child in value]
+        return value
+
+    cleaned = scrub(plan)
+    if not isinstance(cleaned, dict):
+        return {}
+    touched = {str(item or "").strip() for item in (touched_subtask_ids or set())}
+    if not touched:
+        return cleaned
+    patch_fields_by_id = subtask_patch_fields_by_id or {}
+
+    def scoped_mutated_subtask(subtask: dict[str, Any]) -> dict[str, Any]:
+        subtask_id = str(
+            subtask.get("id")
+            or subtask.get("subtask_id")
+            or subtask.get("title")
+            or subtask.get("name")
+            or ""
+        ).strip()
+        patch_fields = patch_fields_by_id.get(subtask_id, {})
+        scoped: dict[str, Any] = {
+            "id": subtask_id,
+            "title": subtask_id or "execute mutation",
+            "goal": "Validate the current execute-time phase-plan mutation.",
+        }
+        if "success_test" in patch_fields:
+            scoped["success_test"] = _patched_success_test(
+                subtask.get("success_test"), patch_fields.get("success_test")
+            )
+        elif "success_test" in subtask:
+            scoped["success_test"] = subtask.get("success_test")
+        for key, value in patch_fields.items():
+            if (
+                key == "id"
+                or key == "success_test"
+                or key in _PHASE_PLAN_MERGE_LIST_KEYS
+                or key in _PHASE_PLAN_POLICY_AUDIT_KEYS
+            ):
+                continue
+            scoped[key] = value
+        for key in _PHASE_PLAN_MERGE_LIST_KEYS:
+            scoped.pop(key, None)
+        success_text = _subtask_success_test_text(scoped)
+        success_paths: list[str] = []
+        for key in _PHASE_PLAN_MERGE_LIST_KEYS:
+            for path in _phase_plan_string_items(subtask.get(key)):
+                if path not in success_paths and _success_test_mentions_path(
+                    success_text, path
+                ):
+                    success_paths.append(path)
+        for key in _PHASE_PLAN_MERGE_LIST_KEYS:
+            values: list[str] = []
+            if key in patch_fields:
+                values.extend(_phase_plan_string_items(patch_fields.get(key)))
+            values.extend(path for path in success_paths if path not in values)
+            if values:
+                scoped[key] = values
+        return scoped
+
+    nodes = cleaned.get("nodes")
+    if not isinstance(nodes, list):
+        return cleaned
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("id") or node.get("manifest_id") or "").strip() != "execute":
+            continue
+        subtasks = node.get("subtasks")
+        if not isinstance(subtasks, list):
+            continue
+        filtered: list[Any] = []
+        for subtask in subtasks:
+            if not isinstance(subtask, dict):
+                filtered.append(subtask)
+                continue
+            subtask_id = str(
+                subtask.get("id")
+                or subtask.get("subtask_id")
+                or subtask.get("title")
+                or subtask.get("name")
+                or ""
+            ).strip()
+            if subtask_id not in touched:
+                continue
+            filtered.append(scoped_mutated_subtask(subtask))
+        node["subtasks"] = filtered
+    return cleaned
+
+
+def _success_test_mentions_path(success_text: str, rel_path: str) -> bool:
+    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
+    if not norm:
+        return False
+    return norm in str(success_text or "").replace("\\", "/")
+
+
+def _active_test_migration_has_evidence(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        fragment in lowered for fragment in _ACTIVE_TEST_MIGRATION_EVIDENCE_FRAGMENTS
+    )
+
+
+def _valid_contract_migration_watcher_payload(
+    payload: dict[str, Any], *, subtask_id: str, success_test: str
+) -> dict[str, Any] | None:
+    if not payload:
+        return None
+    if str(payload.get("status") or "") != "review_recorded":
+        return None
+    if str(payload.get("reviewer") or "") != "umbrella":
+        return None
+    if str(payload.get("review_kind") or "") != "retry_watcher":
+        return None
+    if str(payload.get("subtask_id") or "").strip() != str(subtask_id or "").strip():
+        return None
+    if str(payload.get("success_test") or "").strip() != str(success_test or "").strip():
+        return None
+    try:
+        failed_attempts = int(payload.get("failed_attempts") or 0)
+    except (TypeError, ValueError):
+        return None
+    if failed_attempts < 1:
+        return None
+    return payload
+
+
+def _contract_migration_watcher_payloads(
+    ctx: ToolContext, *, state: dict[str, Any], subtask_id: str, success_test: str
+) -> list[dict[str, Any]]:
+    task_id = str(state.get("task_id") or getattr(ctx, "task_id", "") or "").strip()
+    if not task_id:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for row in _tool_log_rows_for_task(ctx, task_id):
+        if str(row.get("tool") or "") != "request_watcher_review":
+            continue
+        payload = _valid_contract_migration_watcher_payload(
+            _tool_row_result_payload(row),
+            subtask_id=subtask_id,
+            success_test=success_test,
+        )
+        if payload:
+            payloads.append(payload)
+    for row in _phase_control_signal_rows_for_task(
+        ctx, task_id, kind="request_watcher_review"
+    ):
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        payload = _valid_contract_migration_watcher_payload(
+            payload,
+            subtask_id=subtask_id,
+            success_test=success_test,
+        )
+        if payload:
+            payloads.append(payload)
+    return payloads
+
+
+def _contract_migration_watcher_evidence_text(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "operator_reason",
+        "reason",
+        "message",
+        "recommendation",
+        "patch_guidance",
+        "next_step",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    latest_failure = payload.get("latest_failure")
+    if isinstance(latest_failure, dict):
+        for key in ("reason", "output", "output_excerpt", "stderr", "stdout"):
+            value = latest_failure.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+    contract_migration = payload.get("contract_migration")
+    if isinstance(contract_migration, dict):
+        for key in ("verdict", "evidence", "reason"):
+            value = contract_migration.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+    if not parts:
+        try:
+            parts.append(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            pass
+    return "\n".join(parts)
+
+
+def _contract_migration_watcher_supports_files(
+    payload: dict[str, Any], targeted_files: list[str]
+) -> bool:
+    contract_migration = payload.get("contract_migration")
+    if not isinstance(contract_migration, dict):
+        return False
+    verdict = str(contract_migration.get("verdict") or "").strip()
+    if verdict not in {
+        "bad_generated_success_test_contract",
+        "bad_success_test_contract",
+    }:
+        return False
+    raw_files = (
+        contract_migration.get("target_files")
+        or contract_migration.get("files")
+        or contract_migration.get("contract_migration_files")
+    )
+    if isinstance(raw_files, str):
+        values = [raw_files]
+    elif isinstance(raw_files, (list, tuple, set, frozenset)):
+        values = list(raw_files)
+    else:
+        values = []
+    supported = {
+        str(file_path or "").replace("\\", "/").strip().lstrip("/").lower()
+        for file_path in values
+        if str(file_path or "").strip()
+    }
+    if not supported:
+        return False
+    for file_path in targeted_files:
+        norm = str(file_path or "").replace("\\", "/").strip().lstrip("/").lower()
+        if norm in supported:
+            return True
+    return False
+
+
+def _active_success_test_contract_migration_issue(
+    ctx: ToolContext,
+    *,
+    plan: dict[str, Any],
+    subtask: dict[str, Any],
+    subtask_id: str,
+    item: dict[str, Any],
+) -> str | None:
+    try:
+        current_phase = _current_phase_node(ctx, plan)
+        if not isinstance(current_phase, dict):
+            return None
+        if str(current_phase.get("id") or "").strip() != "execute":
+            return None
+        first = _first_incomplete_subtask(_phase_subtasks(current_phase))
+        if not isinstance(first, dict):
+            return None
+        if str(first.get("id") or "").strip() != subtask_id:
+            return None
+        state = _phase_subtask_retry_state(ctx)
+        if not state or int(state.get("failures") or 0) < 1:
+            return None
+        success_text = str(
+            state.get("success_test") or _subtask_success_test_text(subtask)
+        )
+        files = _contract_migration_files_from_patch(item)
+        targeted_files = [
+            file_path
+            for file_path in files
+            if _success_test_mentions_path(success_text, file_path)
+        ]
+        if not targeted_files:
+            return None
+        reason = _contract_migration_reason_from_patch(item)
+        lowered = reason.lower()
+        bad_fragment = next(
+            (
+                fragment
+                for fragment in _ACTIVE_TEST_MIGRATION_BAD_REASON_FRAGMENTS
+                if fragment in lowered
+            ),
+            "",
+        )
+        watcher_payloads = _contract_migration_watcher_payloads(
+            ctx,
+            state=state,
+            subtask_id=subtask_id,
+            success_test=success_text,
+        )
+        has_evidence = (
+            _active_test_migration_has_evidence(reason)
+            or any(
+                _contract_migration_watcher_supports_files(payload, targeted_files)
+                for payload in watcher_payloads
+            )
+            or any(
+                _active_test_migration_has_evidence(
+                    _contract_migration_watcher_evidence_text(payload)
+                )
+                for payload in watcher_payloads
+            )
+        )
+        if not reason or bad_fragment or not has_evidence:
+            return (
+                "declared success-test contract migration for subtask "
+                f"'{subtask_id}' targets {targeted_files} after failing "
+                f"`{success_text}` without proving the generated test is "
+                "internally contradictory, typoed, impossible, or contrary to "
+                "the accepted plan. Repair the implementation against the "
+                "declared success test; do not use contract migration for API "
+                "preference, clean-architecture preference, patch/line-ending "
+                "problems, or import failures."
+            )
+    except Exception:
+        return None
+    return None
+
+
+def _contract_migration_reason_from_patch(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    for key in _CONTRACT_MIGRATION_REASON_KEYS:
+        value = item.get(key)
+        if isinstance(value, dict):
+            text = str(value.get("reason") or value.get("summary") or "").strip()
+        else:
+            text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 __all__ = [
     '_mutate_phase_plan',
     '_add_phase',
@@ -1562,6 +2376,7 @@ __all__ = [
     '_mirror_watcher_review_to_palace',
     '_mirror_phase_plan_mutation_to_palace',
     '_harness_run',
+    '_run_subtask_proof',
     '_mark_subtask_complete',
     '_mirror_phase_subtask_completion_to_palace',
     '_phase_subtask_completion_issue',

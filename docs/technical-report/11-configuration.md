@@ -38,6 +38,8 @@ Configuration is spread across environment variables, CLI flags, YAML files, and
 | `OUROBOROS_PALACE_TRANSIENT_TTL_SEC` | `86400` | TTL for transient store nodes (default 24h) |
 | `OUROBOROS_REFLEXION_PROMOTE_REQUIRES_VERIFY_PASS` | `1` | Safety toggle for reflexion promotion gate |
 
+Durable backend selection (canonical / dual / Hindsight), mirror flags, and release smoke env are documented in **[Durable memory backends](../memory-durable-backends.md)** — not duplicated here.
+
 ### Permissions
 
 | Variable | Default | Purpose |

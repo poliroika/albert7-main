@@ -93,7 +93,15 @@ def test_mcp_discover_endpoint_returns_results(httpd) -> None:
             "topics": ["mcp-server"],
         }
     ]
-    with patch("umbrella.mcp.discovery.discover_servers", return_value=fake):
+    with patch(
+        "umbrella.mcp.discovery.discover_servers",
+        return_value={
+            "results": fake,
+            "warnings": [],
+            "search_queries": ["topic:mcp-server foo"],
+            "status": "ok",
+        },
+    ):
         status, payload = _request(
             port, "POST", "/api/mcp/discover", {"query": "foo", "max_results": 4}
         )

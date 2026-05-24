@@ -12,6 +12,7 @@ SKIP_DIRS = {
     ".git",
     ".hg",
     ".svn",
+    ".memory",
     ".venv",
     "venv",
     "__pycache__",
@@ -55,6 +56,11 @@ def _iter_hashable_files(root: Path) -> Iterable[Path]:
             yield path
 
 
+def _is_hash_skipped_rel(rel: str) -> bool:
+    parts = [part for part in str(rel or "").replace("\\", "/").split("/") if part]
+    return any(part in SKIP_DIRS for part in parts)
+
+
 def workspace_hash(root: str | Path) -> str:
     base = Path(root).resolve()
     rows: list[tuple[str, str]] = []
@@ -75,6 +81,8 @@ def diff_hash(root: str | Path, changed_files: Iterable[str] = ()) -> str:
     for raw in changed_files:
         rel = str(raw or "").replace("\\", "/").strip().lstrip("./")
         if not rel:
+            continue
+        if _is_hash_skipped_rel(rel):
             continue
         path = (base / rel).resolve()
         try:

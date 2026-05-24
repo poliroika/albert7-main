@@ -13,6 +13,7 @@ The repository clone directory name is not fixed (it may still be `albert7`); al
 | Creating Workspaces | [creating-workspaces.md](creating-workspaces.md) | Manual seed creation, programmatic instances, CLI entrypoints |
 | GMAS | [gmas.md](gmas.md) | Framework role, read-only policy, retrieval over GMAS |
 | Umbrella Layer | [umbrella-layer.md](umbrella-layer.md) | Post-refactor subsystems: phases, orchestrator, MemPalace, permissions, retrieval |
+| Durable memory backends | [memory-durable-backends.md](memory-durable-backends.md) | Canonical vs dual vs Hindsight env, product defaults, live smoke tests |
 | Ouroboros | [ouroboros.md](ouroboros.md) | Deep agent per phase, manifest consumption, tool registry, supervisor |
 | Technical Report | [technical-report/README.md](technical-report/README.md) | Multi-page deep dive: 15 chapters covering every aspect of the system |
 

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -31,35 +32,47 @@ log = logging.getLogger(__name__)
 __all__ = ["get_tools", "discover_servers"]
 
 
-def _http_get(url: str) -> bytes:
+def _retry_after_seconds(headers: dict[str, str], *, default: float = 2.5) -> float:
+    raw = (headers.get("Retry-After") or headers.get("retry-after") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1.0, min(float(raw), 10.0))
+    except ValueError:
+        return default
+
+
+def _http_get(url: str) -> tuple[int, bytes]:
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "umbrella-mcp-discovery",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     token = (os.environ.get("GITHUB_TOKEN") or "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"github returned {resp.status}")
-        return resp.read()
+    last_status = 0
+    last_body = b""
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            last_status = int(exc.code or 0)
+            last_body = exc.read() or b""
+            if attempt == 0 and last_status in {403, 429}:
+                time.sleep(
+                    _retry_after_seconds(dict(exc.headers or {}))
+                )
+                continue
+            return last_status, last_body
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"github request failed: {exc}") from exc
+    return last_status, last_body
 
 
-def discover_servers(query: str, *, max_results: int = 5) -> list[dict[str, Any]]:
-    if not query.strip():
-        return []
-    encoded = urllib.parse.quote(f"topic:mcp-server {query}")
-    url = f"https://api.github.com/search/repositories?q={encoded}&sort=stars&per_page={max_results}"
-    try:
-        body = _http_get(url)
-    except Exception:
-        log.warning("MCP discovery search failed", exc_info=True)
-        return []
-    try:
-        payload = json.loads(body.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return []
+def _parse_repo_items(payload: dict[str, Any], *, max_results: int) -> list[dict[str, Any]]:
     items = payload.get("items") or []
     out: list[dict[str, Any]] = []
     for repo in items[:max_results]:
@@ -83,6 +96,76 @@ def discover_servers(query: str, *, max_results: int = 5) -> list[dict[str, Any]
             }
         )
     return out
+
+
+def _search_repositories(q: str, *, max_results: int) -> tuple[list[dict[str, Any]], str | None]:
+    encoded = urllib.parse.quote(q)
+    url = (
+        f"https://api.github.com/search/repositories?q={encoded}"
+        f"&sort=stars&per_page={max_results}"
+    )
+    status, body = _http_get(url)
+    if status != 200:
+        if status in {403, 429}:
+            return [], "rate_limited"
+        return [], "error"
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return [], "error"
+    if not isinstance(payload, dict):
+        return [], "error"
+    return _parse_repo_items(payload, max_results=max_results), None
+
+
+def discover_servers(query: str, *, max_results: int = 5) -> dict[str, Any]:
+    """Search GitHub for MCP servers; works without GITHUB_TOKEN (anonymous API limits)."""
+    query_norm = query.strip()
+    if not query_norm:
+        return {
+            "results": [],
+            "warnings": [],
+            "search_queries": [],
+            "status": "error",
+        }
+    limit = max(1, min(int(max_results), 10))
+    warnings: list[str] = []
+    search_queries: list[str] = []
+    results: list[dict[str, Any]] = []
+    status = "ok"
+
+    primary_q = f"topic:mcp-server {query_norm}"
+    search_queries.append(primary_q)
+    primary, err = _search_repositories(primary_q, max_results=limit)
+    if err:
+        warnings.append(f"github_search_failed:{err}:topic_query")
+        status = err
+    results.extend(primary)
+
+    if not results:
+        fallback_q = f"mcp {query_norm} in:name,description"
+        search_queries.append(fallback_q)
+        fallback, err2 = _search_repositories(fallback_q, max_results=limit)
+        if err2:
+            warnings.append(f"github_search_failed:{err2}:fallback_query")
+            status = err2 if status == "ok" else status
+        results.extend(fallback)
+
+    # Deduplicate by repo name
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in results:
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        deduped.append(item)
+    return {
+        "results": deduped[:limit],
+        "warnings": warnings,
+        "search_queries": search_queries,
+        "status": status if deduped else status,
+    }
 
 
 def _resolve_repo_root(ctx: Any) -> Path:
@@ -109,9 +192,18 @@ def _mcp_discover(
         return json.dumps(
             {"status": "error", "reason": "query is required"}, ensure_ascii=False
         )
-    results = discover_servers(
+    discovery = discover_servers(
         query_norm, max_results=max(1, min(int(max_results or 5), 10))
     )
+    results = list(discovery.get("results") or [])
+    warnings = list(discovery.get("warnings") or [])
+    search_queries = list(discovery.get("search_queries") or [])
+    discovery_status = str(discovery.get("status") or "ok")
+    response_status = "ok"
+    if not results and discovery_status in {"rate_limited", "error"}:
+        response_status = discovery_status
+    elif not results and warnings:
+        response_status = "error"
     # Mirror each discovered MCP server to workspace memory (JSONL +
     # semantic palace). Previously ``mcp_discover`` was completely
     # write-through: results only existed in the tool reply and were
@@ -158,14 +250,13 @@ def _mcp_discover(
             pass
     return json.dumps(
         {
-            "status": "ok",
+            "status": response_status,
             "query": query_norm,
             "intent": str(intent or ""),
             "results": results,
+            "warnings": warnings,
+            "search_queries": search_queries,
             "memory_mirrored_count": mirrored,
-            "github_token_present": bool(
-                (os.environ.get("GITHUB_TOKEN") or "").strip()
-            ),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "next_step": (
                 "If a result looks useful, register it via mcp_install (the user "

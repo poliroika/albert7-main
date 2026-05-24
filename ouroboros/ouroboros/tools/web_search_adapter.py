@@ -98,6 +98,34 @@ def status_from_attempts(results: list[dict[str, Any]], attempts: list[Any]) -> 
     return "no_results"
 
 
+def web_search_via_ddgs(query: str, *, max_results: int = 5) -> dict[str, Any]:
+    """Direct DuckDuckGo search when GMAS is unavailable."""
+    limit = max(1, min(int(max_results), 10))
+    from ddgs import DDGS
+
+    rows: list[dict[str, str]] = []
+    with DDGS(timeout=15) as ddgs:
+        for item in ddgs.text(query, max_results=limit, backend="duckduckgo"):
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "title": str(item.get("title") or ""),
+                    "url": str(item.get("href") or item.get("link") or ""),
+                    "snippet": str(item.get("body") or item.get("snippet") or ""),
+                }
+            )
+    sources = source_rows(rows)
+    return {
+        "status": "ok" if sources else "no_results",
+        "provider": "ddgs_fallback",
+        "answer": fallback_answer_from_results(sources),
+        "sources": sources,
+        "attempts": [{"provider": "ddgs_fallback", "status": "ok", "result_count": len(sources)}],
+        "max_results": limit,
+    }
+
+
 def web_search_via_gmas(
     query: str,
     *,
@@ -107,10 +135,19 @@ def web_search_via_gmas(
     fetch_content: bool = False,
 ) -> dict[str, Any]:
     limit = max(1, min(int(max_results), 10))
-    tool = create_gmas_web_search_tool(
-        max_results=limit,
-        fetch_content=fetch_content,
-    )
+    tool = None
+    try:
+        tool = create_gmas_web_search_tool(
+            max_results=limit,
+            fetch_content=fetch_content,
+        )
+    except Exception as exc:
+        payload = web_search_via_ddgs(query, max_results=limit)
+        payload["gmas_error"] = repr(exc)
+        if payload.get("status") == "ok":
+            return payload
+        payload["status"] = "provider_error"
+        return payload
     try:
         results, attempts = tool._search_with_fallback(
             query,
@@ -147,7 +184,7 @@ def web_search_via_gmas(
                     "attempts": attempt_rows(attempts),
                     "max_results": limit,
                 }
-        return {
+        payload = {
             "status": status_from_attempts(results, attempts),
             "provider": "gmas_web_search",
             "answer": fallback_answer_from_results(sources) if sources else "(no results)",
@@ -155,8 +192,29 @@ def web_search_via_gmas(
             "attempts": attempt_rows(attempts),
             "max_results": limit,
         }
+        if payload["status"] != "ok" and not sources:
+            fallback = web_search_via_ddgs(query, max_results=limit)
+            if fallback.get("sources"):
+                fallback["gmas_status"] = payload["status"]
+                return fallback
+        return payload
+    except Exception as exc:
+        fallback = web_search_via_ddgs(query, max_results=limit)
+        fallback["gmas_error"] = repr(exc)
+        if fallback.get("sources"):
+            return fallback
+        return {
+            "status": "provider_error",
+            "provider": "gmas_web_search",
+            "answer": "(no results)",
+            "sources": [],
+            "attempts": [],
+            "max_results": limit,
+            "error": repr(exc),
+        }
     finally:
-        close = getattr(tool, "close", None)
-        if callable(close):
-            with contextlib.suppress(Exception):
-                close()
+        if tool is not None:
+            close = getattr(tool, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()

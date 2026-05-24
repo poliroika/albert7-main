@@ -534,6 +534,21 @@ def test_list_workspaces_skips_memory_only_workspace_dir(tmp_path) -> None:
     assert "00_workspace_ch" not in ids
 
 
+def test_list_workspaces_includes_task_main_only_workspace_dir(tmp_path) -> None:
+    repo = tmp_path
+    task_only = repo / "workspaces" / "task_only_ws"
+    task_only.mkdir(parents=True)
+    (task_only / "TASK_MAIN.md").write_text("Build the app", encoding="utf-8")
+
+    app = WebBridgeApp(repo)
+    rows = app.list_workspaces()
+    by_id = {row["id"]: row for row in rows}
+
+    assert "task_only_ws" in by_id
+    assert by_id["task_only_ws"]["path"].replace("\\", "/") == "workspaces/task_only_ws"
+    assert by_id["task_only_ws"]["description"] == "Build the app"
+
+
 def test_list_memory_nodes_unknown_workspace_does_not_create_palace(tmp_path) -> None:
     repo = tmp_path
     app = WebBridgeApp(repo)
@@ -1739,6 +1754,30 @@ def test_task_result_to_run_maps_stop_text_to_cancelled(tmp_path) -> None:
         raw_failed_stop_requested, "ws_failed_stop"
     )
     assert failed_stop_row["status"] == "cancelled"
+
+
+def test_task_result_to_run_maps_model_failure_text_to_failed(tmp_path) -> None:
+    app = WebBridgeApp(tmp_path)
+    raw = {
+        "task_id": "phase_web_model_fail",
+        "status": "completed",
+        "result": (
+            "Failed to get a response from model openai/gpt-4 after 3 attempts. "
+            "Last error: connection refused"
+        ),
+        "ts": "2026-05-11T00:07:25Z",
+    }
+    row = app._task_result_to_run(raw, "ws_model_fail")
+    assert row["status"] == "failed"
+
+
+def test_create_workspace_writes_required_files_atomically(tmp_path) -> None:
+    app = WebBridgeApp(tmp_path)
+    ws = app.create_workspace({"name": "Atomic WS", "description": "demo"})
+    root = tmp_path / "workspaces" / ws["id"]
+    assert (root / "workspace.toml").is_file()
+    assert (root / "TASK_MAIN.md").is_file()
+    assert "Atomic WS" in (root / "TASK_MAIN.md").read_text(encoding="utf-8")
 
 
 def test_normalize_run_status_maps_delivery_contract_failures_to_failed() -> None:

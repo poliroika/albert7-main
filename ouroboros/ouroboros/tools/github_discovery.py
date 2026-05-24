@@ -48,8 +48,8 @@ PERMISSIVE_LICENCES = {
     "cc0-1.0",
 }
 
-DEFAULT_BUDGET = 3
-DEFAULT_EXTRACT_BUDGET = 5
+DEFAULT_BUDGET = 10
+DEFAULT_EXTRACT_BUDGET = 12
 CODE_EXTENSIONS = {
     ".py",
     ".js",
@@ -115,7 +115,19 @@ def _consume(
     return True, used + 1
 
 
-def _http_get(url: str, *, timeout: float = 15.0) -> tuple[int, bytes, dict[str, str]]:
+def _retry_after_seconds(headers: dict[str, str], *, default: float = 2.5) -> float:
+    raw = (headers.get("Retry-After") or headers.get("retry-after") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1.0, min(float(raw), 10.0))
+    except ValueError:
+        return default
+
+
+def _http_get(
+    url: str, *, timeout: float = 15.0, allow_retry: bool = True
+) -> tuple[int, bytes, dict[str, str]]:
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "umbrella-github-discovery",
@@ -125,13 +137,29 @@ def _http_get(url: str, *, timeout: float = 15.0) -> tuple[int, bytes, dict[str,
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read(), dict(resp.headers)
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read() or b"", dict(exc.headers or {})
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"github request failed: {exc}") from exc
+    last_status = 0
+    last_body = b""
+    last_headers: dict[str, str] = {}
+    attempts = 2 if allow_retry else 1
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read(), dict(resp.headers)
+        except urllib.error.HTTPError as exc:
+            last_status = int(exc.code or 0)
+            last_body = exc.read() or b""
+            last_headers = dict(exc.headers or {})
+            if (
+                allow_retry
+                and attempt == 0
+                and last_status in {403, 429}
+            ):
+                time.sleep(_retry_after_seconds(last_headers))
+                continue
+            return last_status, last_body, last_headers
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"github request failed: {exc}") from exc
+    return last_status, last_body, last_headers
 
 
 def _normalize_licence(licence: Any) -> str:
@@ -207,21 +235,26 @@ def _write_repo_index(
         return str(target)
 
 
-def _github_search_repositories(query: str, max_repos: int) -> list[dict]:
+def _github_search_repositories(
+    query: str, max_repos: int
+) -> tuple[list[dict], str | None]:
+    """Return (items, error_status). error_status is rate_limited on GitHub throttle."""
     query = query.strip()
     if not query:
-        return []
+        return [], None
     encoded = urllib.parse.quote(query)
     url = f"https://api.github.com/search/repositories?q={encoded}&sort=stars&per_page={max_repos}"
     status, body, _ = _http_get(url)
     if status != 200:
         log.warning("github search returned %s for %s", status, url)
-        return []
+        if status in {403, 429}:
+            return [], "rate_limited"
+        return [], "error"
     try:
         payload = json.loads(body.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
-        return []
-    return list(payload.get("items") or [])[:max_repos]
+        return [], "error"
+    return list(payload.get("items") or [])[:max_repos], None
 
 
 def _github_search_code_in_repo(repo_full_name: str, query: str) -> list[dict]:
@@ -406,7 +439,26 @@ def _github_project_search(
         max_repos = max(1, min(int(max_repos or 5), 10))
     except (TypeError, ValueError):
         max_repos = 5
-    repos = _github_search_repositories(qualifier, max_repos=max_repos)
+    repos, search_error = _github_search_repositories(qualifier, max_repos=max_repos)
+    if search_error:
+        return json.dumps(
+            {
+                "status": search_error,
+                "query": query_norm,
+                "language": language,
+                "results": [],
+                "reason": f"github repository search returned {search_error}",
+                "budget_used": used,
+                "budget_limit": _budget_search(),
+                "next_step": (
+                    "Retry later or narrow the query. When search succeeds, use "
+                    "github_extract_snippets on permissive repos (README.md, "
+                    "src/, examples/) to study patterns before writing new code."
+                ),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+            ensure_ascii=False,
+        )
     items: list[dict] = []
     mirrored_count = 0
     for repo in repos:
@@ -480,8 +532,11 @@ def _github_project_search(
             "memory_mirrored_count": mirrored_count,
             "budget_used": used,
             "budget_limit": _budget_search(),
-            "github_token_present": bool(
-                (os.environ.get("GITHUB_TOKEN") or "").strip()
+            "next_step": (
+                "For 1–2 relevant repos with license_permissive=true, call "
+                "github_extract_snippets(repo_full_name=..., paths=['README.md']) "
+                "or queries=['<task keyword>']) to study architecture and examples; "
+                "adapt patterns, do not copy wholesale."
             ),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },

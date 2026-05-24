@@ -4,6 +4,7 @@ from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.deep_agent_tools import phase_control_actions as _actions
 from umbrella.deep_agent_tools import phase_control_base as _base
 from umbrella.deep_agent_tools import phase_control_research as _research
+from umbrella.deep_agent_tools import phase_control_retry as _retry
 from umbrella.contracts.schemas import (
     COMPLETION_CONTRACT_SCHEMA,
     EVIDENCE_REF_SCHEMA,
@@ -11,7 +12,7 @@ from umbrella.contracts.schemas import (
     VERIFICATION_REPORT_REF_SCHEMA,
 )
 
-_MODULES = (_base, _research, _actions)
+_MODULES = (_base, _research, _retry, _actions)
 
 for _module in _MODULES:
     for _name in getattr(_module, "__all__", ()): 
@@ -333,6 +334,26 @@ def get_tools() -> list[ToolEntry]:
                 },
             },
             handler=_harness_run,
+        ),
+        ToolEntry(
+            name="run_subtask_proof",
+            schema={
+                "name": "run_subtask_proof",
+                "description": (
+                    "Execute the active phase-plan subtask proof command and return "
+                    "ledger-backed verification_report / proof_ref for mark_subtask_complete."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subtask_id": {
+                            "type": "string",
+                            "description": "Defaults to the first pending execute subtask.",
+                        },
+                    },
+                },
+            },
+            handler=_run_subtask_proof,
         ),
     ]
 

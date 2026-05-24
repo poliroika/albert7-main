@@ -101,6 +101,7 @@ def _success_test_observed(*, success_text: str, rows: list[dict[str, Any]]) -> 
         tool
         for tool in (
             "run_workspace_verify",
+            "run_subtask_proof",
             "run_unit_tests",
             "harness_run",
             "shell",

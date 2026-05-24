@@ -12,8 +12,14 @@ Skip this section for ordinary non-agent, non-LLM workspaces. If the current sub
 2. Work only on the first pending subtask.
 3. Use the subtask `proof` contract as the required proof, not a looser equivalent.
 4. Make workspace changes only with workspace-aware write tools.
-5. Run proof through supervisor/verifier-owned tools when possible, especially `run_workspace_verify` for final verification.
-6. Call `mark_subtask_complete(completion_contract={...})` only after fresh ledger-backed evidence exists.
+5. Run the subtask proof with `run_subtask_proof(subtask_id=...)` and use the returned `verification_report` / `proof_ref` in the completion contract. Use `run_workspace_verify` for whole-workspace checks when configured. Prefer these tools over hand-editing `workspace.toml`; autodetect covers common Python `src/<package>/` import checks.
+6. Call `mark_subtask_complete(completion_contract={...})` only after fresh ledger-backed evidence exists. Never invent ledger ids — copy them from `run_subtask_proof`, `run_workspace_verify`, or the latest `ledger_event_id` on `shell` / `apply_workspace_patch` responses.
+
+## workspace.toml (additive verification only)
+
+- You may patch `workspace.toml` during execute to **add or strengthen** `[verification]` steps even when it is not listed on the active subtask, but only if the patch does not delete or downgrade existing checks.
+- Weakening verification (`skip_behavioral`, removing pytest/shell steps, replacing them with file-exists-only) is blocked.
+- If proof still fails, fix code or mutate the subtask proof/plan before trying to weaken verification.
 
 ## Proof Discipline
 
@@ -72,6 +78,12 @@ Use typed evidence refs, not strings:
 
 Freshness matters: proof must be newer than the relevant patch and must match the current `workspace_hash` and `diff_hash`.
 If the subtask intentionally removes workspace files, list them in `deleted_files`; otherwise every created/changed file is treated as expected materialized output.
+
+## Code context before edits
+
+- Before `apply_workspace_patch`, reconcile the active subtask card, its typed `proof`, and fresh evidence: use `read_file` on paths in scope, plus terminal/log output when commands already ran.
+- Do not rely on chat memory or older reads when a file may have changed; stale reads are blocked.
+- After `patch_hunk_mismatch` or `fresh_read_after_hunk_mismatch_required`, re-read the exact file, then patch from current content.
 
 ## Constraints
 

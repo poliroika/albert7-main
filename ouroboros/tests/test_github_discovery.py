@@ -46,7 +46,9 @@ def test_github_project_search_persists_index_md(tmp_path: Path) -> None:
             "license": {"spdx_id": "BSD-3-Clause", "key": "bsd-3-clause"},
         }
     ]
-    with patch.object(gd, "_github_search_repositories", return_value=fake_repos):
+    with patch.object(
+        gd, "_github_search_repositories", return_value=(fake_repos, None)
+    ):
         out = gd._github_project_search(
             ctx, query="web framework", language="python", max_repos=1
         )
@@ -98,7 +100,9 @@ def test_github_project_search_uses_workspace_drive_not_repo_dir_memory(
         }
     ]
 
-    with patch.object(gd, "_github_search_repositories", return_value=fake_repos):
+    with patch.object(
+        gd, "_github_search_repositories", return_value=(fake_repos, None)
+    ):
         payload = json.loads(gd._github_project_search(ctx, query="pptx", max_repos=1))
 
     expected = (
@@ -129,9 +133,11 @@ def test_github_project_search_accepts_max_results_alias(tmp_path: Path) -> None
 
     def fake_search(query: str, *, max_repos: int):
         requested.append(max_repos)
-        return []
+        return [], None
 
-    with patch.object(gd, "_github_search_repositories", side_effect=fake_search):
+    with patch.object(
+        gd, "_github_search_repositories", side_effect=fake_search
+    ):
         payload = json.loads(
             gd._github_project_search(
                 ctx,
@@ -316,7 +322,7 @@ def test_github_project_search_budget_exhausted(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setenv("OUROBOROS_GITHUB_DISCOVERY_BUDGET", "1")
     gd.reset_budget("task_gh_b")
     ctx = _ctx(tmp_path, "task_gh_b")
-    with patch.object(gd, "_github_search_repositories", return_value=[]):
+    with patch.object(gd, "_github_search_repositories", return_value=([], None)):
         a = json.loads(gd._github_project_search(ctx, query="q1"))
         b = json.loads(gd._github_project_search(ctx, query="q2"))
     assert a["status"] == "ok"
@@ -346,11 +352,32 @@ def test_github_project_search_attempts_memory_mirror(tmp_path: Path) -> None:
             "license": {"spdx_id": "MIT", "key": "mit"},
         }
     ]
-    with patch.object(gd, "_github_search_repositories", return_value=fake_repos):
+    with patch.object(
+        gd, "_github_search_repositories", return_value=(fake_repos, None)
+    ):
         out = gd._github_project_search(ctx, query="demo", max_repos=1)
     payload = json.loads(out)
     assert payload["status"] == "ok"
+    assert "github_extract_snippets" in payload.get("next_step", "")
     assert "memory_mirrored_count" in payload, (
         "github_project_search must report memory mirror outcome so the "
         "discovery gate / future recall can rely on it"
     )
+
+
+def test_default_github_discovery_budgets() -> None:
+    assert gd.DEFAULT_BUDGET == 10
+    assert gd.DEFAULT_EXTRACT_BUDGET == 12
+    assert gd._budget_search() == 10
+    assert gd._budget_extract() == 12
+
+
+def test_github_project_search_rate_limited(tmp_path: Path) -> None:
+    gd.reset_budget("task_gh_rl")
+    ctx = _ctx(tmp_path, "task_gh_rl")
+    with patch.object(
+        gd, "_github_search_repositories", return_value=([], "rate_limited")
+    ):
+        payload = json.loads(gd._github_project_search(ctx, query="civ game"))
+    assert payload["status"] == "rate_limited"
+    assert payload["results"] == []

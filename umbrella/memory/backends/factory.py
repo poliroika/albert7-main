@@ -1,5 +1,6 @@
 """Factory helpers for durable memory backends."""
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,8 @@ from umbrella.memory.backends.dual_write import DualWriteDurableBackend
 from umbrella.memory.backends.hindsight import HindsightBackend
 from umbrella.memory.kernel.telemetry import record_memory_event
 
+log = logging.getLogger(__name__)
+
 
 def create_durable_backend(
     repo_root: Path,
@@ -16,11 +19,29 @@ def create_durable_backend(
     workspace_id: str = "",
     mode: str | None = None,
 ) -> Any:
+    """Select durable memory backend.
+
+    See ``docs/memory-durable-backends.md`` for env tables and product defaults.
+    """
     selected = (mode or os.getenv("UMBRELLA_MEMORY_DURABLE_BACKEND", "canonical")).strip().lower()
     canonical = CanonicalMemoryBackend(repo_root=repo_root, workspace_id=workspace_id)
     if selected == "canonical":
         return canonical
     if selected == "hindsight":
+        if os.getenv("UMBRELLA_ALLOW_HINDSIGHT_ONLY", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            log.warning(
+                "hindsight-only disabled (canonical is source of truth); "
+                "set UMBRELLA_ALLOW_HINDSIGHT_ONLY=1 for experimental export/dev"
+            )
+            return canonical
+        log.warning(
+            "Using hindsight-only durable backend (experimental; not source of truth)"
+        )
         return HindsightBackend.from_env(repo_root=repo_root, workspace_id=workspace_id)
     if selected == "dual":
         return DualWriteDurableBackend(

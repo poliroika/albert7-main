@@ -1,6 +1,7 @@
 """Workspace file listing, preview, and read-cache helpers."""
 
 import hashlib
+import time
 
 from umbrella.deep_agent_tools.workspace_common import *
 
@@ -102,6 +103,7 @@ def _mark_workspace_file_read(
             ws_digests[norm] = {
                 "sha256": str(sha256 or ""),
                 "mtime_ns": int(mtime_ns or 0),
+                "read_at": time.time(),
             }
     except Exception:
         log.debug("Failed to mark workspace file read", exc_info=True)
@@ -126,6 +128,24 @@ def _workspace_file_was_read(ctx: Any, workspace_id: str, rel_path: str) -> bool
     except Exception:
         log.debug("Failed to inspect workspace read set", exc_info=True)
     return False
+
+
+def _workspace_file_read_at(ctx: Any, workspace_id: str, rel_path: str) -> float:
+    try:
+        view = getattr(ctx, "loop_state_view", None)
+        if not isinstance(view, dict):
+            return 0.0
+        digests = view.get("file_read_digests")
+        if not isinstance(digests, dict):
+            return 0.0
+        norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
+        marker = digests.get(str(workspace_id), {}).get(norm)
+        if not isinstance(marker, dict):
+            return 0.0
+        return float(marker.get("read_at") or 0.0)
+    except Exception:
+        log.debug("Failed to inspect workspace read timestamp", exc_info=True)
+        return 0.0
 
 
 def read_workspace_file(
@@ -304,5 +324,6 @@ __all__ = [
     '_read_cache_clear',
     '_mark_workspace_file_read',
     '_workspace_file_was_read',
+    '_workspace_file_read_at',
     'read_workspace_file',
 ]

@@ -159,6 +159,34 @@ def read_supervisor_ledger_events(
     return rows
 
 
+def supervisor_ledger_ref(event: SupervisorLedgerEvent) -> dict[str, str]:
+    """Portable ids for CompletionContract / tool JSON payloads."""
+
+    return {
+        "ledger_event_id": event.event_id,
+        "ledger_event_hash": event.event_hash,
+    }
+
+
+def latest_ledger_event_id(
+    *,
+    repo_root: str | Path,
+    workspace_id: str,
+    tool: str | None = None,
+) -> str:
+    """Return the most recent ledger event id, optionally filtered by tool name."""
+
+    for row in reversed(
+        read_supervisor_ledger_events(repo_root=repo_root, workspace_id=workspace_id)
+    ):
+        if tool is not None and str(row.get("tool") or "") != tool:
+            continue
+        event_id = str(row.get("event_id") or "").strip()
+        if event_id:
+            return event_id
+    return ""
+
+
 def find_supervisor_ledger_event(
     *, repo_root: str | Path, workspace_id: str, event_id: str
 ) -> dict[str, Any] | None:
@@ -179,6 +207,8 @@ __all__ = [
     "SupervisorLedgerEvent",
     "append_supervisor_ledger_event",
     "find_supervisor_ledger_event",
+    "latest_ledger_event_id",
     "read_supervisor_ledger_events",
     "supervisor_ledger_path",
+    "supervisor_ledger_ref",
 ]

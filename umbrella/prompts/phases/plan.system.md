@@ -66,6 +66,7 @@ Allowed `oracle.required_properties` values include:
 - Keep the plan flat: one top-level `subtasks` array.
 - Prefer 8-16 meaningful implementation leaves for large app builds.
 - Keep implementation leaves narrow, usually 2-4 closely related files plus matching tests.
+- For the first greenfield scaffold subtask (`project-setup`, `scaffold`, or equivalent), declare `workspace.toml` and `pyproject.toml` in `files_to_change`/`files_to_create` when the workspace needs explicit verification or package layout. Umbrella autodetects common Python `src/<package>/` checks, but explicit `[verification]` steps belong in the plan when behavioral proof is required early.
 - Tests belong under `tests/` or the established frontend test layout.
 - For greenfield Python application/library code, you MUST use exactly one canonical top-level `src/<package>/...` package root.
 - Do not create `backend/src/...`, `server/src/...`, `api/src/...`, bare `src/*.py`, `src/__init__.py`, or parallel package roots such as `src/api/...` and `src/agents/...`.

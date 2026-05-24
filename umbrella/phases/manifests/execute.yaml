@@ -17,6 +17,7 @@ allowed_tools:
   - repo_read
   - repo_list
   - run_workspace_verify
+  - run_subtask_proof
   - run_unit_tests
   - palace_search
   - palace_add
@@ -64,7 +65,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_unit_tests, palace_search, palace_add, palace_link, mutate_phase_plan, add_phase, loop_back_to, request_extra_subtask, mark_subtask_complete, harness_run, enable_tools, mcp_install, mcp_discover, register_temp_tool, web_search, deep_search, request_watcher_review, get_gmas_context, search_gmas_knowledge]
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, run_unit_tests, palace_search, palace_add, palace_link, mutate_phase_plan, add_phase, loop_back_to, request_extra_subtask, mark_subtask_complete, harness_run, enable_tools, mcp_install, mcp_discover, register_temp_tool, web_search, deep_search, request_watcher_review, get_gmas_context, search_gmas_knowledge]
     - deny_tools: [wipe_workspace, reset_palace]
     - deny_path: ["**/.env*", "**/secrets/**"]
 

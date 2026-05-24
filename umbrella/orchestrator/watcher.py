@@ -88,6 +88,10 @@ class WatcherPollLoop:
         return self._invoke_llm_for_trigger(trigger, phase=phase)
 
     def _invoke_llm_for_trigger(self, trigger: TriggerEvent, *, phase: str) -> WatcherSignal | None:
+        auto_signal = self._deterministic_signal_for_trigger(trigger, phase=phase)
+        if auto_signal is not None:
+            self.write_signal(auto_signal)
+            return auto_signal
         try:
             system_prompt = self._load_watcher_prompt()
             user_msg = json.dumps(
@@ -162,6 +166,43 @@ class WatcherPollLoop:
                 if keyword in content.lower():
                     return keyword, content[:200]
             return "ok", ""
+
+    def _deterministic_signal_for_trigger(
+        self, trigger: TriggerEvent, *, phase: str
+    ) -> WatcherSignal | None:
+        if trigger.kind == "repeat_semantic_failure":
+            category = str((trigger.context or {}).get("category") or "").strip()
+            reason = (
+                "Repeated semantic tool failure"
+                + (f" ({category})" if category else "")
+                + (
+                    f" during phase `{phase}`. Abort the phase so the runner can "
+                    "repair the missing evidence/context instead of spending more "
+                    "rounds on the same rejected contract."
+                )
+            )
+            return WatcherSignal(
+                signal_id=str(uuid.uuid4()),
+                created_at=time.time(),
+                kind="abort_phase",
+                reason=reason,
+                trigger=trigger.kind,
+                payload=trigger.context,
+            )
+        if trigger.kind == "repeat_structural_layout":
+            return WatcherSignal(
+                signal_id=str(uuid.uuid4()),
+                created_at=time.time(),
+                kind="abort_phase",
+                reason=(
+                    "Repeated structural layout block during execute; aborting "
+                    "phase so the next attempt can inspect the declared layout "
+                    "policy and repair the file placement."
+                ),
+                trigger=trigger.kind,
+                payload=trigger.context,
+            )
+        return None
 
     def stop(self) -> None:
         self._running = False

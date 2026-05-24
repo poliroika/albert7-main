@@ -48,9 +48,12 @@ class _LauncherHandle:
         self._task_id = task_id
         self._timeout = timeout
 
-    def wait(self) -> dict[str, Any]:
-        result = self._launcher.wait_for_result(self._task_id, timeout=self._timeout)
+    def wait(self, timeout: float | None = None) -> dict[str, Any] | None:
+        wait_timeout = self._timeout if timeout is None else timeout
+        result = self._launcher.wait_for_result(self._task_id, timeout=wait_timeout)
         if result is None:
+            if timeout is not None:
+                return None
             return {"status": "error", "error": "launcher timeout", "task_id": self._task_id}
         return result
 
@@ -240,144 +243,6 @@ class PhaseRunner:
             )
         )
 
-    @staticmethod
-    def _gmas_prelude_info_for_task(task: dict[str, Any]) -> dict[str, str | bool]:
-        overlays = task.get("context_overlays")
-        phase_node = overlays.get("phase_node") if isinstance(overlays, dict) else None
-        if isinstance(phase_node, dict):
-            for raw_card in phase_node.get("subtasks") or []:
-                if not isinstance(raw_card, dict):
-                    continue
-                if str(raw_card.get("status") or "").lower() == "done":
-                    continue
-                parts = [
-                    raw_card.get("id"),
-                    raw_card.get("title"),
-                    raw_card.get("goal"),
-                    json_ready(raw_card.get("proof")),
-                ]
-                text = " ".join(str(part or "") for part in parts).strip()
-                subtask_id = str(raw_card.get("id") or "").strip()
-                if text:
-                    return {
-                        "query": "GMAS context before execute workspace write: "
-                        + text[:500],
-                        "subtask_id": subtask_id,
-                        "requires_context": PhaseRunner._gmas_subtask_requires_context(
-                            raw_card
-                        ),
-                    }
-        return {
-            "query": (
-                "GMAS context before execute workspace write: LLM-backed "
-                "multi-agent game bots using inherited runtime aliases"
-            ),
-            "subtask_id": "",
-            "requires_context": True,
-        }
-
-    @staticmethod
-    def _gmas_prelude_query_for_task(task: dict[str, Any]) -> str:
-        return str(PhaseRunner._gmas_prelude_info_for_task(task).get("query") or "")
-
-    def _inject_gmas_prewrite_context(self, task: dict[str, Any]) -> None:
-        overlays = task.get("context_overlays")
-        if not isinstance(overlays, dict):
-            return
-        if overlays.get("gmas_prewrite_required") is not True:
-            return
-        phase_node = overlays.get("phase_node")
-        manifest_id = ""
-        if isinstance(phase_node, dict):
-            manifest_id = str(phase_node.get("manifest_id") or "")
-        if manifest_id != "execute":
-            return
-        prelude_info = self._gmas_prelude_info_for_task(task)
-        active_subtask_id = str(prelude_info.get("subtask_id") or "")
-        if prelude_info.get("requires_context") is False:
-            overlays["gmas_prewrite_context_injected"] = "not_required_for_subtask"
-            overlays["gmas_prewrite_context_subtask_id"] = active_subtask_id
-            return
-        task_id = str(task.get("id") or "").strip()
-        if self._tool_log_has_tool(
-            task_id=task_id,
-            tool_names={"get_gmas_context", "search_gmas_knowledge"},
-            active_subtask_id=active_subtask_id,
-            require_successful_context=True,
-        ):
-            overlays["gmas_prewrite_context_injected"] = "already_present"
-            overlays["gmas_prewrite_context_subtask_id"] = active_subtask_id
-            return
-        query = str(prelude_info.get("query") or "")
-        try:
-            from umbrella.retrieval.gmas_context import build_gmas_context
-
-            payload = build_gmas_context(
-                self._repo_root,
-                query,
-                max_results=4,
-                max_chars_per_hit=6000,
-            )
-            if isinstance(payload, dict):
-                payload = dict(payload)
-                payload.setdefault("status", "ok")
-                if active_subtask_id:
-                    payload["active_subtask_id"] = active_subtask_id
-            status = "ok"
-        except Exception as exc:
-            log.debug("GMAS execute prelude retrieval failed", exc_info=True)
-            payload = {"status": "error", "error": str(exc), "query": query}
-            status = "error"
-        payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
-        task["input"] = (
-            str(task.get("input") or "")
-            + "\n\n## Umbrella execute prelude: GMAS context\n"
-            + "Umbrella detected that the current execute subtask needs "
-            + "GMAS/LLM agent context and retrieved it before the worker can "
-            + "write that subtask. This satisfies the first-write GMAS gate "
-            + "for the scoped subtask; "
-            + "refresh with `get_gmas_context`/`search_gmas_knowledge` before "
-            + "writing task-specific GMAS agent code if the prelude is not "
-            + "specific enough.\n"
-            + "```json\n"
-            + payload_text[:12000]
-            + ("\n...[truncated]" if len(payload_text) > 12000 else "")
-            + "\n```\n"
-        )
-        overlays["gmas_prewrite_context_injected"] = status
-        overlays["gmas_prewrite_context_query"] = query
-        overlays["gmas_prewrite_context_subtask_id"] = active_subtask_id
-        log_dir = self._drive_root / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        row = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "task_id": task_id,
-            "tool": "get_gmas_context",
-            "args": {
-                "query": query,
-                "max_results": 4,
-                "injected_by": "umbrella_phase_prelude",
-                "active_subtask_id": active_subtask_id,
-            },
-            "result_preview": json.dumps(
-                {
-                    "status": status,
-                    "injected_by": "umbrella_phase_prelude",
-                    "query": query,
-                    "active_subtask_id": active_subtask_id,
-                    "recommended_pattern": payload.get("recommended_pattern")
-                    if isinstance(payload, dict)
-                    else None,
-                    "confidence": payload.get("confidence")
-                    if isinstance(payload, dict)
-                    else None,
-                },
-                ensure_ascii=False,
-            ),
-        }
-        with (log_dir / "tools.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-
     def _read_phase_control_records(
         self,
         *,
@@ -536,6 +401,40 @@ class PhaseRunner:
         if sources:
             merged["sources"] = sources
         return merged
+
+    def _outcome_model_response_failure(self, outcome: dict[str, Any]) -> str:
+        from ouroboros.model_failure import is_model_response_failure
+
+        result_text = str(
+            outcome.get("result")
+            or outcome.get("final_message")
+            or outcome.get("error")
+            or ""
+        )
+        if is_model_response_failure(result_text):
+            return result_text.splitlines()[0].strip() or "model response failure"
+        task_id = str(outcome.get("task_id") or "").strip()
+        if not task_id:
+            return ""
+        from umbrella.artifacts.task_ids import task_artifact_stem
+
+        result_file = (
+            self._drive_root
+            / "task_results"
+            / f"{task_artifact_stem(task_id)}.json"
+        )
+        if not result_file.exists():
+            return ""
+        try:
+            payload = json.loads(result_file.read_text(encoding="utf-8"))
+        except Exception:
+            log.debug("Failed to read task result for model-failure check", exc_info=True)
+            return ""
+        if str(payload.get("status") or "").lower() == "failed":
+            persisted = str(payload.get("result") or "")
+            if is_model_response_failure(persisted):
+                return persisted.splitlines()[0].strip() or "model response failure"
+        return ""
 
     def _phase_completion_failure(
         self,
@@ -1812,7 +1711,6 @@ class PhaseRunner:
                 + "\n```\n"
                 + "Do not finish this phase until the required completion calls are accepted with concrete verification evidence.\n"
             )
-        self._inject_gmas_prewrite_context(base_task)
         base_task["input"] = (base_task.get("input") or "") + f"\n\n## User task\n{task_input}\n"
 
         if self._candidates_per_phase > 1:
@@ -1836,6 +1734,23 @@ class PhaseRunner:
                 phase=phase_node.id,
             ))
             return None
+
+        model_failure = self._outcome_model_response_failure(outcome)
+        if model_failure:
+            phase_node.status = "failed"
+            phase_node.ended_at = time.time()
+            save_plan(plan, self._drive_root)
+            yield self._emit(ResultEnvelope.failure(
+                ErrorCode.WORKER_PANIC,
+                model_failure,
+                run_id=run_id,
+                phase=phase_node.id,
+            ))
+            return PhaseResult(
+                phase_id=phase_node.id,
+                outcome="failed",
+                error=model_failure,
+            )
 
         completion_failure = self._phase_completion_failure(
             phase_node=phase_node,
@@ -2062,9 +1977,25 @@ class PhaseRunner:
                 if hasattr(launcher, "submit_task") else None
             if handle is None:
                 return {"status": "error", "error": "launcher.submit_task returned None"}
-            outcome = handle.wait()
-            outcome["event_count"] = len(outcome.get("events") or [])
-            return outcome
+            phase_started_at = float(phase_node.started_at or time.time())
+            poll_sec = max(1, int(self._watcher._poll_sec))
+            while True:
+                outcome = handle.wait(timeout=float(poll_sec))
+                if outcome is not None:
+                    outcome["event_count"] = len(outcome.get("events") or [])
+                    return outcome
+                self._watcher.tick(
+                    phase=phase_node.id,
+                    phase_started_at=phase_started_at,
+                )
+                pending = self._watcher.read_pending_signal()
+                if pending and pending.kind == "abort_phase":
+                    return {
+                        "status": "error",
+                        "error": pending.reason or "watcher abort_phase",
+                        "task_id": task.get("id"),
+                        "watcher_signal": pending.kind,
+                    }
         except Exception as exc:
             log.error("Phase %s launcher invocation failed", phase_node.id, exc_info=True)
             return {"status": "error", "error": str(exc)}

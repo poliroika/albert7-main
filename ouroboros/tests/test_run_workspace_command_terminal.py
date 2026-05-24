@@ -2893,6 +2893,52 @@ def test_apply_workspace_patch_blocks_future_subtask_file_before_current_complet
     assert not (ws_dir / "frontend" / "src" / "App.tsx").exists()
 
 
+def test_apply_workspace_patch_allows_additive_workspace_toml_out_of_scope(
+    workspace,
+) -> None:
+    ctx, ws_dir, ws_id = workspace
+    _phase_run_ctx(ctx)
+    _write_execute_phase_with_declared_subtasks(ctx.drive_root)
+    (ws_dir / "workspace.toml").write_text(
+        """[[verification.steps]]
+name = "smoke"
+kind = "shell"
+command = ["python", "-c", "print(1)"]
+""",
+        encoding="utf-8",
+    )
+    umbrella_tools.read_workspace_file(
+        ctx, workspace_id=ws_id, file_path="workspace.toml"
+    )
+    new_toml = (
+        "[[verification.steps]]\n"
+        'name = "smoke"\n'
+        'kind = "shell"\n'
+        'command = ["python", "-c", "print(1)"]\n'
+        "\n"
+        "[[verification.steps]]\n"
+        'name = "pkg"\n'
+        'kind = "import_check"\n'
+        'command = ["python", "-c", "import civgame"]\n'
+    )
+    raw = umbrella_tools.apply_workspace_patch(
+        ctx,
+        workspace_id=ws_id,
+        patch=(
+            "*** Begin Patch\n"
+            "*** Delete File: workspace.toml\n"
+            "*** Add File: workspace.toml\n"
+            + "".join(f"+{line}\n" for line in new_toml.splitlines())
+            + "*** End Patch\n"
+        ),
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "applied", payload
+    text = (ws_dir / "workspace.toml").read_text(encoding="utf-8")
+    assert 'name = "pkg"' in text
+    assert 'name = "smoke"' in text
+
+
 def test_apply_workspace_patch_allows_active_subtask_declared_file(workspace) -> None:
     ctx, ws_dir, ws_id = workspace
     _phase_run_ctx(ctx)
@@ -4791,3 +4837,111 @@ def test_commit_workspace_changes_disabled_by_default(workspace) -> None:
     payload = json.loads(raw)
     assert payload["status"] == "blocked"
     assert payload["reason"] == "git_commit_disabled_by_policy"
+
+
+def test_apply_workspace_patch_requires_subtask_context_reads(workspace) -> None:
+    ctx, ws_dir, ws_id = workspace
+    _phase_run_ctx(ctx)
+    state = ctx.drive_root / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "run_id": "phase_web_e3137dc0",
+                "nodes": [
+                    {"id": "preflight", "status": "done"},
+                    {
+                        "id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {"id": "1.1", "status": "done"},
+                            {
+                                "id": "1.2",
+                                "status": "pending",
+                                "title": "Edit engine module",
+                                "files_to_change": ["tests/test_engine.py"],
+                                "success_test": {
+                                    "kind": "cmd",
+                                    "value": "python -m pytest tests/test_engine.py -q",
+                                },
+                            },
+                        ],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target = ws_dir / "tests" / "test_engine.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    raw = umbrella_tools.apply_workspace_patch(
+        ctx,
+        workspace_id=ws_id,
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: tests/test_engine.py\n"
+            "@@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+            "*** End Patch\n"
+        ),
+    )
+
+    payload = json.loads(raw)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "subtask_context_read_required"
+    assert "tests/test_engine.py" in payload["missing_reads"]
+
+
+def test_apply_workspace_patch_requires_fresh_read_after_hunk_mismatch(
+    workspace,
+) -> None:
+    ctx, ws_dir, ws_id = workspace
+    _phase_run_ctx(ctx)
+    target = ws_dir / "tests" / "test_engine.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("value = 1\n", encoding="utf-8")
+    umbrella_tools.read_workspace_file(
+        ctx, workspace_id=ws_id, file_path="tests/test_engine.py"
+    )
+    logs = ctx.drive_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    with (logs / "tools.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "ts": "2099-05-20T08:00:00+00:00",
+                    "task_id": "phase_web_e3137dc0:execute",
+                    "tool": "apply_workspace_patch",
+                    "result_preview": json.dumps(
+                        {
+                            "status": "blocked",
+                            "reason": "patch_hunk_mismatch",
+                            "file_path": "tests/test_engine.py",
+                            "error": "failed to match patch hunk in tests/test_engine.py",
+                        }
+                    ),
+                }
+            )
+            + "\n"
+        )
+
+    raw = umbrella_tools.apply_workspace_patch(
+        ctx,
+        workspace_id=ws_id,
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: tests/test_engine.py\n"
+            "@@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+            "*** End Patch\n"
+        ),
+    )
+
+    payload = json.loads(raw)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "fresh_read_after_hunk_mismatch_required"
+    assert payload["file_path"] == "tests/test_engine.py"

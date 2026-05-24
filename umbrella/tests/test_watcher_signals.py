@@ -67,3 +67,27 @@ def test_stall_detection(tmp_drive):
     ev = triggers.check(phase="execute", phase_started_at=time.time() - 10)
     assert ev is not None
     assert ev.kind == "stall"
+
+
+def test_repeat_semantic_failure_auto_aborts(tmp_drive):
+    tools = tmp_drive / "logs" / "tools.jsonl"
+    row = {
+        "tool": "submit_research_summary",
+        "result_preview": (
+            "ERROR: research summary references finding id(s) that were not "
+            "accepted by palace_add as research_finding for this task."
+        ),
+    }
+    tools.write_text(
+        "\n".join(json.dumps(row) for _ in range(3)) + "\n",
+        encoding="utf-8",
+    )
+    watcher = WatcherPollLoop(tmp_drive, poll_sec=1)
+
+    signal = watcher.tick(phase="research", phase_started_at=time.time() - 5)
+
+    assert signal is not None
+    assert signal.kind == "abort_phase"
+    assert signal.trigger == "repeat_semantic_failure"
+    assert "research_memory_provenance_error" in signal.reason
+    assert watcher.read_pending_signal() is not None

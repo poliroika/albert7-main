@@ -52,6 +52,8 @@ The orchestrator drives a run from start to finish: loading the PhasePlan, spawn
 
 Unified memory facade with multiple Chroma stores, SQLite transient + graph, and tier/scope semantics.
 
+Durable writes use the canonical kernel writer (`umbrella/memory/kernel/writer.py`). Backend mode and Hindsight env: [Durable memory backends](memory-durable-backends.md).
+
 | Module | Purpose |
 |--------|---------|
 | `facade.py` | `MemPalace`: add, search, recall, link, walk, promote, expire_scope |

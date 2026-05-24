@@ -14,6 +14,7 @@ from umbrella.enforcement import (
     restore_snapshot_changes,
     snapshot_workspace,
 )
+from umbrella.enforcement.ledger import supervisor_ledger_ref
 
 
 @contextmanager
@@ -701,7 +702,7 @@ def run_workspace_command(
             except Exception:
                 log.debug("record enforcement event failed", exc_info=True)
             try:
-                append_supervisor_ledger_event(
+                blocked_ledger = append_supervisor_ledger_event(
                     repo_root=repo_root,
                     workspace_id=workspace_id,
                     actor="agent",
@@ -721,6 +722,7 @@ def run_workspace_command(
                     "supervisor ledger append failed for blocked command",
                     exc_info=True,
                 )
+                blocked_ledger = None
             payload = blocked_payload(
                 enforcement_issues,
                 tool_name="run_workspace_command",
@@ -737,6 +739,8 @@ def run_workspace_command(
                     "rollback": rollback,
                 }
             )
+            if blocked_ledger is not None:
+                payload.update(supervisor_ledger_ref(blocked_ledger))
             return _json(payload)
 
         output = result.output
@@ -786,7 +790,7 @@ def run_workspace_command(
         if result.truncated_head or result.truncated_tail:
             payload["truncated"] = True
         try:
-            append_supervisor_ledger_event(
+            command_ledger = append_supervisor_ledger_event(
                 repo_root=repo_root,
                 workspace_id=workspace_id,
                 actor="agent",
@@ -800,6 +804,14 @@ def run_workspace_command(
                 },
                 touched_files=[change.path for change in changes],
             )
+            payload.update(supervisor_ledger_ref(command_ledger))
+            payload["ledger_ref"] = {
+                "ref_type": "ledger_event",
+                "ref_id": command_ledger.event_id,
+                "hash": command_ledger.event_hash,
+                "produced_by": "agent",
+                "phase": phase,
+            }
         except Exception:
             log.debug("supervisor ledger append failed for command", exc_info=True)
         return _json(payload)

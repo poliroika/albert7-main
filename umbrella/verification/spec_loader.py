@@ -1024,6 +1024,49 @@ def _autodetect_smoke_shell_step(workspace_path: Path) -> VerificationStep | Non
     )
 
 
+def _python_package_name_from_pyproject(workspace_path: Path) -> str:
+    pyproject = workspace_path / "pyproject.toml"
+    if not pyproject.is_file():
+        return ""
+    try:
+        with pyproject.open("rb") as fh:
+            data: dict[str, Any] = _toml.load(fh)
+    except Exception:
+        log.debug("failed to parse pyproject.toml for package name", exc_info=True)
+        return ""
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return ""
+    name = str(project.get("name") or "").strip()
+    if not name or not name.replace("-", "").replace("_", "").isalnum():
+        return ""
+    return name.replace("-", "_")
+
+
+def _autodetect_python_src_package_import_step(
+    workspace_path: Path,
+) -> VerificationStep | None:
+    """Import-check for canonical ``src/<package>/`` layouts (hatchling/poetry)."""
+
+    package = _python_package_name_from_pyproject(workspace_path)
+    if not package:
+        return None
+    init_py = workspace_path / "src" / package / "__init__.py"
+    if not init_py.is_file():
+        return None
+    return VerificationStep(
+        kind=VerificationStepKind.IMPORT_CHECK,
+        name=f"import {package}",
+        command=[
+            *_python_command(workspace_path),
+            "-c",
+            f"import {package}; print('ok')",
+        ],
+        timeout_seconds=30,
+        optional=False,
+    )
+
+
 def _autodetect_pytest_step(workspace_path: Path) -> VerificationStep | None:
     for candidate in ("test_smoke.py", "tests", "test"):
         target = workspace_path / candidate
@@ -1052,6 +1095,10 @@ def autodetect_steps(workspace_path: Path) -> list[VerificationStep]:
     pytest_step = _autodetect_pytest_step(workspace_path)
     if pytest_step is not None:
         steps.append(pytest_step)
+
+    src_pkg_step = _autodetect_python_src_package_import_step(workspace_path)
+    if src_pkg_step is not None:
+        steps.append(src_pkg_step)
 
     http_step = _autodetect_http_step(workspace_path)
     if http_step is not None:

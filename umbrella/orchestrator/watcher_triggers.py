@@ -48,6 +48,19 @@ class WatcherTriggers:
 
         tools_path = self._drive / "logs" / "tools.jsonl"
         if tools_path.exists():
+            semantic_errors = _recent_semantic_error_signatures(
+                tools_path, n=self._repeat_m + 1
+            )
+            if len(semantic_errors) >= self._repeat_m:
+                recent = semantic_errors[-self._repeat_m :]
+                if len(set(recent)) == 1:
+                    category = recent[-1].split(":", 1)[0]
+                    return TriggerEvent("repeat_semantic_failure", {
+                        "phase": phase,
+                        "signature": recent[-1],
+                        "category": category,
+                        "count": self._repeat_m,
+                    })
             recent_errors = _recent_error_signatures(tools_path, n=self._repeat_m + 1)
             if len(recent_errors) >= self._repeat_m:
                 if len(set(recent_errors[-self._repeat_m:])) == 1:
@@ -131,6 +144,105 @@ def _recent_error_signatures(tools_path: pathlib.Path, *, n: int) -> list[str]:
                 sigs.append(sig)
         except Exception:
             pass
+        if len(sigs) >= n:
+            break
+    return list(reversed(sigs))
+
+
+def _json_obj_from_preview(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    text = value.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _semantic_error_code(row: dict[str, Any]) -> str:
+    tool = str(row.get("tool") or "")
+    raw = row.get("result_preview") or row.get("result") or row.get("output") or ""
+    payload = _json_obj_from_preview(raw)
+    raw_text = str(raw or "").strip()
+    blob = json.dumps({"row": row, "payload": payload}, ensure_ascii=False).lower()
+    if tool == "run_subtask_proof" and payload.get("passed") is False:
+        shell_result = payload.get("shell_result")
+        shell_blob = (
+            json.dumps(shell_result, ensure_ascii=False).lower()
+            if isinstance(shell_result, dict)
+            else ""
+        )
+        if "attributeerror" in shell_blob:
+            return "proof_runtime_attribute_error"
+        if "modulenotfounderror" in shell_blob or "importerror" in shell_blob:
+            return "proof_runtime_import_error"
+        if "typeerror" in shell_blob:
+            return "proof_runtime_type_error"
+        return "proof_not_passing"
+    if "workspace_hash_mismatch" in blob or "diff_hash_mismatch" in blob:
+        return "completion_hash_mismatch"
+    if "completion_contract" in blob and (
+        "required" in blob or "missing" in blob or "invalid" in blob
+    ):
+        return "completion_contract_invalid"
+    if "fake_evidence_ref" in blob:
+        return "fake_evidence_ref"
+    if "subtask materialization missing" in blob or "subtask_materialization_missing" in blob:
+        return "materialization_missing"
+    if "verification_report.passed must be true" in blob:
+        return "completion_with_failed_proof"
+    if "gmas_context_before_first_write" in blob:
+        return "context_gate_gmas_not_followed"
+    if "subtask_context_read_required" in blob:
+        return "context_gate_read_not_followed"
+    if "patch_hunk_mismatch" in blob:
+        return "patch_hunk_mismatch"
+    if raw_text.startswith("ERROR:"):
+        if tool in {"palace_add", "submit_research_summary"} and (
+            "research_finding" in blob
+            or "source_id" in blob
+            or "evidence metadata" in blob
+            or "finding" in blob
+        ):
+            return "research_memory_provenance_error"
+        return "tool_result_error"
+    return ""
+
+
+def _recent_semantic_error_signatures(
+    tools_path: pathlib.Path, *, n: int
+) -> list[str]:
+    try:
+        lines = tools_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    sigs: list[str] = []
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        code = _semantic_error_code(row)
+        if not code:
+            continue
+        tool = str(row.get("tool") or "")
+        payload = _json_obj_from_preview(
+            row.get("result_preview") or row.get("result") or {}
+        )
+        subtask_id = ""
+        args = row.get("args")
+        if isinstance(args, dict):
+            subtask_id = str(args.get("subtask_id") or "").strip()
+        if not subtask_id and isinstance(payload, dict):
+            subtask_id = str(payload.get("subtask_id") or "").strip()
+        sigs.append(f"{code}:{tool}:{subtask_id}")
         if len(sigs) >= n:
             break
     return list(reversed(sigs))

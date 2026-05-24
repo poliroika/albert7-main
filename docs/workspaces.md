@@ -186,3 +186,31 @@ workspaces/<workspace_id>/
 ```
 
 `runs/`, `snapshots/`, `reports/`, `memory/`, `logs/`, and `instances/` are populated at runtime and are not part of the seed template.
+
+## Memory layout (per workspace vs manager)
+
+Each workspace keeps **isolated** runtime memory under:
+
+```text
+workspaces/<workspace_id>/.memory/
+  palace/     # MemPalace (observations, lessons, durable) — source of truth per project
+  core/       # Always-loaded MD + workspace bkb.yaml (curated, not auto-filled by every run)
+  drive/      # Phase artifacts (bundles, injection reports, BKB proposal queue)
+```
+
+Cross-workspace **manager** memory (shared across all runs) lives under:
+
+```text
+.umbrella/memory/core/          # Identity, manager BKB, manager lessons (by design)
+.umbrella/memory/telemetry/     # Audit JSONL (memory_write_*, etc.)
+```
+
+Running workspace **A** then workspace **B** does **not** merge Chroma nodes between projects. Both runs still see the **same manager core** overlay (constitution + manager rules) plus **their own** workspace core and palace.
+
+Practical rules:
+
+- Put project-specific rules in `workspaces/<id>/.memory/core/bkb.yaml` with `applies_to.workspaces: ["<id>"]` when needed.
+- Keep `.umbrella/memory/core/` for policies that truly apply to every workspace.
+- Agent `palace_add` / durable writes go to `palace/`; they do **not** append to `00_workspace_charter.md` automatically — edit charter/lessons manually or via BKB promotion.
+
+Durable backend env (`canonical` vs `dual`): [memory-durable-backends.md](memory-durable-backends.md).

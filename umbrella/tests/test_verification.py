@@ -716,6 +716,21 @@ class TestSpecLoader:
             for s in steps
         )
 
+    def test_autodetect_python_src_package_import(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "civgame"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        pkg = tmp_path / "src" / "civgame"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text('__version__ = "0.1.0"\n', encoding="utf-8")
+        steps = autodetect_steps(tmp_path)
+        assert any(
+            s.kind == VerificationStepKind.IMPORT_CHECK
+            and "import civgame" in " ".join(s.command)
+            for s in steps
+        )
+
     def test_autodetect_web_server(self, tmp_path: Path) -> None:
         (tmp_path / "web_server.py").write_text("print('stub')\n", encoding="utf-8")
         steps = autodetect_steps(tmp_path)

@@ -406,12 +406,9 @@ def render_phase_user_prompt(
                     "query before the first `apply_workspace_patch`, "
                     "`update_workspace_seed`, `repo_write_commit`, or other "
                     "workspace write. Prefetched context from research/plan is "
-                    "useful background, not a substitute. If this execute task "
-                    "contains an `Umbrella execute prelude: GMAS context` "
-                    "section scoped to this subtask, that prelude satisfies the "
-                    "subtask first-write gate; "
-                    "refresh with another GMAS retrieval before writing "
-                    "task-specific agent/graph/tool code when needed."
+                    "useful background, not a substitute. Use a specific query "
+                    "for the API shape you need; do not invent GMAS imports, "
+                    "constructors, or tool names from memory."
                 )
             lines.append(
                 "Completion call: `mark_subtask_complete(completion_contract={...})` "

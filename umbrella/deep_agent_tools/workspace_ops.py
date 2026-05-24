@@ -8,13 +8,17 @@ from umbrella.deep_agent_tools.workspace_gmas import (
     _llm_behavior_fallback_contract_block,
     _llm_runtime_contract_block,
 )
-from umbrella.deep_agent_tools.workspace_read import _workspace_file_was_read
+from umbrella.deep_agent_tools.workspace_read import (
+    _workspace_file_read_at,
+    _workspace_file_was_read,
+)
 from umbrella.enforcement import (
     append_supervisor_ledger_event,
     blocked_payload,
     check_workspace_paths,
     phase_from_context,
 )
+from umbrella.enforcement.ledger import supervisor_ledger_ref
 from umbrella.contracts import hash_value, workspace_hash
 
 def _workspace_layout_policy_block(rel_path: str) -> dict[str, Any] | None:
@@ -1325,6 +1329,10 @@ def update_workspace_seed(
             return _json(gmas_block)
         if phase_order_block := _phase_plan_write_order_block(ctx):
             return _json(phase_order_block)
+        if retry_block := _phase_subtask_retry_escalation_block(
+            ctx, tool_name="update_workspace_seed"
+        ):
+            return _json(retry_block)
         file_path = _strip_workspace_prefix(workspace_id, file_path)
         if layout_block := _workspace_layout_policy_block(file_path):
             return _json(layout_block)
@@ -1437,7 +1445,11 @@ def _phase_plan_write_order_block(ctx: Any) -> dict[str, Any] | None:
 def _phase_subtask_retry_escalation_block(
     ctx: Any, *, tool_name: str
 ) -> dict[str, Any] | None:
-    return None
+    from umbrella.deep_agent_tools.phase_control_retry import (
+        _phase_subtask_retry_escalation_block as _retry_escalation_block,
+    )
+
+    return _retry_escalation_block(ctx, tool_name=tool_name)
 
 
 def _add_file_literal_hunk_marker_block(
@@ -1500,10 +1512,60 @@ def _workspace_patch_tool_payloads(ctx: Any) -> list[dict[str, Any]]:
             else:
                 continue
             if isinstance(payload, dict):
-                payloads.append(payload)
+                enriched = dict(payload)
+                enriched.setdefault("_logged_at", row.get("ts"))
+                payloads.append(enriched)
     except OSError:
         return []
     return payloads
+
+
+def _tool_log_ts_seconds(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _fresh_read_after_hunk_mismatch_block(
+    ctx: Any,
+    *,
+    workspace_id: str,
+    rel_path: str,
+) -> dict[str, Any] | None:
+    norm = _norm_workspace_rel_path(rel_path)
+    latest_mismatch = 0.0
+    for payload in _workspace_patch_tool_payloads(ctx):
+        if _norm_workspace_rel_path(payload.get("file_path")) != norm:
+            continue
+        if str(payload.get("reason") or "") not in {
+            "patch_hunk_mismatch",
+            "patch_hunk_mismatch_replacement_required",
+        }:
+            continue
+        latest_mismatch = max(
+            latest_mismatch,
+            _tool_log_ts_seconds(payload.get("_logged_at")),
+        )
+    if not latest_mismatch:
+        return None
+    read_at = _workspace_file_read_at(ctx, workspace_id, norm)
+    if read_at > latest_mismatch:
+        return None
+    return {
+        "status": "blocked",
+        "reason": "fresh_read_after_hunk_mismatch_required",
+        "file_path": norm,
+        "latest_hunk_mismatch_at": latest_mismatch,
+        "last_read_at": read_at,
+        "next_step": (
+            "Re-read this exact file with `read_file` after the hunk mismatch, "
+            "then retry the patch using current file content."
+        ),
+    }
 
 
 def _required_replacement_patch_shape(rel_path: str) -> str:
@@ -1737,6 +1799,10 @@ def _plan_workspace_patch_replacement_operation(
                 ),
             }
         )
+    if fresh_read_block := _fresh_read_after_hunk_mismatch_block(
+        ctx, workspace_id=workspace_id, rel_path=rel_path
+    ):
+        return None, _json(fresh_read_block)
     try:
         target = _workspace_path(seed_path, rel_path)
     except ValueError as exc:
@@ -1860,6 +1926,12 @@ def _plan_workspace_patch_operation(
                 ),
             }
         )
+    if op.action in {"update", "delete"} and (
+        fresh_read_block := _fresh_read_after_hunk_mismatch_block(
+            ctx, workspace_id=workspace_id, rel_path=rel_path
+        )
+    ):
+        return None, _json(fresh_read_block)
 
     target = _workspace_path(seed_path, rel_path)
     if op.action in {"update", "delete"} and target.is_file():
@@ -2167,10 +2239,48 @@ def _future_subtask_path_owners(
     return owners
 
 
+def _workspace_toml_additive_verification_patch(
+    seed_path: Path,
+    planned: list[dict[str, Any]],
+) -> bool:
+    """True when every planned workspace.toml change only strengthens verification."""
+    toml_items = [
+        item
+        for item in planned
+        if _norm_workspace_rel_path(item.get("path")) == "workspace.toml"
+    ]
+    if not toml_items:
+        return False
+    for item in toml_items:
+        if str(item.get("action") or "") == "delete":
+            return False
+        new_content = str(item.get("new_content") or "")
+        if not new_content.strip():
+            return False
+        if _workspace_toml_verification_guard(
+            seed_path, "workspace.toml", new_content
+        ):
+            return False
+    return True
+
+
+def _workspace_toml_additive_scope_allowed(
+    seed_path: Path,
+    planned: list[dict[str, Any]],
+    *,
+    out_of_scope: list[str],
+) -> bool:
+    """Allow execute patches to workspace.toml outside subtask scope when only strengthening verification."""
+    if set(out_of_scope) != {"workspace.toml"}:
+        return False
+    return _workspace_toml_additive_verification_patch(seed_path, planned)
+
+
 def _execute_subtask_write_scope_block(
     ctx: Any,
     *,
     planned: list[dict[str, Any]],
+    seed_path: Path | None = None,
 ) -> dict[str, Any] | None:
     task_id = str(getattr(ctx, "task_id", "") or "")
     if ":execute" not in task_id:
@@ -2190,6 +2300,15 @@ def _execute_subtask_write_scope_block(
     )
     out_of_scope = [path for path in planned_paths if path not in allowed]
     if not out_of_scope:
+        return None
+    if (
+        seed_path is not None
+        and _workspace_toml_additive_scope_allowed(
+            seed_path,
+            planned,
+            out_of_scope=out_of_scope,
+        )
+    ):
         return None
     future_owners = _future_subtask_path_owners(subtasks, current_index=active_index)
     future_hits = {
@@ -2215,6 +2334,87 @@ def _execute_subtask_write_scope_block(
             "to add that workspace-relative path to the active subtask's "
             "`files_to_create`, `files_to_change`, or `files_affected`; otherwise "
             "wait until the owning future subtask is active."
+        ),
+    }
+
+
+def _subtask_context_dependency_paths(subtask: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for key in ("files_to_change",):
+        raw = subtask.get(key)
+        if isinstance(raw, str):
+            raw_items: Iterable[Any] = [raw]
+        elif isinstance(raw, Iterable):
+            raw_items = raw
+        else:
+            raw_items = []
+        for item in raw_items:
+            norm = _norm_workspace_rel_path(item)
+            if norm:
+                paths.add(norm)
+    proof = subtask.get("proof")
+    scope = proof.get("scope") if isinstance(proof, dict) else None
+    if isinstance(scope, dict):
+        for key in ("files_under_test", "changed_files_expected"):
+            raw = scope.get(key)
+            if isinstance(raw, str):
+                raw_items = [raw]
+            elif isinstance(raw, Iterable):
+                raw_items = raw
+            else:
+                raw_items = []
+            for item in raw_items:
+                norm = _norm_workspace_rel_path(item)
+                if norm:
+                    paths.add(norm)
+    return paths
+
+
+def _execute_subtask_context_read_block(
+    ctx: Any,
+    *,
+    workspace_id: str,
+    seed_path: Path,
+    planned: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    if ":execute" not in task_id:
+        return None
+    active, _, _ = _active_execute_subtask_for_write_scope(ctx)
+    if not active:
+        return None
+    planned_new = {
+        _norm_workspace_rel_path(item.get("path"))
+        for item in planned
+        if str(item.get("action") or "") == "add"
+    }
+    missing: list[str] = []
+    for rel_path in sorted(_subtask_context_dependency_paths(active)):
+        if rel_path in planned_new:
+            continue
+        try:
+            target = _workspace_path(seed_path, rel_path)
+        except ValueError:
+            continue
+        if not target.is_file():
+            continue
+        if not _workspace_file_was_read(ctx, workspace_id, rel_path):
+            missing.append(rel_path)
+    if not missing:
+        return None
+    return {
+        "status": "blocked",
+        "reason": "subtask_context_read_required",
+        "active_subtask_id": str(active.get("id") or ""),
+        "missing_reads": missing[:12],
+        "message": (
+            "Before writing this execute subtask, read the current source/test "
+            "files named by the active subtask and proof scope."
+        ),
+        "next_step": (
+            "Call phase `read_file` for each missing workspace-relative path, "
+            "then retry the patch. Existing terminal/log evidence is useful, "
+            "but current files are authoritative for code edits."
         ),
     }
 
@@ -2299,6 +2499,10 @@ def apply_workspace_patch(
             return _json(gmas_block)
         if phase_order_block := _phase_plan_write_order_block(ctx):
             return _json(phase_order_block)
+        if retry_block := _phase_subtask_retry_escalation_block(
+            ctx, tool_name="apply_workspace_patch"
+        ):
+            return _json(retry_block)
         try:
             operations = parse_workspace_patch(patch)
         except ValueError as exc:
@@ -2327,6 +2531,21 @@ def apply_workspace_patch(
                 }
             )
 
+        early_planned = [
+            {
+                "path": _strip_workspace_prefix(workspace_id, op.path),
+                "action": op.action,
+            }
+            for op in operations
+        ]
+        if context_block := _execute_subtask_context_read_block(
+            ctx,
+            workspace_id=workspace_id,
+            seed_path=seed_path,
+            planned=early_planned,
+        ):
+            return _json(context_block)
+
         planned, response = _plan_workspace_patch_operations(
             ctx,
             workspace_id=workspace_id,
@@ -2345,15 +2564,33 @@ def apply_workspace_patch(
                     "reason": "workspace_patch_planning_failed",
                 }
             )
-        if scope_block := _execute_subtask_write_scope_block(ctx, planned=planned):
+        if scope_block := _execute_subtask_write_scope_block(
+            ctx, planned=planned, seed_path=seed_path
+        ):
             return _json(scope_block)
+        if context_block := _execute_subtask_context_read_block(
+            ctx,
+            workspace_id=workspace_id,
+            seed_path=seed_path,
+            planned=planned,
+        ):
+            return _json(context_block)
         phase = phase_from_context(ctx)
         planned_paths = [str(item.get("path") or "") for item in planned]
+        planned_norm = {
+            _norm_workspace_rel_path(path)
+            for path in planned_paths
+            if _norm_workspace_rel_path(path)
+        }
+        allow_verifier_policy = planned_norm == {"workspace.toml"} and (
+            _workspace_toml_additive_verification_patch(seed_path, planned)
+        )
         if enforcement_issues := check_workspace_paths(
             "apply_workspace_patch",
             phase,
             planned_paths,
             write_kind="patch",
+            allow_verifier_policy_edit=allow_verifier_policy,
         ):
             return _json(
                 blocked_payload(
@@ -2383,8 +2620,9 @@ def apply_workspace_patch(
             severity="info",
             tags="change,seed,patch",
         )
+        patch_ledger = None
         try:
-            append_supervisor_ledger_event(
+            patch_ledger = append_supervisor_ledger_event(
                 repo_root=repo_root,
                 workspace_id=workspace_id,
                 actor="agent",
@@ -2396,15 +2634,23 @@ def apply_workspace_patch(
             )
         except Exception:
             log.debug("supervisor ledger append failed for apply patch", exc_info=True)
-        body = _json(
-            {
-                "status": "applied",
-                "workspace_id": workspace_id,
-                "applied": applied,
-                "backups": backups[:5],
-                "validation_summary": validation_summary,
+        applied_payload: dict[str, Any] = {
+            "status": "applied",
+            "workspace_id": workspace_id,
+            "applied": applied,
+            "backups": backups[:5],
+            "validation_summary": validation_summary,
+        }
+        if patch_ledger is not None:
+            applied_payload.update(supervisor_ledger_ref(patch_ledger))
+            applied_payload["ledger_ref"] = {
+                "ref_type": "ledger_event",
+                "ref_id": patch_ledger.event_id,
+                "hash": patch_ledger.event_hash,
+                "produced_by": "agent",
+                "phase": phase,
             }
-        )
+        body = _json(applied_payload)
         advisory = _gmas_first_write_advisory(
             ctx,
             repo_root=repo_root,

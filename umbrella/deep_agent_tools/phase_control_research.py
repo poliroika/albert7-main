@@ -1618,6 +1618,12 @@ def _research_summary_validation_issue(
                 "or include the correct returned id."
                 f"{source_hint} {scarcity_issue}"
             )
+    skill_issue = _research_summary_skill_coverage_issue(ctx, rows)
+    if skill_issue:
+        return skill_issue
+    gmas_issue = _research_summary_gmas_coverage_issue(ctx, rows)
+    if gmas_issue:
+        return gmas_issue
     discovery_issue = _research_discovery_validation_issue(ctx, rows)
     if discovery_issue:
         return discovery_issue
@@ -1653,6 +1659,92 @@ def _research_summary_validation_issue(
                 "or replace it with a corrected palace_add finding."
             )
     return ""
+
+
+def _research_summary_allowed_skills(ctx: ToolContext) -> list[str]:
+    overlays = _context_overlays(ctx)
+    manifest = overlays.get("phase_manifest")
+    if not isinstance(manifest, dict):
+        return []
+    raw = manifest.get("allowed_skills") or []
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _research_tool_row_succeeded(row: dict[str, Any]) -> bool:
+    if row.get("error"):
+        return False
+    if row.get("exit_code", 0) not in (0, None):
+        return False
+    raw = str(row.get("result_preview") or row.get("result") or "").strip()
+    return not raw.lower().startswith("error:")
+
+
+def _research_summary_skill_coverage_issue(
+    ctx: ToolContext, rows: list[dict[str, Any]]
+) -> str:
+    allowed = _research_summary_allowed_skills(ctx)
+    if not allowed:
+        return ""
+    loaded = [
+        str((row.get("args") or {}).get("slug") or "").strip()
+        for row in rows
+        if str(row.get("tool") or "") == "load_skill"
+        and isinstance(row.get("args"), dict)
+        and _research_tool_row_succeeded(row)
+    ]
+    if loaded:
+        return ""
+    examples = ", ".join(f"`{item}`" for item in allowed[:4])
+    return (
+        "ERROR: research summary missing required skill coverage. "
+        "This research manifest declares allowed_skills, so load at least one "
+        f"task-relevant skill via `load_skill(slug=...)` before submitting. "
+        f"Available examples: {examples}."
+    )
+
+
+def _research_summary_requires_gmas_context(ctx: ToolContext) -> bool:
+    overlays = _context_overlays(ctx)
+    if bool(overlays.get("gmas_prewrite_required")):
+        return True
+    domains = overlays.get("detected_domains") or []
+    if isinstance(domains, list) and any(
+        str(item).strip().lower() == "multi_agent_gmas" for item in domains
+    ):
+        return True
+    drive_root = pathlib.Path(getattr(ctx, "drive_root", "") or "")
+    workspace_root = drive_root.parent.parent if drive_root.name == "drive" else None
+    if workspace_root is None:
+        return False
+    try:
+        text = (workspace_root / "workspace.toml").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r"(?im)^\s*multi_agent_gmas\s*=\s*true\s*$", text))
+
+
+def _research_summary_gmas_coverage_issue(
+    ctx: ToolContext, rows: list[dict[str, Any]]
+) -> str:
+    if not _research_summary_requires_gmas_context(ctx):
+        return ""
+    gmas_tools = {"get_gmas_context", "search_gmas_knowledge"}
+    attempted = any(
+        str(row.get("tool") or "") in gmas_tools
+        and _research_tool_row_succeeded(row)
+        for row in rows
+    )
+    if attempted:
+        return ""
+    return (
+        "ERROR: research summary missing GMAS context coverage. This workspace "
+        "is marked as multi_agent_gmas/LLM-agent work, so research must call "
+        "`get_gmas_context(query=...)` or `search_gmas_knowledge(query=...)` "
+        "with a concrete architecture/API query in this same research phase "
+        "before handing off to planning."
+    )
 
 
 __all__ = [

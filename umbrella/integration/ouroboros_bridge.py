@@ -1060,24 +1060,10 @@ def _sync_active_skill_packs(
         return
 
     if Domain.MULTI_AGENT_GMAS in domains:
-        artifact_path = knowledge_dir / _SKILL_ARTIFACT_FILES[Domain.MULTI_AGENT_GMAS]
-        if fresh or not artifact_path.exists():
-            # Use the concrete task description (TASK_MAIN.md if present)
-            # for GMAS retrieval; fall back to whatever short text we have
-            # so the query is never empty.
-            retrieval_text = task_main.strip() or (
-                "\n\n".join(chunk for chunk in (user_message, task_input) if chunk)
-            )
-            content = _build_gmas_active_context(
-                repo_root=repo_root, task_text=retrieval_text or composite
-            )
-            if content:
-                _write_optional_markdown(artifact_path, content)
-                log.info(
-                    "Skill artifact %s written for workspace=%s",
-                    artifact_path.name,
-                    workspace_id or "?",
-                )
+        try:
+            (knowledge_dir / _SKILL_ARTIFACT_FILES[Domain.MULTI_AGENT_GMAS]).unlink()
+        except FileNotFoundError:
+            pass
 
     banner_lines = [
         "# Active Skills",
@@ -1088,12 +1074,7 @@ def _sync_active_skill_packs(
         "",
         "When a skill looks relevant, call `load_skill` with its slug for full L3 instructions.",
     ]
-    artifacts = [
-        f"memory/knowledge/{_SKILL_ARTIFACT_FILES[d]}"
-        for d in sorted(domains, key=lambda x: x.value)
-        if d in _SKILL_ARTIFACT_FILES
-        and (knowledge_dir / _SKILL_ARTIFACT_FILES[d]).exists()
-    ]
+    artifacts: list[str] = []
     if artifacts:
         banner_lines.extend(["", "Artifacts:", *[f"- {a}" for a in artifacts]])
     _write_optional_markdown(banner_path, "\n".join(banner_lines))
