@@ -83,6 +83,27 @@ def _constant_bool(node: ast.AST) -> bool | None:
     return None
 
 
+def _python_c_is_import_only(tree: ast.AST) -> bool:
+    if not isinstance(tree, ast.Module) or not tree.body:
+        return False
+    saw_import = False
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            saw_import = True
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id == "print"
+        ):
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            continue
+        return False
+    return saw_import
+
+
 def _python_c_code(command: tuple[str, ...]) -> str:
     if len(command) < 3 or _exe_name(command) not in _PYTHON_EXES:
         return ""
@@ -105,8 +126,9 @@ def _validate_python_c_code(code: str, *, path: str = "") -> list[StaticAnalysis
                 path=path,
                 snippet=code[:160],
                 message=(
-                    "Inline python proof commands must be syntactically valid "
-                    "Python so Umbrella can execute and statically inspect them."
+                    "Inline proof has invalid `python -c` code; it must be "
+                    "syntactically valid Python so Umbrella can execute and "
+                    "statically inspect it."
                 ),
             )
         )
@@ -123,10 +145,31 @@ def _validate_python_c_code(code: str, *, path: str = "") -> list[StaticAnalysis
                 )
             )
         return issues
+    has_import = any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(tree))
+    has_assert = any(isinstance(node, ast.Assert) for node in ast.walk(tree))
+    has_checked_subprocess = False
+    complex_inline = False
+    workspace_imports = [
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and isinstance(node.module, str)
+        and node.module.startswith(("src.", "backend.", "frontend."))
+    ]
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         name = _call_name(node.func)
+        if name in {
+            "subprocess.Popen",
+            "subprocess.run",
+            "time.sleep",
+            "requests.get",
+            "requests.post",
+        }:
+            complex_inline = True
+        if name in _SUBPROCESS_CALLS:
+            has_checked_subprocess = True
         if name not in _SUBPROCESS_CALLS:
             continue
         for keyword in node.keywords:
@@ -152,8 +195,54 @@ def _validate_python_c_code(code: str, *, path: str = "") -> list[StaticAnalysis
                             "Verification subprocesses must fail loudly instead "
                             "of using check=False."
                         ),
-                    )
                 )
+            )
+    if complex_inline or len(code) > 220 or "\n" in code:
+        issues.append(
+            StaticAnalysisIssue(
+                code="complex_python_inline_proof",
+                path=path,
+                snippet=code[:160],
+                message=(
+                    "Inline python proof is too complex for a plan command; "
+                    "move orchestration, service startup, sleeps, HTTP checks, "
+                    "or multi-line logic into a checked-in verifier script or "
+                    "managed harness."
+                ),
+            )
+        )
+    if workspace_imports:
+        issues.append(
+            StaticAnalysisIssue(
+                code="workspace_import_inline_proof",
+                path=path,
+                snippet=", ".join(workspace_imports[:4]),
+                message=(
+                    "Inline python proof imports workspace/application modules; "
+                    "put behavioral assertions in pytest or a checked-in "
+                    "verifier so imports, fixtures, and package paths are "
+                    "owned by the workspace."
+                ),
+            )
+        )
+    if (
+        has_import
+        and not has_assert
+        and not has_checked_subprocess
+        and _python_c_is_import_only(tree)
+    ):
+        issues.append(
+            StaticAnalysisIssue(
+                code="import_only_proof",
+                path=path,
+                snippet=code[:160],
+                message=(
+                    "Inline python proof only imports modules; add a real "
+                    "assertion, execute a checked verifier script, or use "
+                    "pytest for behavioral proof."
+                ),
+            )
+        )
     return issues
 
 
@@ -197,13 +286,31 @@ def validate_argv(
             )
         )
     lowered_args = {part.lower() for part in command[1:3]}
+    if exe in _PYTHON_EXES and len(command) >= 2:
+        target = str(command[1] or "")
+        if "::" in target and (target.endswith(".py") or ".py::" in target):
+            issues.append(
+                StaticAnalysisIssue(
+                    code="python_pytest_node_without_pytest",
+                    path=path,
+                    snippet=target,
+                    message=(
+                        "Python proof points at a pytest node directly; use "
+                        "`python -m pytest <target>` so pytest executes the "
+                        "test contract."
+                    ),
+                )
+            )
     if exe in _SHELL_EXES and lowered_args & _SHELL_EVAL_FLAGS:
         issues.append(
             StaticAnalysisIssue(
                 code="shell_process_control_forbidden",
                 path=path,
                 snippet=" ".join(command[:3]),
-                message="Proof command uses shell eval flags instead of direct argv.",
+                message=(
+                    "Proof command uses non-portable or unmanaged "
+                    "shell/process-control instead of direct argv."
+                ),
             )
         )
     for part in command:
@@ -215,9 +322,10 @@ def validate_argv(
                     path=path,
                     snippet=token,
                     message=(
-                        "Proof command argv must not include shell chaining "
-                        "operators; split setup and verification into direct "
-                        "commands or use a checked-in script."
+                        "Proof command argv must not include non-portable or "
+                        "unmanaged shell/process-control operators; split "
+                        "setup and verification into direct commands or use a "
+                        "checked-in script."
                     ),
                 )
             )
@@ -229,7 +337,7 @@ def validate_argv(
                     code="shell_failure_masking",
                     path=path,
                     snippet=token,
-                    message="Proof command masks failures.",
+                    message="Proof command masks command failure status.",
                 )
             )
     issues.extend(_validate_python_c_code(_python_c_code(command), path=path))

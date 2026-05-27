@@ -65,17 +65,39 @@ def render_report_md(scenario: MemoryScenario, result: MemoryScenarioResult) -> 
                 lines.append(f"- error: {err}")
         report = step.injection_report
         if report:
-            lines.append("### Included")
+            lines.append("### BKB / memory included")
+            lines.append("| id | reason | directive |")
+            lines.append("|---|---|---|")
             for row in report.get("included") or []:
                 if isinstance(row, dict):
                     lines.append(
-                        f"- {row.get('id')}: {row.get('reason')} "
-                        f"(directive={row.get('directive')})"
+                        f"| {row.get('id')} | {row.get('reason')} | {row.get('directive')} |"
                     )
-            lines.append("### Skipped")
+            lines.append("### BKB / memory skipped")
+            lines.append("| id | reason |")
+            lines.append("|---|---|")
             for row in report.get("skipped") or []:
                 if isinstance(row, dict):
-                    lines.append(f"- {row.get('id')}: {row.get('reason')}")
+                    lines.append(f"| {row.get('id')} | {row.get('reason')} |")
+        prompt = step.prompt or str((step.task or {}).get("input") or "")
+        if prompt:
+            markers = [
+                ("ALWAYS-LOADED", "[ALWAYS-LOADED MEMORY]"),
+                ("Phase instructions", "Phase instructions"),
+                ("Supplemental", "Supplemental"),
+            ]
+            lines.append("### Prompt order")
+            lines.append("| marker | position |")
+            lines.append("|---|---:|")
+            for label, needle in markers:
+                pos = prompt.find(needle)
+                lines.append(f"| {label} | {pos if pos >= 0 else 'missing'} |")
+        before_p = (step.snapshot_before.get("palace") or {}).get("count", 0)
+        after_p = (step.snapshot_after.get("palace") or {}).get("count", 0)
+        if before_p or after_p:
+            lines.append("### Palace diff")
+            lines.append(f"| before | after | delta |")
+            lines.append(f"| {before_p} | {after_p} | {after_p - before_p} |")
         lines.append("")
 
     lines.append("## Artifacts")

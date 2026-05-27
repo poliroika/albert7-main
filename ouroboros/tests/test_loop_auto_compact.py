@@ -7,6 +7,22 @@ import pytest
 from ouroboros.loop import _auto_set_pending_compaction_for_overflow
 
 
+def test_triggers_when_history_plus_reserved_near_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: input-only thresholds miss input+max_tokens overflow (gemma-4 run)."""
+    monkeypatch.setenv("OUROBOROS_MODEL_CONTEXT_TOKENS", "128000")
+    body = "a" * (62_000 * 4)
+    messages = [{"role": "user", "content": body}]
+    ctx = SimpleNamespace(_pending_compaction=None)
+    _auto_set_pending_compaction_for_overflow(
+        messages,
+        ctx,
+        reserved_output_tokens=65536,
+    )
+    assert ctx._pending_compaction == 3
+
+
 def test_sets_aggressive_pending_at_95_percent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OUROBOROS_MODEL_CONTEXT_TOKENS", "10000")
     # ~12000 tokens: 48000 chars

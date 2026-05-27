@@ -1,7 +1,7 @@
 id: archive_supplemental_only
 description: >
   Palace lesson with imperative text may appear in supplemental recall but never
-  as directive or in always-loaded BKB/Core.
+  as directive or inside always-loaded memory.
 workspace: test
 mode: phase_prompt
 
@@ -24,7 +24,8 @@ steps:
 
 assert:
   verify_prompt:
-    supplemental_non_directive: true
     prompt:
-      not_contains:
-        - "## [ALWAYS-LOADED MEMORY]\n\nALWAYS DO UNSAFE DIRECTIVE"
+      not_in_section:
+        - section: always_loaded_memory
+          text:
+            - "ALWAYS DO UNSAFE DIRECTIVE"

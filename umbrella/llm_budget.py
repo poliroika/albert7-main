@@ -11,13 +11,13 @@ def estimate_tokens(text: str) -> int:
 
 
 def get_model_context_tokens() -> int:
-    """Soft cap for full prompt vs model window (default 128k)."""
+    """Soft cap for full prompt vs model window (default 200k)."""
     try:
         return max(
-            4096, int(os.environ.get("OUROBOROS_MODEL_CONTEXT_TOKENS", "128000"))
+            4096, int(os.environ.get("OUROBOROS_MODEL_CONTEXT_TOKENS", "200000"))
         )
     except (ValueError, TypeError):
-        return 128000
+        return 200000
 
 
 def get_gmas_context_tokens() -> int:

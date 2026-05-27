@@ -8,6 +8,7 @@ prompt_files:
 
 allowed_tools:
   - apply_workspace_patch
+  - replace_workspace_file
   - delete_workspace_file
   - shell
   - terminal_session
@@ -18,17 +19,16 @@ allowed_tools:
   - repo_list
   - run_workspace_verify
   - run_subtask_proof
+  - bg_start
+  - bg_status
+  - bg_tail
+  - bg_list
+  - bg_kill
   - run_unit_tests
-  - palace_search
-  - palace_add
-  - palace_link
   - mutate_phase_plan
-  - loop_back_to
-  - request_extra_subtask
+  - request_scope_change
   - mark_subtask_complete
   - request_watcher_review
-  - get_gmas_context
-  - search_gmas_knowledge
 
 forbidden_tools:
   - wipe_workspace
@@ -39,7 +39,6 @@ allowed_skills:
   - terminal-debugging
   - error-self-repair
   - strict-verification-sync
-  - gmas-overview
 
 memory:
   always_on:
@@ -56,7 +55,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, run_unit_tests, palace_search, palace_add, palace_link, mutate_phase_plan, loop_back_to, request_extra_subtask, mark_subtask_complete, request_watcher_review, get_gmas_context, search_gmas_knowledge]
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, bg_start, bg_status, bg_tail, bg_list, bg_kill, run_unit_tests, mutate_phase_plan, request_scope_change, mark_subtask_complete, request_watcher_review]
     - deny_tools: [wipe_workspace, reset_palace]
     - deny_path: ["**/.env*", "**/secrets/**"]
 

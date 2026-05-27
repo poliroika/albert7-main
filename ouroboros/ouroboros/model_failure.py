@@ -9,4 +9,5 @@ def is_model_response_failure(text: str) -> bool:
     return (
         "failed to get a response from model" in lowered
         or "failed to get a response from the model" in lowered
+        or "model returned an empty response" in lowered
     )

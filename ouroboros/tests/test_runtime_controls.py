@@ -599,6 +599,27 @@ def test_loop_stop_request_matches_remediation_child_task(tmp_path: Path):
     assert result[0] == "Stop requested by dashboard: operator"
 
 
+def test_loop_stop_request_run_id_matches_phase_task(tmp_path: Path):
+    from ouroboros.loop import _check_stop_requested
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "stop_requested.json").write_text(
+        json.dumps({"run_id": "run-1", "reason": "operator"}),
+        encoding="utf-8",
+    )
+
+    result = _check_stop_requested(
+        tmp_path,
+        "run-1:plan_review",
+        {},
+        {"assistant_notes": []},
+    )
+
+    assert result is not None
+    assert result[0] == "Stop requested by dashboard: operator"
+
+
 def test_handle_tool_calls_skips_remaining_batch_after_stop(monkeypatch, tmp_path: Path):
     import ouroboros.loop as loop
 

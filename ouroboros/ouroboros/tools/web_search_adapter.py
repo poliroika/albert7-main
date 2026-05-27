@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
+from ouroboros.limits import DISCOVERY_CONTENT_CHARS
+
 
 def fallback_answer_from_results(results: list[dict[str, str]]) -> str:
     lines = []
@@ -53,7 +55,7 @@ def normalize_results(items: list[Any]) -> list[dict[str, str]]:
                 "title": str(item.get("title") or ""),
                 "url": str(item.get("url") or ""),
                 "snippet": str(item.get("snippet") or ""),
-                "content": str(item.get("content") or "")[:4000],
+                "content": str(item.get("content") or "")[:DISCOVERY_CONTENT_CHARS],
             }
         )
     return out

@@ -13,8 +13,19 @@ from umbrella.memory.kernel.models import (
 )
 from umbrella.memory.kernel.policy import memory_write_policy_issues
 from umbrella.memory.kernel.telemetry import record_memory_event
-from umbrella.memory.palace.facade import MemPalace
 from umbrella.memory.paths import normalize_workspace_id
+from umbrella.memory.palace.facade import MemPalace as _DefaultMemPalace
+
+MemPalace = _DefaultMemPalace
+
+
+def _mem_palace_class() -> Any:
+    from umbrella.memory.palace import facade
+
+    current = getattr(facade, "MemPalace", _DefaultMemPalace)
+    if current is not _DefaultMemPalace:
+        return current
+    return MemPalace
 
 
 def _preset_canonical_id(event: MemoryEvent) -> str:
@@ -28,7 +39,7 @@ def existing_canonical_node(
     node_id: str,
     store: str,
 ) -> bool:
-    palace = MemPalace(repo_root, normalize_workspace_id(workspace_id))
+    palace = _mem_palace_class()(repo_root, normalize_workspace_id(workspace_id))
     try:
         return palace.get(node_id, stores=[store]) is not None
     finally:
@@ -137,7 +148,7 @@ def write_memory_event(
         )
 
     try:
-        palace = MemPalace(repo_root, ws)
+        palace = _mem_palace_class()(repo_root, ws)
         try:
             if node_id:
                 committed_id = palace.add(**kwargs, node_id=node_id)

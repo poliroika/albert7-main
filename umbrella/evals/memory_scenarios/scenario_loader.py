@@ -6,6 +6,8 @@ from typing import Any
 import yaml
 
 from umbrella.evals.memory_scenarios.fixtures import SCENARIOS_DIR
+
+LLM_SCENARIOS_DIR = SCENARIOS_DIR / "llm"
 from umbrella.evals.memory_scenarios.models import MemoryScenario, ScenarioSeed, ScenarioStep
 
 
@@ -54,18 +56,39 @@ def load_scenario(path: Path) -> MemoryScenario:
         source_path=path,
         raw_seed=dict(data.get("seed") or {}),
         llm=dict(data.get("llm") or {}),
+        requires_no_volatile_stub=bool(data.get("requires_no_volatile_stub")),
     )
 
 
-def list_scenario_paths(scenarios_dir: Path | None = None) -> list[Path]:
+def list_scenario_paths(
+    scenarios_dir: Path | None = None,
+    *,
+    include_llm: bool = False,
+) -> list[Path]:
     root = scenarios_dir or SCENARIOS_DIR
     if not root.is_dir():
         return []
-    return sorted(root.glob("*.yaml"))
+    paths = sorted(root.glob("*.yaml"))
+    if include_llm and LLM_SCENARIOS_DIR.is_dir():
+        paths.extend(sorted(LLM_SCENARIOS_DIR.glob("*.yaml")))
+    return paths
 
 
-def load_all_scenarios(scenarios_dir: Path | None = None) -> list[MemoryScenario]:
-    return [load_scenario(p) for p in list_scenario_paths(scenarios_dir)]
+def load_all_scenarios(
+    scenarios_dir: Path | None = None,
+    *,
+    include_llm: bool = False,
+) -> list[MemoryScenario]:
+    return [
+        load_scenario(p)
+        for p in list_scenario_paths(scenarios_dir, include_llm=include_llm)
+    ]
+
+
+def load_all_llm_scenarios() -> list[MemoryScenario]:
+    if not LLM_SCENARIOS_DIR.is_dir():
+        return []
+    return [load_scenario(p) for p in sorted(LLM_SCENARIOS_DIR.glob("*.yaml"))]
 
 
 def load_scenario_by_id(

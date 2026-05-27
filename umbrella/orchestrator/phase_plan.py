@@ -124,6 +124,10 @@ def _first_string_list(raw: dict[str, Any], *keys: str) -> list[str]:
     return []
 
 
+def _dict_from_any(raw: Any) -> dict[str, Any] | None:
+    return dict(raw) if isinstance(raw, dict) else None
+
+
 def _subtask_from_dict(raw: dict[str, Any], idx: int) -> SubtaskCard:
     title = str(raw.get("title") or raw.get("name") or f"Subtask {idx + 1}").strip()
     subtask_id = str(raw.get("id") or raw.get("subtask_id") or f"subtask_{idx + 1:02d}").strip()
@@ -132,6 +136,9 @@ def _subtask_from_dict(raw: dict[str, Any], idx: int) -> SubtaskCard:
         if isinstance(raw.get("proof"), dict)
         else None
     )
+    memory_scope = _dict_from_any(raw.get("memory_scope"))
+    if memory_scope is None and isinstance(raw.get("proof"), dict):
+        memory_scope = _dict_from_any(raw["proof"].get("memory_scope"))
     return SubtaskCard(
         id=subtask_id,
         title=title,
@@ -141,6 +148,7 @@ def _subtask_from_dict(raw: dict[str, Any], idx: int) -> SubtaskCard:
         proof=proof,
         codeptr_refs=[str(x) for x in (raw.get("codeptr_refs") or [])],
         mcp_refs=[str(x) for x in (raw.get("mcp_refs") or [])],
+        memory_scope=memory_scope,
         files_to_create=_first_string_list(
             raw,
             "files_to_create",

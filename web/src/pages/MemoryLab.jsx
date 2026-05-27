@@ -38,14 +38,7 @@ export default function MemoryLab() {
     try {
       const data = await getMemoryScenarioReport(id);
       setReport(data);
-      const first = (data.prompts || [])[0];
-      if (first?.path) {
-        const res = await fetch(`${process.env.REACT_APP_BACKEND_URL || ''}/api/memory/scenarios/${id}/report`);
-        const json = await res.json();
-        setPromptText(json.report_md || '');
-      } else {
-        setPromptText(data.report_md || '');
-      }
+      setPromptText(data.report_md || '');
     } catch (e) {
       toast.error(String(e.message || e));
     }

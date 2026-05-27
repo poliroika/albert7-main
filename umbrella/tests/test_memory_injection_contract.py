@@ -49,6 +49,27 @@ def test_memory_injection_contract_present_in_phase_task(repo) -> None:
     assert overlays.get("prevent_ouroboros_auto_core_overlay") is True
 
 
+def test_phase_task_id_includes_started_at_attempt_suffix(repo) -> None:
+    from pathlib import Path
+
+    manifest = load_manifest(Path("umbrella/phases/manifests/execute.yaml"))
+    phase_node = PhaseNode(id="execute", manifest_id="execute", started_at=123.456)
+    palace = MemPalace(repo, "ws1")
+    try:
+        task = build_phase_task(
+            phase_node=phase_node,
+            manifest=manifest,
+            workspace_id="ws1",
+            run_id="run-1",
+            palace=palace,
+            repo_root=repo,
+        )
+    finally:
+        palace.close()
+
+    assert task["id"] == "run-1:execute:123456"
+
+
 def test_memory_injection_contract_directive_sections_from_fixture_workspace(
     test_workspace_copy,
 ) -> None:

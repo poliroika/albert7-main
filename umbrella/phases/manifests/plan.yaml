@@ -15,10 +15,12 @@ allowed_tools:
   - propose_subtasks
   - load_skill
   - palace_search
-  - palace_add
   - palace_link
   - list_available_tools
+  - github_project_search
+  - github_extract_snippets
   - mcp_discover
+  - mcp_install
   - get_gmas_context
   - search_gmas_knowledge
   - submit_phase_plan
@@ -40,6 +42,8 @@ allowed_skills:
   - test-strategy-author
   - gmas-pattern-author
   - gmas-overview
+  - github-discovery
+  - mcp-discovery
   - architecture-author
 
 memory:
@@ -56,13 +60,11 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [read_file, list_files, propose_phase_plan, propose_subtasks, load_skill, palace_search, palace_add, palace_link, list_available_tools, mcp_discover, get_gmas_context, search_gmas_knowledge, submit_phase_plan, loop_back_to]
+    - allow_tools: [read_file, list_files, propose_phase_plan, propose_subtasks, load_skill, palace_search, palace_link, list_available_tools, github_project_search, github_extract_snippets, mcp_discover, mcp_install, get_gmas_context, search_gmas_knowledge, submit_phase_plan, loop_back_to]
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, enable_tools, register_temp_tool, claude_code_edit, sandbox_self_edit]
 
 exit_criteria:
   required_calls: [propose_phase_plan, submit_phase_plan]
-  min_palace_writes:
-    - {store: palace.run, n: 1}
 
 mini_review_after: plan_review
 

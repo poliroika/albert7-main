@@ -2,6 +2,7 @@
 
 import argparse
 import errno
+import io
 import logging
 import sys
 from pathlib import Path
@@ -11,6 +12,18 @@ from umbrella.web_bridge.handler import build_handler
 from umbrella.web_bridge.util import WEB_BUILD_DIR
 
 log = logging.getLogger(__name__)
+
+
+def _windows_utf8_stream(stream):
+    if sys.platform != "win32":
+        return stream
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        return stream
+    encoding = str(getattr(stream, "encoding", "") or "").replace("-", "").lower()
+    if encoding == "utf8":
+        return stream
+    return io.TextIOWrapper(buffer, encoding="utf-8", errors="replace")
 
 
 class ReusableThreadingHTTPServer:
@@ -67,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", type=Path, default=None)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+    sys.stdout = _windows_utf8_stream(sys.stdout)
+    sys.stderr = _windows_utf8_stream(sys.stderr)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",

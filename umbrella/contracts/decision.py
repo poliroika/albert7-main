@@ -1,7 +1,5 @@
 """Phase transition decisions derived from typed contract issues."""
 
-from __future__ import annotations
-
 from typing import Any
 
 from umbrella.contracts.models import ContractIssue, PhaseDecision, TaskRiskProfile
@@ -28,6 +26,9 @@ def decide_phase_transition(
         if any(issue.code in {"policy_violation", "verifier_mutation_attempt"} for issue in blocking):
             action = "abort"
             target = None
+        elif all(issue.code == "proof_stale_rerun_required" for issue in blocking):
+            action = "verify"
+            target = phase
         else:
             action = "loop_back"
             target = phase

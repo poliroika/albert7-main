@@ -2893,7 +2893,7 @@ def test_apply_workspace_patch_blocks_future_subtask_file_before_current_complet
     assert not (ws_dir / "frontend" / "src" / "App.tsx").exists()
 
 
-def test_apply_workspace_patch_allows_additive_workspace_toml_out_of_scope(
+def test_apply_workspace_patch_blocks_workspace_toml_out_of_scope(
     workspace,
 ) -> None:
     ctx, ws_dir, ws_id = workspace
@@ -2933,9 +2933,10 @@ command = ["python", "-c", "print(1)"]
         ),
     )
     payload = json.loads(raw)
-    assert payload["status"] == "applied", payload
+    assert payload["status"] == "blocked", payload
+    assert payload["issues"][0]["code"] == "verifier_policy_write_requires_supervisor_approval"
     text = (ws_dir / "workspace.toml").read_text(encoding="utf-8")
-    assert 'name = "pkg"' in text
+    assert 'name = "pkg"' not in text
     assert 'name = "smoke"' in text
 
 

@@ -1,8 +1,24 @@
 """Agent-facing phase-contract tool handlers."""
 
+import shlex
+
 from umbrella.deep_agent_tools.phase_contract_common import *
 from umbrella.deep_agent_tools.phase_contract_base import *
 from umbrella.deep_agent_tools.phase_contract_declarations import _iter_plan_strings
+from umbrella.deep_agent_tools.phase_contract_policy import (
+    _phase_plan_empty_test_skeleton_issues,
+    _phase_plan_file_reference_issues,
+    _phase_plan_greenfield_layout_issues,
+    _phase_plan_llm_env_issues,
+    _phase_plan_llm_fallback_issues,
+    _phase_plan_llm_provider_default_issues,
+    _phase_plan_llm_test_double_issues,
+    _phase_plan_missing_leaf_file_field_issues,
+    _phase_plan_generic_success_test_issues,
+    _phase_plan_success_test_issues,
+    _phase_plan_workspace_prefix_issues,
+    _workspace_existing_impl_roots,
+)
 from umbrella.deep_agent_tools.phase_control_base import (
     _llm_cached_decision_handoff_issue,
     _llm_fallback_handoff_issue,
@@ -13,7 +29,20 @@ from umbrella.deep_agent_tools.phase_control_research import (
     _negative_claim_contradiction_issue,
     _unread_existing_workspace_path_issue,
 )
+from umbrella.deep_agent_tools.phase_control_common import (
+    _LLM_ENV_CONTEXT_RE,
+    _LLM_ENV_OMISSION_REQUIRED_RE,
+    _OPENAI_KEY_RE,
+    _OPENAI_REQUIRED_RE,
+    _WEB_SEARCH_ONLY_CONTEXT_RE,
+)
+from umbrella.deep_agent_tools.domain_policy import (
+    HOST_LLM_ENV_BRIDGE_ALIASES,
+    PUBLIC_LLM_ENV_ALIASES,
+    unsupported_llm_env_alias_issues,
+)
 from umbrella.deep_agent_tools.research_provenance import (
+    next_finding_source_hint as _next_finding_source_hint,
     research_finding_source_provenance_issue as _research_finding_source_provenance_issue,
     tool_result_content_grounding_issue as _tool_result_content_grounding_issue,
 )
@@ -22,6 +51,7 @@ from umbrella.contracts import (
     ContractIssue,
     ContractValidator,
     build_workspace_context,
+    canonicalize_phase_plan,
     compile_phase_plan,
 )
 
@@ -319,6 +349,63 @@ def _metadata_verified_false(metadata: dict[str, Any]) -> bool:
     return text in {"0", "false", "no", "off", "unverified"}
 
 
+_PALACE_ADD_NON_LLM_TASK_CONTEXT_RE = re.compile(
+    r"(?is)("
+    r"\bnot\s+(?:an?\s+)?(?:llm|gmas|bot|agent)\b|"
+    r"\bno\s+(?:llm|gmas|bot|agent)\b|"
+    r"\bwithout\s+(?:llm|gmas|bot|agent)\s+(?:integration|runtime|calls?)\b|"
+    r"\b(?:llm|gmas|bot|agent)\b.{0,80}\b(?:irrelevant|not\s+(?:required|applicable)|"
+    r"non[-\s]?applicable)\b"
+    r")"
+)
+
+
+def _palace_add_llm_env_contract_issue(text: str, *, subject: str) -> str:
+    raw = str(text or "")
+    for issue in unsupported_llm_env_alias_issues(raw, subject=subject):
+        return issue.message
+    if not _LLM_ENV_CONTEXT_RE.search(raw):
+        return ""
+    public_mentions = [
+        alias
+        for alias in PUBLIC_LLM_ENV_ALIASES
+        if re.search(rf"\b{re.escape(alias)}\b", raw)
+    ]
+    host_mentions = [
+        alias
+        for alias in HOST_LLM_ENV_BRIDGE_ALIASES
+        if re.search(rf"\b{re.escape(alias)}\b", raw)
+    ]
+    non_llm_task_context = bool(_PALACE_ADD_NON_LLM_TASK_CONTEXT_RE.search(raw))
+    if non_llm_task_context and not host_mentions and not _OPENAI_REQUIRED_RE.search(raw):
+        return ""
+    web_search_only = bool(_WEB_SEARCH_ONLY_CONTEXT_RE.search(raw)) and not public_mentions
+    contract_context = bool(_LLM_ENV_OMISSION_REQUIRED_RE.search(raw))
+    mentions_provider_key = bool(_OPENAI_KEY_RE.search(raw)) and not web_search_only
+    if not (
+        public_mentions
+        or host_mentions
+        or contract_context
+        or _OPENAI_REQUIRED_RE.search(raw)
+        or mentions_provider_key
+    ):
+        return ""
+    missing = [alias for alias in PUBLIC_LLM_ENV_ALIASES if alias not in public_mentions]
+    if not missing:
+        return ""
+    return (
+        f"{subject} uses an incomplete LLM runtime env contract. Generated "
+        "workspace code/tests and phase memory must support public runtime "
+        "`LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` aliases; Umbrella "
+        "bridges host `OUROBOROS_*` launch aliases into those public names "
+        "before running workspace commands. Do not require `OPENAI_API_KEY` "
+        "or plain `LLM_API_KEY` as the only way to run real LLM/e2e behavior. "
+        "Missing aliases: "
+        + ", ".join(f"`{alias}`" for alias in missing)
+        + "."
+    )
+
+
 _PALACE_ADD_VERIFIED_OUTCOME_KINDS = {
     "completion_memory",
     "durable",
@@ -444,51 +531,6 @@ def _infer_phase_palace_add_kind(
     if _PHASE_MEMORY_PROGRESS_NOTE_RE.search(text):
         return kind_s or "observation"
     return "research_finding"
-
-
-def _llm_env_contract_issue_from_text(
-    text: str,
-    *,
-    subject: str,
-    require_explicit_contract: bool,
-) -> str:
-    value = str(text or "")
-    public_aliases = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
-    unsupported_aliases = {
-        "LL_BASE_URL": "Use LLM_BASE_URL.",
-        "OUROBOROS_LLM_MODEL": "Use public LLM_MODEL in generated workspaces; Umbrella host launch uses OUROBOROS_MODEL.",
-    }
-    present = {alias for alias in public_aliases if alias in value}
-    mentions_runtime_contract = require_explicit_contract or bool(
-        present
-        or "OPENAI_API_KEY" in value
-        or "OUROBOROS_LLM_API_KEY" in value
-        or "OUROBOROS_LLM_BASE_URL" in value
-        or "OUROBOROS_MODEL" in value
-        or any(alias in value for alias in unsupported_aliases)
-    )
-    if not mentions_runtime_contract:
-        return ""
-    unsupported = [
-        f"{alias}: {hint}"
-        for alias, hint in unsupported_aliases.items()
-        if alias in value
-    ]
-    missing = [alias for alias in public_aliases if alias not in present]
-    if "OPENAI_API_KEY" in value and "LLM_API_KEY" not in present:
-        unsupported.append(
-            "OPENAI_API_KEY: generated workspaces must expose provider-neutral LLM_API_KEY unless they intentionally choose OpenAI-only behavior."
-        )
-    if not missing and not unsupported:
-        return ""
-    parts: list[str] = []
-    if missing:
-        parts.append(
-            f"{subject} must include the public LLM runtime aliases {', '.join(public_aliases)}; missing: {', '.join(missing)}."
-        )
-    if unsupported:
-        parts.append("Unsupported or host-only alias references: " + "; ".join(unsupported))
-    return " ".join(parts)
 
 
 def _palace_add(
@@ -657,7 +699,7 @@ def _palace_add(
             "files were read in this phase."
         )
     if phase in {"research", "plan"}:
-        finding_text = "\n".join(part for part in (title, body) if part)
+        finding_text = "\n".join(part for part in (title, content) if part)
         fallback_issue = _llm_fallback_handoff_issue(
             finding_text,
             label=f"palace_add {phase} finding",
@@ -689,33 +731,27 @@ def _palace_add(
                 "decisions on fresh real runtime calls, then cite only the "
                 "accepted id."
             )
-        env_issue = _llm_env_contract_issue_from_text(
+        llm_env_issue = _palace_add_llm_env_contract_issue(
             finding_text,
             subject=f"palace_add {phase} finding",
-            require_explicit_contract=False,
         )
-        if env_issue:
-            return (
-                "ERROR: "
-                + env_issue
-                + " This memory entry was not saved. Save a corrected finding "
-                "with the public LLM_* runtime aliases and optional inherited "
-                "Umbrella compatibility aliases, then cite only the accepted id."
-            )
+        if llm_env_issue:
+            return f"ERROR: {llm_env_issue} This memory entry was not saved."
     if phase == "research" and str(kind or "").strip().lower() == "research_finding":
+        source_hint = _next_finding_source_hint(rows)
         provenance_issue = _research_finding_source_provenance_issue(
             rows,
             source_id=source_id,
         )
         if provenance_issue:
-            return provenance_issue
+            return provenance_issue + source_hint
         grounding_issue = _tool_result_content_grounding_issue(
             rows,
             source_id=source_id,
             content="\n".join(part for part in (title, content) if part),
         )
         if grounding_issue:
-            return grounding_issue
+            return grounding_issue + source_hint
     mem_store, mem_tier, mem_scope = _palace_add_store_policy(
         ctx,
         palace_path=palace_path,
@@ -984,33 +1020,1043 @@ def _blocking_contract_issues(issues: list[ContractIssue]) -> list[ContractIssue
 
 def _contract_issue_text(issues: list[ContractIssue], *, limit: int = 12) -> str:
     return "; ".join(
-        f"{issue.code}: {issue.message or issue.code}" for issue in issues[:limit]
+        (
+            f"{issue.code}"
+            f"{f'[{issue.subtask_id}]' if getattr(issue, 'subtask_id', '') else ''}: "
+            f"{issue.message or issue.code}"
+        )
+        for issue in issues[:limit]
     )
+
+
+def _plan_stub_intent_issue(plan: dict[str, Any], notes: str = "") -> str:
+    if '"_depth_limit": true' in json.dumps(plan, ensure_ascii=False).lower():
+        return (
+            "phase plan contains a depth-limit placeholder; expand it into "
+            "concrete executable leaf subtasks before proposing the plan"
+        )
+    for text in _iter_plan_strings({"plan": plan, "notes": notes}):
+        lowered = str(text or "").lower()
+        if not any(token in lowered for token in ("stub", "mock", "placeholder")):
+            continue
+        if re.search(
+            r"\b(?:no|not|never|without|avoid|reject|forbid|forbidden|"
+            r"disallow|prohibit|prohibited|anti[-_\s]?patterns?)\b"
+            r".{0,120}\b(?:stub|mock|placeholder|dry[-\s]?run)\b",
+            lowered,
+        ):
+            continue
+        if any(
+            token in lowered
+            for token in ("implement", "build", "create", "add", "fix", "repair")
+        ):
+            return "plan proposes stub/mock/placeholder implementation for required behavior"
+    return ""
+
+
+def _plan_unknown_tool_issues(plan: dict[str, Any]) -> list[str]:
+    from ouroboros.tools.registry import CORE_TOOL_NAMES
+
+    known = set(CORE_TOOL_NAMES) | {
+        "shell",
+        "read_file",
+        "list_files",
+        "harness_run",
+        "mutate_phase_plan",
+        "run_subtask_proof",
+        "request_watcher_review",
+        "mark_subtask_complete",
+        "submit_micro_review",
+        "run_workspace_verify",
+    }
+    issues: list[str] = []
+
+    def walk(value: Any, path: str = "plan") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}"
+                validates_tools = str(key) == "allowed_tools" or (
+                    str(key) == "tools" and ".subtasks[" in path
+                )
+                if validates_tools:
+                    raw_items = child if isinstance(child, list) else str(child).split(",")
+                    for raw in raw_items:
+                        name = str(raw or "").strip()
+                        if name and name not in known:
+                            issues.append(
+                                f"plan field `{child_path}` declares unknown phase tool `{name}`"
+                            )
+                else:
+                    walk(child, child_path)
+        elif isinstance(value, list):
+            for idx, child in enumerate(value):
+                walk(child, f"{path}[{idx}]")
+
+    walk(plan)
+    return issues
+
+
+def _iter_plan_subtasks_for_policy(value: Any) -> list[dict[str, Any]]:
+    subtasks: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key) in {"subtasks", "phases", "ordered_subtasks"} and isinstance(child, list):
+                subtasks.extend(item for item in child if isinstance(item, dict))
+            subtasks.extend(_iter_plan_subtasks_for_policy(child))
+    elif isinstance(value, list):
+        for child in value:
+            subtasks.extend(_iter_plan_subtasks_for_policy(child))
+    return subtasks
+
+
+def _declared_plan_paths(value: Any) -> list[str]:
+    paths: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key) in {
+                "files",
+                "file",
+                "deliverables",
+                "files_to_create",
+                "files_to_change",
+                "files_affected",
+            }:
+                raw_items = child if isinstance(child, list) else [child]
+                paths.extend(str(item or "") for item in raw_items)
+            else:
+                paths.extend(_declared_plan_paths(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.extend(_declared_plan_paths(child))
+    return [path.replace("\\", "/").strip().strip("/") for path in paths if str(path).strip()]
+
+
+def _plan_existing_workspace_policy_issues(ctx: ToolContext, plan: dict[str, Any]) -> list[str]:
+    existing_roots = _workspace_existing_impl_roots(ctx)
+    if not existing_roots:
+        return []
+    issues: list[str] = []
+    migration_text = "\n".join(_iter_plan_strings(plan)).lower()
+    has_migration_intent = any(
+        token in migration_text
+        for token in ("migrate", "move existing", "integrate existing", "remove obsolete")
+    )
+    allowed_new_roots = {"tests", "docs", "src", "scripts", "assets"}
+    for path in _declared_plan_paths(plan):
+        top = path.split("/", 1)[0]
+        if (
+            top
+            and "/" in path
+            and top not in existing_roots
+            and top not in allowed_new_roots
+            and not has_migration_intent
+        ):
+            issues.append(
+                f"new top-level implementation root `{top}` would be introduced "
+                "beside existing workspace roots; migrate/integrate existing code "
+                "or declare an explicit migration instead of scaffolding a parallel root"
+            )
+    for subtask in _iter_plan_subtasks_for_policy(plan):
+        subtask_id = str(subtask.get("id") or subtask.get("title") or "<unknown>")
+        text = "\n".join(_iter_plan_strings(subtask)).lower()
+        if "without scaffolding" in text or "not scaffold" in text:
+            continue
+        if any(
+            phrase in text
+            for phrase in (
+                "setup project structure",
+                "project setup",
+                "create full-stack",
+                "from scratch",
+                "scaffold",
+            )
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` proposes setup/scaffold/create-from-scratch "
+                "work for an existing workspace; repair or integrate the current "
+                "implementation instead of scaffolding/building project structure from scratch"
+            )
+    return issues
+
+
+def _plan_success_test_policy_issues(plan: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    for subtask in _iter_plan_subtasks_for_policy(plan):
+        subtask_id = str(subtask.get("id") or subtask.get("title") or "<unknown>")
+        raw_success = (
+            subtask.get("verification_command")
+            or subtask.get("success_test")
+            or subtask.get("success_checks")
+            or subtask.get("success_check")
+        )
+        verification_command = str(subtask.get("verification_command") or "").strip()
+        if not verification_command and isinstance(subtask.get("success_test"), list):
+            issues.append(
+                f"subtask `{subtask_id}` success_test must be a single "
+                "executable command or a typed proof; split multiple checks "
+                "into separate subtasks or a checked-in verifier script"
+            )
+        if not verification_command and isinstance(subtask.get("success_test"), dict):
+            command_value = str(subtask["success_test"].get("command") or "").strip()
+            if command_value.startswith("-"):
+                issues.append(
+                    f"subtask `{subtask_id}` success_test command is missing "
+                    "an executable; write the full command, e.g. `python -m "
+                    "pytest ...`, instead of relying on type metadata"
+                )
+        success_text = verification_command or str(raw_success or "")
+        lowered = success_text.lower()
+        if not success_text:
+            continue
+        if isinstance(raw_success, str):
+            try:
+                shlex.split(raw_success)
+            except ValueError as exc:
+                issues.append(
+                    f"subtask `{subtask_id}` success_test has unbalanced "
+                    f"double quotes or invalid shell quoting: {exc}"
+                )
+        if lowered.strip() in {"run_workspace_verify", "run_unit_tests"}:
+            issues.append(
+                f"subtask `{subtask_id}` has bare `run_workspace_verify`/"
+                "`run_unit_tests` as success_test: use an executable project "
+                "command or typed proof for the subtask; Umbrella runs "
+                "supervisor verification separately"
+            )
+        elif re.match(r"^\s*(?:run_workspace_verify|run_unit_tests)\s+\S+", lowered):
+            issues.append(
+                f"subtask `{subtask_id}` uses a generic Umbrella supervisor "
+                "tool with pseudo-arguments in success_test; replace it with "
+                "a real executable project command such as `python -m pytest ...`"
+            )
+        elif re.match(
+            r"^\s*(?:harness_run|run_workspace_verify|run_unit_tests):",
+            lowered,
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` uses a generic Umbrella supervisor "
+                "tool with pseudo-arguments in success_test; replace it with "
+                "a real executable project command such as `python -m pytest ...`"
+            )
+        if re.search(r"(?:^|&&|\|\||;)\s*echo\b", lowered):
+            issues.append(
+                f"subtask `{subtask_id}` has decorative shell output command "
+                "`echo` in success_test; replace it with a real assertion, "
+                "build command, test command, or checked-in verifier script"
+            )
+        if re.search(
+            r"\s-\s+(?:must|should|verifies?|validates?|checks?|exit\s+code)\b",
+            lowered,
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` success_test contains descriptive "
+                "acceptance text after an executable command; move prose into "
+                "goal/notes and keep success_test as argv-only proof"
+            )
+        if re.match(r"\s*command\s*:", lowered):
+            issues.append(
+                f"subtask `{subtask_id}` success_test contains descriptive "
+                "text with a prefix `Command:`; provide only the executable "
+                "command"
+            )
+        if re.search(r"\b(?:succeeds?|passes?)\s*;\s*without\b", lowered):
+            issues.append(
+                f"subtask `{subtask_id}` success_test contains descriptive "
+                "pass/fail outcome prose; encode this as pytest assertions or "
+                "a checked-in verifier script"
+            )
+        parenthetical = re.search(r"\s\(([^)]{8,120})\)\s*$", success_text)
+        if (
+            parenthetical
+            and re.search(r"\b(?:pytest|python -m pytest|npm)\b", lowered)
+            and not re.search(
+                r"\b(?:cd|npm|python|pytest|not|and|or)\b|&&|\|\|",
+                parenthetical.group(1).lower(),
+            )
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` success_test contains parenthetical "
+                "explanatory prose; keep proof commands machine-executable"
+            )
+        if re.search(r"(?:^|\s)curl\b", lowered) and re.search(
+            r"https?://(?:127\.0\.0\.1|localhost)", lowered
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` success_test uses a direct HTTP "
+                "shell command against localhost; use a managed server "
+                "harness with readiness and cleanup, or a checked-in verifier "
+                "that starts/stops the service deterministically"
+            )
+        if "--passwithnotests" in lowered:
+            issues.append(
+                f"subtask `{subtask_id}` success_test allows empty JavaScript "
+                "test suites via `--passWithNoTests`; require real tests or "
+                "use a build/typecheck proof instead"
+            )
+        if re.search(r"\b(?:mock|fake|dry[-\s]?run|--mock(?:[-_][a-z0-9]+)?)\b", lowered):
+            context_text = "\n".join(_iter_plan_strings(subtask)).lower()
+            if re.search(r"\b(?:llm|gmas|bot|agent|e2e|integration|runtime)\b", context_text):
+                issues.append(
+                    f"subtask `{subtask_id}` success_test uses a "
+                    "mocked path / mock/fake/dry-run path "
+                    "for an LLM/e2e/integration proof; required behavior must "
+                    "use the inherited real runtime env or fail/skip/pause "
+                    "explicitly when that env is absent"
+                )
+        if re.search(r"(?:^|\s)(?:cd\s+)?workspaces[/\\]", lowered):
+            issues.append(
+                f"subtask `{subtask_id}` success_test references a host "
+                "workspace path; proof commands already run inside the "
+                "workspace and should use workspace-relative paths"
+            )
+        if re.search(r"(?:^|\s)cd\s+src(?:\s|$)", lowered):
+            issues.append(
+                f"subtask `{subtask_id}` success_test changes into source "
+                "root `src`; proof commands should run from the workspace "
+                "root with workspace-relative test and source paths"
+            )
+        if (
+            (
+                "error_llm" in lowered
+                or re.search(r"\b(?:llm|gmas|bot|agent|model)\b", lowered)
+            )
+            and re.search(r"\bassert\b", lowered)
+            and (
+                "error_llm" in lowered
+                or re.search(r"\bor\b[^;\n]{0,120}[\"']error[\"']", lowered)
+            )
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` success_test treats an LLM/GMAS "
+                "error path as a passing outcome; proof must require real "
+                "success or assert that failures are surfaced/paused"
+            )
+        if any(
+            phrase in lowered
+            for phrase in (
+                "user reports",
+                "manual",
+                "human player",
+                "human verifies",
+                "network inspector",
+                "browser console has",
+            )
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` has non-automatable success_test: "
+                "describes browser/user observation; replace manual/"
+                "user-reported proof with an executable command or harness"
+            )
+        elif "documentation of" in lowered and not any(
+            token in lowered for token in ("pytest", "python", "npm", "run_", "harness")
+        ):
+            issues.append(
+                f"subtask `{subtask_id}` has non-automatable success_test: "
+                "replace prose documentation criteria with an executable command or typed proof"
+            )
+    return issues
+
+
+def _plan_read_path_issues(ctx: ToolContext, plan: dict[str, Any]) -> list[str]:
+    try:
+        root = _workspace_root_for_phase(ctx, _workspace_id(ctx))
+    except Exception:
+        return []
+    issues: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key) == "files_to_read":
+                    raw_items = child if isinstance(child, list) else [child]
+                    for raw in raw_items:
+                        rel = str(raw or "").replace("\\", "/").strip().strip("/")
+                        if rel and not (root / rel).exists():
+                            issues.append(f"non-existent file `{rel}` referenced in phase plan")
+                else:
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(plan)
+    return issues
+
+
+def _plan_compactness_issues(plan: dict[str, Any]) -> list[str]:
+    subtasks = _iter_plan_subtasks_for_policy(plan)
+    if len(subtasks) <= 16:
+        return []
+    plan_text = "\n".join(_iter_plan_strings(plan)).lower()
+    if not re.search(
+        r"\b(?:gmas|llm|multi[-\s]?agent|agent graph|frontend|backend|"
+        r"websocket|fastapi|react|typescript|civilization|game)\b",
+        plan_text,
+    ):
+        return []
+    return [
+        "phase plan has "
+        f"{len(subtasks)} executable leaves; keep large greenfield Umbrella "
+        "plans compact at roughly 8-16 leaves by grouping related work into "
+        "vertical slices with one real typed proof each. A good repair target "
+        "is 12-14 leaves. Do not oscillate between many tiny leaves and one "
+        "oversized leaf; merge adjacent vertical slices while preserving "
+        "proof ownership."
+    ]
+
+
+_PLAN_CODE_EXTENSIONS = {
+    ".py",
+    ".pyi",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+}
+
+
+def _plan_subtask_declared_paths(subtask: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("files_to_create", "files_to_change", "files_affected"):
+        raw = subtask.get(key)
+        if isinstance(raw, str):
+            paths.append(raw)
+        elif isinstance(raw, list):
+            paths.extend(str(item) for item in raw if str(item).strip())
+    proof = subtask.get("proof")
+    if isinstance(proof, dict):
+        scope = proof.get("scope")
+        if isinstance(scope, dict):
+            for key in ("files_under_test", "changed_files_expected"):
+                raw = scope.get(key)
+                if isinstance(raw, str):
+                    paths.append(raw)
+                elif isinstance(raw, list):
+                    paths.extend(str(item) for item in raw if str(item).strip())
+    return [path.replace("\\", "/").strip("/") for path in paths if str(path).strip()]
+
+
+def _plan_path_looks_like_code(path: str) -> bool:
+    suffix = pathlib.PurePosixPath(str(path or "").replace("\\", "/")).suffix.lower()
+    return suffix in _PLAN_CODE_EXTENSIONS
+
+
+def _plan_path_looks_like_test(path: str) -> bool:
+    normalised = str(path or "").replace("\\", "/").lower().strip("/")
+    if not normalised:
+        return False
+    parts = [part for part in normalised.split("/") if part]
+    if any(part in {"test", "tests", "__tests__"} for part in parts[:-1]):
+        return True
+    name = parts[-1]
+    stem = name.rsplit(".", 1)[0]
+    return (
+        stem.startswith("test_")
+        or stem.endswith("_test")
+        or name.endswith((".test.js", ".test.jsx", ".test.ts", ".test.tsx"))
+        or name.endswith((".spec.js", ".spec.jsx", ".spec.ts", ".spec.tsx"))
+    )
+
+
+def _plan_broad_leaf_issues(plan: dict[str, Any]) -> list[str]:
+    subtasks = _iter_plan_subtasks_for_policy(plan)
+    if len(subtasks) < 6:
+        return []
+    plan_text = "\n".join(_iter_plan_strings(plan)).lower()
+    if not re.search(
+        r"\b(?:gmas|llm|multi[-\s]?agent|agent graph|frontend|backend|"
+        r"websocket|fastapi|react|typescript|civilization|game)\b",
+        plan_text,
+    ):
+        return []
+    too_broad: list[str] = []
+    for idx, subtask in enumerate(subtasks, start=1):
+        paths = sorted(set(_plan_subtask_declared_paths(subtask)))
+        code_paths = [path for path in paths if _plan_path_looks_like_code(path)]
+        if len(paths) <= 4 or len(code_paths) <= 3:
+            continue
+        subtask_id = str(
+            subtask.get("id")
+            or subtask.get("subtask_id")
+            or subtask.get("title")
+            or subtask.get("name")
+            or f"subtask #{idx}"
+        )
+        too_broad.append(f"{subtask_id} ({len(paths)} files)")
+    if not too_broad:
+        return []
+    return [
+        "phase plan has implementation subtask(s) that are too broad for a "
+        "bounded Umbrella execute loop: "
+        + ", ".join(too_broad[:8])
+        + ". [PHASE_PLAN_REPAIR_SCAFFOLD] Split broad leaves into narrower "
+        "vertical product slices of about 2-4 files each, keep one behavioral "
+        "typed proof per leaf, and move future/optional files into later "
+        "subtasks only when they are required by the current user goal."
+    ]
+
+
+_PLAN_ALLOWED_ENV_FILES = {".env.example", ".env.sample", ".env.template"}
+_PLAN_FORBIDDEN_SECRET_DIRS = {"secret", "secrets", "credential", "credentials"}
+_PLAN_FORBIDDEN_CONTROL_DIRS = {".memory", ".umbrella", ".umbrella_scratch"}
+_PLAN_FORBIDDEN_CONTROL_FILES = {"workspace.toml"}
+
+
+def _plan_forbidden_file_issues(plan: dict[str, Any]) -> list[str]:
+    offending: list[str] = []
+    for path in _declared_plan_paths(plan):
+        rel = path.replace("\\", "/").strip("/")
+        parts = [part.lower() for part in pathlib.PurePosixPath(rel).parts if part]
+        if not parts:
+            continue
+        basename = parts[-1]
+        if rel.startswith("../") or "/../" in rel or parts[0] == ".git":
+            offending.append(path)
+            continue
+        if parts[0] in _PLAN_FORBIDDEN_CONTROL_DIRS:
+            offending.append(path)
+            continue
+        if len(parts) == 1 and basename in _PLAN_FORBIDDEN_CONTROL_FILES:
+            offending.append(path)
+            continue
+        if basename.startswith(".env") and basename not in _PLAN_ALLOWED_ENV_FILES:
+            offending.append(path)
+            continue
+        if any(part in _PLAN_FORBIDDEN_SECRET_DIRS for part in parts[:-1]):
+            offending.append(path)
+    if not offending:
+        return []
+    return [
+        "phase plan references protected secret/env workspace path(s), "
+        "paths outside the active candidate workspace, or "
+        "workspace/control/evaluator path(s); do not create or modify "
+        "`.memory`, `.umbrella`, `workspace.toml`, real `.env` files, or "
+        "secret/credential directories, and never target `.git` or `..` "
+        "host paths "
+        "from generated workspace tasks. Use phase tools for memory/control "
+        "signals, documented env contracts, `.env.example`, or tests that "
+        "inherit Umbrella runtime aliases instead. Offending path(s): "
+        + ", ".join(offending[:8])
+    ]
+
+
+def _plan_annotated_path_issues(plan: dict[str, Any]) -> list[str]:
+    file_keys = {
+        "files_to_create",
+        "files_to_change",
+        "files_affected",
+        "files_under_test",
+        "changed_files_expected",
+    }
+    offending: list[str] = []
+
+    def visit(value: Any, *, in_file_field: bool = False) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(child, in_file_field=str(key).lower() in file_keys)
+            return
+        if isinstance(value, list):
+            for child in value:
+                visit(child, in_file_field=in_file_field)
+            return
+        if not in_file_field or not isinstance(value, str):
+            return
+        raw = value.strip()
+        if re.search(r"\.[A-Za-z0-9]{1,8}\s+\([^)]{1,120}\)$", raw):
+            offending.append(raw)
+
+    visit(plan)
+    if not offending:
+        return []
+    return [
+        "phase plan file fields contain annotated pseudo-paths; use plain "
+        "workspace-relative paths and move notes into goal/notes metadata. "
+        "Offending path(s): " + ", ".join(offending[:8])
+    ]
+
+
+def _plan_frontend_test_path_issues(plan: dict[str, Any]) -> list[str]:
+    offending = [
+        path
+        for path in _declared_plan_paths(plan)
+        if path.replace("\\", "/").lower().startswith("tests/frontend/")
+        and pathlib.PurePosixPath(path).suffix.lower() in {".js", ".jsx", ".ts", ".tsx"}
+    ]
+    if not offending:
+        return []
+    return [
+        "frontend package test files are declared outside the frontend "
+        "package; move them under `frontend/` so npm/vitest ownership, "
+        "imports, and package scripts are consistent. Offending path(s): "
+        + ", ".join(offending[:8])
+    ]
+
+
+def _pytest_targets_from_success_text(value: str) -> list[str]:
+    try:
+        parts = shlex.split(str(value or ""))
+    except ValueError:
+        parts = str(value or "").split()
+    targets: list[str] = []
+    for part in parts:
+        token = part.replace("\\", "/").strip().strip("'\"")
+        if "::" in token:
+            token = token.split("::", 1)[0]
+        if "/" not in token and "." not in pathlib.PurePosixPath(token).name:
+            continue
+        if _plan_path_looks_like_test(token):
+            targets.append(token)
+    return targets
+
+
+def _plan_pytest_target_ownership_issues(plan: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    declared_so_far: set[str] = set()
+    for subtask in _iter_plan_subtasks_for_policy(plan):
+        subtask_id = str(subtask.get("id") or subtask.get("title") or "<unknown>")
+        declared = {
+            path.replace("\\", "/").strip("/")
+            for path in _plan_subtask_declared_paths(subtask)
+        }
+        success_text = str(
+            subtask.get("verification_command")
+            or subtask.get("success_test")
+            or subtask.get("success_checks")
+            or subtask.get("success_check")
+            or ""
+        )
+        if "pytest" not in success_text.lower():
+            declared_so_far.update(declared)
+            continue
+        targets = _pytest_targets_from_success_text(success_text)
+        label = " ".join(
+            str(subtask.get(key) or "")
+            for key in ("id", "title", "goal")
+        ).lower()
+        if ("final" in label or "deployment" in label) and targets:
+            reused = [
+                target
+                for target in targets
+                if target in declared_so_far and target not in declared
+            ]
+            if reused:
+                issues.append(
+                    f"subtask `{subtask_id}` reuses prior pytest target(s) "
+                    f"{reused[:8]} for final verification; declare a "
+                    "distinct final proof artifact in this leaf"
+                )
+        missing = [
+            target
+            for target in targets
+            if target not in declared and target not in declared_so_far
+        ]
+        if missing:
+            issues.append(
+                f"subtask `{subtask_id}` success_test references pytest "
+                f"target(s) {missing[:8]} that are not declared in "
+                "`files_to_create`/`files_to_change` on the same or an "
+                "earlier plan leaf"
+            )
+        declared_so_far.update(declared)
+    return issues
+
+
+def _plan_frontend_build_entrypoint_issues(plan: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    declared_so_far: set[str] = set()
+    for subtask in _iter_plan_subtasks_for_policy(plan):
+        declared = {
+            path.replace("\\", "/")
+            for path in _plan_subtask_declared_paths(subtask)
+        }
+        success_text = str(
+            subtask.get("verification_command")
+            or subtask.get("success_test")
+            or subtask.get("success_check")
+            or subtask.get("success_checks")
+            or ""
+        ).lower()
+        subtask_id = str(subtask.get("id") or subtask.get("title") or "<unknown>")
+        if re.search(
+            r"\b(?:npm|pnpm|yarn)(?:\s+\S+){0,6}\s+(?:run\s+)?build\b|"
+            r"\bvite\s+build\b",
+            success_text,
+        ):
+            available = declared_so_far | declared
+            has_index = "frontend/index.html" in available
+            has_main = any(
+                path in available
+                for path in (
+                    "frontend/src/main.tsx",
+                    "frontend/src/main.jsx",
+                    "frontend/src/main.ts",
+                    "frontend/src/main.js",
+                )
+            )
+            has_app = any(
+                path in available
+                for path in (
+                    "frontend/src/App.tsx",
+                    "frontend/src/App.jsx",
+                    "frontend/src/App.ts",
+                    "frontend/src/App.js",
+                )
+            )
+            if not (has_index and has_main and has_app):
+                issues.append(
+                    f"subtask `{subtask_id}` has frontend build success_test "
+                    "before the files needed for a Vite/React entrypoint are "
+                    "declared; declare `frontend/index.html`, "
+                    "`frontend/src/<entry>.tsx`, and `frontend/src/App.tsx` "
+                    "in the same or an earlier leaf, or move the build proof "
+                    "after the entrypoint leaf"
+                )
+        declared_so_far.update(declared)
+    return issues
+
+
+def _plan_revision_contract_issues(ctx: ToolContext, plan: dict[str, Any]) -> list[str]:
+    overlays = getattr(ctx, "context_overlays", {}) or {}
+    phase_node = overlays.get("phase_node") if isinstance(overlays, dict) else None
+    overlay = phase_node.get("overlay") if isinstance(phase_node, dict) else None
+    if not isinstance(overlay, dict):
+        return []
+    reason = str(overlay.get("retry_reason") or "").strip().lower()
+    if not reason.startswith("micro review requested revisions"):
+        return []
+    contract = overlay.get("revision_contract")
+    if not isinstance(contract, dict):
+        return []
+    raw_revisions = contract.get("required_plan_changes") or contract.get("revisions") or []
+    revisions = [str(item).strip() for item in raw_revisions if str(item).strip()]
+    if not revisions:
+        return []
+    plan_text = json.dumps(plan, ensure_ascii=False).lower()
+    stopwords = {
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "phase",
+        "project",
+        "subtask",
+        "subtasks",
+        "replace",
+        "these",
+        "fields",
+        "provide",
+        "specify",
+        "exactly",
+        "validates",
+        "pytest-cov",
+        "platform-appropriate",
+    }
+    issues: list[str] = []
+    for revision in revisions:
+        revision_l = revision.lower()
+        if re.match(r"\s*(?:consider|optional|maybe|could|nice to have)\b", revision_l):
+            continue
+        if re.search(r"\bconcrete\s+executable\s+commands?\b", revision_l):
+            success_texts = [
+                str(
+                    subtask.get("verification_command")
+                    or subtask.get("success_test")
+                    or subtask.get("success_check")
+                    or subtask.get("success_checks")
+                    or ""
+                ).strip()
+                for subtask in _iter_plan_subtasks_for_policy(plan)
+                if isinstance(subtask, dict)
+            ]
+            if success_texts and all(
+                re.search(
+                    r"\b(?:python|py|pytest|node|npm|npx|pnpm|yarn|uv|"
+                    r"playwright|run_workspace_verify|run_unit_tests|"
+                    r"harness_run|http_boot|behavioral_http)\b",
+                    text.lower(),
+                )
+                for text in success_texts
+            ):
+                continue
+        if re.search(
+            r"\bsplit\b.{0,80}\btest\s+creation\b.{0,80}\bvalidation\b"
+            r".{0,80}\bseparate\s+subtasks\b",
+            revision_l,
+        ):
+            subtasks = [
+                subtask
+                for subtask in _iter_plan_subtasks_for_policy(plan)
+                if isinstance(subtask, dict)
+            ]
+            success_texts = [
+                str(
+                    subtask.get("verification_command")
+                    or subtask.get("success_test")
+                    or subtask.get("success_check")
+                    or subtask.get("success_checks")
+                    or ""
+                ).strip()
+                for subtask in subtasks
+            ]
+            has_test_files = any(
+                any("test" in path.lower() for path in _plan_subtask_declared_paths(subtask))
+                for subtask in subtasks
+            )
+            if (
+                len(subtasks) >= 2
+                and has_test_files
+                and success_texts
+                and all(text for text in success_texts)
+            ):
+                continue
+        if re.search(r"(?:\$|\bbudget\b|\busd\b|\bresources?\b)", revision_l) and not re.search(
+            r"\b(?:add|replace|remove|rename|specify|set|change|include|"
+            r"create|split|use)\b",
+            revision_l,
+        ):
+            continue
+        if "replace" in revision_l and " with " in revision_l:
+            positive = revision_l.split(" with ", 1)[1]
+        elif "revision requires" in revision_l:
+            positive = revision_l.split("revision requires", 1)[1]
+        else:
+            positive = revision_l
+        semantic_numbers = re.findall(
+            r"\b(\d+(?:\.\d+)?)\s*(?:times?|retries?|attempts?|turns?|"
+            r"interactions?|rounds?|%)\b",
+            positive,
+        )
+        missing_numbers = [
+            number for number in semantic_numbers if number not in plan_text
+        ]
+        if missing_numbers:
+            issues.append(
+                "review revision numeric requirement appears unaddressed: "
+                f"`{revision}`; missing number(s): "
+                + ", ".join(missing_numbers[:8])
+            )
+            continue
+        alternatives = [
+            item.strip()
+            for item in re.split(r"\bor\b", positive)
+            if item.strip()
+        ] or [positive]
+        missing_by_alternative: list[list[str]] = []
+        revision_satisfied = False
+        for alternative in alternatives:
+            keywords = [
+                item
+                for raw in re.findall(r"[a-z0-9_.-]{4,}", alternative)
+                for item in (raw.strip("._-"),)
+                if item
+                and item not in stopwords
+                and not re.fullmatch(
+                    r"\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?",
+                    item,
+                )
+            ]
+            if not keywords:
+                revision_satisfied = True
+                break
+            covered = [item for item in keywords if item in plan_text]
+            floor = 1 if len(alternatives) > 1 else 2
+            required = min(len(keywords), max(floor, (len(keywords) + 1) // 2))
+            if len(covered) >= required:
+                revision_satisfied = True
+                break
+            missing_by_alternative.append([item for item in keywords if item not in covered])
+        if revision_satisfied:
+            continue
+        missing = min(missing_by_alternative, key=len) if missing_by_alternative else []
+        issues.append(
+            "review revision appears unaddressed: "
+            f"`{revision}`; missing keyword(s): " + ", ".join(missing[:8])
+        )
+    return issues
+
+
+def _legacy_success_test_to_proof(subtask: dict[str, Any]) -> dict[str, Any] | None:
+    if isinstance(subtask.get("proof"), dict):
+        return None
+    raw = (
+        subtask.get("verification_command")
+        or subtask.get("success_test")
+        or subtask.get("success_checks")
+        or subtask.get("success_check")
+    )
+    if raw is None and isinstance(subtask.get("verification"), dict):
+        verification = subtask["verification"]
+        commands = verification.get("commands")
+        if isinstance(commands, list) and len(commands) == 1:
+            raw = commands[0]
+        elif isinstance(commands, str):
+            raw = commands
+        elif isinstance(verification.get("command"), str):
+            raw = verification.get("command")
+    command_text = ""
+    if isinstance(raw, str):
+        command_text = raw.strip()
+    elif isinstance(raw, dict):
+        for key in ("command", "value", "cmd"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                command_text = value.strip()
+                break
+    if not command_text:
+        return None
+    try:
+        command = shlex.split(command_text)
+    except ValueError:
+        command = command_text.split()
+    lowered = command_text.lower()
+    kind = "pytest" if "pytest" in lowered else "command"
+    if re.search(r"\bnpm\b.{0,40}\b(?:build|run\s+build)\b", lowered):
+        kind = "build"
+    paths = _plan_subtask_declared_paths(subtask)
+    test_paths = [path for path in paths if _plan_path_looks_like_test(path)]
+    non_test_paths = [path for path in paths if path not in test_paths]
+    files_under_test = non_test_paths or paths
+    required_properties = ["no_test_tampering"] if test_paths else []
+    if kind == "build":
+        required_properties.append("build_succeeds")
+    return {
+        "execution": {"kind": kind, "command": command, "shell": False},
+        "oracle": {
+            "oracle_type": "build" if kind == "build" else "unit_assertions",
+            "required_properties": required_properties,
+            "negative_cases_required": kind != "build",
+        },
+        "scope": {
+            "files_under_test": files_under_test,
+            "changed_files_expected": paths,
+            "pytest_targets": [item for item in command if "test" in item.lower()]
+            if kind == "pytest"
+            else [],
+        },
+        "anti_gaming": {"requires_real_runtime": False},
+        "required_capabilities": [],
+    }
+
+
+def _migrate_legacy_success_tests(plan: dict[str, Any]) -> dict[str, Any]:
+    subtasks = plan.get("subtasks")
+    if not isinstance(subtasks, list):
+        return plan
+    changed = False
+    migrated: list[Any] = []
+    for item in subtasks:
+        if not isinstance(item, dict):
+            migrated.append(item)
+            continue
+        proof = _legacy_success_test_to_proof(item)
+        if proof is None:
+            migrated.append(item)
+            continue
+        migrated.append({**item, "proof": proof})
+        changed = True
+    if not changed:
+        return plan
+    return {**plan, "subtasks": migrated}
 
 
 def _validate_phase_plan_contract(
     ctx: ToolContext,
     plan: dict[str, Any],
+    *,
+    notes: str = "",
 ) -> list[ContractIssue]:
+    if notes and isinstance(plan, dict) and not plan.get("notes"):
+        plan = {**plan, "notes": notes}
     plan_ir, compile_issues = compile_phase_plan(
         plan,
         run_id=_run_id(ctx),
         workspace_id=_workspace_id(ctx),
     )
+    issues = list(compile_issues)
+    contradiction = _negative_claim_contradiction_issue(
+        ctx,
+        rows=_tool_log_rows_for_task(ctx, str(getattr(ctx, "task_id", "") or "")),
+        text=json.dumps({"plan": plan, "notes": notes}, ensure_ascii=False),
+        label="phase plan",
+    )
+    if contradiction:
+        issues.append(
+            ContractIssue(
+                code="stale_plan_claim",
+                severity="blocking",
+                phase="plan",
+                message=contradiction.removeprefix("ERROR: ").strip(),
+            )
+        )
+    if stub_issue := _plan_stub_intent_issue(plan, notes):
+        issues.append(
+            ContractIssue(
+                code="stub_plan_intent",
+                severity="blocking",
+                phase="plan",
+                message=stub_issue,
+            )
+        )
+    for tool_issue in _plan_unknown_tool_issues(plan):
+        issues.append(
+            ContractIssue(
+                code="unknown_plan_tool",
+                severity="blocking",
+                phase="plan",
+                message=tool_issue,
+            )
+        )
+    for policy_issue in (
+        *_plan_existing_workspace_policy_issues(ctx, plan),
+        *_plan_success_test_policy_issues(plan),
+        *_phase_plan_success_test_issues(plan),
+        *_phase_plan_generic_success_test_issues(plan),
+        *_plan_read_path_issues(ctx, plan),
+        *_plan_compactness_issues(plan),
+        *_plan_broad_leaf_issues(plan),
+        *_plan_forbidden_file_issues(plan),
+        *_plan_annotated_path_issues(plan),
+        *_plan_frontend_test_path_issues(plan),
+        *_plan_pytest_target_ownership_issues(plan),
+        *_plan_frontend_build_entrypoint_issues(plan),
+        *_phase_plan_file_reference_issues(ctx, plan),
+        *_phase_plan_missing_leaf_file_field_issues(plan),
+        *_phase_plan_llm_fallback_issues(plan),
+        *_phase_plan_llm_test_double_issues(plan),
+        *_phase_plan_llm_env_issues(plan),
+        *_phase_plan_llm_provider_default_issues(plan),
+        *_phase_plan_empty_test_skeleton_issues(plan),
+        *_phase_plan_workspace_prefix_issues(ctx, plan),
+        *_phase_plan_greenfield_layout_issues(ctx, plan),
+        *_plan_revision_contract_issues(ctx, plan),
+    ):
+        issues.append(
+            ContractIssue(
+                code="phase_plan_policy",
+                severity="blocking",
+                phase="plan",
+                message=policy_issue,
+            )
+        )
     workspace_id = _workspace_id(ctx)
     context = build_workspace_context(
         repo_root=pathlib.Path(ctx.host_repo_root or ctx.repo_dir),
         workspace_root=_workspace_root_for_phase(ctx, workspace_id),
         workspace_id=workspace_id,
     )
+    drive_root = pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None
     return ContractValidator.validate(
         ContractBundle(
             run_id=_run_id(ctx),
             workspace_id=workspace_id,
             plan=plan_ir,
-            issues=tuple(compile_issues),
+            issues=tuple(issues),
         ),
         context=context,
+        drive_root=drive_root,
     )
 
 
@@ -1072,16 +2118,54 @@ def _propose_phase_plan(
 ) -> str:
     if stop := _stop_requested_message(ctx, "propose_phase_plan"):
         return stop
+    if plan is None and isinstance(extra.get("content"), dict):
+        plan = extra["content"]
     if not isinstance(plan, dict):
-        return "ERROR: phase plan contract rejected: `plan` must be a typed object."
+        return (
+            "ERROR: phase plan contract rejected: `plan` must be a typed "
+            "object with a top-level `subtasks` array."
+        )
+    embedded_plan = plan.get("plan")
+    if isinstance(embedded_plan, str) and embedded_plan.strip():
+        if plan.get("plan_truncated"):
+            return (
+                "ERROR: phase plan contract rejected: truncated serialized "
+                "text in `plan.plan`; submit a compact JSON object with "
+                "top-level `subtasks` instead of a large serialized blob."
+            )
+        try:
+            decoded = json.loads(embedded_plan)
+        except json.JSONDecodeError as exc:
+            return (
+                "ERROR: phase plan contract rejected: serialized text in "
+                f"`plan.plan` is not valid JSON: {exc}"
+            )
+        if not isinstance(decoded, dict):
+            return (
+                "ERROR: phase plan contract rejected: serialized text in "
+                "`plan.plan` must decode to a typed object."
+            )
+        plan = decoded
+    plan = canonicalize_phase_plan(plan)
+    plan = _migrate_legacy_success_tests(plan)
     if not notes:
         for key in ("note", "rationale", "explanation", "summary"):
             value = extra.get(key)
             if isinstance(value, str) and value.strip():
                 notes = value.strip()
                 break
-    contract_issues = _blocking_contract_issues(_validate_phase_plan_contract(ctx, plan))
+    contract_issues = _blocking_contract_issues(
+        _validate_phase_plan_contract(ctx, plan, notes=notes)
+    )
     if contract_issues:
+        policy_issues = [
+            issue for issue in contract_issues if issue.code == "phase_plan_policy"
+        ]
+        if policy_issues and len(policy_issues) == len(contract_issues):
+            return (
+                "ERROR: phase plan violates workspace policy: "
+                + _contract_issue_text(policy_issues, limit=8)
+            )
         return (
             "ERROR: phase plan contract rejected: "
             + _contract_issue_text(contract_issues, limit=8)

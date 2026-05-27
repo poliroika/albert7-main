@@ -1,0 +1,25 @@
+{
+  "schema_version": "1",
+  "status": "submitted",
+  "notes": "Replace with discovery findings for your workspace. No domain labels — only capability slugs you probed.",
+  "constraints": ["headless CI", "no outbound network unless declared"],
+  "capabilities": {
+    "python": {"available": true, "source": "probe"},
+    "subprocess": {"available": true, "source": "probe"},
+    "network": {
+      "available": false,
+      "source": "declared",
+      "reason": "sandbox blocks egress",
+      "probe": {
+        "kind": "command",
+        "command": ["python", "-c", "import urllib.request; urllib.request.urlopen('https://example.com', timeout=2)"],
+        "expect_exit": 0
+      }
+    }
+  },
+  "discovery_channels": [
+    {"tool": "github_project_search", "outcome": "attempted", "notes": "query + evidence ref"},
+    {"tool": "web_search", "outcome": "no_results", "notes": "optional when charter/manifest requires"}
+  ],
+  "recommended_skills": []
+}

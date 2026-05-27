@@ -8,6 +8,7 @@ from umbrella.deep_agent_tools import phase_control_retry as _retry
 from umbrella.contracts.schemas import (
     COMPLETION_CONTRACT_SCHEMA,
     EVIDENCE_REF_SCHEMA,
+    REVIEW_COVERAGE_SCHEMA,
     REVIEW_ISSUE_SCHEMA,
     VERIFICATION_REPORT_REF_SCHEMA,
 )
@@ -28,7 +29,12 @@ def get_tools() -> list[ToolEntry]:
                 "description": (
                     "Mutate the active PhasePlan (add/remove/reorder phases, "
                     "update node status/subtask cards). Subtask cards must "
-                    "continue to satisfy contract v1 typed proof validation."
+                    "continue to satisfy contract v1 typed proof validation. "
+                    "Do not use this just to gain permission for an ordinary "
+                    "source edit; PhasePlan file ownership is advisory during "
+                    "execute. Top-level contract_migration_reason and "
+                    "contract_migration_files are accepted as an alias for the "
+                    "active execute subtask."
                 ),
                 "parameters": {
                     "type": "object",
@@ -83,17 +89,127 @@ def get_tools() -> list[ToolEntry]:
             handler=_loop_back_to,
         ),
         ToolEntry(
+            name="submit_capability_declaration",
+            schema={
+                "name": "submit_capability_declaration",
+                "description": (
+                    "Persist discovery-backed capability declaration before "
+                    "research handoff. Capabilities are free-form slugs; optional "
+                    "per-capability probe runs a workspace argv command. "
+                    "Capabilities describe what the platform/tooling can run, "
+                    "not which proof strategy is preferred for this task; do "
+                    "not mark a capability unavailable merely because it is "
+                    "not suitable or not needed. "
+                    "Harness runtime capabilities such as desktop_gui_runtime "
+                    "must be probe-backed under that same slug when available; "
+                    "for real-window GUI tasks, try the same-slug probe before "
+                    "declaring the runtime unavailable unless policy already "
+                    "proves it cannot run. A desktop_gui_runtime probe must "
+                    "create/update/destroy or show a native window/root; "
+                    "import-only checks belong to desktop_gui_headless or a "
+                    "library-specific capability. If the handoff recommends "
+                    "Tkinter/PyQt/PySide/wxPython/native desktop GUI, declare "
+                    "a usable desktop_gui_headless or desktop_gui_runtime "
+                    "capability instead of leaving GUI proof implicit."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["capabilities", "notes"],
+                    "properties": {
+                        "capabilities": {
+                            "type": "object",
+                            "description": (
+                                "Capability slug -> bool or "
+                                "{available, source, reason, probe:{kind,command}}. "
+                                "available=false must mean a real platform, "
+                                "policy, install, or failed-probe limitation, "
+                                "not a planning preference. "
+                                "Probe-required harness capabilities cannot be "
+                                "declared available without a probe on that slug. "
+                                "For desktop_gui_runtime, do not use import-only "
+                                "commands; create/destroy or show a real GUI root. "
+                                "For native GUI toolkit work, include "
+                                "desktop_gui_headless available=true when "
+                                "headless adapter/controller proof can run."
+                            ),
+                        },
+                        "probes": {
+                            "type": "object",
+                            "description": (
+                                "Optional slug -> probe spec; merged into capabilities. "
+                                "This is how research runs capability checks "
+                            "without shell access. For Tkinter real-window "
+                            "desktop runtime, use probes.desktop_gui_runtime="
+                            "{\"kind\":\"command\",\"command\":[\"python\","
+                            "\"-c\",\"import tkinter as tk; root=tk.Tk(); "
+                            "root.update(); root.destroy()\"],\"expect_exit\":0}. "
+                            "If you also pass capabilities.<slug>.available, "
+                            "it must match the probe result."
+                        ),
+                        },
+                        "discovery_channels": {
+                            "type": "array",
+                            "description": (
+                                "Discovery rows. Preferred row shape: "
+                                "{tool, outcome, notes}. Common rows such as "
+                                "{channel, search, results, sources} are "
+                                "normalized."
+                            ),
+                            "items": {"type": "object"},
+                        },
+                        "discoveries": {
+                            "type": "array",
+                            "description": (
+                                "Alias for discovery_channels for compatibility."
+                            ),
+                            "items": {"type": "object"},
+                        },
+                        "recommended_skills": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "constraints": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "limitations": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "notes": {"type": "string"},
+                        "evidence_refs": {
+                            "type": "array",
+                            "items": EVIDENCE_REF_SCHEMA,
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["draft", "submitted"],
+                            "default": "submitted",
+                        },
+                    },
+                },
+            },
+            handler=_submit_capability_declaration,
+        ),
+        ToolEntry(
             name="submit_research_summary",
             schema={
                 "name": "submit_research_summary",
                 "description": "Signal completion of the research phase with architecture and findings references.",
                 "parameters": {
                     "type": "object",
-                    "required": ["architecture_id", "findings_ids"],
+                    "required": ["architecture_id", "findings_ids", "notes"],
                     "properties": {
                         "architecture_id": {"type": "string"},
                         "findings_ids": {"type": "array", "items": {"type": "string"}},
-                        "notes": {"type": "string"},
+                        "notes": {
+                            "type": "string",
+                            "minLength": 20,
+                            "description": (
+                                "Concrete handoff notes covering libraries, "
+                                "skills, risks, and recommended architecture."
+                            ),
+                        },
                         "coverage_status": {
                             "type": "string",
                             "enum": ["complete", "source_scarce", "blocked"],
@@ -118,20 +234,49 @@ def get_tools() -> list[ToolEntry]:
                 "name": "submit_micro_review",
                 "description": (
                     "Submit a typed mini-review contract. Notes are human-only; "
-                    "machine decisions use issue codes/severities."
+                    "machine decisions use issue codes/severities. For ok, "
+                    "coverage booleans mean checked/no blocker; do not use "
+                    "false for not-applicable."
                 ),
                 "parameters": {
                     "type": "object",
-                    "required": ["verdict", "issues"],
+                    "required": ["verdict", "issues", "coverage"],
                     "properties": {
                         "verdict": {"type": "string", "enum": ["ok", "revise", "abort"]},
                         "issues": {"type": "array", "items": REVIEW_ISSUE_SCHEMA},
+                        "coverage": REVIEW_COVERAGE_SCHEMA,
+                        "required_plan_changes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
                         "loop_back_target": {"type": "string"},
                         "notes": {"type": "string"},
                     },
                 },
             },
             handler=_submit_micro_review,
+        ),
+        ToolEntry(
+            name="request_scope_change",
+            schema={
+                "name": "request_scope_change",
+                "description": (
+                    "Expand the active execute subtask scope by adding paths to "
+                    "files_to_create. Use after scope_change_required blocks."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["paths"],
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "rationale": {"type": "string"},
+                    },
+                },
+            },
+            handler=_request_scope_change,
         ),
         ToolEntry(
             name="submit_phase_plan",
@@ -250,6 +395,15 @@ def get_tools() -> list[ToolEntry]:
                     "properties": {
                         "status": {"type": "string", "enum": ["ready", "blocked"]},
                         "blockers": {"type": "array", "items": {"type": "string"}},
+                        "research_depth": {
+                            "type": "string",
+                            "enum": ["none", "light", "full"],
+                            "description": "Required when status=ready. Task complexity tier for research phase.",
+                        },
+                        "research_depth_rationale": {
+                            "type": "string",
+                            "description": "Brief reason for the chosen depth (max 500 chars).",
+                        },
                     },
                 },
             },
@@ -309,9 +463,10 @@ def get_tools() -> list[ToolEntry]:
             schema={
                 "name": "request_watcher_review",
                 "description": (
-                    "Record a watcher review request/control signal for the "
-                    "current phase; the handler may return an existing retry "
-                    "diagnosis but does not synchronously run a separate LLM."
+                    "Record a typed retry-watcher review/control signal for "
+                    "the current phase. Returns verdict, allowed_next_actions, "
+                    "forbidden_next_actions, and any contract_migration token; "
+                    "it does not synchronously run a separate LLM."
                 ),
                 "parameters": {
                     "type": "object",

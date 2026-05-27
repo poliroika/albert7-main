@@ -190,7 +190,12 @@ class EvidenceResolver:
         return issues
 
     def validate_verification_report_ref(
-        self, ref: VerificationReportRef, *, phase: str = "", subtask_id: str = ""
+        self,
+        ref: VerificationReportRef,
+        *,
+        phase: str = "",
+        subtask_id: str = "",
+        allow_workspace_hash_mismatch_if_diff_matches: bool = False,
     ) -> list[ContractIssue]:
         evidence_ref = ref.evidence_ref(phase=phase, subtask_id=subtask_id)
         issues = self.validate_ref(evidence_ref, phase=phase, subtask_id=subtask_id)
@@ -219,18 +224,31 @@ class EvidenceResolver:
         current_workspace_hash = self.context.current_workspace_hash or workspace_hash(
             self.workspace_root
         )
-        if ref.workspace_hash and ref.workspace_hash != current_workspace_hash:
+        current_diff_hash = self.context.current_diff_hash
+        scoped_diff_matches = (
+            allow_workspace_hash_mismatch_if_diff_matches
+            and bool(current_diff_hash)
+            and bool(ref.diff_hash)
+            and ref.diff_hash == current_diff_hash
+        )
+        if (
+            ref.workspace_hash
+            and ref.workspace_hash != current_workspace_hash
+            and not scoped_diff_matches
+        ):
             issues.append(
                 ContractIssue(
-                    code="workspace_hash_mismatch",
+                    code="proof_stale_rerun_required",
                     severity="blocking",
                     phase=phase,
                     subtask_id=subtask_id,
-                    message="Verification report was produced for a different workspace hash.",
+                    message=(
+                        "Verification report was produced for a different "
+                        "workspace hash; rerun proof instead of rolling back phase."
+                    ),
                     evidence_refs=(evidence_ref,),
                 )
             )
-        current_diff_hash = self.context.current_diff_hash
         if (
             current_diff_hash
             and ref.diff_hash
@@ -239,11 +257,14 @@ class EvidenceResolver:
         ):
             issues.append(
                 ContractIssue(
-                    code="diff_hash_mismatch",
+                    code="proof_stale_rerun_required",
                     severity="blocking",
                     phase=phase,
                     subtask_id=subtask_id,
-                    message="Verification report was produced for a different diff hash.",
+                    message=(
+                        "Verification report was produced for a different diff "
+                        "hash; rerun proof instead of rolling back phase."
+                    ),
                     evidence_refs=(evidence_ref,),
                 )
             )

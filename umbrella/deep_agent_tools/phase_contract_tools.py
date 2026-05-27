@@ -5,13 +5,20 @@ from umbrella.deep_agent_tools import phase_contract_base as _base
 from umbrella.deep_agent_tools import phase_contract_declarations as _declarations
 from umbrella.deep_agent_tools import domain_policy as _domain_policy
 from umbrella.deep_agent_tools import phase_contract_handlers as _handlers
-from umbrella.contracts.schemas import EVIDENCE_REF_SCHEMA, VERIFICATION_REPORT_REF_SCHEMA
+from umbrella.deep_agent_tools import phase_contract_policy as _policy
+from umbrella.contracts.schemas import (
+    EVIDENCE_REF_SCHEMA,
+    PHASE_PLAN_SCHEMA,
+    PHASE_PLAN_SUBTASK_SCHEMA,
+    VERIFICATION_REPORT_REF_SCHEMA,
+)
 from umbrella.deep_agent_tools.research_provenance import SOURCE_ID_DESCRIPTION
 
 _MODULES = (
     _base,
     _declarations,
     _domain_policy,
+    _policy,
     _handlers,
 )
 
@@ -40,8 +47,35 @@ def get_tools() -> list[ToolEntry]:
         ToolEntry("request_human_checkpoint", _schema("request_human_checkpoint", "Request an operator checkpoint.", {"reason": {"type": "string"}, "payload": {"type": "object"}}), _request_human_checkpoint),
         ToolEntry("request_extra_subtask", _schema("request_extra_subtask", "Request adding a new phase subtask.", {"reason": {"type": "string"}, "proposed_subtask": {"type": "object"}}), _request_extra_subtask),
         ToolEntry("register_temp_tool", _schema("register_temp_tool", "Register a temporary tool proposal for review.", {"name": {"type": "string"}, "description": {"type": "string"}, "schema": {"type": "object"}}, ["name"]), _register_temp_tool),
-        ToolEntry("propose_phase_plan", _schema("propose_phase_plan", "Record a proposed Umbrella phase plan using contract v1 typed proof objects only.", {"plan": {"type": "object"}, "notes": {"type": "string"}}), _propose_phase_plan),
-        ToolEntry("propose_subtasks", _schema("propose_subtasks", "Record proposed Umbrella subtasks.", {"steps": {"type": "array", "items": {"type": "object"}}, "notes": {"type": "string"}}), _propose_subtasks),
+        ToolEntry(
+            "propose_phase_plan",
+            _schema(
+                "propose_phase_plan",
+                (
+                    "Record a proposed Umbrella phase plan using contract v1 "
+                    "typed proof objects. Each leaf can declare memory_scope, "
+                    "allowed_tools, allowed_skills, codeptr_refs, and mcp_refs "
+                    "for execute/proof context propagation."
+                ),
+                {"plan": PHASE_PLAN_SCHEMA, "notes": {"type": "string"}},
+            ),
+            _propose_phase_plan,
+        ),
+        ToolEntry(
+            "propose_subtasks",
+            _schema(
+                "propose_subtasks",
+                "Record proposed Umbrella subtasks using typed proof contracts.",
+                {
+                    "steps": {
+                        "type": "array",
+                        "items": PHASE_PLAN_SUBTASK_SCHEMA,
+                    },
+                    "notes": {"type": "string"},
+                },
+            ),
+            _propose_subtasks,
+        ),
         ToolEntry("read_drive_log", _schema("read_drive_log", "Read recent lines from a drive log file.", {"log_name": {"type": "string"}, "tail": {"type": "integer", "default": 100}}), _read_drive_log),
         ToolEntry("read_terminal_scrollback", _schema("read_terminal_scrollback", "Read workspace terminal scrollback.", {"workspace_id": {"type": "string"}, "last_lines": {"type": "integer", "default": 200}}), _read_terminal_scrollback),
         ToolEntry(

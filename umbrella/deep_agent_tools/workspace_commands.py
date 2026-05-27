@@ -118,6 +118,30 @@ def _append_scrollback(
     _maybe_rotate_scrollback(path)
 
 
+def _active_subtask_harness_profile(ctx: Any) -> str:
+    drive_root = getattr(ctx, "drive_root", None)
+    if not drive_root:
+        return ""
+    try:
+        plan_path = Path(drive_root) / "state" / "phase_plan.json"
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        for node in payload.get("nodes") or []:
+            if not isinstance(node, dict) or str(node.get("id") or "") != "execute":
+                continue
+            for subtask in node.get("subtasks") or []:
+                if not isinstance(subtask, dict):
+                    continue
+                if str(subtask.get("status") or "").lower() == "done":
+                    continue
+                proof = subtask.get("proof")
+                if isinstance(proof, dict):
+                    return str(proof.get("harness_profile") or "")
+            break
+    except Exception:
+        log.debug("active harness profile lookup failed", exc_info=True)
+    return ""
+
+
 def _secret_path_marker_from_token(value: str) -> str:
     token = str(value or "").strip().strip("'\"")
     if not token:
@@ -632,20 +656,33 @@ def run_workspace_command(
             )
         is_interactive_launch, launch_hint = _looks_like_interactive_app_launch(cmd)
         if is_interactive_launch:
+            runtime_profile = _active_subtask_harness_profile(ctx)
+            if runtime_profile == "desktop_gui_runtime":
+                next_step = (
+                    "The active subtask is a desktop_gui_runtime proof. Use "
+                    "`run_subtask_proof` so Umbrella launches the app through "
+                    "the managed runtime lifecycle, waits for readiness, "
+                    "collects evidence, and cleans up. For exploratory "
+                    "runtime work use bg_start/bg_status/bg_tail/bg_kill, not "
+                    "foreground run_workspace_command."
+                )
+            else:
+                next_step = (
+                    "Use non-interactive checks only: pytest/smoke commands, CLI test mode, "
+                    "or import checks like `python -c \"import main; print('ok')\"`."
+                )
             return _json(
                 {
                     "status": "blocked",
                     "reason": "interactive_app_launch_guard",
                     "command": cmd,
                     "matched": launch_hint,
+                    "active_harness_profile": runtime_profile,
                     "hint": (
                         "Interactive local app launches are blocked in run_workspace_command "
                         "to avoid hanging/broken foreground sessions."
                     ),
-                    "next_step": (
-                        "Use non-interactive checks only: pytest/smoke commands, CLI test mode, "
-                        "or import checks like `python -c \"import main; print('ok')\"`."
-                    ),
+                    "next_step": next_step,
                 }
             )
         py_c_problem = _python_c_compound_problem(cmd)

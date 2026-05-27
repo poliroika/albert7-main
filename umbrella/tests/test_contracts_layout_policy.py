@@ -16,6 +16,10 @@ def _layout_issues(raw_plan: dict, tmp_path: Path, setup_workspace=None) -> list
     workspace = tmp_path / "workspaces" / "civilization"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "pyproject.toml").write_text("[project]\nname='civ'\n", encoding="utf-8")
+    (workspace / "workspace.toml").write_text(
+        "[policies]\ngreenfield_python_src_layout = true\n",
+        encoding="utf-8",
+    )
     if setup_workspace is not None:
         setup_workspace(workspace)
     plan_ir, compile_issues = compile_phase_plan(

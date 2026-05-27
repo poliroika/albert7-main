@@ -8,13 +8,9 @@ when_to_use: "When editing workspace files."
 
 ## Patch Discipline
 
-Patch the source of truth with minimal, coherent changes.
+After a patch tool returns `required_mode`, obey it exactly:
 
-Rules:
-- Keep all task artifacts inside the target workspace unless the task asks otherwise.
-- Use established project structure or create a clear src, tests, docs, and entrypoint layout.
-- Remove obsolete files when replacing an approach.
-- Avoid hardcoded success paths and fake outputs.
-- Prefer structured parsers and APIs over fragile string hacks.
+- `fresh_read` — call `read_file`, then retry a smaller hunk.
+- `replace_workspace_file` — use `replace_workspace_file(path, expected_sha256, content)` with the digest from read.
 
-After patching, run the nearest relevant verification.
+Do not use delete/recreate sidecars or freeform recovery when Umbrella returns a typed block.

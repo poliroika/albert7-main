@@ -53,6 +53,12 @@ def test_resolve_proactive_budget_bounds():
     assert small >= 1800
     huge = resolve_proactive_budget(phase="research", manifest_budget=500000)
     assert huge <= 7500
+    explicit = resolve_proactive_budget(
+        phase="execute",
+        manifest_budget=8000,
+        env_override="800",
+    )
+    assert explicit == 800
 
 
 def test_build_overlay_contains_always_loaded(repo):

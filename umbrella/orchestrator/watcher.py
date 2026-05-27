@@ -8,35 +8,15 @@ from typing import Any
 
 from umbrella.phases.base import WatcherSignal
 from umbrella.orchestrator.watcher_triggers import WatcherTriggers, TriggerEvent
+from umbrella.orchestrator.watcher_semantic import (
+    build_semantic_lesson,
+    semantic_escalation_key,
+    semantic_signal_kind_for_streak,
+    semantic_thresholds,
+    watcher_use_llm_on_semantic,
+)
 
 log = logging.getLogger(__name__)
-
-_REPEAT_SEMANTIC_RESTART_CATEGORIES = frozenset({
-    "proof_not_passing",
-})
-_REPEAT_SEMANTIC_INJECT_LESSON_CATEGORIES = frozenset({
-    "completion_contract_invalid",
-    "materialization_missing",
-    "completion_with_failed_proof",
-    "patch_hunk_mismatch",
-    "completion_hash_mismatch",
-})
-_REPEAT_SEMANTIC_ABORT_CATEGORIES = frozenset({
-    "fake_evidence_ref",
-})
-
-
-def _repeat_semantic_failure_signal_kind(category: str) -> str:
-    normalized = str(category or "").strip()
-    if not normalized:
-        return "abort_phase"
-    if normalized in _REPEAT_SEMANTIC_ABORT_CATEGORIES:
-        return "abort_phase"
-    if normalized.startswith("proof_runtime_") or normalized in _REPEAT_SEMANTIC_RESTART_CATEGORIES:
-        return "restart_phase"
-    if normalized in _REPEAT_SEMANTIC_INJECT_LESSON_CATEGORIES:
-        return "inject_lesson"
-    return "abort_phase"
 
 
 class WatcherPollLoop:
@@ -62,6 +42,7 @@ class WatcherPollLoop:
         self._triggers = WatcherTriggers(drive_root)
         self._running = False
         self._processed: set[str] = set()
+        self._semantic_emit_keys: set[str] = set()
         self._signal_path = drive_root / "state" / "watcher_signal.json"
         self._processed_path = drive_root / "state" / "watcher_signals.processed.jsonl"
         self._load_processed_signal_ids()
@@ -79,11 +60,17 @@ class WatcherPollLoop:
                     sid = str(row.get("signal_id") or "").strip()
                     if sid:
                         self._processed.add(sid)
+                    emit_key = str(row.get("semantic_emit_key") or "").strip()
+                    if emit_key:
+                        self._semantic_emit_keys.add(emit_key)
         except Exception:
             log.debug("Failed to load watcher processed signal ids", exc_info=True)
 
     def write_signal(self, signal: WatcherSignal) -> None:
         self._signal_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(signal.payload or {})
+        if signal.payload is None:
+            payload = {}
         tmp = self._signal_path.with_suffix(".tmp")
         tmp.write_text(
             json.dumps({
@@ -92,7 +79,7 @@ class WatcherPollLoop:
                 "kind": signal.kind,
                 "reason": signal.reason,
                 "trigger": signal.trigger,
-                "payload": signal.payload,
+                "payload": payload,
             }),
             encoding="utf-8",
         )
@@ -119,12 +106,36 @@ class WatcherPollLoop:
 
     def mark_processed(self, signal_id: str) -> None:
         self._processed.add(signal_id)
+        emit_key = ""
+        if self._signal_path.exists():
+            try:
+                data = json.loads(self._signal_path.read_text(encoding="utf-8"))
+                payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+                emit_key = str(payload.get("semantic_emit_key") or "").strip()
+                if emit_key:
+                    self._semantic_emit_keys.add(emit_key)
+            except Exception:
+                log.debug("Failed to read semantic_emit_key for processed signal", exc_info=True)
         self._processed_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"signal_id": signal_id, "processed_at": time.time()}
+        if emit_key:
+            row["semantic_emit_key"] = emit_key
         with self._processed_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"signal_id": signal_id, "processed_at": time.time()}) + "\n")
+            f.write(json.dumps(row) + "\n")
 
-    def tick(self, *, phase: str, phase_started_at: float, worker_pid: int | None = None) -> WatcherSignal | None:
-        trigger = self._triggers.check(phase=phase, phase_started_at=phase_started_at)
+    def tick(
+        self,
+        *,
+        phase: str,
+        phase_started_at: float,
+        worker_pid: int | None = None,
+        task_id: str = "",
+    ) -> WatcherSignal | None:
+        trigger = self._triggers.check(
+            phase=phase,
+            phase_started_at=phase_started_at,
+            task_id=task_id,
+        )
         if trigger is None:
             trigger = self._triggers.check_worker_alive(worker_pid)
         if trigger is None:
@@ -132,6 +143,13 @@ class WatcherPollLoop:
         return self._invoke_llm_for_trigger(trigger, phase=phase)
 
     def _invoke_llm_for_trigger(self, trigger: TriggerEvent, *, phase: str) -> WatcherSignal | None:
+        if trigger.kind == "repeat_semantic_failure":
+            signal = self._semantic_failure_signal(trigger, phase=phase)
+            if signal is not None:
+                self.write_signal(signal)
+                return signal
+            return None
+
         auto_signal = self._deterministic_signal_for_trigger(trigger, phase=phase)
         if auto_signal is not None:
             self.write_signal(auto_signal)
@@ -182,6 +200,110 @@ class WatcherPollLoop:
                 return signal
             return None
 
+    def _semantic_failure_signal(
+        self, trigger: TriggerEvent, *, phase: str
+    ) -> WatcherSignal | None:
+        ctx = trigger.context or {}
+        category = str(ctx.get("category") or "").strip()
+        streak = int(ctx.get("streak") or ctx.get("count") or 0)
+        signature = str(ctx.get("signature") or "").strip()
+        kind = semantic_signal_kind_for_streak(category, streak)
+        if not kind:
+            return None
+
+        emit_key = semantic_escalation_key(
+            phase=str(ctx.get("phase") or phase),
+            category=category,
+            streak=streak,
+        )
+        if emit_key in self._semantic_emit_keys:
+            return None
+
+        tools_path = self._drive / "logs" / "tools.jsonl"
+        recent_tools = ctx.get("recent_tools")
+        if not isinstance(recent_tools, list):
+            recent_tools = None
+        lesson = build_semantic_lesson(
+            phase=phase,
+            category=category,
+            streak=streak,
+            signature=signature,
+            tools_path=tools_path,
+            recent_tools=recent_tools,
+        )
+
+        if watcher_use_llm_on_semantic() and kind != "abort_phase":
+            llm_kind, llm_reason = self._llm_semantic_override(trigger, phase=phase, lesson=lesson)
+            if llm_kind and llm_kind != "ok":
+                kind = llm_kind
+                if llm_reason.strip():
+                    lesson = f"{lesson}\n\nWatcher LLM note: {llm_reason.strip()}"
+
+        inject_m, restart_m, abort_m = semantic_thresholds()
+        if kind == "abort_phase":
+            reason = (
+                f"Repeated semantic tool failure ({category}) during phase `{phase}` "
+                f"after {streak} consecutive occurrence(s) (abort threshold {abort_m}). "
+                "The runner cannot recover safely in-place."
+            )
+        elif kind == "restart_phase":
+            reason = (
+                f"Repeated semantic tool failure ({category}) during phase `{phase}` "
+                f"after {streak} occurrence(s) (restart threshold {restart_m}). "
+                "Restart the phase with a fresh repair loop."
+            )
+        else:
+            reason = (
+                f"Repeated semantic tool failure ({category}) during phase `{phase}` "
+                f"after {streak} occurrence(s) (inject threshold {inject_m}). "
+                "Apply the Watcher correction below before retrying."
+            )
+
+        payload = dict(ctx)
+        payload["semantic_emit_key"] = emit_key
+        payload["watcher_lesson"] = lesson
+        payload["watcher_semantic_category"] = category
+
+        return WatcherSignal(
+            signal_id=str(uuid.uuid4()),
+            created_at=time.time(),
+            kind=kind,
+            reason=reason,
+            trigger=trigger.kind,
+            payload=payload,
+        )
+
+    def _llm_semantic_override(
+        self, trigger: TriggerEvent, *, phase: str, lesson: str
+    ) -> tuple[str, str]:
+        try:
+            system_prompt = self._load_watcher_prompt()
+            user_msg = json.dumps(
+                {
+                    "trigger": trigger.kind,
+                    "phase": phase,
+                    "context": trigger.context,
+                    "deterministic_lesson": lesson,
+                },
+                ensure_ascii=False,
+            )
+            llm = self._get_llm()
+            model = os.environ.get("OUROBOROS_WATCHER_MODEL") or llm.default_model()
+            response_msg, _usage = llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                model=model,
+                reasoning_effort="low",
+                max_tokens=512,
+            )
+            content = (response_msg.get("content") or "").strip()
+            return self._parse_watcher_response(content, trigger)
+        except Exception as exc:
+            log.warning("Watcher semantic LLM call failed: %s", exc)
+            return "", ""
+
     def _get_llm(self) -> Any:
         if self._llm_client is not None:
             return self._llm_client
@@ -221,31 +343,6 @@ class WatcherPollLoop:
     def _deterministic_signal_for_trigger(
         self, trigger: TriggerEvent, *, phase: str
     ) -> WatcherSignal | None:
-        if trigger.kind == "repeat_semantic_failure":
-            category = str((trigger.context or {}).get("category") or "").strip()
-            kind = _repeat_semantic_failure_signal_kind(category)
-            reason = (
-                "Repeated semantic tool failure"
-                + (f" ({category})" if category else "")
-                + f" during phase `{phase}`. "
-                + (
-                    "Restart the phase with a fresh repair loop."
-                    if kind == "restart_phase"
-                    else (
-                        "Inject the lesson into the next attempt before retrying completion."
-                        if kind == "inject_lesson"
-                        else "Abort the phase; the runner cannot recover safely in-place."
-                    )
-                )
-            )
-            return WatcherSignal(
-                signal_id=str(uuid.uuid4()),
-                created_at=time.time(),
-                kind=kind,
-                reason=reason,
-                trigger=trigger.kind,
-                payload=trigger.context,
-            )
         if trigger.kind == "repeat_structural_layout":
             return WatcherSignal(
                 signal_id=str(uuid.uuid4()),

@@ -207,12 +207,12 @@ def format_llm_exception_for_user_log(exc: BaseException, *, max_len: int = 400)
     text = str(exc)
     if llm_error_looks_like_html_tunnel_page(text):
         return (
-            "HTML/tunnel 404 (frp/nginx), not OpenAI JSON — "
-            "check VPN and frp remote_port → backend; POST …/v1/chat/completions must return JSON"
+            "HTML/tunnel 404 (frp/nginx), not OpenAI JSON - "
+            "check VPN and frp remote_port -> backend; POST .../v1/chat/completions must return JSON"
         )
     if len(text) <= max_len:
         return text
-    return text[: max_len - 1] + "…"
+    return text[: max_len - 3] + "..."
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -469,14 +469,14 @@ class LLMClient:
             err_text = str(e)
             if llm_error_looks_like_html_tunnel_page(err_text):
                 log.error(
-                    "[LLM] Request failed after %.1fs: ответ — HTML (часто 404 frp/nginx), не JSON API. "
-                    "POST %s model=%s. Проверьте туннель: upstream должен отдавать OpenAI-совместимый /v1/chat/completions.",
+                    "[LLM] Request failed after %.1fs: HTML tunnel page instead of OpenAI JSON. "
+                    "POST %s model=%s. Check VPN/frp: upstream must serve OpenAI-compatible /v1/chat/completions.",
                     _elapsed,
                     endpoint,
                     model,
                 )
             else:
-                short = err_text if len(err_text) <= 800 else err_text[:800] + "…"
+                short = err_text if len(err_text) <= 800 else err_text[:797] + "..."
                 log.error(
                     "[LLM] Request failed after %.1fs: %s model=%s endpoint=%s",
                     _elapsed,

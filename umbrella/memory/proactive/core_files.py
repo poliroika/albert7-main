@@ -106,7 +106,16 @@ def ensure_core_seed_files(core_root: Path, *, kind: str = "manager") -> None:
             "00_identity.md": "# Identity\nVerify outcomes before claiming success.\n",
             "10_operating_principles.md": "# Principles\nPrefer evidence-backed changes over assumptions.\n",
             "20_manager_lessons.md": "# Lessons\nPromote only verified lessons via BKB gate.\n",
-            "30_failure_patterns.md": "# Anti-patterns\nDo not repeat known failure modes without mitigation.\n",
+            "30_failure_patterns.md": (
+                "# Anti-patterns\n"
+                "Do not repeat known failure modes without mitigation.\n\n"
+                "## Phase exit evidence\n"
+                "- False diff_hash_mismatch on phase exit: use completion "
+                "changed_files for contract validation.\n\n"
+                "## Loop-back routing\n"
+                "- Stale loop_back_to after mark_subtask_complete or "
+                "mutate_phase_plan is superseded.\n"
+            ),
             "40_active_risks.md": "# Risks\nTrack active risks until closed or accepted.\n",
             "50_open_threads.md": "# Open threads\nUnresolved work stays explicit until resolved.\n",
             "00_workspace_charter.md": "# Charter\nScope and constraints for this workspace.\n",

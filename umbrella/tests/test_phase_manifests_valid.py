@@ -73,9 +73,30 @@ def test_plan_phase_requires_authoritative_plan_artifact():
     assert "propose_phase_plan" in manifest.exit_criteria.required_calls
     assert "submit_phase_plan" in manifest.exit_criteria.required_calls
     assert "loop_back_to" in manifest.allowed_tools
+    assert "palace_add" not in manifest.allowed_tools
+    assert manifest.exit_criteria.min_palace_writes == ()
     assert "harness_run" not in manifest.allowed_tools
     assert "enable_tools" not in manifest.allowed_tools
     assert "register_temp_tool" not in manifest.allowed_tools
+
+
+def test_phase_plan_tool_schema_exposes_context_fields():
+    from umbrella.deep_agent_tools.phase_contract_tools import get_tools
+
+    tools = {tool.name: tool.schema for tool in get_tools()}
+    plan_schema = tools["propose_phase_plan"]["parameters"]["properties"]["plan"]
+    subtask_props = plan_schema["properties"]["subtasks"]["items"]["properties"]
+
+    assert plan_schema["required"] == ["subtasks"]
+    assert plan_schema["properties"]["subtasks"]["minItems"] == 1
+    assert "phases" not in plan_schema["properties"]
+    assert "steps" not in plan_schema["properties"]
+    assert "proof" in subtask_props
+    assert "memory_scope" in subtask_props
+    assert "allowed_tools" in subtask_props
+    assert "allowed_skills" in subtask_props
+    assert "codeptr_refs" in subtask_props
+    assert "mcp_refs" in subtask_props
 
 
 def test_execute_schedules_subtask_review_manifest():
@@ -113,6 +134,61 @@ def test_plan_prompt_documents_executable_leaf_payload_contract():
     assert "mock/fake/dry-run" in prompt
 
 
+def test_plan_prompt_does_not_target_workspace_toml_as_subtask_file():
+    prompt = (PROMPTS_DIR / "plan.system.md").read_text(encoding="utf-8")
+
+    assert "Do not declare `workspace.toml`" in prompt
+    assert "declare `workspace.toml` and `pyproject.toml`" not in prompt
+
+
+def test_plan_review_coverage_means_dimension_checked():
+    prompt = (PROMPTS_DIR / "plan_review.system.md").read_text(encoding="utf-8")
+
+    assert 'Coverage keys mean "this dimension was checked"' in prompt
+    assert "including dimensions where blockers were found" in prompt
+
+
+def test_prompts_route_domain_rules_through_harness_profiles():
+    plan_prompt = (PROMPTS_DIR / "plan.system.md").read_text(encoding="utf-8")
+    review_prompt = (PROMPTS_DIR / "plan_review.system.md").read_text(encoding="utf-8")
+    execute_prompt = (PROMPTS_DIR / "execute.system.md").read_text(encoding="utf-8")
+
+    assert "proof.harness_profile" in plan_prompt
+    assert "Umbrella harness profile catalog" in plan_prompt
+    assert "desktop_gui_runtime" in plan_prompt
+    assert "memory_scope" in plan_prompt
+    assert "known `proof.harness_profile`" in review_prompt
+    assert "desktop_gui_runtime" in review_prompt
+    assert "active Umbrella harness contract" in execute_prompt
+    assert "desktop_gui_runtime" in execute_prompt
+    assert "tk.Tk()" not in execute_prompt
+
+
+def test_plan_review_prompt_accepts_no_test_tampering_property():
+    prompt = (PROMPTS_DIR / "plan_review.system.md").read_text(encoding="utf-8")
+
+    assert "`no_test_tampering` is a valid `oracle.required_properties` entry" in prompt
+    assert "do not reject it merely because it appears in `required_properties`" in prompt
+    assert "Pure test-verification subtasks" in prompt
+    assert "Do not ask to remove `no_test_tampering`" in prompt
+
+
+def test_plan_review_prompt_matches_desktop_runtime_validator():
+    prompt = (PROMPTS_DIR / "plan_review.system.md").read_text(encoding="utf-8")
+
+    assert "`proof.execution.kind` is `command`" in prompt
+    assert "Do not request `pytest` as the primary proof command" in prompt
+    assert "harness_options.assert_command" in prompt
+
+
+def test_research_prompt_tells_agents_not_to_mark_pending_probe_unavailable():
+    prompt = (PROMPTS_DIR / "research.system.md").read_text(encoding="utf-8")
+
+    assert "omit that capability's `available` field" in prompt
+    assert "Do not set `available=false` for a pending probe" in prompt
+    assert "omit `capabilities.desktop_gui_runtime.available`" in prompt
+
+
 def test_agent_facing_runtime_prompts_do_not_teach_unsupported_model_alias():
     prompt_paths = [
         PROMPTS_DIR / "plan.system.md",
@@ -128,16 +204,13 @@ def test_agent_facing_runtime_prompts_do_not_teach_unsupported_model_alias():
         assert "OUROBOROS_LLM_MODEL" not in text, str(prompt_path)
 
 
-def test_execute_prompt_frontloads_conditional_gmas_pre_write_contract():
+def test_execute_prompt_does_not_frontload_conditional_gmas_pre_write_contract():
     prompt = (PROMPTS_DIR / "execute.system.md").read_text(encoding="utf-8")
     gate = prompt.split("## Required Workflow", 1)[0]
 
-    assert "Domain-specific GMAS/LLM-agent gate" in gate
-    assert "Skip this section for ordinary non-agent, non-LLM workspaces" in gate
-    assert "get_gmas_context(query=...)" in gate
-    assert "search_gmas_knowledge(query=...)" in gate
-    assert "before the first workspace write" in gate
-    assert "Do not wait for `apply_workspace_patch`" in gate
+    assert "Domain-specific GMAS/LLM-agent gate" not in gate
+    assert "get_gmas_context(query=...)" not in gate
+    assert "search_gmas_knowledge(query=...)" not in gate
 
 
 def test_gmas_knowledge_tools_available_before_execute():
@@ -172,6 +245,8 @@ def test_review_and_verify_manifests_have_read_only_diagnostics():
 
     final_review = load_manifest(MANIFESTS_DIR / "final_review.yaml")
     assert "run_workspace_verify" in final_review.allowed_tools
+    assert "run_workspace_verify" in final_review.exit_criteria.required_prior_calls
+    assert "run_real_e2e" in final_review.exit_criteria.required_prior_calls
     assert "submit_verification" not in final_review.allowed_tools
     assert "promote_to_durable" not in final_review.allowed_tools
     assert "verification-protocol" not in final_review.allowed_skills
@@ -186,6 +261,37 @@ def test_phase_manifest_tools_exist_in_ouroboros_registry():
     reg = PhaseRegistry(MANIFESTS_DIR)
     errors = validate_phase_tool_contract(reg.all(), repo_root=repo_root)
     assert not errors, "Phase tool contract errors:\n" + "\n".join(errors)
+
+
+def test_phase_tool_contract_includes_umbrella_only_tools_when_registry_shadowed():
+    import sys
+    from umbrella.phases.tool_contract import validate_phase_tool_contract
+    from umbrella.phases.registry import PhaseRegistry
+
+    repo_root = MANIFESTS_DIR.parents[2]
+    reg = PhaseRegistry(MANIFESTS_DIR)
+    original_path = list(sys.path)
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "ouroboros" or name.startswith("ouroboros.")
+    }
+    try:
+        for name in list(sys.modules):
+            if name == "ouroboros" or name.startswith("ouroboros."):
+                sys.modules.pop(name, None)
+        sys.path[:] = [str(repo_root), *original_path]
+        import ouroboros
+
+        assert not hasattr(ouroboros, "tools")
+        errors = validate_phase_tool_contract(reg.all(), repo_root=repo_root)
+        assert not errors, "\n".join(errors)
+    finally:
+        for name in list(sys.modules):
+            if name == "ouroboros" or name.startswith("ouroboros."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.path[:] = original_path
 
 
 def test_phase_tool_contract_finds_nested_ouroboros_from_repo_root_only():

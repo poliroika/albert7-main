@@ -8,12 +8,18 @@ from umbrella.contracts.hashing import hash_value, workspace_hash
 from umbrella.context.models import (
     CapabilityContractView,
     ContextSourceRef,
+    HarnessContractView,
+    CurrentPhaseEnvelope,
     LLMContextItem,
     LLMInputBundle,
     MemorySelection,
     ToolContractView,
     WorkspaceFileDigest,
     WorkspaceInventorySnapshot,
+)
+from umbrella.contracts.harness_profiles import (
+    build_harness_contract_payload,
+    render_harness_contract_markdown,
 )
 
 
@@ -205,6 +211,52 @@ def _artifact_role_for_phase(phase_id: str, drive_root: Path | None) -> str:
     return "phase_plan_json"
 
 
+def _build_current_phase_envelope(
+    *,
+    phase_id: str,
+    active_subtask: dict | None,
+    drive_root: Path | None,
+) -> CurrentPhaseEnvelope | None:
+    if phase_id != "execute" or not active_subtask:
+        return None
+    allowed: list[str] = []
+    for key in ("files_to_create", "files_to_change", "files_affected"):
+        raw = active_subtask.get(key)
+        if isinstance(raw, str) and raw.strip():
+            allowed.append(raw.strip().replace("\\", "/").lstrip("/"))
+        elif isinstance(raw, (list, tuple)):
+            allowed.extend(
+                str(item).strip().replace("\\", "/").lstrip("/")
+                for item in raw
+                if str(item).strip()
+            )
+    last_failure = ""
+    if drive_root is not None:
+        tools_path = drive_root / "logs" / "tools.jsonl"
+        if tools_path.is_file():
+            try:
+                lines = tools_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                lines = []
+            for line in reversed(lines[-40:]):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                raw = str(row.get("result_preview") or row.get("result") or "")
+                if raw.strip().lower().startswith("error:") or '"status": "blocked"' in raw:
+                    last_failure = raw[:400]
+                    break
+    return CurrentPhaseEnvelope(
+        goal=str(active_subtask.get("goal") or active_subtask.get("title") or ""),
+        active_subtask=str(active_subtask.get("id") or ""),
+        allowed_files=tuple(sorted(set(allowed))),
+        last_failure=last_failure,
+        open_issues=(),
+        forbidden_repeats=(),
+    )
+
+
 def compile_phase_context(
     *,
     workspace_root: Path,
@@ -224,12 +276,14 @@ def compile_phase_context(
     recall_bundle: dict[str, Any] | None = None,
     proactive_memory: dict[str, Any] | None = None,
     drive_root: Path | None = None,
+    subtask_memory_chunks: list[dict[str, Any]] | None = None,
 ) -> LLMInputBundle:
     del memory_client
     phase_id = str(getattr(phase_node, "id", "") or "")
     manifest_id = str(getattr(manifest, "id", "") or "")
     system_sections: list[LLMContextItem] = []
     user_sections: list[LLMContextItem] = []
+    contract_items: list[LLMContextItem] = []
     source_refs: list[ContextSourceRef] = []
 
     for idx, section in enumerate(phase_prompt_sections or []):
@@ -267,24 +321,35 @@ def compile_phase_context(
         )
         source_refs.append(ref)
 
+    active_subtask_id = (
+        str(active_subtask.get("id") or "").strip()
+        if isinstance(active_subtask, dict)
+        else ""
+    )
     if phase_id == "execute" and active_subtask:
+        envelope = _build_current_phase_envelope(
+            phase_id=phase_id,
+            active_subtask=active_subtask,
+            drive_root=drive_root,
+        )
         scope_text = json.dumps(
             {
-                "id": active_subtask.get("id"),
-                "files_to_create": active_subtask.get("files_to_create"),
-                "files_to_change": active_subtask.get("files_to_change"),
-                "files_affected": active_subtask.get("files_affected"),
-                "proof": active_subtask.get("proof"),
+                "goal": envelope.goal if envelope else "",
+                "active_subtask": envelope.active_subtask if envelope else active_subtask.get("id"),
+                "allowed_files": list(envelope.allowed_files) if envelope else [],
+                "last_failure": envelope.last_failure if envelope else "",
+                "open_issues": list(envelope.open_issues) if envelope else [],
+                "forbidden_repeats": list(envelope.forbidden_repeats) if envelope else [],
             },
             ensure_ascii=False,
             indent=2,
         )
-        ref = ContextSourceRef(kind="manifest", path="phase_plan.json", phase=phase_id, run_id=run_id)
+        ref = ContextSourceRef(kind="phase_envelope", path="current_phase_envelope", phase=phase_id, run_id=run_id)
         user_sections.append(
             LLMContextItem(
-                id="active_subtask",
-                role="active_subtask",
-                title=str(active_subtask.get("id") or "active"),
+                id="current_phase_envelope",
+                role="phase_envelope",
+                title="Current phase envelope",
                 text=scope_text,
                 source=ref,
                 freshness="current_run",
@@ -292,6 +357,38 @@ def compile_phase_context(
             )
         )
         source_refs.append(ref)
+
+    if phase_id == "execute" and subtask_memory_chunks:
+        for idx, chunk in enumerate(subtask_memory_chunks):
+            if not isinstance(chunk, dict):
+                continue
+            ref = str(chunk.get("ref") or "")
+            kind = str(chunk.get("kind") or "asset")
+            inject_mode = str(chunk.get("inject_mode") or "on_demand")
+            if inject_mode == "search_only" or not chunk.get("loaded"):
+                continue
+            text = str(chunk.get("text") or chunk.get("preview") or "")[:4000]
+            if not text.strip():
+                continue
+            item_ref = ContextSourceRef(
+                kind="subtask_memory_asset",
+                path=ref,
+                phase=phase_id,
+                run_id=run_id,
+            )
+            user_sections.append(
+                LLMContextItem(
+                    id=f"subtask_memory.{idx}",
+                    role="subtask_memory_asset",
+                    title=f"{kind}: {ref}",
+                    text=text,
+                    source=item_ref,
+                    freshness="current_run",
+                    trust="supervisor",
+                    include_reason=inject_mode,
+                )
+            )
+            source_refs.append(item_ref)
 
     tool_contract = None
     if tool_filter:
@@ -305,6 +402,13 @@ def compile_phase_context(
 
     capability_contract = None
     if capability_envelope:
+        fixed_capability_keys = {
+            "phase",
+            "workspace_write",
+            "shell",
+            "memory_write",
+            "verification",
+        }
         capability_contract = CapabilityContractView(
             phase=str(capability_envelope.get("phase") or phase_id),
             workspace_write=dict(capability_envelope.get("workspace_write") or {}),
@@ -312,15 +416,65 @@ def compile_phase_context(
             memory_write=dict(capability_envelope.get("memory_write") or {}),
             verification=dict(capability_envelope.get("verification") or {}),
             source=ContextSourceRef(kind="capability_policy", phase=phase_id, run_id=run_id),
+            extra={
+                str(key): value
+                for key, value in capability_envelope.items()
+                if str(key) not in fixed_capability_keys
+            },
         )
+
+    harness_payload = build_harness_contract_payload(
+        phase_id=phase_id,
+        active_subtask=active_subtask,
+        capability_envelope=capability_envelope,
+    )
+    harness_contract = None
+    if harness_payload.get("mode") != "none":
+        payload_text = json.dumps(harness_payload, sort_keys=True, ensure_ascii=False)
+        ref = ContextSourceRef(
+            kind="harness_contract",
+            path="umbrella/contracts/harness_profiles.py",
+            phase=phase_id,
+            run_id=run_id,
+            hash=hash_value(payload_text),
+        )
+        harness_contract = HarnessContractView(
+            schema_version=str(harness_payload.get("schema_version") or "1"),
+            mode=str(harness_payload.get("mode") or ""),
+            selected_ids=list(harness_payload.get("selected_ids") or []),
+            reason=str(harness_payload.get("reason") or ""),
+            profiles=list(harness_payload.get("profiles") or []),
+            source=ref,
+        )
+        rendered_harness = render_harness_contract_markdown(harness_payload)
+        if rendered_harness.strip():
+            contract_items.append(
+                LLMContextItem(
+                    id="harness_contract",
+                    role="harness_contract",
+                    title=(
+                        "Harness profile catalog"
+                        if harness_contract.mode == "catalog"
+                        else "Active harness contract"
+                    ),
+                    text=rendered_harness[:5000],
+                    source=ref,
+                    freshness="current_run",
+                    trust="system",
+                    include_reason=harness_contract.reason,
+                )
+            )
+            source_refs.append(ref)
 
     inventory = _build_workspace_inventory(
         workspace_root, active_subtask=active_subtask
     )
     memory_items = _memory_items_from_recall(recall_bundle)
     proactive_items = _memory_items_from_proactive(proactive_memory)
-    if proactive_items:
+    if proactive_items and phase_id != "execute":
         memory_items = proactive_items + memory_items
+    elif proactive_items and phase_id == "execute":
+        memory_items = proactive_items[:2] + memory_items
     proactive_section_ids = [
         str(section.get("name") or "")
         for section in (proactive_memory or {}).get("sections", [])
@@ -331,9 +485,12 @@ def compile_phase_context(
         "run_id": run_id,
         "system": [item.text[:200] for item in system_sections],
         "user": [item.text[:200] for item in user_sections],
+        "active_subtask_id": active_subtask_id,
         "active_subtask": active_subtask,
         "tool_filter": tool_filter,
         "inventory": inventory.missing_declared_files if inventory else [],
+        "contract_items": [item.text[:300] for item in contract_items],
+        "harness_contract": harness_payload,
         "proactive_memory_hash": hash_value(
             json.dumps(proactive_memory or {}, sort_keys=True, ensure_ascii=False)
         ),
@@ -350,11 +507,13 @@ def compile_phase_context(
         user_sections=user_sections,
         memory_items=memory_items,
         authoritative_artifacts=[item for item in user_sections if item.role == "authoritative_artifact"],
-        contract_items=[],
+        contract_items=contract_items,
+        active_subtask_id=active_subtask_id or None,
         active_subtask=active_subtask,
         workspace_inventory=inventory,
         tool_contract=tool_contract,
         capability_contract=capability_contract,
+        harness_contract=harness_contract,
         source_refs=source_refs,
         input_hash=hash_value(json.dumps(hash_payload, sort_keys=True, ensure_ascii=False)),
     )

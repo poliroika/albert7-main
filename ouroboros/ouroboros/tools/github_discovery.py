@@ -26,7 +26,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from ouroboros.limits import DISCOVERY_CONTENT_CHARS
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from umbrella.discovery.adoption_playbook import external_adoption_playbook
+from umbrella.discovery.external_catalog import mirror_preview_body, register_card
+from umbrella.discovery.web_page_chunks import preview_text
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +51,19 @@ PERMISSIVE_LICENCES = {
     "0bsd",
     "cc0-1.0",
 }
+
+
+def _github_extract_suggestions(
+    *, licence_permissive: bool, query: str
+) -> dict[str, Any]:
+    paths = ["README.md"]
+    if licence_permissive:
+        paths.extend(["src/", "examples/", "app/"])
+    return {
+        "paths": paths,
+        "queries": [query.strip(), "agent", "main loop"] if query.strip() else ["agent"],
+        "tool": "github_extract_snippets",
+    }
 
 DEFAULT_BUDGET = 10
 DEFAULT_EXTRACT_BUDGET = 12
@@ -476,16 +493,11 @@ def _github_project_search(
                     mirror_external_finding_to_memory,
                 )
 
-                body = (
-                    f"{full_name} — {desc or '(no description)'}\n"
-                    f"url: {repo.get('html_url') or ''}\n"
-                    f"licence: {licence_norm or 'unknown'} "
-                    f"(permissive={licence_norm in PERMISSIVE_LICENCES})\n"
-                    f"stars: {repo.get('stargazers_count') or 0}, "
-                    f"forks: {repo.get('forks_count') or 0}\n"
-                    f"language: {repo.get('language') or ''}\n"
-                    f"topics: {', '.join(str(t) for t in (repo.get('topics') or []))}\n"
-                    f"search_query: {query_norm}"
+                body = mirror_preview_body(
+                    source_id=f"github:{full_name}",
+                    url=str(repo.get("html_url") or ""),
+                    preview=desc,
+                    storage_ref=index_path,
                 )
                 tags = ["github", "inspiration", "external_research"]
                 if repo.get("language"):
@@ -508,35 +520,62 @@ def _github_project_search(
                     mirrored_count += 1
             except Exception:
                 log.debug("github_project_search memory mirror skipped", exc_info=True)
+        licence_permissive = licence_norm in PERMISSIVE_LICENCES
+        source_id = f"github:{full_name}"
+        catalog_id = register_card(
+            ctx,
+            kind="github_repo",
+            source_id=source_id,
+            storage_ref=index_path,
+            preview=desc,
+            tags=["github", "inspiration"] + [f"lang:{repo['language']}".lower()]
+            if repo.get("language")
+            else ["github", "inspiration"],
+            licence=licence_norm,
+            url=str(repo.get("html_url") or ""),
+            title=full_name,
+            palace_room="github_discovery",
+        )
         items.append(
             {
                 "name": repo.get("name"),
-                "full_name": repo.get("full_name"),
+                "full_name": full_name,
                 "html_url": repo.get("html_url"),
-                "description": repo.get("description"),
+                "preview": preview_text(desc),
                 "stars": repo.get("stargazers_count"),
-                "forks": repo.get("forks_count"),
-                "topics": repo.get("topics") or [],
                 "language": repo.get("language"),
                 "license": licence_norm,
-                "license_permissive": licence_norm in PERMISSIVE_LICENCES,
+                "license_permissive": licence_permissive,
                 "index_md": index_path,
+                "catalog_id": catalog_id,
+                "source_id": source_id,
+                "suggested_extract": _github_extract_suggestions(
+                    licence_permissive=licence_permissive,
+                    query=query_norm,
+                ),
             }
         )
+    catalog_ids = [str(i.get("catalog_id") or "") for i in items if i.get("catalog_id")]
     return json.dumps(
         {
             "status": "ok",
             "query": query_norm,
             "language": language,
             "results": items,
+            "catalog_ids": catalog_ids,
             "memory_mirrored_count": mirrored_count,
             "budget_used": used,
             "budget_limit": _budget_search(),
+            "adoption_playbook": external_adoption_playbook(
+                source_kind="github_repo",
+                source_handle=f"github_project_search:{query_norm}",
+            ),
             "next_step": (
-                "For 1–2 relevant repos with license_permissive=true, call "
-                "github_extract_snippets(repo_full_name=..., paths=['README.md']) "
-                "or queries=['<task keyword>']) to study architecture and examples; "
-                "adapt patterns, do not copy wholesale."
+                "Pick 1–2 relevant repos. For each, call github_extract_snippets "
+                "using suggested_extract.paths/queries, then decide intent "
+                "(idea_only | pattern_adapt | codeptr | dependency_import) and "
+                "record it via palace_add with a matching source_id. Read "
+                "knowledge_md paths before adapting code in execute."
             ),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
@@ -680,6 +719,7 @@ def _github_extract_snippets(
             licence_permissive=licence_permissive,
             queries=queries,
         )
+        snippet_text = body if licence_permissive else body[:1500]
         # Mirror to memory (JSONL + semantic palace) so recall surfaces
         # the snippet later. For non-permissive licences we keep a short
         # summary only — same policy as the disk write.
@@ -688,15 +728,11 @@ def _github_extract_snippets(
                 mirror_external_finding_to_memory,
             )
 
-            snippet_text = body if licence_permissive else body[:1500]
-            mem_body = (
-                f"github:{repo_full_name}/{path}\n"
-                f"url: https://github.com/{repo_full_name}/blob/HEAD/{path}\n"
-                f"licence: {licence_norm or 'unknown'} "
-                f"(permissive={licence_permissive})\n"
-                f"queries: {', '.join(queries) or '(none)'}\n"
-                f"size: {len(body)} chars; full_included={licence_permissive}\n"
-                f"--- excerpt ---\n{snippet_text[:4000]}"
+            mem_body = mirror_preview_body(
+                source_id=f"github:{repo_full_name}/{path}",
+                url=f"https://github.com/{repo_full_name}/blob/HEAD/{path}",
+                preview=snippet_text[:DISCOVERY_CONTENT_CHARS],
+                storage_ref=rel,
             )
             mirror = mirror_external_finding_to_memory(
                 ctx,
@@ -725,27 +761,74 @@ def _github_extract_snippets(
         except Exception:
             log.debug("github_extract_snippets memory mirror skipped", exc_info=True)
 
+        source_id = f"github:{repo_full_name}/{path}"
+        catalog_id = register_card(
+            ctx,
+            kind="github_snippet",
+            source_id=source_id,
+            storage_ref=rel,
+            preview=snippet_text[:400] if licence_permissive else body[:400],
+            tags=[
+                "github",
+                "snippet",
+                f"repo:{repo_full_name}",
+            ],
+            licence=licence_norm,
+            size_bytes=len(body),
+            palace_room="github_snippets",
+        )
         extracted.append(
             {
                 "path": path,
                 "knowledge_md": rel,
                 "size": len(body),
+                "preview": preview_text(snippet_text),
+                "catalog_id": catalog_id,
+                "source_id": source_id,
+                "research_source_id": f"github:{repo_full_name}",
                 "full_body_included": full_body_included,
                 "licence_blocked_reason": blocked,
             }
         )
 
+    knowledge_paths = [
+        str(item.get("knowledge_md") or "")
+        for item in extracted
+        if str(item.get("knowledge_md") or "").strip()
+    ]
     return json.dumps(
         {
             "status": "ok",
             "repo": repo_full_name,
+            "repo_source_id": f"github:{repo_full_name}",
             "intent": str(intent or "").strip(),
             "license": licence_norm,
             "license_permissive": licence_permissive,
             "extracted": extracted,
+            "catalog_ids": [
+                str(item.get("catalog_id") or "")
+                for item in extracted
+                if item.get("catalog_id")
+            ],
             "memory_mirrored_count": mirrored_count,
             "budget_used": used,
             "budget_limit": _budget_extract(),
+            "adoption_playbook": external_adoption_playbook(
+                source_kind="github_snippet",
+                source_handle=f"github:{repo_full_name}",
+                memory_paths=knowledge_paths,
+                licence_permissive=licence_permissive,
+            ),
+            "next_step": (
+                "For each extracted knowledge_md file, choose reuse intent "
+                "(idea_only | pattern_adapt | codeptr | dependency_import). "
+                "Save research_finding records with "
+                f"source_id=github:{repo_full_name}. Use the path-level "
+                "extracted[].source_id only for codeptr/path-specific notes. "
+                "Wire plan subtask codeptr_refs to the workspace paths you "
+                "will implement. read_file each snippet before "
+                "apply_workspace_patch in execute."
+            ),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
         ensure_ascii=False,
@@ -759,10 +842,11 @@ def get_tools() -> list[ToolEntry]:
             {
                 "name": "github_project_search",
                 "description": (
-                    "Search GitHub for repositories that look related to your "
-                    "current task.  Use sparingly — there's a per-run budget.  "
-                    "Returns repository metadata plus a per-repo `index.md` "
-                    "card stored under `.memory/drive/memory/knowledge/inspiration/`."
+                    "Search GitHub for repositories related to the task. Returns "
+                    "metadata, per-repo index.md under "
+                    "`.memory/drive/memory/knowledge/inspiration/`, "
+                    "suggested_extract hints, and an adoption_playbook describing "
+                    "how to record idea vs pattern vs codeptr vs dependency reuse."
                 ),
                 "parameters": {
                     "type": "object",
@@ -796,13 +880,11 @@ def get_tools() -> list[ToolEntry]:
             {
                 "name": "github_extract_snippets",
                 "description": (
-                    "Pull implementation files, examples, and docs from a GitHub "
-                    "repo as inspiration snippets. Directory paths and simple "
-                    "globs are expanded, with code/examples preferred over "
-                    "README-only summaries. Snippets are stored under "
-                    "`.memory/drive/memory/knowledge/inspiration/<owner>/<repo>/`. "
-                    "For non-permissive licences the body is suppressed and only "
-                    "the link plus a short summary is kept."
+                    "Pull files from a GitHub repo into inspiration snippets "
+                    "(`knowledge/inspiration/<owner>/<repo>/`). Returns "
+                    "knowledge_md paths, licence policy, and adoption_playbook "
+                    "for deliberate reuse (idea / adapt / codeptr / dependency). "
+                    "Call after github_project_search on 1–2 relevant repos."
                 ),
                 "parameters": {
                     "type": "object",

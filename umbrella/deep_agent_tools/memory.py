@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from ouroboros.limits import MEMORY_HIT_PREVIEW_CHARS
 from umbrella.deep_agent_tools.context import (
     _current_workspace_id_from_drive,
     _json,
@@ -143,6 +144,7 @@ _UNVERIFIED_MEMORY_TAGS = {
     "unverified_lesson",
 }
 _UNVERIFIED_MEMORY_ROOMS = {
+    "observation",
     "ideas-hypothesis",
     "ideas-observation_from_log",
     "scratchpad",
@@ -792,7 +794,7 @@ def _canonical_memory_items(hits: list[dict[str, Any]], limit: int) -> list[dict
             "subtask_id": h.get("subtask_id", ""),
             "run_id": h.get("run_id", ""),
             "verified": bool(h.get("verified", False)),
-            "content": str(h.get("content") or "")[:2000],
+            "content": str(h.get("content") or "")[:MEMORY_HIT_PREVIEW_CHARS],
             "source": "canonical_mempalace",
         }
         for h in hits[:limit]
@@ -1045,7 +1047,7 @@ def get_umbrella_memory(
                         "wing": h.get("wing", ""),
                         "room": h.get("room", ""),
                         "hall": h.get("hall", ""),
-                        "content": h.get("content", "")[:2000],
+                        "content": h.get("content", "")[:MEMORY_HIT_PREVIEW_CHARS],
                         "distance": round(h.get("distance", 1.0), 4),
                     }
                     for h in palace_hits[:limit]

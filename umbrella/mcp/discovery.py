@@ -17,6 +17,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, List
 
+from umbrella.discovery.adoption_playbook import external_adoption_playbook
 from umbrella.mcp.registry import McpRegistry, default_registry_path
 
 try:
@@ -248,6 +249,11 @@ def _mcp_discover(
                     mirrored += 1
         except Exception:
             pass
+    candidate_handles = [
+        f"mcp:{str(item.get('name') or '').strip()}"
+        for item in results
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
     return json.dumps(
         {
             "status": response_status,
@@ -257,12 +263,18 @@ def _mcp_discover(
             "warnings": warnings,
             "search_queries": search_queries,
             "memory_mirrored_count": mirrored,
+            "candidate_source_ids": candidate_handles,
+            "adoption_playbook": external_adoption_playbook(
+                source_kind="mcp_server",
+                source_handle=f"mcp_discover:{query_norm}",
+            ),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "next_step": (
-                "If a result looks useful, register it via mcp_install (the user "
-                "will be asked to approve before stdio commands are launched). "
-                "All results are also mirrored to workspace memory so future "
-                "`get_umbrella_memory` recall can surface them."
+                "For useful servers: palace_add a research_finding with "
+                "source_id=mcp_discover:<this query> or mcp:<server>, noting "
+                "install transport/command. In plan, call mcp_install to register "
+                "(disabled until enabled in UI). Do not assume install_hint_npx is "
+                "correct — verify README first via web_fetch or github_extract."
             ),
         },
         ensure_ascii=False,

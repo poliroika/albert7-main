@@ -1,10 +1,13 @@
 """Validation helpers for the phase-manifest/tool-registry contract."""
 
+import logging
 import pathlib
 import sys
 from typing import Iterable
 
 from umbrella.phases.base import PhaseManifest
+
+log = logging.getLogger(__name__)
 
 
 def _ensure_ouroboros_import_path(repo_root: pathlib.Path) -> None:
@@ -13,26 +16,34 @@ def _ensure_ouroboros_import_path(repo_root: pathlib.Path) -> None:
     inner = (outer / "ouroboros").resolve()
     if not inner.is_dir():
         return
+    repo = repo_root.resolve()
     sys.path[:] = [
         path
         for path in sys.path
-        if pathlib.Path(path or ".").resolve() != outer
+        if pathlib.Path(path or ".").resolve() not in {outer, repo}
     ]
     sys.path.insert(0, str(outer))
+    for name in list(sys.modules):
+        if name == "ouroboros" or name.startswith("ouroboros."):
+            sys.modules.pop(name, None)
 
-    parent = sys.modules.get("ouroboros")
-    parent_paths = (
-        [
-            str(pathlib.Path(str(path)).resolve())
-            for path in getattr(parent, "__path__", []) or []
-        ]
-        if parent is not None
-        else []
-    )
-    if parent is not None and str(inner) not in parent_paths:
-        for name in list(sys.modules):
-            if name == "ouroboros" or name.startswith("ouroboros."):
-                sys.modules.pop(name, None)
+
+def _umbrella_declared_tool_names() -> set[str]:
+    """Union Umbrella-owned tool specs even if a stale ``ouroboros`` import shadowed the registry."""
+    names: set[str] = set()
+    try:
+        from umbrella.deep_agent_tools.ouroboros_entries import get_ouroboros_tool_entries
+
+        names.update(entry.name for entry in get_ouroboros_tool_entries())
+    except Exception:
+        log.debug("Could not load ouroboros_entries tool names", exc_info=True)
+    try:
+        from umbrella.deep_agent_tools.phase_control_tools import get_tools
+
+        names.update(entry.name for entry in get_tools())
+    except Exception:
+        log.debug("Could not load phase_control tool names", exc_info=True)
+    return names
 
 
 def registered_ouroboros_tool_names(repo_root: pathlib.Path) -> set[str]:
@@ -48,8 +59,10 @@ def registered_ouroboros_tool_names(repo_root: pathlib.Path) -> set[str]:
     )
     entries = getattr(registry, "_entries", {})
     if isinstance(entries, dict):
-        return {str(name) for name in entries.keys()}
-    return set(registry.available_tools())
+        names = {str(name) for name in entries.keys()}
+    else:
+        names = set(registry.available_tools())
+    return names | _umbrella_declared_tool_names()
 
 
 def validate_phase_tool_contract(

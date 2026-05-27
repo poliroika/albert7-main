@@ -72,7 +72,238 @@ VALID_REVIEW_CODES = (
     "legacy_contract_used",
     "llm_judge_only_evidence",
     "greenfield_python_src_layout_policy",
+    "unknown_harness_profile",
+    "missing_capability_declaration",
+    "capability_probe_failed",
 )
+
+REVIEW_COVERAGE_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Review coverage checklist. For verdict ok, every field must be true; "
+        "true means checked/no blocker, including checked-not-applicable."
+    ),
+    "required": [
+        "policy_conflicts",
+        "oracle_compatibility",
+        "proof_strength",
+        "scope_validity",
+        "runtime_capabilities",
+        "test_validity",
+    ],
+    "properties": {
+        "policy_conflicts": {"type": "boolean"},
+        "oracle_compatibility": {"type": "boolean"},
+        "proof_strength": {"type": "boolean"},
+        "scope_validity": {"type": "boolean"},
+        "runtime_capabilities": {"type": "boolean"},
+        "test_validity": {"type": "boolean"},
+    },
+}
+
+FULL_REVIEW_COVERAGE = {
+    "policy_conflicts": True,
+    "oracle_compatibility": True,
+    "proof_strength": True,
+    "scope_validity": True,
+    "runtime_capabilities": True,
+    "test_validity": True,
+}
+
+PROOF_CONTRACT_SCHEMA = {
+    "type": "object",
+    "required": ["execution", "oracle", "scope"],
+    "properties": {
+        "execution": {
+            "type": "object",
+            "required": ["kind", "command"],
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "pytest",
+                        "verification_step",
+                        "http_boot",
+                        "behavioral_http",
+                        "input_sensitivity",
+                        "mutation_smoke",
+                        "metamorphic",
+                        "property_test",
+                        "import_check",
+                        "build",
+                        "command",
+                    ],
+                },
+                "command": {"type": "array", "items": {"type": "string"}},
+                "timeout_sec": {"type": "integer"},
+                "shell": {"type": "boolean"},
+                "subdir": {"type": "string"},
+            },
+        },
+        "oracle": {
+            "type": "object",
+            "required": ["oracle_type", "required_properties"],
+            "properties": {
+                "oracle_type": {
+                    "type": "string",
+                    "enum": [
+                        "unit_assertions",
+                        "behavioral_http",
+                        "input_sensitivity",
+                        "metamorphic",
+                        "snapshot",
+                        "mutation_kill",
+                        "golden_file",
+                        "build",
+                        "import",
+                    ],
+                },
+                "required_properties": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "distinct_inputs_distinct_outputs",
+                            "invalid_input_rejected",
+                            "round_trip",
+                            "idempotence",
+                            "monotonicity",
+                            "no_test_tampering",
+                            "mutation_killed",
+                            "runtime_started",
+                            "module_imports",
+                            "build_succeeds",
+                        ],
+                    },
+                },
+                "negative_cases_required": {"type": "boolean"},
+                "input_sensitivity_required": {"type": "boolean"},
+            },
+        },
+        "scope": {
+            "type": "object",
+            "properties": {
+                "files_under_test": {"type": "array", "items": {"type": "string"}},
+                "changed_files_expected": {"type": "array", "items": {"type": "string"}},
+                "pytest_targets": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "anti_gaming": {
+            "type": "object",
+            "properties": {
+                "allows_mock": {"type": "boolean"},
+                "allows_snapshot_update": {"type": "boolean"},
+                "allows_test_only_change": {"type": "boolean"},
+                "requires_real_runtime": {"type": "boolean"},
+            },
+        },
+        "harness_profile": {"type": "string"},
+        "harness_options": {
+            "type": "object",
+            "description": (
+                "Harness-specific launch, interaction, evidence, timeout, "
+                "and cleanup details. Required for real runtime GUI proof."
+            ),
+        },
+        "required_capabilities": {"type": "array", "items": {"type": "string"}},
+        "human_claims": {"type": "array", "items": {"type": "string"}},
+        "evidence_refs": {"type": "array", "items": EVIDENCE_REF_SCHEMA},
+    },
+}
+
+SUBTASK_MEMORY_SCOPE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "baseline": {"type": "array", "items": {"type": "string"}},
+        "assets": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["kind", "ref"],
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "codeptr",
+                            "knowledge_md",
+                            "github_repo",
+                            "github_snippet",
+                            "web_page",
+                            "web_section",
+                            "web_search_hit",
+                            "palace_finding",
+                            "gmas_context",
+                            "workspace_file",
+                            "mcp_server",
+                            "skill",
+                            "terminal_tail",
+                        ],
+                    },
+                    "ref": {"type": "string"},
+                    "title": {"type": "string"},
+                    "inject_mode": {
+                        "type": "string",
+                        "enum": ["preload", "on_demand", "search_only"],
+                    },
+                    "max_chars": {"type": "integer"},
+                    "source_id": {"type": "string"},
+                },
+            },
+        },
+        "palace_search_queries": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "string"},
+    },
+}
+
+PHASE_PLAN_SUBTASK_SCHEMA = {
+    "type": "object",
+    "required": ["id", "title", "goal", "proof"],
+    "properties": {
+        "id": {"type": "string"},
+        "title": {"type": "string"},
+        "goal": {"type": "string"},
+        "files_to_create": {"type": "array", "items": {"type": "string"}},
+        "files_to_change": {"type": "array", "items": {"type": "string"}},
+        "files_affected": {"type": "array", "items": {"type": "string"}},
+        "dependencies": {"type": "array", "items": {"type": "string"}},
+        "acceptance_claims": {"type": "array", "items": {"type": "string"}},
+        "proof": PROOF_CONTRACT_SCHEMA,
+        "memory_scope": SUBTASK_MEMORY_SCOPE_SCHEMA,
+        "allowed_tools": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Extra phase tool names needed by this leaf.",
+        },
+        "allowed_skills": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Extra skills/prompts the execute phase should load.",
+        },
+        "codeptr_refs": {"type": "array", "items": {"type": "string"}},
+        "mcp_refs": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+PHASE_PLAN_SCHEMA = {
+    "type": "object",
+    "required": ["subtasks"],
+    "properties": {
+        "plan_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "workspace_id": {"type": "string"},
+        "subtasks": {
+            "type": "array",
+            "minItems": 1,
+            "items": PHASE_PLAN_SUBTASK_SCHEMA,
+        },
+    },
+    "description": (
+        "Executable Umbrella phase plan. Use exactly one top-level `subtasks` "
+        "array with typed proof objects and put "
+        "memory_scope, allowed_tools, allowed_skills, codeptr_refs, and "
+        "mcp_refs on each leaf that needs extra context or tools."
+    ),
+}
 
 REVIEW_ISSUE_SCHEMA = {
     "type": "object",
@@ -144,4 +375,3 @@ COMPLETION_CONTRACT_SCHEMA = {
         "notes": {"type": "string"},
     },
 }
-

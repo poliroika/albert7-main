@@ -19,6 +19,7 @@ RESULT_BEARING_SOURCE_TOOLS = {
     "github_project_search",
     "mcp_discover",
     "web_search",
+    "web_fetch",
 }
 EXACT_SOURCE_TOOL_IDS = {
     "apply_workspace_patch",
@@ -56,11 +57,13 @@ SOURCE_ID_DESCRIPTION = (
     "For counted research_finding memory, cite current evidence: a concrete "
     "github:owner/repo returned by github_project_search, a tool-qualified id "
     "such as github_project_search:<exact-query>, mcp_discover:<exact-query>, "
-    "web_search:<exact-query>, or deep_search:<intent-or-query> only when that "
-    "result has non-empty results, or get_gmas_context/search_gmas_knowledge:"
-    "<query> after non-fallback, sufficiently confident GMAS discovery. Do "
-    "not use bare result-bearing tool ids, palace_search recall, palace_add/run "
-    "ids, TASK_MAIN.md, or preflight-only calls as counted-finding provenance."
+    "web_search:<exact-query>, web_fetch:<canonical-url>, or "
+    "deep_search:<intent-or-query> only when that result has non-empty results, "
+    "or get_gmas_context/search_gmas_knowledge:<query> after non-fallback, "
+    "sufficiently confident GMAS discovery. Catalog handles ek:... are pointers "
+    "only (not counted provenance). Do not use bare result-bearing tool ids, "
+    "palace_search recall, palace_add/run ids, TASK_MAIN.md, or preflight-only "
+    "calls as counted-finding provenance."
 )
 
 PROMPT_RULES = (
@@ -712,6 +715,32 @@ def github_namespace_source_seen(rows: list[dict[str, Any]], target: str) -> boo
     return False
 
 
+def github_namespace_seen_in_discovery(rows: list[dict[str, Any]], target: str) -> bool:
+    """Accept github:owner/repo when github_project_search or deep/web results cite it."""
+    if github_namespace_source_seen(rows, target):
+        return True
+    wanted = str(target or "").strip().strip("/").lower()
+    if not wanted:
+        return False
+    wanted_handle = f"github:{wanted}"
+    for row in rows:
+        tool = str(row.get("tool") or "").strip().lower()
+        if tool not in {"deep_search", "web_search"}:
+            continue
+        if not tool_row_has_usable_result(row):
+            continue
+        for handle in github_source_handles_from_row(row):
+            if handle.lower() == wanted_handle:
+                return True
+        for anchor in raw_result_anchor_strings(row):
+            norm = _normalise_anchor_text(anchor)
+            if norm == _normalise_anchor_text(wanted_handle):
+                return True
+            if norm == _normalise_anchor_text(wanted):
+                return True
+    return False
+
+
 def tool_row_matches_qualifier(row: dict[str, Any], qualifier: str) -> bool:
     needle = str(qualifier or "").strip().lower()
     if not needle:
@@ -742,11 +771,11 @@ def _normalise_anchor_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" /")
 
 
-def _result_entry_anchor_strings(entry: Any) -> list[str]:
+def _result_entry_anchor_strings(entry: Any, *, tool_name: str = "") -> list[str]:
     if not isinstance(entry, dict):
         return []
     anchors: list[str] = []
-    for key in (
+    keys = (
         "full_name",
         "name",
         "title",
@@ -754,7 +783,17 @@ def _result_entry_anchor_strings(entry: Any) -> list[str]:
         "url",
         "source",
         "id",
-    ):
+    )
+    if str(tool_name or "").strip().lower() == "github_project_search":
+        keys = (
+            "full_name",
+            "html_url",
+            "url",
+            "source_id",
+            "source",
+            "id",
+        )
+    for key in keys:
         value = entry.get(key)
         if not isinstance(value, str):
             continue
@@ -804,7 +843,7 @@ def tool_result_content_grounding_issue(
     for row in matching_rows:
         payload = tool_result_payload(row)
         for entry in result_entries(payload):
-            for anchor in _result_entry_anchor_strings(entry):
+            for anchor in _result_entry_anchor_strings(entry, tool_name=tool_l):
                 norm = _normalise_anchor_text(anchor)
                 if len(norm) < 4 or norm in seen:
                     continue
@@ -822,14 +861,15 @@ def tool_result_content_grounding_issue(
                 anchors.append(anchor)
                 if norm in content_norm:
                     return ""
-        for anchor in raw_result_anchor_strings(row):
-            norm = _normalise_anchor_text(anchor)
-            if len(norm) < 4 or norm in seen:
-                continue
-            seen.add(norm)
-            anchors.append(anchor)
-            if norm in content_norm:
-                return ""
+        if tool_l != "github_project_search":
+            for anchor in raw_result_anchor_strings(row):
+                norm = _normalise_anchor_text(anchor)
+                if len(norm) < 4 or norm in seen:
+                    continue
+                seen.add(norm)
+                anchors.append(anchor)
+                if norm in content_norm:
+                    return ""
     if not anchors:
         return ""
     examples = ", ".join(f"`{anchor}`" for anchor in anchors[:4])
@@ -951,14 +991,14 @@ def research_finding_source_provenance_issue(
         )
     if source_l.startswith("github:"):
         target = source.split(":", 1)[1]
-        if github_namespace_source_seen(rows, target):
+        if github_namespace_seen_in_discovery(rows, target):
             return ""
         return (
             f"ERROR: palace_add research_finding source_id `{source}` does not "
-            "match any repository returned by `github_project_search` in this "
-            "research task. Use a returned `github:owner/repo` value, the exact "
-            "`github_project_search` tool source, or save this as "
-            "`kind=observation`."
+            "match any repository returned by `github_project_search` or cited in "
+            "a current deep_search/web_search result in this research task. Use a "
+            "returned `github:owner/repo` value, the exact `github_project_search` "
+            "tool source, or save this as `kind=observation`."
         )
     if source_l.startswith("gmas:"):
         if any(

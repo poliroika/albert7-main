@@ -33,18 +33,33 @@ def test_gmas_context_query_accepts_symbol_or_specific_terms() -> None:
     )
 
 
-def test_gmas_context_query_rejects_generic_workspace_research_query() -> None:
+def test_gmas_context_query_allows_exploratory_query_in_research_phase() -> None:
     ctx = SimpleNamespace(
+        task_id="phase_web_test:research",
         context_overlays={
             "gmas_prewrite_required": True,
             "detected_domains": ["multi_agent_gmas"],
-        }
+        },
     )
 
-    issue = _gmas_context_query_specificity_issue(
+    assert not _gmas_context_query_specificity_issue(
         "multi-agent game AI bot strategy turn-based",
         None,
         ctx=ctx,
+    )
+
+
+def test_gmas_context_query_rejects_generic_query_during_execute_agent_subtask() -> None:
+    active = {
+        "id": "gmas-ai-agents",
+        "goal": "Implement GMAS-backed civilization bots.",
+        "files_to_create": ["src/civilization/civilization/ai/agents.py"],
+    }
+
+    issue = _gmas_context_query_specificity_issue(
+        "multi-agent game AI bot strategy turn-based",
+        active,
+        ctx=SimpleNamespace(task_id="phase_web_test:execute"),
     )
 
     assert issue

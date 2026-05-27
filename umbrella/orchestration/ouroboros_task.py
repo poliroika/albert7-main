@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -363,9 +364,22 @@ def _collect_palace_entries(
     )
 
 
+def _execute_scoped_external_enabled() -> bool:
+    raw = os.environ.get("UMBRELLA_EXECUTE_SCOPED_EXTERNAL", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _drop_external_recall_lines(entries: list[str]) -> list[str]:
+    if not _execute_scoped_external_enabled():
+        return entries
+    markers = ("github:", "deep_search", "external_research", "web_fetch:", "web_search")
+    return [line for line in entries if not any(m in line.lower() for m in markers)]
+
+
 def _render_palace_chunks(
     palace_entries: list[str], flagged_palace: list[str]
 ) -> list[str]:
+    palace_entries = _drop_external_recall_lines(palace_entries)
     chunks: list[str] = []
     if palace_entries:
         chunks.append("### Recent Umbrella memory")

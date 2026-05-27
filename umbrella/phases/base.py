@@ -124,6 +124,7 @@ class SubtaskCard:
     proof: ProofSpec | None = None
     codeptr_refs: list[str] = field(default_factory=list)
     mcp_refs: list[str] = field(default_factory=list)
+    memory_scope: dict[str, Any] | None = None
     files_to_create: list[str] = field(default_factory=list)
     files_to_change: list[str] = field(default_factory=list)
     files_affected: list[str] = field(default_factory=list)

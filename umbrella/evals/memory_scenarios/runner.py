@@ -72,13 +72,36 @@ class MemoryScenarioRunner:
         self._hindsight_log: FakeHindsightCallLog | None = None
 
     def run(self, scenario: MemoryScenario) -> MemoryScenarioResult:
+        if scenario.requires_no_volatile_stub and os.environ.get(
+            "UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", ""
+        ).strip() in {"1", "true", "yes", "on"}:
+            report_dir = self.report_root / scenario.id
+            report_dir.mkdir(parents=True, exist_ok=True)
+            return MemoryScenarioResult(
+                scenario_id=scenario.id,
+                ok=True,
+                repo_root=REPO_ROOT,
+                workspace_id=scenario.workspace,
+                step_results=[],
+                invariant_failures=[],
+                report_dir=report_dir,
+                dashboard={"skipped": "volatile_stub_enabled_in_environment"},
+            )
+
         tmp = tempfile.mkdtemp(prefix="mem-scenario-")
         repo = Path(tmp)
         failures: list[str] = []
         step_results: list[ScenarioStepResult] = []
         ws = scenario.workspace
+        old_env = dict(os.environ)
 
         try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.setdefault("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", "1")
+            for key, val in scenario.env.items():
+                os.environ[key] = str(val)
+
             prepare_scenario_repo(
                 repo,
                 workspace_id=ws,
@@ -86,12 +109,7 @@ class MemoryScenarioRunner:
                 manager_fixture=scenario.seed.manager_fixture,
                 extra_workspaces=scenario.seed.extra_workspaces,
             )
-            raw_seed = scenario.raw_seed
-            seed_from_dict(repo, ws, raw_seed)
-
-            for key, val in scenario.env.items():
-                os.environ[key] = val
-            os.environ.setdefault("UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB", "1")
+            seed_from_dict(repo, ws, scenario.raw_seed)
 
             report_dir = self.report_root / scenario.id
             if report_dir.exists():
@@ -128,29 +146,42 @@ class MemoryScenarioRunner:
                     )
 
             for step in steps:
-                before = capture_snapshot(repo, step.workspace_id or ws, context["drive"])
+                step_drive = context["drive"]
+                if step.workspace_id and step.workspace_id != ws:
+                    step_drive = drive_root(repo, step.workspace_id)
+                before = capture_snapshot(repo, step.workspace_id or ws, step_drive)
                 result = self._run_step(scenario, step, context)
-                after = capture_snapshot(
-                    repo, step.workspace_id or ws, context["drive"]
-                )
+                after = capture_snapshot(repo, step.workspace_id or ws, step_drive)
                 result.palace_before = before.get("palace", {})
                 result.palace_after = after.get("palace", {})
+                result.snapshot_before = before
+                result.snapshot_after = after
                 write_step_snapshots(report_dir, step.id, before, after)
                 self._write_step_artifacts(report_dir, step.id, result)
                 step_results.append(result)
 
-                assert_spec = scenario.assertions.get(step.id) or {}
-                if not assert_spec and scenario.mode == "phase_prompt_matrix":
-                    assert_spec = scenario.assertions.get("_default") or {}
-                if assert_spec:
+                if result.errors:
+                    failures.extend(
+                        f"{scenario.id}.{step.id}: {err}" for err in result.errors
+                    )
+
+                assert_spec = scenario.assertions.get(step.id)
+                if assert_spec is None and scenario.mode == "phase_prompt_matrix":
+                    assert_spec = scenario.assertions.get("_default")
+                if assert_spec is not None:
                     errs = evaluate_assert_block(
-                        step.id, assert_spec, result, task=result.task
+                        step.id,
+                        assert_spec,
+                        result,
+                        task=result.task,
+                        repo=repo,
+                        workspace_id=step.workspace_id or ws,
+                        drive=step_drive,
                     )
                     result.errors.extend(errs)
+                    if errs:
+                        failures.extend(f"{scenario.id}.{step.id}: {e}" for e in errs)
                     result.ok = result.ok and not errs
-
-                if not result.ok:
-                    failures.extend(result.errors)
 
             for key, spec in scenario.assertions.items():
                 if key.endswith("_prompt") or key in context.get("tasks", {}):
@@ -184,6 +215,8 @@ class MemoryScenarioRunner:
             write_scenario_artifacts(report_dir, scenario, mem_result)
             return mem_result
         finally:
+            os.environ.clear()
+            os.environ.update(old_env)
             if not self.keep_tmp:
                 shutil.rmtree(tmp, ignore_errors=True)
 
@@ -256,6 +289,17 @@ class MemoryScenarioRunner:
             elif step.action == "fake_hindsight_reflect":
                 errors.extend(self._action_fake_reflect(repo, ws, drive, step, context))
 
+            elif step.action == "hindsight_backend_reflect":
+                errors.extend(
+                    self._action_hindsight_backend_reflect(repo, ws, drive, step, context)
+                )
+
+            elif step.action == "accept_bkb_patch":
+                errors.extend(self._action_accept_bkb_patch(repo, ws, drive, step))
+
+            elif step.action == "process_reflexion_bkb_patch":
+                errors.extend(self._action_process_reflexion_patch(repo, ws, drive, step))
+
             elif step.action == "init_ouroboros_memory":
                 prior_id = step.args.get("task_step_id")
                 task = context["tasks"].get(str(prior_id)) if prior_id else None
@@ -271,8 +315,25 @@ class MemoryScenarioRunner:
                 palace = MemPalace(repo, ws)
                 try:
                     health = palace.health()
-                    if health.get("unavailable") and not health.get("error"):
-                        errors.append("backend unavailable masked as empty")
+                    result.overlays = dict(result.overlays or {})
+                    result.overlays["memory_health"] = health
+                    if step.args.get("expect_unavailable"):
+                        if health.get("volatile_stub"):
+                            errors.append(
+                                "memory_health: volatile stub enabled; "
+                                "set UMBRELLA_ALLOW_VOLATILE_MEMORY_STUB=0"
+                            )
+                        elif health.get("ok") and not health.get("stores_fail"):
+                            # Real chromadb available — unavailable path not exercisable here.
+                            pass
+                        elif health.get("ok"):
+                            errors.append(
+                                "memory_health: failures present but ok=true (masked)"
+                            )
+                        elif not health.get("stores_fail"):
+                            errors.append(
+                                "memory_health: expected stores_fail when backend missing"
+                            )
                 finally:
                     palace.close()
 
@@ -493,6 +554,160 @@ class MemoryScenarioRunner:
         )
         if result.get("queued", 0) < 1:
             return ["hindsight candidate not queued"]
+        context["last_reflect_queued"] = result.get("queued", 0)
+        return []
+
+    def _action_hindsight_backend_reflect(
+        self,
+        repo: Path,
+        ws: str,
+        drive: Path,
+        step: ScenarioStep,
+        context: dict[str, Any],
+    ) -> list[str]:
+        from umbrella.enforcement.ledger import append_supervisor_ledger_event
+        from umbrella.memory.backends.base import ReflectionQuery
+        from umbrella.memory.backends.hindsight import HindsightBackend
+        from umbrella.memory.hindsight.candidates import (
+            write_hindsight_candidates_as_pending_proposals,
+        )
+        from umbrella.memory.hindsight.config import HindsightConfig
+
+        event = append_supervisor_ledger_event(
+            repo_root=repo,
+            workspace_id=ws,
+            actor="verifier",
+            phase="verify",
+            tool="harness",
+            result={"passed": True},
+        )
+        evidence = [
+            {
+                "ref_type": "ledger_event",
+                "ref_id": event.event_id,
+                "hash": event.event_hash,
+                "produced_by": "verifier",
+            }
+        ]
+        fake: FakeHindsightClient = context["fake_hindsight"]
+        fake.reflect_payload = {
+            "candidates": [
+                {
+                    "id": "hs-backend-c1",
+                    "title": "Backend reflect candidate",
+                    "content": "Candidate via HindsightBackend.reflect_candidates path.",
+                    "kind": "behavior",
+                    "confidence": 0.9,
+                    "evidence_refs": evidence,
+                }
+            ]
+        }
+        if self._hindsight_log:
+            self._hindsight_log.append("reflect_candidates", {"via": "backend"})
+        backend = HindsightBackend(
+            repo_root=repo,
+            workspace_id=ws,
+            config=HindsightConfig(enabled=True, reflect_enabled=True),
+            client=fake,
+        )
+        candidates = backend.reflect_candidates(
+            ReflectionQuery(
+                question="What lessons apply?",
+                workspace_id=ws,
+                run_id=step.run_id,
+                phase_id=step.phase or "reflexion",
+            )
+        )
+        if not candidates:
+            return ["hindsight_backend_reflect returned no candidates"]
+        queued = write_hindsight_candidates_as_pending_proposals(
+            drive_root=drive,
+            repo_root=repo,
+            workspace_id=ws,
+            run_id=step.run_id,
+            phase_id=step.phase or "reflexion",
+            candidates=candidates,
+        )
+        if queued.get("queued", 0) < 1:
+            return [f"hindsight backend queue failed: {queued}"]
+        return []
+
+    def _action_accept_bkb_patch(
+        self, repo: Path, ws: str, drive: Path, step: ScenarioStep
+    ) -> list[str]:
+        from umbrella.enforcement.ledger import append_supervisor_ledger_event
+        from umbrella.memory.proactive.promotion import ProposedBkbPatch, accept_bkb_patch
+
+        args = step.args
+        expect_accepted = bool(args.get("expect_accepted", True))
+        evidence = list(args.get("evidence_refs") or [])
+        if args.get("use_valid_ledger"):
+            event = append_supervisor_ledger_event(
+                repo_root=repo,
+                workspace_id=ws,
+                actor="verifier",
+                phase="verify",
+                tool="harness",
+                result={"passed": True},
+            )
+            evidence = [
+                {
+                    "ref_type": "ledger_event",
+                    "ref_id": event.event_id,
+                    "hash": event.event_hash,
+                    "produced_by": "verifier",
+                }
+            ]
+        patch = ProposedBkbPatch(
+            patch_id=str(args.get("patch_id") or "harness-patch"),
+            workspace_id=ws,
+            run_id=step.run_id,
+            phase_id=step.phase or "reflexion",
+            actor="supervisor",
+            source_evidence=evidence,
+            rules=list(
+                args.get("rules")
+                or [
+                    {
+                        "id": "harness_hs_rule",
+                        "title": "Harness hindsight rule",
+                        "scope": "workspace",
+                        "type": "behavior",
+                        "source_backend": "hindsight",
+                        "rule": {"behavior": "Typed evidence required."},
+                    }
+                ]
+            ),
+        )
+        try:
+            result = accept_bkb_patch(
+                repo, patch, target="workspace", drive_root=drive
+            )
+            accepted = bool(result.get("accepted"))
+        except ValueError as exc:
+            if expect_accepted:
+                return [f"accept_bkb_patch failed: {exc}"]
+            return []
+        if not accepted and expect_accepted:
+            return [f"accept_bkb_patch not accepted: {result}"]
+        if accepted and not expect_accepted:
+            return ["accept_bkb_patch should have been rejected"]
+        return []
+
+    def _action_process_reflexion_patch(
+        self, repo: Path, ws: str, drive: Path, step: ScenarioStep
+    ) -> list[str]:
+        from umbrella.memory.proactive.phase_hooks import process_reflexion_bkb_patch
+
+        result = process_reflexion_bkb_patch(
+            repo_root=repo,
+            drive_root=drive,
+            workspace_id=ws,
+            run_id=step.run_id,
+        )
+        if step.args.get("expect_accepted") is False:
+            if result and result.get("accepted"):
+                return ["process_reflexion_bkb_patch should not accept without proposal"]
         return []
 
     def _write_step_artifacts(
@@ -567,11 +782,21 @@ def run_all_scenarios(
     *,
     report_root: Path | None = None,
     fail_fast: bool = False,
+    phase_filter: str | None = None,
+    include_llm: bool = False,
     **kwargs: Any,
 ) -> MemoryScenarioResult:
     results: list[MemoryScenarioResult] = []
     runner = MemoryScenarioRunner(report_root=report_root, **kwargs)
-    for scenario in load_all_scenarios():
+    scenarios = load_all_scenarios(include_llm=include_llm)
+    if phase_filter:
+        scenarios = [
+            s
+            for s in scenarios
+            if any(st.phase == phase_filter for st in s.steps)
+            or phase_filter in str(s.assertions.get("matrix_phases") or [])
+        ]
+    for scenario in scenarios:
         result = runner.run(scenario)
         results.append(result)
         if fail_fast and not result.ok:

@@ -180,7 +180,11 @@ def safe_relpath(p: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def truncate_for_log(s: str, max_chars: int = 4000) -> str:
+def truncate_for_log(s: str, max_chars: int | None = None) -> str:
+    if max_chars is None:
+        from ouroboros.limits import TRUNCATE_FOR_LOG_DEFAULT
+
+        max_chars = TRUNCATE_FOR_LOG_DEFAULT
     if len(s) <= max_chars:
         return s
     return s[: max_chars // 2] + "\n...\n" + s[-max_chars // 2 :]
@@ -274,8 +278,12 @@ def get_git_info(repo_dir: pathlib.Path) -> tuple[str, str]:
 def sanitize_task_for_event(
     task: dict[str, Any],
     drive_logs: pathlib.Path,
-    threshold: int = 4000,
+    threshold: int | None = None,
 ) -> dict[str, Any]:
+    if threshold is None:
+        from ouroboros.limits import TASK_TEXT_LOG_CHARS
+
+        threshold = TASK_TEXT_LOG_CHARS
     """Sanitize task dict for event logging: truncate large text, strip base64 images, persist full text."""
     def _json_ready(value: Any) -> Any:
         if isinstance(value, (set, frozenset, tuple)):
@@ -372,10 +380,23 @@ def sanitize_tool_result_for_log(result: str) -> str:
 def sanitize_tool_args_for_log(
     fn_name: str,
     args: dict[str, Any],
-    threshold: int = 3000,
+    threshold: int | None = None,
 ) -> dict[str, Any]:
+    if threshold is None:
+        from ouroboros.limits import TOOL_ARGS_LOG_CHARS
+
+        threshold = TOOL_ARGS_LOG_CHARS
     """Sanitize tool arguments for logging: redact secrets, truncate large fields."""
-    max_depth = 4
+    max_depth = (
+        10
+        if fn_name
+        in {
+            "propose_phase_plan",
+            "propose_subtasks",
+            "mutate_phase_plan",
+        }
+        else 4
+    )
 
     def _sanitize_value(key: str, value: Any, depth: int) -> Any:
         if depth > max_depth:

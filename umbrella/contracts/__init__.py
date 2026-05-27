@@ -4,6 +4,13 @@ from umbrella.contracts.compiler import ContractCompiler
 from umbrella.contracts.decision import PhaseDecisionEngine, decide_phase_transition
 from umbrella.contracts.evidence import EvidenceResolver, build_workspace_context
 from umbrella.contracts.hashing import diff_hash, hash_value, workspace_hash
+from umbrella.contracts.harness_profiles import (
+    HarnessProfile,
+    all_harness_profiles,
+    build_harness_contract_payload,
+    known_harness_profile_ids,
+    probe_required_capability_ids,
+)
 from umbrella.contracts.models import (
     CURRENT_CONTRACT_VERSION,
     Actor,
@@ -31,7 +38,7 @@ from umbrella.contracts.models import (
     WorkspaceContext,
     json_ready,
 )
-from umbrella.contracts.plan_ir import compile_phase_plan
+from umbrella.contracts.plan_ir import canonicalize_phase_plan, compile_phase_plan
 from umbrella.contracts.policy_input import to_policy_input
 from umbrella.contracts.layout_policy import validate_plan_layout_policy
 from umbrella.contracts.validators import (
@@ -58,6 +65,7 @@ __all__ = [
     "ContractValidator",
     "EvidenceRef",
     "EvidenceResolver",
+    "HarnessProfile",
     "PhaseDecision",
     "PhaseDecisionEngine",
     "PlanIR",
@@ -75,11 +83,16 @@ __all__ = [
     "VerificationReportRef",
     "WorkspaceContext",
     "build_workspace_context",
+    "all_harness_profiles",
+    "build_harness_contract_payload",
+    "canonicalize_phase_plan",
     "compile_phase_plan",
     "decide_phase_transition",
     "diff_hash",
     "hash_value",
     "json_ready",
+    "known_harness_profile_ids",
+    "probe_required_capability_ids",
     "to_policy_input",
     "validate_completion_contract",
     "validate_completion_materialization",

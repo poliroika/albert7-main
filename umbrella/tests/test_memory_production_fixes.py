@@ -298,7 +298,8 @@ def test_overlay_always_includes_mandatory_core(repo, phase_id):
         )
     names = [s.name.lower() for s in overlay.sections]
     assert any("identity" in n or "constitution" in n for n in names)
-    assert any("phase commitment" in n for n in names)
+    if phase_id in {"execute", "verify"}:
+        assert any("bkb" in n for n in names)
 
 
 def test_bkb_patch_rejects_string_evidence(repo):

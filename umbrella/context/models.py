@@ -61,6 +61,17 @@ class CapabilityContractView:
     memory_write: dict[str, Any]
     verification: dict[str, Any]
     source: ContextSourceRef
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class HarnessContractView:
+    schema_version: str
+    mode: str
+    selected_ids: list[str]
+    reason: str
+    profiles: list[dict[str, Any]]
+    source: ContextSourceRef
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,16 @@ class WorkspaceInventorySnapshot:
 
 
 @dataclass(frozen=True)
+class CurrentPhaseEnvelope:
+    goal: str
+    active_subtask: str
+    allowed_files: tuple[str, ...] = ()
+    last_failure: str = ""
+    open_issues: tuple[str, ...] = ()
+    forbidden_repeats: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LLMInputBundle:
     schema_version: str
     run_id: str
@@ -100,9 +121,11 @@ class LLMInputBundle:
     memory_items: list[MemorySelection] = field(default_factory=list)
     authoritative_artifacts: list[LLMContextItem] = field(default_factory=list)
     contract_items: list[LLMContextItem] = field(default_factory=list)
+    active_subtask_id: str | None = None
     active_subtask: dict[str, Any] | None = None
     workspace_inventory: WorkspaceInventorySnapshot | None = None
     tool_contract: ToolContractView | None = None
     capability_contract: CapabilityContractView | None = None
+    harness_contract: HarnessContractView | None = None
     source_refs: list[ContextSourceRef] = field(default_factory=list)
     input_hash: str = ""

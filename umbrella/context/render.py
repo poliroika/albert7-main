@@ -27,7 +27,9 @@ def bundle_to_overlay_dict(bundle: LLMInputBundle) -> dict[str, Any]:
         "input_hash": bundle.input_hash,
         "system_sections": [_item_dict(item) for item in bundle.system_sections],
         "user_sections": [_item_dict(item) for item in bundle.user_sections],
+        "contract_items": [_item_dict(item) for item in bundle.contract_items],
         "memory_items": [asdict(item) for item in bundle.memory_items],
+        "active_subtask_id": bundle.active_subtask_id,
         "active_subtask": bundle.active_subtask,
         "workspace_inventory": (
             asdict(bundle.workspace_inventory)
@@ -48,8 +50,14 @@ def bundle_to_overlay_dict(bundle: LLMInputBundle) -> dict[str, Any]:
                 "shell": bundle.capability_contract.shell,
                 "memory_write": bundle.capability_contract.memory_write,
                 "verification": bundle.capability_contract.verification,
+                **bundle.capability_contract.extra,
             }
             if bundle.capability_contract
+            else {}
+        ),
+        "harness_contract": (
+            asdict(bundle.harness_contract)
+            if bundle.harness_contract is not None
             else {}
         ),
         "rendered_system_preview": "\n".join(

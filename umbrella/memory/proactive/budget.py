@@ -58,11 +58,9 @@ def resolve_proactive_budget(
     ceiling = _MAX_HIGH_RISK if phase_key in _HIGH_RISK_PHASES else _MAX_NORMAL
 
     if explicit is not None:
-        budget = explicit
-    else:
-        budget = base
+        return max(1, min(explicit, ceiling))
 
-    budget = max(_MIN_TOKENS, min(budget, ceiling))
+    budget = max(_MIN_TOKENS, min(base, ceiling))
 
     if manifest_budget > 0 and explicit is None:
         phase_cap = int(manifest_budget * _PHASE_CAP_FRACTION)

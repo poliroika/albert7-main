@@ -446,7 +446,10 @@ def build_llm_messages(
     bible_md = _read_prompt(env, workspace_id, "BIBLE")
     consciousness_md = _read_prompt(env, workspace_id, "CONSCIOUSNESS")
     readme_md = _safe_read(env.repo_path("README.md"))
-    state_json = _safe_read(env.drive_path("state/state.json"), fallback="{}")
+    state_json = _state_json_for_prompt(
+        _safe_read(env.drive_path("state/state.json"), fallback="{}"),
+        task,
+    )
 
     # --- Load memory ---
     memory.ensure_files()
@@ -999,6 +1002,24 @@ def _task_context_overlay(task: dict[str, Any], name: str) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value or "").strip()
+
+
+def _state_json_for_prompt(state_json: str, task: dict[str, Any]) -> str:
+    if not _umbrella_phase_prompt_owned_by_task(task):
+        return state_json
+    try:
+        state = json.loads(state_json)
+    except (TypeError, json.JSONDecodeError):
+        return state_json
+    current = state.get("current_task") if isinstance(state, dict) else None
+    if not isinstance(current, dict) or "task_input" not in current:
+        return state_json
+    omitted_chars = len(str(current.pop("task_input") or ""))
+    current["task_input_omitted"] = {
+        "chars": omitted_chars,
+        "reason": "umbrella_phase_prompt_already_sent_as_user_message",
+    }
+    return json.dumps(state, ensure_ascii=False, indent=2)
 
 
 def _umbrella_phase_prompt_owned_by_task(task: dict[str, Any]) -> bool:

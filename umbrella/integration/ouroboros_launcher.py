@@ -437,11 +437,9 @@ class OuroborosLauncher:
             os.environ.setdefault("OUROBOROS_NO_WRITE_TOOL_ABORT_AFTER_NUDGES", "1")
             os.environ.setdefault("OUROBOROS_PLANNER_PHASE_ROUNDS", "14")
             os.environ.setdefault("OUROBOROS_MAX_ROUNDS", "200")
-            # Per-tool-round token cap. Set high enough to emit large
-            # files (full HTML/JS dashboards, ~500-line modules) in a
-            # single ``update_workspace_seed`` call without truncation.
-            os.environ.setdefault("OUROBOROS_MAX_TOKENS", "65536")
-            os.environ.setdefault("OUROBOROS_TOOL_MAX_TOKENS", "65536")
+            # Leave headroom for prompt history on 200k-class models; override in .env if needed.
+            os.environ.setdefault("OUROBOROS_MAX_TOKENS", "32768")
+            os.environ.setdefault("OUROBOROS_TOOL_MAX_TOKENS", "8192")
 
             # Debug: check env presence without logging secret-bearing endpoints.
             log.info(

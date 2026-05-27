@@ -57,7 +57,7 @@ class TestLLMConfig(unittest.TestCase):
         long_exc = RuntimeError("x" * 500)
         out2 = format_llm_exception_for_user_log(long_exc, max_len=80)
         self.assertLessEqual(len(out2), 80)
-        self.assertTrue(out2.endswith("…"))
+        self.assertTrue(out2.endswith("..."))
 
     def test_custom_base_url_uses_generic_key_and_skips_openrouter_extras(self):
         from ouroboros.llm import LLMClient

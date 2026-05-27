@@ -52,6 +52,7 @@ permissions:
     - deny_tools: [apply_workspace_patch, shell, terminal_session, repo_write_commit, palace_add, claude_code_edit, sandbox_self_edit]
 
 exit_criteria:
+  required_prior_calls: [run_workspace_verify, run_real_e2e]
   required_calls: [submit_final_review]
 
 mini_review_after: null

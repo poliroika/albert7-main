@@ -4513,8 +4513,8 @@ class WebBridgeApp:
                     "name": current,
                     "provider": "env",
                     "context": int(
-                        os.environ.get("OUROBOROS_MODEL_CONTEXT_TOKENS", "128000")
-                        or 128000
+                        os.environ.get("OUROBOROS_MODEL_CONTEXT_TOKENS", "200000")
+                        or 200000
                     ),
                 },
             )

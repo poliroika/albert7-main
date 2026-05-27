@@ -1798,6 +1798,13 @@ def test_normalize_run_status_keeps_verified_completed_mapping() -> None:
     assert WebBridgeApp._normalize_run_status("cancelled") == "cancelled"
 
 
+def test_web_bridge_handler_imports_without_eager_ouroboros() -> None:
+    """Memory Lab must not import runner/ouroboros at handler import time."""
+    from umbrella.web_bridge.handler import build_handler
+
+    build_handler(WebBridgeApp(REPO_ROOT))
+
+
 def test_memory_scenarios_api_list(httpd) -> None:
     host, port = "127.0.0.1", httpd
     status, data = _get_json(host, port, "/api/memory/scenarios")

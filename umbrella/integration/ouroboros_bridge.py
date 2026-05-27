@@ -1059,7 +1059,20 @@ def _sync_active_skill_packs(
         _clear_skill_artifacts(knowledge_dir)
         return
 
+    artifacts: list[str] = []
     if Domain.MULTI_AGENT_GMAS in domains:
+        artifact_name = _SKILL_ARTIFACT_FILES[Domain.MULTI_AGENT_GMAS]
+        artifact_path = knowledge_dir / artifact_name
+        if fresh or not artifact_path.exists():
+            content = _build_gmas_active_context(
+                repo_root=repo_root,
+                task_text=composite,
+            )
+            if content:
+                _write_optional_markdown(artifact_path, content)
+        if artifact_path.exists():
+            artifacts.append(f"memory/knowledge/{artifact_name}")
+    else:
         try:
             (knowledge_dir / _SKILL_ARTIFACT_FILES[Domain.MULTI_AGENT_GMAS]).unlink()
         except FileNotFoundError:
@@ -1074,7 +1087,6 @@ def _sync_active_skill_packs(
         "",
         "When a skill looks relevant, call `load_skill` with its slug for full L3 instructions.",
     ]
-    artifacts: list[str] = []
     if artifacts:
         banner_lines.extend(["", "Artifacts:", *[f"- {a}" for a in artifacts]])
     _write_optional_markdown(banner_path, "\n".join(banner_lines))

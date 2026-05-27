@@ -229,6 +229,7 @@ class ProofExecutionSpec:
     command: tuple[str, ...] = ()
     timeout_sec: int = 120
     shell: bool = False
+    subdir: str = ""
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ProofExecutionSpec":
@@ -238,6 +239,7 @@ class ProofExecutionSpec:
             command=tuple(str(item) for item in command) if isinstance(command, list) else (),
             timeout_sec=int(value.get("timeout_sec") or 120),
             shell=bool(value.get("shell")),
+            subdir=str(value.get("subdir") or "").strip().strip("/\\"),
         )
 
 
@@ -303,17 +305,40 @@ class ProofSpec:
     oracle: ProofOracleSpec
     scope: ProofScopeSpec
     anti_gaming: ProofAntiGamingSpec = field(default_factory=ProofAntiGamingSpec)
+    harness_profile: str = ""
+    harness_options: dict[str, Any] = field(default_factory=dict)
+    required_capabilities: tuple[str, ...] = ()
     human_claims: tuple[str, ...] = ()
     evidence_refs: tuple[EvidenceRef, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ProofSpec":
         refs = value.get("evidence_refs") or ()
+        harness = value.get("harness")
+        harness_profile = _contract_string(
+            value.get("harness_profile") or value.get("harness_id")
+        )
+        harness_options: dict[str, Any] = {}
+        if isinstance(harness, dict):
+            harness_profile = harness_profile or _contract_string(harness.get("id"))
+            options = harness.get("options")
+            if isinstance(options, dict):
+                harness_options = dict(options)
+        raw_options = value.get("harness_options")
+        if isinstance(raw_options, dict):
+            harness_options = dict(raw_options)
         return cls(
             execution=ProofExecutionSpec.from_mapping(value.get("execution") or {}),
             oracle=ProofOracleSpec.from_mapping(value.get("oracle") or {}),
             scope=ProofScopeSpec.from_mapping(value.get("scope") or {}),
             anti_gaming=ProofAntiGamingSpec.from_mapping(value.get("anti_gaming") or {}),
+            harness_profile=harness_profile,
+            harness_options=harness_options,
+            required_capabilities=tuple(
+                str(item).strip()
+                for item in (value.get("required_capabilities") or ())
+                if str(item).strip()
+            ),
             human_claims=tuple(str(item) for item in value.get("human_claims") or ()),
             evidence_refs=tuple(
                 EvidenceRef.from_mapping(item)
@@ -333,6 +358,11 @@ class SubtaskIR:
     dependencies: tuple[str, ...] = ()
     proof: ProofSpec | None = None
     acceptance_claims: tuple[str, ...] = ()
+    memory_scope: dict[str, Any] = field(default_factory=dict)
+    allowed_tools: tuple[str, ...] = ()
+    allowed_skills: tuple[str, ...] = ()
+    codeptr_refs: tuple[str, ...] = ()
+    mcp_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -340,6 +370,7 @@ class PlanIR:
     run_id: str
     workspace_id: str
     subtasks: tuple[SubtaskIR, ...] = ()
+    notes: str = ""
 
 
 @dataclass(frozen=True)
@@ -369,14 +400,52 @@ class ReviewIssue:
 
 
 @dataclass(frozen=True)
+class ReviewCoverageChecklist:
+    policy_conflicts: bool = False
+    oracle_compatibility: bool = False
+    proof_strength: bool = False
+    scope_validity: bool = False
+    runtime_capabilities: bool = False
+    test_validity: bool = False
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any] | None) -> "ReviewCoverageChecklist | None":
+        if not isinstance(value, dict):
+            return None
+        return cls(
+            policy_conflicts=bool(value.get("policy_conflicts")),
+            oracle_compatibility=bool(value.get("oracle_compatibility")),
+            proof_strength=bool(value.get("proof_strength")),
+            scope_validity=bool(value.get("scope_validity")),
+            runtime_capabilities=bool(value.get("runtime_capabilities")),
+            test_validity=bool(value.get("test_validity")),
+        )
+
+    def is_complete(self) -> bool:
+        return all(
+            (
+                self.policy_conflicts,
+                self.oracle_compatibility,
+                self.proof_strength,
+                self.scope_validity,
+                self.runtime_capabilities,
+                self.test_validity,
+            )
+        )
+
+
+@dataclass(frozen=True)
 class ReviewContract:
     verdict: ReviewVerdict
     issues: tuple[ReviewIssue, ...] = ()
     loop_back_target: str = ""
     notes: str = ""
+    coverage: ReviewCoverageChecklist | None = None
+    required_plan_changes: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ReviewContract":
+        changes = value.get("required_plan_changes") or ()
         return cls(
             verdict=cast(ReviewVerdict, str(value.get("verdict") or "")),
             issues=tuple(
@@ -386,6 +455,8 @@ class ReviewContract:
             ),
             loop_back_target=str(value.get("loop_back_target") or ""),
             notes=str(value.get("notes") or ""),
+            coverage=ReviewCoverageChecklist.from_mapping(value.get("coverage")),
+            required_plan_changes=tuple(str(item) for item in changes if str(item).strip()),
         )
 
 
@@ -499,4 +570,3 @@ class PhaseDecision:
     target_phase: str | None = None
     blocking_issue_codes: tuple[str, ...] = ()
     reason: str = ""
-

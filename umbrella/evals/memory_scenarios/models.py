@@ -38,6 +38,7 @@ class MemoryScenario:
     source_path: Path | None = None
     raw_seed: dict[str, Any] = field(default_factory=dict)
     llm: dict[str, Any] = field(default_factory=dict)
+    requires_no_volatile_stub: bool = False
 
 
 @dataclass
@@ -52,6 +53,8 @@ class ScenarioStepResult:
     injection_report: dict[str, Any] = field(default_factory=dict)
     palace_before: dict[str, Any] = field(default_factory=dict)
     palace_after: dict[str, Any] = field(default_factory=dict)
+    snapshot_before: dict[str, Any] = field(default_factory=dict)
+    snapshot_after: dict[str, Any] = field(default_factory=dict)
     files_changed: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 

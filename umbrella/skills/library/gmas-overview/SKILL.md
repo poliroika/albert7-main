@@ -8,14 +8,27 @@ when_to_use: "When a workspace task needs LLM-backed agents, multi-agent coordin
 
 ## GMAS Usage
 
-Prefer the in-repo GMAS primitives for LLM-backed agents.
+Prefer the in-repo GMAS primitives for LLM-backed agents (`gmas/` package, dependency `frontier-ai-gmas`).
 
-Design guidance:
+### How to load context (do not guess APIs)
+
+1. **Research / plan** — broad queries are allowed. Call `get_gmas_context` or `search_gmas_knowledge`, then read `key_symbols`, `key_files`, `results`, and `implementation_guide`.
+2. **Execute (GMAS subtask)** — before the first write, call again with **concrete symbols** from step 1 plus the subtask goal, e.g. `AgentProfile MACPRunner LLMCallerFactory <your subtask>`.
+3. Implement only APIs that appear in retrieval hits. Do **not** invent `gmas.LLMClient` or similar unless listed in `key_symbols`.
+
+### Design guidance
+
 - Model agents as explicit roles with inputs, outputs, and state.
 - Keep game or domain state in deterministic code.
 - Use LLM agents for decisions, negotiation, planning, and narrative reasoning.
 - Parse LLM outputs through structured contracts before mutating state.
-- Resolve runtime LLM env through the standalone project aliases `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL`. Umbrella maps host control-plane launch env into those public aliases before workspace commands run, so generated workspace code, docs, tests, and env examples should not mention or require control-plane aliases. Do not require `OPENAI_API_KEY` unless the selected provider is OpenAI, and do not hardcode OpenAI base URLs or `gpt-*` fallback models in generated workspace code.
-- Handle missing credentials with explicit startup/runtime errors, retry, or paused bot turns. Do not fall back to static, random, cached, or hardcoded decisions while pretending LLM decisions happened.
+- Resolve runtime LLM env through public aliases `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`.
+- Handle missing credentials with explicit errors — no silent mock decisions pretending to be LLM output.
 
-Verification should prove at least one real agent decision path using the normalized public `LLM_*` runtime env when credentials are present.
+### Typical patterns (verify in context, do not assume)
+
+- `AgentProfile` + system prompt for bot identity.
+- `MACPRunner` / graph execution for multi-agent turns.
+- `LLMCallerFactory` / caller config for real LLM calls.
+
+Verification should prove at least one real agent decision path when credentials are present.

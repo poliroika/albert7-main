@@ -40,7 +40,7 @@ _TEST_PATH_RE = re.compile(r"(^|/)(tests?/|test_[^/]+\.py$)")
 _ADDED_TAMPER_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "pytest_skip_or_xfail",
-        re.compile(r"\bpytest\.(?:skip|xfail)\b|@pytest\.mark\.xfail\b"),
+        re.compile(r"\bpytest\.(?:skip|xfail)\b|@pytest\.mark\.(?:skipif|xfail)\b"),
         "Tests must not be skipped/xfail'ed as proof of completion.",
     ),
     (

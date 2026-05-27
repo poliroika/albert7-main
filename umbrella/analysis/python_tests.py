@@ -41,16 +41,61 @@ def _weak_none_compare(node: ast.AST) -> bool:
     return bool(node.comparators) and isinstance(node.comparators[0], ast.Constant) and node.comparators[0].value is None
 
 
+def _contains_weak_none_compare(node: ast.AST) -> bool:
+    return any(_weak_none_compare(child) for child in ast.walk(node))
+
+
+def _assertion_has_behavior_signal(node: ast.AST) -> bool:
+    if _constant_truth(node):
+        return False
+    if isinstance(node, ast.Name):
+        return False
+    if _weak_none_compare(node):
+        return False
+    if isinstance(node, ast.BoolOp):
+        return any(_assertion_has_behavior_signal(value) for value in node.values)
+    return True
+
+
+def _iter_asserts_without_nested_functions(node: ast.AST):
+    pending = list(ast.iter_child_nodes(node))
+    while pending:
+        child = pending.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.Assert):
+            yield child
+        pending.extend(ast.iter_child_nodes(child))
+
+
+def _constant_none(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _looks_like_gui_constructor(name: str) -> bool:
+    leaf = name.rsplit(".", 1)[-1]
+    lowered = leaf.lower()
+    if "gui" in lowered or "tk" in lowered:
+        return True
+    return leaf.endswith(("App", "Window", "Frame", "View", "Dialog"))
+
+
 class PyTestTamperVisitor(ast.NodeVisitor):
     def __init__(self, *, path: str, source: str) -> None:
         self.path = path
         self.source_lines = source.splitlines()
         self.issues: list[StaticAnalysisIssue] = []
-        self._test_stack: list[str] = []
+        self._test_behavior_stack: list[bool] = []
+        self._tkinter_aliases: set[str] = {"tkinter"}
+        self._tk_name_imported = False
 
     @property
     def in_test(self) -> bool:
-        return bool(self._test_stack)
+        return bool(self._test_behavior_stack)
+
+    @property
+    def current_test_has_behavior_signal(self) -> bool:
+        return bool(self._test_behavior_stack and self._test_behavior_stack[-1])
 
     def _add(self, code: str, node: ast.AST, message: str) -> None:
         self.issues.append(
@@ -65,24 +110,50 @@ class PyTestTamperVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         if node.name.startswith("test_"):
-            self._test_stack.append(node.name)
+            has_behavior_signal = any(
+                _assertion_has_behavior_signal(assert_node.test)
+                for assert_node in _iter_asserts_without_nested_functions(node)
+            )
+            self._test_behavior_stack.append(has_behavior_signal)
             self.generic_visit(node)
-            self._test_stack.pop()
+            self._test_behavior_stack.pop()
             return
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         if node.name.startswith("test_"):
-            self._test_stack.append(node.name)
+            has_behavior_signal = any(
+                _assertion_has_behavior_signal(assert_node.test)
+                for assert_node in _iter_asserts_without_nested_functions(node)
+            )
+            self._test_behavior_stack.append(has_behavior_signal)
             self.generic_visit(node)
-            self._test_stack.pop()
+            self._test_behavior_stack.pop()
             return
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "tkinter":
+                self._tkinter_aliases.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == "tkinter":
+            for alias in node.names:
+                if alias.name == "Tk":
+                    self._tk_name_imported = True
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         name = _call_name(node)
         leaf = name.rsplit(".", 1)[-1] if name else ""
-        if name in {"pytest.skip", "pytest.xfail"} or name.endswith(".skip") or name.endswith(".xfail"):
+        if (
+            name in {"pytest.skip", "pytest.xfail", "pytest.mark.skipif"}
+            or name.endswith(".skip")
+            or name.endswith(".xfail")
+            or name.endswith(".skipif")
+        ):
             self._add(
                 "pytest_skip_or_xfail",
                 node,
@@ -100,6 +171,28 @@ class PyTestTamperVisitor(ast.NodeVisitor):
                 node,
                 "Monkeypatching target behavior is not acceptable proof.",
             )
+        if (
+            any(name == f"{alias}.Tk" for alias in self._tkinter_aliases)
+            or (name == "Tk" and self._tk_name_imported)
+        ):
+            self._add(
+                "native_gui_root_in_test",
+                node,
+                "Proof tests must not require a real native GUI root; use a headless adapter/model for behavior.",
+            )
+        if _looks_like_gui_constructor(name):
+            for keyword in node.keywords:
+                if keyword.arg in {"root", "master", "parent"} and _constant_none(keyword.value):
+                    self._add(
+                        "implicit_native_gui_root_in_test",
+                        node,
+                        (
+                            "Passing root/master/parent=None to a GUI constructor "
+                            "can create a native root indirectly; use an injected "
+                            "headless adapter or a desktop GUI runtime proof."
+                        ),
+                    )
+                    break
         if name.endswith("subprocess.run"):
             for keyword in node.keywords:
                 if keyword.arg == "check" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False:
@@ -117,7 +210,7 @@ class PyTestTamperVisitor(ast.NodeVisitor):
                 node,
                 "Trivial constant assertions do not prove behavior.",
             )
-        elif _weak_none_compare(node.test):
+        elif _contains_weak_none_compare(node.test) and not self.current_test_has_behavior_signal:
             self._add(
                 "weak_not_none_assertion",
                 node,

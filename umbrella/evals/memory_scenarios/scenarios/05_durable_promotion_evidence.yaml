@@ -32,4 +32,21 @@ steps:
       append_ledger: true
       expect_saved: true
 
-assert: {}
+assert:
+  promote_no_evidence:
+    palace:
+      no_new_store_nodes:
+        - palace.durable
+
+  promote_fake_ledger:
+    palace:
+      no_new_store_nodes:
+        - palace.durable
+
+  promote_valid:
+    palace:
+      new_store_nodes:
+        palace.durable: 1
+      contains_metadata:
+        trust_level: public_verified
+        evidence_refs_json_contains: ledger_event

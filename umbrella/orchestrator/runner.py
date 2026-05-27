@@ -5,6 +5,7 @@ import pathlib
 import re
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Callable, Iterator
 
 from umbrella.phases.base import (
@@ -16,11 +17,19 @@ from umbrella.phases.base import (
     SubtaskCard,
     WatcherSignal,
 )
+from umbrella.phases.identity import phase_control_row_matches
 from umbrella.phases.registry import get_registry
 from umbrella.orchestrator.phase_plan import build_default_plan, save_plan, load_plan
 from umbrella.orchestrator.watcher import WatcherPollLoop
 from umbrella.env import watcher_budget_enforcement_enabled
 from umbrella.orchestrator.worker import build_phase_task
+from umbrella.contracts.models import ReviewContract
+from umbrella.orchestrator.subtask_recovery import (
+    all_execute_subtasks_done,
+    execute_node_from_plan,
+    recovery_at_for_plan,
+    review_superseded_by_recovery,
+)
 from umbrella.memory.palace.facade import MemPalace
 from umbrella.utils.result_envelope import ResultEnvelope, ErrorCode
 from umbrella.utils.tool_logs import is_effective_write_tool_log_row
@@ -33,9 +42,12 @@ from umbrella.contracts import (
     ContractValidator,
     PhaseDecisionEngine,
     ProofSpec,
+    WorkspaceContext,
     build_workspace_context,
+    canonicalize_phase_plan,
     compile_phase_plan,
     json_ready,
+    hash_value,
     validate_done_subtasks_materialized,
 )
 
@@ -199,6 +211,7 @@ class PhaseRunner:
             )
 
         if kind == "force_verify":
+            task_id = str(outcome.get("task_id") or "").strip()
             result, envelope = self._finish_phase_loop_back(
                 phase_node=phase_node,
                 plan=plan,
@@ -211,6 +224,10 @@ class PhaseRunner:
             if target is not None:
                 overlay = dict(target.overlay or {})
                 overlay["watcher_force_verify"] = True
+                overlay["watcher_force_verify_after"] = time.time()
+                overlay["watcher_force_verify_tool_row_floor"] = len(
+                    self._tool_log_rows_for_task(task_id=task_id)
+                )
                 overlay["required_next_actions"] = [
                     "run_subtask_proof",
                     "run_workspace_verify",
@@ -238,7 +255,7 @@ class PhaseRunner:
             return result, envelope
 
         if kind in {"restart_phase", "inject_lesson"}:
-            return self._finish_phase_loop_back(
+            result, envelope = self._finish_phase_loop_back(
                 phase_node=phase_node,
                 plan=plan,
                 run_id=run_id,
@@ -246,8 +263,29 @@ class PhaseRunner:
                 loop_back_target=phase_node.id,
                 retry_reason=reason,
             )
+            payload = signal.payload if isinstance(signal.payload, dict) else {}
+            lesson = str(payload.get("watcher_lesson") or "").strip()
+            category = str(payload.get("watcher_semantic_category") or "").strip()
+            target = plan.get_node(phase_node.id)
+            if target is not None and (lesson or category):
+                overlay = dict(target.overlay or {})
+                if lesson:
+                    overlay["watcher_lesson"] = lesson
+                if category:
+                    overlay["watcher_semantic_category"] = category
+                target.overlay = overlay
+                save_plan(plan, self._drive_root)
+            return result, envelope
 
         return None, None
+
+    @staticmethod
+    def _watcher_signal_interrupts_phase(signal: WatcherSignal | None) -> bool:
+        if signal is None:
+            return False
+        # inject_lesson is advisory context. It must not abort a phase that may
+        # recover naturally on the next model/tool round.
+        return str(signal.kind or "").strip() != "inject_lesson"
 
     @staticmethod
     def _tool_row_json_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -395,13 +433,13 @@ class PhaseRunner:
         seen: set[str] = set()
         for row in records:
             row_task_id = str(row.get("task_id") or "")
-            if task_id and row_task_id and row_task_id != task_id:
+            if task_id and not phase_control_row_matches(row, task_id=task_id):
                 continue
             created = row.get("created_at")
             if (
                 phase_started_at is not None
                 and isinstance(created, (int, float))
-                and float(created) < float(phase_started_at)
+                and float(created) < float(phase_started_at) - 5.0
             ):
                 continue
             signal_id = str(row.get("signal_id") or "").strip()
@@ -466,12 +504,19 @@ class PhaseRunner:
             items: list[str] = []
             if isinstance(revisions, list):
                 items = [str(item).strip() for item in revisions if str(item).strip()]
+            changes = payload.get("required_plan_changes")
+            required_plan_changes: list[str] = []
+            if isinstance(changes, list):
+                required_plan_changes = [
+                    str(item).strip() for item in changes if str(item).strip()
+                ]
             notes = str((payload or {}).get("notes") or "").strip()
             return {
                 "source_phase": phase_node.id,
                 "source_task_id": task_id,
                 "verdict": "revise",
                 "revisions": items,
+                "required_plan_changes": required_plan_changes,
                 "notes": notes,
             }
         return {}
@@ -488,6 +533,7 @@ class PhaseRunner:
             contracts.append(existing)
         contracts.append(latest)
         revisions: list[str] = []
+        required_plan_changes: list[str] = []
         notes: list[str] = []
         sources: list[dict[str, str]] = []
         for contract in contracts:
@@ -497,6 +543,12 @@ class PhaseRunner:
                     text = str(item or "").strip()
                     if text and text not in revisions:
                         revisions.append(text)
+            raw_changes = contract.get("required_plan_changes")
+            if isinstance(raw_changes, list):
+                for item in raw_changes:
+                    text = str(item or "").strip()
+                    if text and text not in required_plan_changes:
+                        required_plan_changes.append(text)
             note = str(contract.get("notes") or "").strip()
             if note and note not in notes:
                 notes.append(note)
@@ -511,6 +563,7 @@ class PhaseRunner:
                     sources.append(source)
         merged = dict(latest)
         merged["revisions"] = revisions
+        merged["required_plan_changes"] = required_plan_changes
         if notes:
             merged["notes"] = "\n\n".join(notes)
         if sources:
@@ -559,6 +612,15 @@ class PhaseRunner:
         manifest: Any,
         outcome: dict[str, Any],
     ) -> str:
+        outcome_text = str(
+            outcome.get("result")
+            or outcome.get("final_message")
+            or outcome.get("error")
+            or ""
+        )
+        if "phase_impasse" in outcome_text[:1000]:
+            return "phase_impasse: " + outcome_text.strip()[:1000]
+
         required = list(getattr(manifest.exit_criteria, "required_calls", ()) or ())
         if not required:
             return ""
@@ -573,6 +635,19 @@ class PhaseRunner:
             if kind:
                 by_kind[kind] = row
         missing = [name for name in required if name not in by_kind]
+        if missing and phase_node.manifest_id == "plan":
+            task_run_id = str(outcome.get("run_id") or "").strip()
+            if not task_run_id and ":" in task_id:
+                task_run_id = task_id.split(":", 1)[0]
+            if self._submitted_phase_plan_satisfies_run(
+                run_id=task_run_id,
+                since=phase_node.started_at,
+            ):
+                missing = [
+                    name
+                    for name in missing
+                    if name not in {"submit_phase_plan", "propose_phase_plan"}
+                ]
         if missing:
             return (
                 "phase exit criteria missing required call(s): "
@@ -594,11 +669,14 @@ class PhaseRunner:
             details = str((verification.get("payload") or {}).get("details") or "")
             return f"verification did not pass: {details[:500]}"
 
-        palace_rules = list(
-            getattr(manifest.exit_criteria, "required_palace_writes", ()) or ()
-        ) + list(getattr(manifest.exit_criteria, "min_palace_writes", ()) or ())
-        for rule in palace_rules:
-            needed = max(1, int(getattr(rule, "n", 1) or 1))
+        task_run_id = str(outcome.get("run_id") or "").strip()
+        if not task_run_id and ":" in task_id:
+            task_run_id = task_id.split(":", 1)[0]
+        for rule, needed in self._phase_exit_palace_write_rules(
+            manifest=manifest,
+            phase_node=phase_node,
+            run_id=task_run_id or "",
+        ):
             tools = self._palace_write_tools_for_rule(manifest=manifest, rule=rule)
             count = self._phase_required_palace_write_count(
                 task_id=task_id,
@@ -616,13 +694,12 @@ class PhaseRunner:
                 )
 
         if phase_node.id == "research":
-            task_run_id = str(outcome.get("run_id") or "").strip()
-            if not task_run_id and ":" in task_id:
-                task_run_id = task_id.split(":", 1)[0]
             summary_failure = self._latest_research_summary_handoff_failure(
                 run_id=task_run_id or None,
                 min_valid_findings=self._research_summary_min_valid_findings_for_manifest(
-                    manifest
+                    manifest,
+                    phase_node=phase_node,
+                    run_id=task_run_id or run_id,
                 ),
             )
             if summary_failure:
@@ -639,7 +716,22 @@ class PhaseRunner:
             target = self._phase_loop_back_target(
                 phase_node=phase_node,
                 outcome=outcome,
+                plan=plan,
             )
+            if (
+                not target
+                and phase_node.manifest_id == "execute"
+                and all_execute_subtasks_done(phase_node)
+            ):
+                task_run_id = str(outcome.get("run_id") or "").strip()
+                if not task_run_id and ":" in task_id:
+                    task_run_id = task_id.split(":", 1)[0]
+                if not self._phase_contract_decision_failure(
+                    phase=phase_node.id,
+                    manifest=manifest,
+                    run_id=task_run_id,
+                ):
+                    return ""
             if target and plan.get_node(target) is not None:
                 return self._micro_review_revision_reason(payload)
 
@@ -674,15 +766,199 @@ class PhaseRunner:
         task_run_id = str(outcome.get("run_id") or "").strip()
         if not task_run_id and ":" in task_id:
             task_run_id = task_id.split(":", 1)[0]
+        completion_subtask_id = ""
+        if manifest.id == "execute":
+            completed = self._latest_completed_subtask_from_phase(
+                phase_node=phase_node,
+                outcome=outcome,
+            )
+            completion_subtask_id = completed.id if completed is not None else ""
+        elif manifest.id == "subtask_review":
+            completion_subtask_id = self._reviewed_subtask_id(phase_node)
         contract_failure = self._phase_contract_decision_failure(
             phase=phase_node.id,
             manifest=manifest,
             run_id=task_run_id,
+            completion_subtask_id=completion_subtask_id,
         )
         if contract_failure:
             return contract_failure
 
         return ""
+
+    def _contract_validation_context(self, bundle: ContractBundle) -> WorkspaceContext:
+        paths: dict[str, None] = {}
+        for completion in bundle.completions:
+            for raw in completion.changed_files or ():
+                rel = str(raw or "").replace("\\", "/").strip().lstrip("./")
+                if rel:
+                    paths[rel] = None
+        return build_workspace_context(
+            repo_root=self._repo_root,
+            workspace_root=self._repo_root / "workspaces" / self._workspace_id,
+            workspace_id=self._workspace_id,
+            changed_files=tuple(paths),
+        )
+
+    @staticmethod
+    def _parse_contract_loop_back_target(completion_failure: str, *, default: str) -> str:
+        prefix = "contract decision loop_back to "
+        if not completion_failure.startswith(prefix):
+            return default
+        target, _, _ = completion_failure.removeprefix(prefix).partition(":")
+        return target.strip() or default
+
+    @staticmethod
+    def _loop_back_supersede_after(records: list[dict[str, Any]]) -> float | None:
+        stamps: list[float] = []
+        for row in records:
+            kind = str(row.get("kind") or "")
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if kind == "submit_micro_review":
+                if str(payload.get("verdict") or "") != "ok":
+                    continue
+            elif kind not in (
+                "mark_subtask_complete",
+                "mutate_phase_plan",
+                "submit_phase_plan",
+            ):
+                continue
+            created = row.get("created_at")
+            if isinstance(created, (int, float)):
+                stamps.append(float(created))
+        return max(stamps) if stamps else None
+
+    def _read_run_control_records(self, *, run_id: str) -> list[dict[str, Any]]:
+        if not run_id:
+            return []
+        return self._read_phase_control_records(task_id="", phase_started_at=None)
+
+    @staticmethod
+    def _filter_records_for_run(
+        records: list[dict[str, Any]], *, run_id: str
+    ) -> list[dict[str, Any]]:
+        if not run_id:
+            return records
+        filtered: list[dict[str, Any]] = []
+        for row in records:
+            row_run = str(row.get("run_id") or "")
+            task_id = str(row.get("task_id") or "")
+            if row_run == run_id or task_id.startswith(f"{run_id}:"):
+                filtered.append(row)
+        return filtered
+
+    @staticmethod
+    def _latest_signal_at(
+        records: list[dict[str, Any]],
+        *,
+        kind: str,
+        phase: str = "",
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> float:
+        latest = 0.0
+        for row in records:
+            if str(row.get("kind") or "") != kind:
+                continue
+            if phase and str(row.get("phase") or "") != phase:
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if predicate is not None and not predicate(payload):
+                continue
+            created = row.get("created_at")
+            if isinstance(created, (int, float)):
+                latest = max(latest, float(created))
+        return latest
+
+    def _plan_review_ok_supersedes_plan_floor(self, *, run_id: str) -> bool:
+        """Accepted plan_review ok after the latest submit_phase_plan clears floor re-check."""
+        records = self._filter_records_for_run(
+            self._read_run_control_records(run_id=run_id),
+            run_id=run_id,
+        )
+        latest_submit = self._latest_signal_at(records, kind="submit_phase_plan")
+        if latest_submit <= 0:
+            return False
+        latest_ok = self._latest_signal_at(
+            records,
+            kind="submit_micro_review",
+            phase="plan_review",
+            predicate=lambda payload: str(payload.get("verdict") or "") == "ok",
+        )
+        return latest_ok >= latest_submit
+
+    def _submitted_phase_plan_satisfies_run(
+        self,
+        *,
+        run_id: str,
+        since: float | None = None,
+    ) -> bool:
+        path = self._drive_root / "state" / "phase_plan_submitted_latest.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.debug("submitted phase plan unreadable", exc_info=True)
+            return False
+        if not isinstance(data, dict):
+            return False
+        if run_id and str(data.get("run_id") or "") not in {"", run_id}:
+            return False
+        created = data.get("created_at")
+        if (
+            since is not None
+            and isinstance(created, (int, float))
+            and float(created) < float(since)
+        ):
+            return False
+        plan = data.get("plan")
+        if not isinstance(plan, dict):
+            return False
+        return bool(canonicalize_phase_plan(plan).get("subtasks"))
+
+    def _fresh_passing_workspace_verify_for_current_hash(self) -> bool:
+        from umbrella.contracts.hashing import workspace_hash
+
+        workspace_root = self._repo_root / "workspaces" / self._workspace_id
+        if not workspace_root.is_dir():
+            return False
+        current = workspace_hash(workspace_root)
+        path = self._drive_root / "logs" / "tools.jsonl"
+        if not path.is_file():
+            return False
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            log.debug("tools.jsonl unreadable for workspace verify freshness", exc_info=True)
+            return False
+        for line in reversed(lines[-800:]):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("tool") or "") != "run_workspace_verify":
+                continue
+            preview = str(row.get("result_preview") or "").strip()
+            if not preview.startswith("{"):
+                continue
+            try:
+                payload = json.loads(preview)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("passed") is not True:
+                continue
+            ref = payload.get("verification_report_ref")
+            if not isinstance(ref, dict):
+                continue
+            if ref.get("passed") is True and str(ref.get("workspace_hash") or "") == current:
+                return True
+        return False
+
+    @staticmethod
+    def _fresh_workspace_verify_supersedes_stale_proofs(phase: str) -> bool:
+        return (
+            phase == "execute"
+            or phase.startswith("subtask_review")
+            or phase in {"final_review", "verify"}
+        )
 
     def _phase_contract_decision_failure(
         self,
@@ -690,6 +966,7 @@ class PhaseRunner:
         phase: str,
         manifest: Any,
         run_id: str = "",
+        completion_subtask_id: str = "",
     ) -> str:
         bundle = ContractCompiler.from_run(
             repo_root=self._repo_root,
@@ -697,12 +974,31 @@ class PhaseRunner:
             workspace_id=self._workspace_id,
             run_id=run_id,
         )
-        context = build_workspace_context(
-            repo_root=self._repo_root,
-            workspace_root=self._repo_root / "workspaces" / self._workspace_id,
-            workspace_id=self._workspace_id,
+        scoped_subtask_id = str(completion_subtask_id or "").strip()
+        if scoped_subtask_id:
+            bundle = replace(
+                bundle,
+                completions=tuple(
+                    completion
+                    for completion in bundle.completions
+                    if completion.subtask_id == scoped_subtask_id
+                ),
+            )
+        context = self._contract_validation_context(bundle)
+        issues = ContractValidator.validate(
+            bundle,
+            context=context,
+            exit_phase=phase,
+            drive_root=self._drive_root,
         )
-        issues = ContractValidator.validate(bundle, context=context)
+        if self._fresh_workspace_verify_supersedes_stale_proofs(
+            phase
+        ) and self._fresh_passing_workspace_verify_for_current_hash():
+            issues = [
+                issue
+                for issue in issues
+                if issue.code != "proof_stale_rerun_required"
+            ]
         decision = PhaseDecisionEngine.decide(
             phase=phase,
             issues=issues,
@@ -716,9 +1012,15 @@ class PhaseRunner:
             return f"contract decision human_checkpoint: {reason}"
         if decision.action == "abort":
             return f"contract decision abort: {reason}"
+        if decision.action == "verify":
+            return f"contract decision verify_in_place: {reason}"
         if decision.action == "loop_back":
             target = decision.target_phase or phase
-            return f"contract decision loop_back to {target}: {reason}"
+            from umbrella.contracts.platform_context import capability_gate_recovery_hint
+
+            recovery = capability_gate_recovery_hint(issues) or ""
+            suffix = f" Suggested recovery: {recovery}" if recovery else ""
+            return f"contract decision loop_back to {target}: {reason}{suffix}"
         return f"contract decision {decision.action}: {reason}"
 
     @staticmethod
@@ -872,7 +1174,18 @@ class PhaseRunner:
             )
         phase_node.overlay = dict(overlay)
         if target is not None and target.id != phase_node.id:
-            target.overlay = dict(overlay)
+            if (
+                target.manifest_id == "execute"
+                and all_execute_subtasks_done(target)
+            ):
+                self._clear_stale_execute_retry_overlay(target)
+            else:
+                target.overlay = dict(overlay)
+        self._invalidate_after_verify_loopback(
+            plan=plan,
+            source_phase=phase_node,
+            loop_back_target=loop_back_target,
+        )
         self._mirror_phase_retry_context_to_palace(
             phase_node=phase_node,
             run_id=run_id,
@@ -900,6 +1213,39 @@ class PhaseRunner:
             ),
         ))
         return result, envelope
+
+    @staticmethod
+    def _invalidate_after_verify_loopback(
+        *,
+        plan: PhasePlan,
+        source_phase: PhaseNode,
+        loop_back_target: str,
+    ) -> None:
+        if source_phase.manifest_id != "verify" or loop_back_target != "execute":
+            return
+        for node in plan.nodes:
+            if node.manifest_id not in {"final_review", "verify"}:
+                continue
+            node.status = "pending"
+            node.started_at = None
+            node.ended_at = None
+            if node.manifest_id == "final_review":
+                overlay = dict(node.overlay or {})
+                overlay["invalidated_by_verify_loopback"] = True
+                node.overlay = overlay
+        plan.version += 1
+        plan.edits_log.append(
+            PlanEdit(
+                timestamp=time.time(),
+                actor="runner",
+                patch={
+                    "invalidate_after_verify_loopback": {
+                        "target": loop_back_target,
+                        "reset_manifests": ["final_review", "verify"],
+                    },
+                },
+            )
+        )
 
     def _phase_tool_success_count(self, *, task_id: str, tool_name: str) -> int:
         path = self._drive_root / "logs" / "tools.jsonl"
@@ -1145,26 +1491,48 @@ class PhaseRunner:
         *,
         phase_node: PhaseNode,
         outcome: dict[str, Any],
+        plan: PhasePlan | None = None,
     ) -> str:
         task_id = str(outcome.get("task_id") or "")
         records = self._read_phase_control_records(
             task_id=task_id,
             phase_started_at=phase_node.started_at,
         )
+        resolved_plan = plan if plan is not None else load_plan(self._drive_root)
+        recovery_at = recovery_at_for_plan(resolved_plan, signal_rows=records)
+        supersede_after = self._loop_back_supersede_after(records)
         for row in reversed(records):
             if str(row.get("kind") or "") != "loop_back_to":
                 continue
-            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            target = str((payload or {}).get("phase") or "").strip()
-            if target:
-                return target
+            created = row.get("created_at")
+            if (
+                supersede_after is not None
+                and isinstance(created, (int, float))
+                and float(created) <= supersede_after
+            ):
+                continue
+            payload = row.get("payload")
+            if isinstance(payload, dict):
+                target = str(payload.get("phase") or "").strip()
+                if target:
+                    return target
         for row in reversed(records):
             if str(row.get("kind") or "") != "submit_micro_review":
                 continue
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            if str((payload or {}).get("verdict") or "") == "revise":
-                explicit_target = str((payload or {}).get("loop_back_target") or "").strip()
-                return explicit_target or self._default_review_loop_back_target(phase_node.id)
+            if str((payload or {}).get("verdict") or "") != "revise":
+                continue
+            candidate = ReviewContract.from_mapping(payload)
+            created = row.get("created_at")
+            review_at = float(created) if isinstance(created, (int, float)) else 0.0
+            if review_superseded_by_recovery(
+                candidate,
+                recovery_at=recovery_at,
+                review_created_at=review_at,
+            ):
+                continue
+            explicit_target = str((payload or {}).get("loop_back_target") or "").strip()
+            return explicit_target or self._default_review_loop_back_target(phase_node.id)
         for row in reversed(records):
             kind = str(row.get("kind") or "")
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
@@ -1180,8 +1548,74 @@ class PhaseRunner:
                 return self._default_review_loop_back_target(phase_node.id)
         return ""
 
+    def _research_depth_for_node(
+        self,
+        phase_node: PhaseNode | None,
+        *,
+        run_id: str = "",
+    ) -> str:
+        overlay = phase_node.overlay if isinstance(phase_node, PhaseNode) else None
+        if isinstance(overlay, dict):
+            value = str(overlay.get("research_depth") or "").strip().lower()
+            if value in {"none", "light", "full"}:
+                return value
+        from umbrella.orchestrator.preflight_depth import read_preflight_research_depth
+
+        preflight_depth = read_preflight_research_depth(self._drive_root, run_id=run_id)
+        if preflight_depth in {"none", "light", "full"}:
+            return preflight_depth
+        return "light"
+
     @staticmethod
-    def _research_summary_min_valid_findings_for_manifest(manifest: Any) -> int:
+    def _research_depth_min_write_count(depth: str, configured: int) -> int:
+        value = str(depth or "").strip().lower()
+        if value == "none":
+            return 0
+        if value == "light":
+            return 1 if configured > 0 else 0
+        return configured
+
+    def _phase_exit_palace_write_rules(
+        self,
+        *,
+        manifest: Any,
+        phase_node: PhaseNode | None,
+        run_id: str = "",
+    ) -> list[tuple[Any, int]]:
+        criteria = getattr(manifest, "exit_criteria", None)
+        effective: list[tuple[Any, int]] = []
+        for rule in getattr(criteria, "required_palace_writes", ()) or ():
+            try:
+                needed = max(1, int(getattr(rule, "n", 1) or 1))
+            except (TypeError, ValueError):
+                needed = 1
+            effective.append((rule, needed))
+        depth = self._research_depth_for_node(phase_node, run_id=run_id)
+        manifest_id = str(getattr(manifest, "id", "") or "")
+        for rule in getattr(criteria, "min_palace_writes", ()) or ():
+            try:
+                configured = max(1, int(getattr(rule, "n", 1) or 1))
+            except (TypeError, ValueError):
+                configured = 1
+            needed = configured
+            if manifest_id == "research":
+                needed = self._research_depth_min_write_count(depth, configured)
+            if needed > 0:
+                effective.append((rule, needed))
+        return effective
+
+    def _research_summary_min_valid_findings_for_manifest(
+        self,
+        manifest: Any,
+        *,
+        phase_node: PhaseNode | None = None,
+        run_id: str = "",
+    ) -> int:
+        depth = self._research_depth_for_node(phase_node, run_id=run_id)
+        if depth == "none":
+            return 0
+        if depth == "light":
+            return 1
         criteria = getattr(manifest, "exit_criteria", None)
         rules = list(getattr(criteria, "required_palace_writes", ()) or ()) + list(
             getattr(criteria, "min_palace_writes", ()) or ()
@@ -1327,10 +1761,20 @@ class PhaseRunner:
                 issues=tuple(compile_issues),
             ),
             context=context,
+            drive_root=self._drive_root,
         )
         if contract_issues:
+            if run_id and self._plan_review_ok_supersedes_plan_floor(run_id=run_id):
+                return ""
             issue = contract_issues[0]
-            return f"latest phase plan contract rejected: {issue.code}: {issue.message}"
+            from umbrella.contracts.platform_context import capability_gate_recovery_hint
+
+            recovery = capability_gate_recovery_hint(contract_issues) or ""
+            suffix = f" Recovery: {recovery}" if recovery else ""
+            return (
+                f"latest phase plan contract rejected: {issue.code}: {issue.message}"
+                f"{suffix}"
+            )
         return ""
 
     def _merge_persisted_plan_state(self, plan: PhasePlan) -> PhasePlan:
@@ -1348,7 +1792,45 @@ class PhaseRunner:
         plan.nodes = persisted.nodes
         plan.version = persisted.version
         plan.edits_log = persisted.edits_log
+        self._close_recovered_subtask_reviews(plan)
         return plan
+
+    def _close_recovered_subtask_reviews(self, plan: PhasePlan) -> None:
+        execute = execute_node_from_plan(plan)
+        if execute is None or not execute.subtasks:
+            return
+        changed = False
+        for node in plan.nodes:
+            if node.manifest_id != "subtask_review" or node.status != "pending":
+                continue
+            overlay = node.overlay if isinstance(node.overlay, dict) else {}
+            subtask_id = str(overlay.get("subtask_id") or "").strip()
+            if not subtask_id:
+                continue
+            card = next((c for c in execute.subtasks if c.id == subtask_id), None)
+            if card is None or card.status != "done":
+                continue
+            completion = card.completion if isinstance(card.completion, dict) else {}
+            report = completion.get("verification_report")
+            if not (isinstance(report, dict) and report.get("passed") is True):
+                continue
+            node.status = "done"
+            node.ended_at = time.time()
+            changed = True
+        if changed:
+            plan.version += 1
+            save_plan(plan, self._drive_root)
+
+    @staticmethod
+    def _clear_stale_execute_retry_overlay(execute: PhaseNode) -> None:
+        if not all_execute_subtasks_done(execute):
+            return
+        if not isinstance(execute.overlay, dict):
+            return
+        overlay = dict(execute.overlay)
+        for key in ("retry_reason", "retry_context", "revision_contract"):
+            overlay.pop(key, None)
+        execute.overlay = overlay if overlay else None
 
     @staticmethod
     def _iter_plan_child_dicts(raw: Any) -> list[dict[str, Any]]:
@@ -1360,7 +1842,7 @@ class PhaseRunner:
 
     @classmethod
     def _execution_items_from_plan(cls, plan: dict[str, Any]) -> list[dict[str, Any]]:
-        raw = plan.get("subtasks")
+        raw = canonicalize_phase_plan(plan).get("subtasks")
         if isinstance(raw, (list, dict)):
             return cls._iter_plan_child_dicts(raw)
         return []
@@ -1373,6 +1855,19 @@ class PhaseRunner:
                 "contract v1 rejects nested or serialized plan wrappers; submit the typed plan object directly",
             )
         return plan, ""
+
+    @classmethod
+    def _memory_scope_from_plan_item(cls, item: dict[str, Any]) -> dict[str, Any] | None:
+        raw = item.get("memory_scope")
+        if isinstance(raw, dict):
+            return dict(raw)
+        proof = item.get("proof")
+        if isinstance(proof, dict):
+            nested = proof.get("memory_scope")
+            if isinstance(nested, dict):
+                return dict(nested)
+        return None
+
     def _subtask_card_from_plan_item(
         self,
         item: dict[str, Any],
@@ -1405,6 +1900,7 @@ class PhaseRunner:
             ),
             codeptr_refs=[str(value) for value in (item.get("codeptr_refs") or [])],
             mcp_refs=[str(value) for value in (item.get("mcp_refs") or [])],
+            memory_scope=self._memory_scope_from_plan_item(item),
             files_to_create=self._first_plan_string_list(
                 item,
                 "files_to_create",
@@ -1486,7 +1982,7 @@ class PhaseRunner:
             return False
         if self._latest_phase_plan_execution_floor_failure(run_id=run_id):
             return False
-        payload, _source = self._phase_plan_execution_payload(run_id=run_id)
+        payload, source = self._phase_plan_execution_payload(run_id=run_id)
         if not payload:
             return False
         proposed = payload.get("plan") if isinstance(payload, dict) else None
@@ -1497,6 +1993,20 @@ class PhaseRunner:
             return False
         execute = plan.get_node("execute")
         if execute is None:
+            return False
+        source_key = hash_value(
+            {
+                "source": source,
+                "plan_id": payload.get("plan_id"),
+                "created_at": payload.get("created_at"),
+                "plan": proposed,
+            }
+        )
+        overlay = dict(execute.overlay or {}) if isinstance(execute.overlay, dict) else {}
+        if execute.subtasks and (
+            overlay.get("synced_phase_plan_source") == source_key
+            or self._phase_plan_source_already_synced(plan, source_key)
+        ):
             return False
 
         previous_status = {
@@ -1523,6 +2033,8 @@ class PhaseRunner:
         ] == [self._subtask_card_contract_key(card) for card in cards]:
             return False
         execute.subtasks = cards
+        overlay["synced_phase_plan_source"] = source_key
+        execute.overlay = overlay
         plan.version += 1
         plan.edits_log.append(
             PlanEdit(
@@ -1530,11 +2042,24 @@ class PhaseRunner:
                 actor="runner",
                 patch={
                     "sync_execute_subtasks_from_plan_id": payload.get("plan_id"),
+                    "sync_execute_subtasks_from_plan_source": source_key,
                     "subtask_ids": new_ids,
                 },
             )
         )
         return True
+
+    @staticmethod
+    def _phase_plan_source_already_synced(plan: PhasePlan, source_key: str) -> bool:
+        if not source_key:
+            return False
+        for edit in reversed(plan.edits_log or []):
+            patch = getattr(edit, "patch", None)
+            if not isinstance(patch, dict):
+                continue
+            if patch.get("sync_execute_subtasks_from_plan_source") == source_key:
+                return True
+        return False
 
     @staticmethod
     def _subtask_card_contract_key(card: SubtaskCard) -> tuple[Any, ...]:
@@ -1549,6 +2074,9 @@ class PhaseRunner:
             else "",
             tuple(card.codeptr_refs or ()),
             tuple(card.mcp_refs or ()),
+            json.dumps(json_ready(card.memory_scope), sort_keys=True)
+            if card.memory_scope is not None
+            else "",
             tuple(card.files_to_create or ()),
             tuple(card.files_to_change or ()),
             tuple(card.files_affected or ()),
@@ -1656,6 +2184,75 @@ class PhaseRunner:
         )
         return review_node_id
 
+    def _next_node_after(self, plan: PhasePlan, phase_node: PhaseNode) -> PhaseNode | None:
+        try:
+            index = plan.nodes.index(phase_node)
+        except ValueError:
+            return None
+        if index + 1 >= len(plan.nodes):
+            return None
+        return plan.nodes[index + 1]
+
+    def _schedule_generic_review_phase(
+        self,
+        *,
+        plan: PhasePlan,
+        phase_node: PhaseNode,
+        review_manifest_id: str,
+        run_id: str,
+    ) -> str:
+        next_node = self._next_node_after(plan, phase_node)
+        if next_node is not None and next_node.manifest_id == review_manifest_id:
+            return next_node.id
+        safe_id = self._safe_phase_id_part(phase_node.id)
+        review_node_id = f"{review_manifest_id}:{safe_id}"
+        existing = plan.get_node(review_node_id)
+        if existing is not None:
+            return existing.id
+        overlay: dict[str, Any] = {
+            "review_target": phase_node.id,
+            "source_phase_id": phase_node.id,
+            "run_id": run_id,
+        }
+        if review_manifest_id == "subtask_review":
+            source_overlay = (
+                phase_node.overlay if isinstance(phase_node.overlay, dict) else {}
+            )
+            overlay["subtask_id"] = str(
+                source_overlay.get("subtask_id") or phase_node.id
+            )
+            overlay["execute_phase_id"] = str(
+                source_overlay.get("execute_phase_id")
+                or phase_node.parent_phase_id
+                or ""
+            )
+        review_node = PhaseNode(
+            id=review_node_id,
+            manifest_id=review_manifest_id,
+            status="pending",
+            parent_phase_id=phase_node.id,
+            overlay=overlay,
+        )
+        try:
+            index = plan.nodes.index(phase_node)
+        except ValueError:
+            index = max(0, len(plan.nodes) - 1)
+        plan.nodes.insert(index + 1, review_node)
+        plan.version += 1
+        plan.edits_log.append(
+            PlanEdit(
+                timestamp=time.time(),
+                actor="runner",
+                patch={
+                    "insert_phase": review_node_id,
+                    "manifest_id": review_manifest_id,
+                    "after": phase_node.id,
+                    "mini_review_after": True,
+                },
+            )
+        )
+        return review_node_id
+
     def _reviewed_subtask_id(self, phase_node: PhaseNode) -> str:
         overlay = phase_node.overlay if isinstance(phase_node.overlay, dict) else {}
         return str((overlay or {}).get("subtask_id") or "").strip()
@@ -1744,6 +2341,7 @@ class PhaseRunner:
     def _phase_effective_write_count(self, *, task_id: str) -> int:
         write_tools = {
             "apply_workspace_patch",
+            "replace_workspace_file",
             "update_workspace_seed",
             "update_workspace_from_instance",
             "delete_workspace_file",
@@ -1770,6 +2368,23 @@ class PhaseRunner:
         except OSError:
             log.debug("Failed to read tools log for write count", exc_info=True)
         return count
+
+    def _execute_phase_missing_write_failure(
+        self,
+        *,
+        phase_node: PhaseNode,
+        outcome: dict[str, Any],
+        completed_subtask: Any | None,
+    ) -> str:
+        if phase_node.id != "execute":
+            return ""
+        if completed_subtask is not None:
+            return ""
+        if self._phase_effective_write_count(
+            task_id=str(outcome.get("task_id") or "")
+        ) > 0:
+            return ""
+        return "execute phase completed without any effective workspace write tool calls"
 
     def run(
         self,
@@ -1965,6 +2580,41 @@ class PhaseRunner:
             drive_root=self._drive_root,
             repo_root=self._repo_root,
         )
+        task_overlays = base_task.get("context_overlays")
+        if isinstance(task_overlays, dict) and isinstance(
+            task_overlays.get("policy_conflict"), dict
+        ):
+            conflicts = task_overlays.get("policy_conflict") or {}
+            reason = "; ".join(
+                str(item.get("message") or item.get("code") or item)
+                for item in (conflicts.get("conflicts") or [])
+                if isinstance(item, dict)
+            ) or str(conflicts.get("diagnostic") or "phase policy conflict")
+            phase_node.status = "failed"
+            phase_node.ended_at = time.time()
+            save_plan(plan, self._drive_root)
+            yield self._emit(ResultEnvelope.failure(
+                ErrorCode.EVIDENCE_VALIDATION_FAILED,
+                f"policy_conflict: {reason}",
+                run_id=run_id,
+                phase=phase_node.id,
+            ))
+            return None
+        selected_research_depth = ""
+        overlays = task_overlays
+        if isinstance(overlays, dict):
+            selected_research_depth = str(
+                overlays.get("research_depth") or ""
+            ).strip().lower()
+        if manifest.id == "research":
+            depth = self._research_depth_for_node(phase_node, run_id=run_id)
+            if depth in {"none", "light", "full"}:
+                overlay = dict(phase_node.overlay or {})
+                if overlay.get("research_depth") != depth:
+                    overlay["research_depth"] = depth
+                    phase_node.overlay = overlay
+                    save_plan(plan, self._drive_root)
+                selected_research_depth = depth
         if isinstance(phase_node.overlay, dict) and phase_node.overlay.get(
             "retry_reason"
         ):
@@ -2008,8 +2658,17 @@ class PhaseRunner:
 
         self._merge_persisted_plan_state(plan)
         phase_node = plan.get_node(phase_node.id) or phase_node
+        if manifest.id == "execute":
+            self._clear_stale_execute_retry_overlay(phase_node)
 
         pending_signal = self._watcher.read_pending_signal()
+        if (
+            pending_signal is not None
+            and not self._watcher_signal_interrupts_phase(pending_signal)
+            and outcome.get("status") != "watcher"
+        ):
+            self._watcher.mark_processed(pending_signal.signal_id)
+            pending_signal = None
         if outcome.get("status") == "watcher" or pending_signal is not None:
             if pending_signal is not None:
                 result, envelope = self._apply_pending_watcher_signal(
@@ -2060,6 +2719,22 @@ class PhaseRunner:
             manifest=manifest,
             outcome=outcome,
         )
+        if (
+            completion_failure
+            and completion_failure.startswith("contract decision loop_back")
+            and manifest.id == "execute"
+            and all_execute_subtasks_done(phase_node)
+        ):
+            task_run_id = str(outcome.get("run_id") or "").strip()
+            task_id = str(outcome.get("task_id") or "")
+            if not task_run_id and ":" in task_id:
+                task_run_id = task_id.split(":", 1)[0]
+            if not self._phase_contract_decision_failure(
+                phase=phase_node.id,
+                manifest=manifest,
+                run_id=task_run_id,
+            ):
+                completion_failure = ""
         if not completion_failure and manifest.id == "execute":
             incomplete = self._incomplete_subtasks(phase_node)
             completed = self._latest_completed_subtask_from_phase(
@@ -2077,22 +2752,49 @@ class PhaseRunner:
                     "CompletionContract after its proof evidence is present."
                 )
         if not completion_failure and manifest.id == "execute":
-            if self._phase_effective_write_count(
-                task_id=str(outcome.get("task_id") or "")
-            ) <= 0:
-                completion_failure = (
-                    "execute phase completed without any effective workspace write tool calls"
-                )
+            completion_failure = self._execute_phase_missing_write_failure(
+                phase_node=phase_node,
+                outcome=outcome,
+                completed_subtask=completed,
+            )
         if completion_failure:
+            if (
+                completion_failure.startswith("contract decision verify_in_place")
+                and manifest.id == "execute"
+            ):
+                result, envelope = self._finish_phase_loop_back(
+                    phase_node=phase_node,
+                    plan=plan,
+                    run_id=run_id,
+                    outcome=outcome,
+                    loop_back_target=phase_node.id,
+                    retry_reason=completion_failure,
+                )
+                target = plan.get_node(phase_node.id)
+                if target is not None:
+                    overlay = dict(target.overlay or {})
+                    if all_execute_subtasks_done(target):
+                        self._clear_stale_execute_retry_overlay(target)
+                        overlay = dict(target.overlay or {})
+                    overlay["required_next_actions"] = ["run_workspace_verify"]
+                    overlay["stale_proof_recovery"] = True
+                    target.overlay = overlay
+                    save_plan(plan, self._drive_root)
+                yield envelope
+                return result
             if completion_failure.startswith(
                 ("micro review requested revisions", "contract decision loop_back")
             ):
-                loop_back_target = self._phase_loop_back_target(
-                    phase_node=phase_node,
-                    outcome=outcome,
-                )
-                if not loop_back_target:
-                    loop_back_target = "plan" if manifest.id == "plan_review" else phase_node.id
+                if completion_failure.startswith("contract decision loop_back"):
+                    loop_back_target = self._parse_contract_loop_back_target(
+                        completion_failure,
+                        default=phase_node.id,
+                    )
+                else:
+                    loop_back_target = self._phase_loop_back_target(
+                        phase_node=phase_node,
+                        outcome=outcome,
+                    ) or ("plan" if manifest.id == "plan_review" else phase_node.id)
                 if loop_back_target and plan.get_node(loop_back_target) is not None:
                     if manifest.id == "subtask_review" and loop_back_target == "execute":
                         self._set_reviewed_subtask_verdict(
@@ -2295,6 +2997,22 @@ class PhaseRunner:
                     plan=plan,
                     review_node=phase_node,
                 )
+            else:
+                review_manifest_id = str(
+                    getattr(manifest, "mini_review_after", "") or ""
+                ).strip()
+                if review_manifest_id:
+                    scheduled = self._schedule_generic_review_phase(
+                        plan=plan,
+                        phase_node=phase_node,
+                        review_manifest_id=review_manifest_id,
+                        run_id=run_id,
+                    )
+                    result = PhaseResult(
+                        phase_id=phase_node.id,
+                        outcome="done",
+                        artifacts={"scheduled_phase": scheduled},
+                    )
 
         phase_node.status = "done"
         phase_node.ended_at = time.time()
@@ -2341,9 +3059,10 @@ class PhaseRunner:
                     phase=phase_node.id,
                     phase_started_at=phase_started_at,
                     worker_pid=worker_pid,
+                    task_id=str(task.get("id") or ""),
                 )
                 pending = self._watcher.read_pending_signal()
-                if pending is not None:
+                if self._watcher_signal_interrupts_phase(pending):
                     return {
                         "status": "watcher",
                         "task_id": task.get("id"),
@@ -2429,9 +3148,10 @@ class PhaseRunner:
                 phase=phase_node.id,
                 phase_started_at=phase_started_at,
                 worker_pid=worker_pid,
+                task_id=str(task.get("id") or ""),
             )
             pending = self._watcher.read_pending_signal()
-            if pending is not None:
+            if PhaseRunner._watcher_signal_interrupts_phase(pending):
                 return {
                     "status": "watcher",
                     "task_id": task.get("id"),
@@ -2475,4 +3195,3 @@ def run_phases(
         on_envelope=on_envelope,
     )
     yield from runner.run(task_input, phases=phases, run_id=run_id, dry_run=dry_run)
-

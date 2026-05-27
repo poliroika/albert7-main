@@ -14,6 +14,8 @@ from umbrella.memory import (
     record_workspace_lesson,
 )
 from umbrella.memory.models import SignalCategory
+from umbrella.memory.palace_backend import get_palace_backend
+from umbrella.memory.paths import palace_path_for
 
 log = logging.getLogger(__name__)
 
@@ -110,21 +112,21 @@ def run_reflection_phase(
         },
     )
     try:
-        from umbrella.memory.palace.facade import MemPalace
-
-        _palace = MemPalace(repo_root, workspace_id)
-        _lesson_content = (
+        palace = get_palace_backend(palace_path_for(repo_root, workspace_id))
+        lesson_content = (
             f"{lesson.change_summary} | expected:{lesson.expected_effect}"
             f" | observed:{lesson.observed_effect}"
         )
-        _palace.add(
-            store="palace.lesson",
-            content=_lesson_content,
-            tier="warm",
-            scope="cross_run_durable",
+        palace.add(
+            workspace_id=workspace_id,
+            event_type="reflection",
+            room="lesson",
+            title=f"verified reflection {task_id}",
+            content=lesson_content,
+            kind="lesson",
             tags=["lesson", "verified", "reflection"],
-            verified=True,
-            phase="verify",
+            task_id=task_id,
+            metadata_extra={"verified": True, "phase": "verify"},
         )
     except Exception:
         log.debug("Reflection palace.lesson mirror failed", exc_info=True)
@@ -224,17 +226,17 @@ def _record_avoid_lesson(
             },
         )
         try:
-            from umbrella.memory.palace.facade import MemPalace
-
-            _palace = MemPalace(repo_root, workspace_id)
-            _palace.add(
-                store="palace.lesson",
+            palace = get_palace_backend(palace_path_for(repo_root, workspace_id))
+            palace.add(
+                workspace_id=workspace_id,
+                event_type="reflection",
+                room="lesson",
+                title=f"avoid reflection {task_id}",
                 content=f"AVOID unverified run | {str(summary)[:400]}",
-                tier="warm",
-                scope="cross_run_durable",
+                kind="lesson",
                 tags=["lesson", "avoid", "unverified_lesson", "reflection"],
-                verified=False,
-                phase="verify",
+                task_id=task_id,
+                metadata_extra={"verified": False, "phase": "verify"},
             )
         except Exception:
             log.debug("Reflection avoid-lesson palace mirror failed", exc_info=True)

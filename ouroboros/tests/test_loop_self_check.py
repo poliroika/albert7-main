@@ -19,6 +19,7 @@ from ouroboros.loop import (
     _maybe_inject_no_write_tool_nudge,
     _maybe_inject_repeated_read_guard,
     _maybe_inject_self_check,
+    _rounds_label_for_log,
     _periodic_recall_enabled_for_phase,
     _reject_tool_calls_under_no_write_enforcement,
     _resolve_llm_loop_retries,
@@ -49,6 +50,10 @@ class TestLoopSelfCheck(unittest.TestCase):
         self.assertIn("completion contract", content)
         self.assertIn("Only stop", content)
         self.assertNotIn("Should I just STOP", content)
+
+    def test_rounds_label_for_log_uses_ascii_on_windows_consoles(self):
+        self.assertEqual(_rounds_label_for_log("∞"), "inf")
+        self.assertEqual(_rounds_label_for_log("120"), "120")
 
     def test_self_check_renders_unlimited_rounds_safely(self):
         """When MAX_ROUNDS is 0 (unlimited mode), the checkpoint reminder must
@@ -190,9 +195,11 @@ class TestLoopMemoryHelpers(unittest.TestCase):
         self.assertEqual(_guess_initial_workspace(msgs), "")
 
     def test_extract_task_brief_caps_length(self):
-        long_msg = {"role": "user", "content": "x" * 5000}
+        from ouroboros.limits import TASK_BRIEF_MAX_CHARS
+
+        long_msg = {"role": "user", "content": "x" * (TASK_BRIEF_MAX_CHARS + 2000)}
         out = _extract_task_brief([long_msg])
-        self.assertLessEqual(len(out), 2000)
+        self.assertLessEqual(len(out), TASK_BRIEF_MAX_CHARS)
 
     def test_extract_task_brief_prefers_user_over_system(self):
         msgs = [
@@ -525,6 +532,38 @@ class TestForbiddenToolRewrite(unittest.TestCase):
         )
         self.assertEqual(rewritten["function"]["name"], "mark_subtask_complete")
         self.assertIsNone(note)
+
+
+class TestContractToolErrorFlag(unittest.TestCase):
+    class _DummyTools:
+        CODE_TOOLS = frozenset()
+
+        def available_tools(self):
+            return ["palace_add"]
+
+        def execute(self, name: str, args: dict):
+            return "ERROR: palace_add research_finding requires a source_id."
+
+    def test_error_prefix_marks_tool_result_as_error(self):
+        import json
+
+        tools = self._DummyTools()
+        with tempfile.TemporaryDirectory() as tmp:
+            drive_logs = pathlib.Path(tmp)
+            tc = {
+                "id": "call_contract",
+                "function": {"name": "palace_add", "arguments": json.dumps({})},
+            }
+            out = _execute_single_tool(
+                tools=tools,
+                tc=tc,
+                drive_logs=drive_logs,
+                task_id="task-contract",
+                allowed_tool_names=frozenset({"palace_add"}),
+                phase_label="research",
+            )
+        self.assertTrue(out["is_error"])
+        self.assertTrue(str(out["result"]).startswith("ERROR:"))
 
 
 class TestForbiddenToolDelegation(unittest.TestCase):

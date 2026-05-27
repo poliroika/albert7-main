@@ -37,7 +37,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from ouroboros.limits import DISCOVERY_CONTENT_CHARS
 from ouroboros.tools.registry import ToolContext, ToolEntry
+
+_DISCOVERY_CAP = DISCOVERY_CONTENT_CHARS
 from ouroboros.tools.web_search_adapter import (
     attempt_rows as _attempt_rows,
     create_gmas_web_search_tool as _create_gmas_web_search_tool,
@@ -360,7 +363,7 @@ def _jina_search(
                 "title": f"Jina Reader result {idx}",
                 "url": item_url,
                 "snippet": "",
-                "content": text[:4000] if idx == 1 else "",
+                "content": text[:_DISCOVERY_CAP] if idx == 1 else "",
             }
             for idx, item_url in enumerate(urls, start=1)
         ]
@@ -370,7 +373,7 @@ def _jina_search(
                     "title": "Jina Search result",
                     "url": url,
                     "snippet": text[:280].replace("\n", " "),
-                    "content": text[:4000],
+                    "content": text[:_DISCOVERY_CAP],
                 }
             ]
         normalized = _normalize_results(results)
@@ -378,7 +381,7 @@ def _jina_search(
             "status": "ok" if normalized else "no_results",
             "provider": "jina_reader_search",
             "browser_backend": "jina_reader",
-            "answer": text[:4000] if text else "(no results)",
+            "answer": text[:_DISCOVERY_CAP] if text else "(no results)",
             "results": normalized,
             "sources": _source_rows(normalized),
             "attempts": [
@@ -519,94 +522,121 @@ def _rel_or_abs(path: Path, base: Path) -> str:
         return str(path)
 
 
+def _slim_search_results(results: list[dict[str, str]]) -> list[dict[str, str]]:
+    from umbrella.discovery.web_page_chunks import preview_text
+
+    slim: list[dict[str, str]] = []
+    for item in results:
+        row = {
+            "title": item.get("title") or "",
+            "url": item.get("url") or "",
+            "snippet": preview_text(item.get("snippet") or ""),
+            "catalog_id": str(item.get("catalog_id") or ""),
+            "section_ids": list(item.get("section_ids") or []),
+        }
+        content = str(item.get("content") or "").strip()
+        if content and len(content) <= 2000:
+            row["content"] = content
+        elif not content:
+            row["content"] = preview_text(item.get("snippet") or "")
+        slim.append(row)
+    return slim
+
+
 def _persist(
     ctx: ToolContext,
     *,
     query: str,
     intent: str,
     results: list[dict[str, str]],
-) -> tuple[str, str]:
-    """Persist results to the workspace knowledge directory.
+    fetch_content: bool = False,
+    return_catalog_ids: bool = False,
+) -> tuple[str, Any]:
+    from umbrella.discovery.external_catalog import (
+        mirror_preview_body,
+        persist_fetched_page,
+        persist_search_session,
+    )
+    from umbrella.memory.external_findings import mirror_external_finding_to_memory
 
-    Returns ``(knowledge_md_path, ideas_jsonl_path)`` (relative-to-repo
-    strings or empty).
-    """
-    knowledge_path = ""
-    ideas_path = ""
-    host_root, workspace_root, memory_root, drive_root = _workspace_memory_paths(ctx)
+    host_root, workspace_root, _memory_root, drive_root = _workspace_memory_paths(ctx)
     try:
-        knowledge_dir = drive_root / "memory" / "knowledge"
-        knowledge_dir.mkdir(parents=True, exist_ok=True)
-        md_path = knowledge_dir / KNOWLEDGE_FILENAME
-        block_lines: list[str] = []
-        block_lines.append(f"## {intent} — {query}")
-        block_lines.append(
-            f"_ts: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}_"
-        )
-        block_lines.append("")
-        for idx, item in enumerate(results, start=1):
-            title = item.get("title") or "Untitled"
-            url = item.get("url") or ""
-            snippet = (item.get("snippet") or "").replace("\n", " ").strip()
-            block_lines.append(f"{idx}. [{title}]({url}) — {snippet[:280]}")
-        block_lines.append("")
-        with md_path.open("a", encoding="utf-8") as fh:
-            fh.write("\n".join(block_lines) + "\n")
-        knowledge_path = _rel_or_abs(md_path, host_root)
+        legacy = drive_root / "memory" / "knowledge" / KNOWLEDGE_FILENAME
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        with legacy.open("a", encoding="utf-8") as fh:
+            fh.write(f"## {intent} — {query}\n\n")
+            for item in results[:5]:
+                title = str(item.get("title") or item.get("url") or "result").strip()
+                url = str(item.get("url") or "").strip()
+                snippet = str(item.get("snippet") or "").replace("\n", " ").strip()
+                if url:
+                    fh.write(f"- [{title}]({url})")
+                else:
+                    fh.write(f"- {title}")
+                if snippet:
+                    fh.write(f" — {snippet[:280]}")
+                fh.write("\n")
+            fh.write("\n")
     except OSError:
-        log.warning("deep_search persist to knowledge md failed", exc_info=True)
+        log.debug("deep_search legacy web_research append skipped", exc_info=True)
 
+    knowledge_path, catalog_ids = persist_search_session(
+        ctx, query=query, intent=intent, results=results
+    )
+    if fetch_content:
+        for item in results[:3]:
+            url = str(item.get("url") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if not url or not content:
+                continue
+            page = persist_fetched_page(
+                ctx,
+                url=url,
+                body=content,
+                intent=intent,
+                parent_id=str(item.get("catalog_id") or "") or None,
+            )
+            if page.get("section_ids"):
+                item["section_ids"] = page["section_ids"]
     try:
-        ideas_target = memory_root / "ideas.jsonl"
-        ideas_target.parent.mkdir(parents=True, exist_ok=True)
-        row = {
-            "id": f"web_{int(time.time() * 1000)}",
-            "kind": "web_research",
-            "intent": intent,
-            "title": f"deep_search: {query[:120]}",
-            "content": "; ".join(
-                f"{item.get('title')} ({item.get('url')})"
-                for item in results[:5]
-                if item.get("url")
-            ),
-            "tags": ["web", "deep_search", intent],
-            "task_id": getattr(ctx, "task_id", None),
-            "workspace_id": workspace_root.name,
-            "palace_path": f"Research/{intent}/{query[:80]}",
-            "created_at": time.time(),
-        }
-        with ideas_target.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        ideas_path = _rel_or_abs(ideas_target, host_root)
-    except OSError:
-        log.warning("deep_search persist to ideas.jsonl failed", exc_info=True)
-    try:
-        from umbrella.memory.palace.facade import MemPalace
-        import pathlib as _pl
-
-        _repo = (
-            _pl.Path(ctx.repo_dir)
-            if hasattr(ctx, "repo_dir")
-            else _pl.Path(".")
-        )
-        _ws = getattr(ctx, "workspace_id", "") or ""
-        _palace = MemPalace(_repo, _ws)
-        finding_text = "; ".join(
+        summary = "; ".join(
             f"{item.get('title')} ({item.get('url')})"
             for item in results[:5]
             if item.get("url")
         )
-        _palace.add(
-            store="palace.idea",
-            content=finding_text,
-            tier="warm",
-            scope="cross_run_durable",
-            tags=["finding", "research", "deep_search"],
-            verified=False,
-            phase="research",
+        mirror_result = mirror_external_finding_to_memory(
+            ctx,
+            kind="web_research",
+            title=f"deep_search:{intent}:{query[:80]}",
+            body=mirror_preview_body(
+                source_id=f"deep_search:{intent}:{query}",
+                preview=summary,
+                storage_ref=knowledge_path,
+            ),
+            tags=["web", "deep_search", intent, "external_research"],
+            palace_room="web_search",
+            palace_subpath=f"web/search/{intent}",
         )
     except Exception:
-        pass
+        log.debug("deep_search palace mirror skipped", exc_info=True)
+        mirror_result = {}
+    if knowledge_path and host_root:
+        try:
+            if str(knowledge_path).startswith(".memory/"):
+                target_path = workspace_root / knowledge_path
+            else:
+                target_path = Path(host_root) / knowledge_path.lstrip("./")
+            knowledge_path = _rel_or_abs(target_path, host_root)
+        except OSError:
+            pass
+    if return_catalog_ids:
+        return knowledge_path, catalog_ids
+    mirrored_ws = str(mirror_result.get("workspace_id") or "").strip()
+    ideas_path = (
+        f"workspaces/{mirrored_ws}/.memory/ideas.jsonl"
+        if mirrored_ws
+        else ""
+    )
     return knowledge_path, ideas_path
 
 
@@ -726,8 +756,13 @@ def _deep_search(
             ensure_ascii=False,
         )
 
-    knowledge_path, ideas_path = _persist(
-        ctx, query=query_norm, intent=intent_norm, results=results
+    knowledge_path, catalog_ids = _persist(
+        ctx,
+        query=query_norm,
+        intent=intent_norm,
+        results=results,
+        fetch_content=bool(fetch_content),
+        return_catalog_ids=True,
     )
     payload = {
         "status": "ok",
@@ -740,13 +775,13 @@ def _deep_search(
         "budget_used": used,
         "budget_limit": limit,
         "knowledge_md": knowledge_path,
-        "ideas_jsonl": ideas_path,
-        "answer": search_payload.get("answer", ""),
+        "catalog_ids": catalog_ids,
+        "answer_preview": str(search_payload.get("answer", ""))[:400],
         "sources": search_payload.get("sources", []),
         "attempts": search_payload.get("attempts", []),
         "browser_fallback_from": search_payload.get("browser_fallback_from", ""),
         "external_engine_fallback_from": search_payload.get("external_engine_fallback_from", ""),
-        "results": results,
+        "results": _slim_search_results(results),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     return json.dumps(payload, ensure_ascii=False)

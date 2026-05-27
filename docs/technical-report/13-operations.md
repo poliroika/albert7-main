@@ -62,6 +62,7 @@ System self-improvement is wired through `umbrella/orchestrator/self_improvement
 | Round I/O | `.umbrella/ouroboros_drive/logs/round_io/` | Per-round JSON |
 | State | `.umbrella/ouroboros_drive/state/state.json` | JSON |
 | PhasePlan | `.umbrella/ouroboros_drive/state/phase_plan.json` | JSON |
+| Capability declaration | `.umbrella/ouroboros_drive/state/capability_declaration.json` | JSON |
 | Watcher signals | `.umbrella/ouroboros_drive/state/watcher_signal.json` | JSON |
 | Processed signals | `.umbrella/ouroboros_drive/state/watcher_signals.processed.jsonl` | JSONL |
 | Verification | `workspaces/<ws>/instances/<inst>/runs/<run>/verification_report.json` | JSON |

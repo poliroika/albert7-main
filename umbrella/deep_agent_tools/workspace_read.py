@@ -48,7 +48,7 @@ def _read_cache_enabled() -> bool:
     }
 
 
-def _read_cache_get(key: tuple[str, str, int, int]) -> str | None:
+def _read_cache_get(key: tuple[Any, ...]) -> str | None:
     if not _read_cache_enabled():
         return None
     value = _read_cache.get(key)
@@ -59,7 +59,7 @@ def _read_cache_get(key: tuple[str, str, int, int]) -> str | None:
     return value
 
 
-def _read_cache_put(key: tuple[str, str, int, int], value: str) -> None:
+def _read_cache_put(key: tuple[Any, ...], value: str) -> None:
     if not _read_cache_enabled():
         return
     _read_cache[key] = value
@@ -195,14 +195,30 @@ def read_workspace_file(
         )
         cached = _read_cache_get(cache_key)
         if cached is not None:
-            _mark_workspace_file_read(ctx, workspace_id, file_path)
+            try:
+                cached_payload = json.loads(cached)
+            except Exception:
+                cached_payload = {}
+            _mark_workspace_file_read(
+                ctx,
+                workspace_id,
+                file_path,
+                sha256=str(cached_payload.get("content_sha256") or ""),
+                mtime_ns=_coerce_int(cached_payload.get("mtime_ns"), 0),
+            )
             return cached
+        try:
+            file_bytes = target.read_bytes()
+            file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+        except OSError:
+            file_bytes = b""
+            file_sha256 = ""
         total_lines: int | None = None
         requested_end = 0
         observed_line_count = 0
         has_more_lines_after = False
         if line_start_int > 0 and target.suffix.lower() not in {".docx", ".pptx"}:
-            raw = target.read_bytes()
+            raw = file_bytes
             if b"\x00" in raw[:8192]:
                 content, truncated, content_kind = (
                     "[binary file preview unavailable]",
@@ -227,7 +243,7 @@ def read_workspace_file(
                     truncated = False
                 content_kind = "text"
         elif start > 0 and target.suffix.lower() not in {".docx", ".pptx"}:
-            raw = target.read_bytes()
+            raw = file_bytes
             if b"\x00" in raw[:8192]:
                 content, truncated, content_kind = (
                     "[binary file preview unavailable]",
@@ -248,7 +264,7 @@ def read_workspace_file(
                 if start > 0:
                     content = content[start : start + cap]
             else:
-                raw = target.read_bytes()
+                raw = file_bytes
                 if b"\x00" in raw[:8192]:
                     content, truncated, content_kind = (
                         "[binary file preview unavailable]",
@@ -270,9 +286,10 @@ def read_workspace_file(
             and content_kind == "text"
             and total_lines is not None
         )
-        content_sha256 = ""
+        preview_sha256 = ""
         if content_kind == "text" and isinstance(content, str):
-            content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            preview_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        content_sha256 = file_sha256 or preview_sha256
         payload = _json(
             {
                 "workspace_id": workspace_id,
@@ -280,6 +297,7 @@ def read_workspace_file(
                 "resolved_name": target.name,
                 "content_kind": content_kind,
                 "content_sha256": content_sha256,
+                "preview_sha256": preview_sha256,
                 "mtime_ns": mtime_ns,
                 "file_size": file_size,
                 "truncated": truncated,

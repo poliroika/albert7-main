@@ -19,9 +19,7 @@ _PHASE_ALWAYS: dict[str, list[str]] = {
     ],
     "execute": [
         "accepted plan",
-        "implementation anti-patterns",
         "BKB",
-        "active risks",
     ],
     "verify": [
         "verification contract",
@@ -69,7 +67,7 @@ _PHASE_ALWAYS: dict[str, list[str]] = {
     ],
 }
 
-_MANDATORY_CORE_KEYWORDS = ("identity", "constitution", "bkb", "phase commitments")
+_MANDATORY_CORE_KEYWORDS = ("identity", "constitution", "bkb")
 
 _KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
     "workspace charter": ("charter", "workspace charter"),
@@ -128,7 +126,7 @@ def select_sections_by_policy(
     sections: list[OverlaySection],
     policy: dict[str, Any],
 ) -> list[OverlaySection]:
-    """Always keep L0 identity/BKB/phase commitments; add phase-specific sections."""
+    """Always keep L0 identity/BKB; add phase-specific sections by policy."""
     mandatory = [s for s in sections if _is_mandatory_core(s)]
     always = [str(item) for item in (policy.get("always_sections") or [])]
     phase_extra = [

@@ -1,6 +1,14 @@
 """State, signal, and log helpers for phase-control tools."""
 
 from umbrella.deep_agent_tools.phase_control_common import *
+from umbrella.deep_agent_tools.phase_control_text_quality import (
+    _looks_like_mojibake,
+    _normalize_handoff_text,
+)
+from umbrella.contracts import canonicalize_phase_plan
+_PLAN_REVIEW_SUBMITTED_REL_PATH = (
+    ".memory/drive/state/phase_plan_submitted_latest.json"
+)
 
 
 def _drive_state(ctx: ToolContext) -> pathlib.Path:
@@ -29,18 +37,10 @@ def _write_phase_plan(ctx: ToolContext, plan: dict[str, Any]) -> None:
     plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-_KNOWN_UMBRELLA_PHASE_IDS = {
-    "preflight",
-    "research",
-    "research_review",
-    "plan",
-    "plan_review",
-    "execute",
-    "subtask_review",
-    "final_review",
-    "verify",
-}
-
+from umbrella.phases.identity import (
+    phase_id_from_task_id as _phase_id_from_task_id,
+    resolve_phase_id as _phase_control_phase_id,
+)
 
 _LLM_CACHED_DECISION_HANDOFF_RE = re.compile(
     r"(?is)"
@@ -50,26 +50,13 @@ _LLM_CACHED_DECISION_HANDOFF_RE = re.compile(
     r"\breuse\s+cached\s+"
     r"(?:decisions?|actions?|responses?|outputs?|reasoning)\b"
 )
-
-
-def _phase_id_from_task_id(task_id: str) -> str:
-    value = str(task_id or "").strip()
-    if ":" in value:
-        suffix = value.rsplit(":", 1)[-1].strip()
-        if suffix in _KNOWN_UMBRELLA_PHASE_IDS:
-            return suffix
-    return ""
-
-
-def _phase_control_phase_id(ctx: ToolContext) -> str:
-    task_phase = _phase_id_from_task_id(str(getattr(ctx, "task_id", "") or ""))
-    if task_phase:
-        return task_phase
-    view = getattr(ctx, "loop_state_view", None)
-    phase = str(view.get("phase_label") or "").strip() if isinstance(view, dict) else ""
-    if phase.lower() in {"linear", "phase"}:
-        return ""
-    return phase
+_NO_TEST_TAMPERING_TOKEN = r"no[_\-\s]?test[_\-\s]?tampering"
+_BAD_REVIEW_REMOVE_NO_TEST_TAMPERING_RE = re.compile(
+    rf"(?is)\b(?:remove|drop|delete|omit|strip)\b[^.;\n]{{0,120}}"
+    rf"\b{_NO_TEST_TAMPERING_TOKEN}\b|"
+    rf"\b{_NO_TEST_TAMPERING_TOKEN}\b[^.;\n]{{0,120}}"
+    r"\b(?:remove|drop|delete|omit|strip|removed|dropped|deleted|omitted|stripped)\b"
+)
 
 
 def _write_control_signal(ctx: ToolContext, kind: str, payload: dict[str, Any]) -> str:
@@ -84,6 +71,7 @@ def _write_control_signal(ctx: ToolContext, kind: str, payload: dict[str, Any]) 
         "payload": payload,
         "actor": "worker",
         "task_id": str(getattr(ctx, "task_id", "") or ""),
+        "run_id": _run_id(ctx),
         "phase": phase,
     }
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -159,7 +147,10 @@ def _mirror_submitted_phase_plan_memory(
     ).strip()
     if not workspace_id:
         return
-    plan = submitted.get("plan") if isinstance(submitted.get("plan"), dict) else {}
+    raw_plan = submitted.get("plan") if isinstance(submitted.get("plan"), dict) else {}
+    plan = canonicalize_phase_plan(raw_plan)
+    if plan and plan != raw_plan:
+        submitted["plan"] = plan
     subtasks = plan.get("subtasks") if isinstance(plan.get("subtasks"), list) else []
     subtask_ids = [
         str(item.get("id") or "").strip()
@@ -370,16 +361,6 @@ def _record_research_summary_artifact(
         pass
 
 
-def _looks_like_mojibake(text: str) -> bool:
-    value = str(text or "")
-    if not value:
-        return False
-    if any(marker in value for marker in _MOJIBAKE_STRONG_MARKERS):
-        return True
-    markers = _MOJIBAKE_MARKER_RE.findall(value)
-    return len(markers) >= 3 and (len("".join(markers)) / max(1, len(value))) > 0.02
-
-
 def _json_obj_from_preview(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -424,53 +405,12 @@ def _tool_row_time(row: dict[str, Any]) -> float | None:
 
 
 def _llm_fallback_handoff_issue(text: str, *, label: str) -> str:
-    raw = str(text or "")
-    if not raw:
-        return ""
-    if not re.search(r"(?i)\b(llm|gmas|bot|agent|model)\b", raw):
-        return ""
-    for match in _BAD_REVIEW_FALLBACK_RE.finditer(raw):
-        window = _review_policy_claim_window(raw, match)
-        if _review_fallback_match_is_explicitly_dangerous(window):
-            return (
-                f"ERROR: {label} requests or preserves forbidden LLM fallback "
-                "behavior. Research handoff must describe explicit configuration, "
-                "retry/pause, or surfaced runtime errors, not fallback actions or "
-                "replacement AI decisions."
-            )
-        if (
-            _review_fallback_match_is_env_alias(window)
-            or _review_fallback_match_is_protective(window)
-        ):
-            continue
-        return (
-            f"ERROR: {label} requests or preserves forbidden LLM fallback "
-            "behavior. Research handoff must describe explicit configuration, "
-            "retry/pause, or surfaced runtime errors, not fallback actions or "
-            "replacement AI decisions."
-        )
+    del text, label
     return ""
 
 
 def _llm_test_double_handoff_issue(text: str, *, label: str) -> str:
-    raw = str(text or "")
-    if not raw:
-        return ""
-    if not re.search(r"(?i)\b(llm|gmas|bot|agent|model)\b", raw):
-        return ""
-    for match in _BAD_REVIEW_LLM_TEST_DOUBLE_RE.finditer(raw):
-        claim = _review_policy_claim_window(raw, match)
-        if _review_llm_test_double_match_is_protective(claim):
-            continue
-        matched = " ".join(match.group(0).split())[:220]
-        return (
-            f"ERROR: {label} requests or preserves mock/fake/dry-run LLM "
-            "test-double behavior for an LLM/GMAS/bot path. Research and "
-            "plan handoffs may require non-LLM unit seams, but core LLM bot "
-            "behavior must be proved with the inherited real runtime env or "
-            "fail/skip/pause with a clear real-LLM-required message. "
-            f"Matched text: `{matched}`."
-        )
+    del text, label
     return ""
 
 
@@ -506,22 +446,7 @@ def _llm_cached_decision_match_is_protective(text: str) -> bool:
 
 
 def _llm_cached_decision_handoff_issue(text: str, *, label: str) -> str:
-    raw = str(text or "")
-    if not re.search(r"(?i)\b(llm|gmas|bot|agent|model)\b", raw):
-        return ""
-    for match in _LLM_CACHED_DECISION_HANDOFF_RE.finditer(raw):
-        claim = _review_policy_claim_window(raw, match)
-        if _llm_cached_decision_match_is_protective(claim):
-            continue
-        matched = " ".join(match.group(0).split())[:220]
-        return (
-            f"ERROR: {label} proposes cached decision/action/response reuse "
-            "for an LLM/GMAS/bot path. Research and plan handoffs may cache "
-            "static reference data or prompts, but bot decisions must come from "
-            "fresh inherited runtime-env LLM calls or fail/skip/pause with a "
-            "clear real-LLM-required message. "
-            f"Matched text: `{matched}`."
-        )
+    del text, label
     return ""
 
 
@@ -529,6 +454,60 @@ def _review_policy_claim_window(text: str, match: re.Match[str]) -> str:
     """Keep fallback/mock policy checks local to the matched claim."""
     raw = str(text or "")
     return raw[max(0, match.start() - 120) : min(len(raw), match.end() + 40)]
+
+
+def _review_no_test_tampering_removal_is_protective(text: str) -> bool:
+    lowered = str(text or "").lower()
+    token = _NO_TEST_TAMPERING_TOKEN
+    if re.search(
+        rf"\b(?:no|not|never|must\s+not|should\s+not|do\s+not|don't|without)\b"
+        rf"[^.;\n]{{0,100}}\b(?:remove|drop|delete|omit|strip)\b"
+        rf"[^.;\n]{{0,100}}\b{token}\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        rf"\b(?:keep|preserve|retain)\b[^.;\n]{{0,100}}\b{token}\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        rf"\b{token}\b[^.;\n]{{0,100}}"
+        r"\b(?:stay|remain|be\s+kept|be\s+preserved|be\s+retained)\b",
+        lowered,
+    ):
+        return True
+    return False
+
+
+def _review_no_test_tampering_removal_issue(text: str, *, label: str) -> str:
+    for match in _BAD_REVIEW_REMOVE_NO_TEST_TAMPERING_RE.finditer(str(text or "")):
+        window = _review_policy_claim_window(text, match)
+        if _review_no_test_tampering_removal_is_protective(window):
+            continue
+        matched = " ".join(match.group(0).split())[:220]
+        return (
+            f"ERROR: {label} cannot request removing `no_test_tampering` "
+            "from test-changing/test-verification subtasks. Keep the "
+            "anti-tamper property and fix proof scope, pytest targets, or "
+            "oracle strength instead. "
+            f"Matched text: `{matched}`."
+        )
+    return ""
+
+
+def _review_fallback_claim_is_ai_runtime_related(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return bool(
+        re.search(
+            r"\b(?:llm|gmas|bot|model|provider|openai|llm_api_key|"
+            r"llm_base_url|llm_model|api[-_\s]?keys?|"
+            r"base[-_\s]?url|credentials?|runtime\s+env|"
+            r"env(?:ironment)?\s+(?:vars?|variables?)|ai\s+(?:decisions?|actions?)|"
+            r"agent(?:s)?\s+(?:decisions?|actions?|runtime|behaviou?r))\b",
+            lowered,
+        )
+    )
 
 
 def _review_fallback_match_is_explicitly_dangerous(text: str) -> bool:
@@ -687,6 +666,81 @@ def _review_provider_model_match_is_protective(text: str) -> bool:
     )
 
 
+def _review_text_blocks(
+    *,
+    issues: list[dict[str, Any]] | None,
+    revisions: list[str] | None,
+    notes: str,
+    include_notes: bool = True,
+    required_plan_changes: list[str] | None = None,
+) -> str:
+    parts: list[str] = []
+    for item in issues or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("message") or ""))
+    parts.extend(str(item) for item in (revisions or []))
+    if include_notes:
+        parts.append(str(notes or ""))
+    parts.extend(str(item) for item in (required_plan_changes or []))
+    return "\n".join(part.strip() for part in parts if str(part).strip())
+
+
+def _plan_review_validation_issue(
+    ctx: ToolContext,
+    *,
+    verdict: str,
+    issues: list[dict[str, Any]] | None,
+    revisions: list[str] | None,
+    notes: str,
+    required_plan_changes: list[str] | None = None,
+) -> str:
+    phase = _phase_control_phase_id(ctx)
+    if phase not in {"plan_review", "subtask_review"}:
+        return ""
+    verdict_lc = str(verdict or "").strip().lower()
+    review_text = _review_text_blocks(
+        issues=issues,
+        revisions=revisions,
+        notes=notes,
+        include_notes=verdict_lc in {"revise", "abort"},
+        required_plan_changes=required_plan_changes,
+    )
+    if verdict_lc in {"revise", "abort"} and not review_text.strip():
+        return (
+            "ERROR: submit_micro_review contract rejected: revise requires "
+            "actionable feedback in typed issues, required_plan_changes, or notes."
+        )
+    if not review_text.strip():
+        return ""
+    label = f"{phase} {verdict_lc or 'verdict'}"
+    anti_tamper_issue = _review_no_test_tampering_removal_issue(
+        review_text,
+        label=label,
+    )
+    if anti_tamper_issue:
+        return anti_tamper_issue
+    if _BAD_REVIEW_MEMORY_EDIT_RE.search(review_text):
+        return (
+            "ERROR: plan review cannot request edits to memory/research hall "
+            "artifacts; loop back to research or use palace tools instead."
+        )
+    if _BAD_REVIEW_NONPORTABLE_COMMAND_RE.search(review_text):
+        return (
+            "ERROR: plan review cannot prescribe non-portable Unix shell "
+            "operators in proof commands; use argv arrays with shell=false."
+        )
+    for match in _BAD_REVIEW_PROVIDER_MODEL_RE.finditer(review_text):
+        window = _review_policy_claim_window(review_text, match)
+        if _review_provider_model_match_is_protective(window):
+            continue
+        return (
+            "ERROR: (phase: plan_review) plan review cannot prescribe "
+            "provider-specific model choices in plan revisions; use inherited "
+            "runtime env aliases."
+        )
+    return ""
+
+
 def _context_overlays(ctx: ToolContext) -> dict[str, Any]:
     raw = getattr(ctx, "context_overlays", None)
     return raw if isinstance(raw, dict) else {}
@@ -694,7 +748,48 @@ def _context_overlays(ctx: ToolContext) -> dict[str, Any]:
 
 def _loop_state_view(ctx: ToolContext) -> dict[str, Any]:
     raw = getattr(ctx, "loop_state_view", None)
-    return raw if isinstance(raw, dict) else {}
+    if isinstance(raw, dict):
+        return raw
+    view: dict[str, Any] = {}
+    try:
+        ctx.loop_state_view = view  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return view
+
+
+def _set_loop_state_key(ctx: ToolContext, key: str, value: Any) -> None:
+    view = _loop_state_view(ctx)
+    view[key] = value
+
+
+def _set_typed_action_gate(ctx: ToolContext, gate: dict[str, Any]) -> None:
+    _set_loop_state_key(ctx, "typed_action_gate", gate)
+
+
+def _clear_typed_action_gate(ctx: ToolContext) -> None:
+    view = _loop_state_view(ctx)
+    view.pop("typed_action_gate", None)
+
+
+def _completion_tools_after_passed_proof(ctx: ToolContext) -> list[str]:
+    phase = _phase_control_phase_id(ctx)
+    common = ["read_file", "run_subtask_proof"]
+    if phase.endswith("_review"):
+        return ["submit_micro_review", *common]
+    return ["mark_subtask_complete", *common]
+
+
+def _set_completion_session(ctx: ToolContext, session: dict[str, Any]) -> None:
+    _set_loop_state_key(ctx, "completion_session", session)
+    overlays = _context_overlays(ctx)
+    phase_node = overlays.get("phase_node")
+    if isinstance(phase_node, dict):
+        node_overlay = phase_node.get("overlay")
+        if not isinstance(node_overlay, dict):
+            node_overlay = {}
+            phase_node["overlay"] = node_overlay
+        node_overlay["completion_session"] = session
 
 
 def _is_phase_run_context(ctx: ToolContext) -> bool:
@@ -702,6 +797,158 @@ def _is_phase_run_context(ctx: ToolContext) -> bool:
         return True
     overlays = _context_overlays(ctx)
     return isinstance(overlays.get("phase_node"), dict)
+
+
+def _review_revision_policy_issue(
+    ctx: ToolContext,
+    *,
+    verdict: str = "",
+    revisions: list[str] | None = None,
+    notes: str = "",
+    reason: str = "",
+) -> str:
+    verdict_lc = str(verdict or "").strip().lower()
+    notes_are_actionable = verdict_lc in {"revise", "abort"}
+    text = "\n".join(
+        str(item or "")
+        for item in [
+            *(revisions or []),
+            *( [notes, reason] if notes_are_actionable else [] ),
+        ]
+        if str(item or "").strip()
+    )
+    if not text:
+        return ""
+    anti_tamper_issue = _review_no_test_tampering_removal_issue(
+        text,
+        label="review feedback",
+    )
+    if anti_tamper_issue:
+        return anti_tamper_issue
+    for match in _BAD_REVIEW_PROVIDER_MODEL_RE.finditer(text):
+        window = _review_policy_claim_window(text, match)
+        if _review_provider_model_match_is_protective(window):
+            continue
+        phase = _plan_review_phase_label(ctx)
+        return (
+            "ERROR: review feedback cannot require provider-specific model "
+            "names or OpenAI-only recommendations for a provider-neutral "
+            "Umbrella/Ouroboros workspace. Require the runtime alias contract "
+            "and provider-neutral configuration docs instead"
+            + (f" (phase: {phase})" if phase else "")
+        )
+    if _BAD_REVIEW_MEMORY_EDIT_RE.search(text):
+        phase = _plan_review_phase_label(ctx)
+        return (
+            "ERROR: review feedback cannot require editing existing palace/"
+            "memory/research hall artifacts as a plan-phase fix. Add a corrected "
+            "palace finding or loop back to research when the handoff is unsafe; "
+            "plans should ignore stale memory instead of rewriting old drawers"
+            + (f" (phase: {phase})" if phase else "")
+        )
+    if _BAD_REVIEW_NONPORTABLE_COMMAND_RE.search(text):
+        phase = _plan_review_phase_label(ctx)
+        return (
+            "ERROR: review feedback cannot require non-portable Unix shell "
+            "commands such as grep, timeout, `|| true`, ps, or pkill as mandatory "
+            "workspace verification. Require a checked-in pytest/node/browser test, "
+            "a portable Python script, or an explicit PowerShell command instead"
+            + (f" (phase: {phase})" if phase else "")
+        )
+    return ""
+
+
+def _micro_review_feedback_issue(
+    *, verdict: str, revisions: list[str] | None = None, notes: str = ""
+) -> str:
+    verdict_lc = str(verdict or "").strip().lower()
+    if verdict_lc not in {"revise", "abort"}:
+        return ""
+    feedback_parts = [
+        str(item or "").strip()
+        for item in [*(revisions or []), notes]
+        if str(item or "").strip()
+    ]
+    if feedback_parts:
+        return ""
+    return (
+        "ERROR: submit_micro_review with verdict=revise or verdict=abort "
+        "requires actionable feedback in revisions or notes. Name the exact "
+        "blocking issue(s), affected subtask/path/contract, and the required "
+        "correction before asking the previous phase to retry."
+    )
+
+
+def _plan_review_phase_label(ctx: ToolContext) -> str:
+    phase = _phase_control_phase_id(ctx)
+    if phase:
+        return phase
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    return task_id.split(":", 1)[1] if ":" in task_id else task_id
+
+
+def _plan_review_ok_artifact_issue(ctx: ToolContext, *, verdict: str) -> str:
+    if _plan_review_phase_label(ctx) != "plan_review":
+        return ""
+    if str(verdict or "").strip().lower() != "ok":
+        return ""
+    payload = _submitted_phase_plan_payload(ctx)
+    if not payload:
+        return ""
+    created_at = payload.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        created_at = None
+    from umbrella.deep_agent_tools.phase_control_research import (
+        _read_file_paths_for_task,
+        _research_reference_was_read,
+        _tool_rows_after,
+    )
+
+    rows = _tool_log_rows_for_task(ctx, str(getattr(ctx, "task_id", "") or ""))
+    rows_since_plan = _tool_rows_after(
+        rows,
+        float(created_at) if created_at is not None else None,
+    )
+    read_paths = _read_file_paths_for_task(ctx, rows_since_plan)
+    if _research_reference_was_read(_PLAN_REVIEW_SUBMITTED_REL_PATH, read_paths):
+        return ""
+    return (
+        "ERROR: plan_review ok requires reading "
+        f"{_PLAN_REVIEW_SUBMITTED_REL_PATH} in this review phase before "
+        "accepting the submitted handoff from memory."
+    )
+
+
+def _plan_review_ok_policy_issue(ctx: ToolContext, *, verdict: str) -> str:
+    if _plan_review_phase_label(ctx) != "plan_review":
+        return ""
+    if str(verdict or "").strip().lower() != "ok":
+        return ""
+    payload = _submitted_phase_plan_payload(ctx)
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, dict):
+        return ""
+    try:
+        from umbrella.deep_agent_tools.phase_contract_policy import (
+            _phase_plan_policy_issues,
+        )
+
+        issues = _phase_plan_policy_issues(
+            plan,
+            ctx=ctx,
+            notes=str(payload.get("notes") or ""),
+        )
+    except Exception:
+        issues = []
+    if not issues:
+        return ""
+    return (
+        "ERROR: plan_review ok cannot accept the latest phase plan artifact "
+        "because it violates workspace policy: "
+        + "; ".join(issues)
+        + ". Loop back to plan with concrete revisions instead of allowing "
+        "execute to start from an unsafe plan."
+    )
 
 
 __all__ = [
@@ -723,9 +970,12 @@ __all__ = [
     '_workspace_id_from_drive',
     '_record_research_summary_artifact',
     '_looks_like_mojibake',
+    '_normalize_handoff_text',
     '_json_obj_from_preview',
     '_tool_log_rows_for_task',
     '_tool_row_time',
+    '_plan_review_validation_issue',
+    '_review_text_blocks',
     '_llm_fallback_handoff_issue',
     '_llm_test_double_handoff_issue',
     '_llm_cached_decision_handoff_issue',
@@ -738,5 +988,15 @@ __all__ = [
     '_review_provider_model_match_is_protective',
     '_context_overlays',
     '_loop_state_view',
+    '_set_typed_action_gate',
+    '_clear_typed_action_gate',
+    '_completion_tools_after_passed_proof',
+    '_set_completion_session',
     '_is_phase_run_context',
+    '_review_revision_policy_issue',
+    '_micro_review_feedback_issue',
+    '_plan_review_phase_label',
+    '_plan_review_ok_artifact_issue',
+    '_plan_review_ok_policy_issue',
+    '_PLAN_REVIEW_SUBMITTED_REL_PATH',
 ]

@@ -65,12 +65,16 @@ RECENT_LIMIT: int = int(os.environ.get("OUROBOROS_RECALL_RECENT", "10"))
 SEARCH_LIMIT: int = int(os.environ.get("OUROBOROS_RECALL_SEARCH", "5"))
 LESSONS_LIMIT: int = int(os.environ.get("OUROBOROS_RECALL_LESSONS", "5"))
 
-# Truncation limits for content in the inline recall block. We are
-# building a *system message*, not a tool result — we can't afford the
-# full 2000-char drawer body. Drawers get clipped harder than lessons
-# because we usually have many drawers and few lessons.
-DRAWER_PREVIEW_CHARS: int = 280
-LESSON_PREVIEW_CHARS: int = 480
+# Truncation limits for content in the inline recall block (env-tunable).
+from ouroboros.limits import (
+    RECALL_BLOCK_MAX_CHARS,
+    RECALL_DRAWER_PREVIEW_CHARS,
+    RECALL_LESSON_PREVIEW_CHARS,
+    TASK_BRIEF_MAX_CHARS,
+)
+
+DRAWER_PREVIEW_CHARS = RECALL_DRAWER_PREVIEW_CHARS
+LESSON_PREVIEW_CHARS = RECALL_LESSON_PREVIEW_CHARS
 
 
 def _safe_palace(repo_root: Path, workspace_id: str = "") -> Any | None:
@@ -1001,6 +1005,12 @@ def _guess_initial_workspace(messages: list[dict[str, Any]]) -> str:
         content = msg.get("content")
         if not isinstance(content, str):
             continue
+        match = re.search(
+            r"(?<![\w.-])workspace_id\s*=\s*[`'\"]?([A-Za-z0-9_.-]+)",
+            content,
+        )
+        if match:
+            return _workspace_candidate(match.group(1))
         for line in content.splitlines():
             candidate = _workspace_from_labeled_line(line, labels=_WORKSPACE_ID_LABELS)
             if candidate:
@@ -1054,7 +1064,7 @@ def _extract_task_brief(messages: list[dict[str, Any]]) -> str:
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, str) and content.strip():
             pieces.append(content.strip())
-    return "\n".join(pieces)[:2000]
+    return "\n".join(pieces)[:TASK_BRIEF_MAX_CHARS]
 
 
 def maybe_inject_periodic_recall(
@@ -1217,7 +1227,7 @@ def record_verify_outcome(
             event_type="test",
             room="verify_runs",
             title=title,
-            content=details[:4000],
+            content=details[:RECALL_BLOCK_MAX_CHARS],
             kind="success" if passed else "warning",
             tags=["verify", "verify_runs", "pass" if passed else "fail"],
             metadata_extra={

@@ -204,6 +204,13 @@ def test_github_extract_snippets_includes_body_for_permissive(tmp_path: Path) ->
         )
     payload = json.loads(out)
     assert payload["license_permissive"] is True
+    assert payload["repo_source_id"] == "github:some/mit-repo"
+    assert payload["extracted"][0]["research_source_id"] == "github:some/mit-repo"
+    assert payload["extracted"][0]["source_id"] == "github:some/mit-repo/hello.py"
+    assert "research_finding records with source_id=github:some/mit-repo" in payload[
+        "next_step"
+    ]
+    assert "extracted[].source_id only for codeptr" in payload["next_step"]
     assert payload["extracted"][0]["full_body_included"] is True
     md = (
         ctx.repo_dir

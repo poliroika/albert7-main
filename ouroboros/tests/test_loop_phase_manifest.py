@@ -21,6 +21,44 @@ def _make_minimal_task(tool_filter=None, overlays=None):
     return task
 
 
+def _write_basic_capability_declaration(state: pathlib.Path) -> None:
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "capability_declaration.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "status": "submitted",
+                "capabilities": {
+                    "python": {"available": True, "source": "probe"},
+                    "subprocess": {"available": True, "source": "probe"},
+                },
+                "probe_audit": {"python": True, "subprocess": True},
+                "notes": "Python and subprocess are available for this phase-plan fixture.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _pytest_proof(command: list[str], *, target: str = "tests") -> dict:
+    return {
+        "execution": {
+            "kind": "pytest",
+            "command": command,
+            "shell": False,
+        },
+        "oracle": {
+            "oracle_type": "unit_assertions",
+            "required_properties": ["build_succeeds"],
+        },
+        "scope": {
+            "pytest_targets": [target],
+        },
+        "anti_gaming": {"requires_real_runtime": True},
+        "required_capabilities": ["python", "subprocess"],
+    }
+
+
 def test_tool_filter_allow_restricts_schemas(tmp_path):
     """When tool_filter.allow is set, only those tools appear in tool_schemas."""
     import sys, os
@@ -265,6 +303,23 @@ def test_propose_subtasks_does_not_replace_authoritative_phase_plan(tmp_path):
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "run-plan:plan"
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "capability_declaration.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "status": "submitted",
+                "capabilities": {
+                    "python": {"available": True, "source": "probe"},
+                    "subprocess": {"available": True, "source": "probe"},
+                },
+                "probe_audit": {"python": True, "subprocess": True},
+                "notes": "Python and subprocess are available for this phase-plan fixture.",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     phase_result = phase_contract._propose_phase_plan(
         ctx,
@@ -273,7 +328,27 @@ def test_propose_subtasks_does_not_replace_authoritative_phase_plan(tmp_path):
             "subtasks": [
                 {
                     "id": "build",
-                    "success_test": "python -m pytest tests -q",
+                    "title": "Build",
+                    "goal": "Implement the build leaf and prove it with pytest.",
+                    "files_to_create": ["src/demo/__init__.py"],
+                    "proof": {
+                        "execution": {
+                            "kind": "pytest",
+                            "command": ["python", "-m", "pytest", "tests", "-q"],
+                            "shell": False,
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": ["build_succeeds"],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/demo/__init__.py"],
+                            "changed_files_expected": ["src/demo/__init__.py"],
+                            "pytest_targets": ["tests"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                        "required_capabilities": ["python", "subprocess"],
+                    },
                 }
             ],
         },
@@ -290,7 +365,33 @@ def test_propose_subtasks_does_not_replace_authoritative_phase_plan(tmp_path):
         steps=[
             {
                 "id": "verify",
-                "success_test": "python -m pytest tests/test_api.py -q",
+                "title": "Verify",
+                "goal": "Run the API pytest proof.",
+                "files_to_create": ["src/demo/api.py"],
+                "proof": {
+                    "execution": {
+                        "kind": "pytest",
+                        "command": [
+                            "python",
+                            "-m",
+                            "pytest",
+                            "tests/test_api.py",
+                            "-q",
+                        ],
+                        "shell": False,
+                    },
+                    "oracle": {
+                        "oracle_type": "unit_assertions",
+                        "required_properties": ["build_succeeds"],
+                    },
+                    "scope": {
+                        "files_under_test": ["src/demo/api.py"],
+                        "changed_files_expected": ["src/demo/api.py"],
+                        "pytest_targets": ["tests/test_api.py"],
+                    },
+                    "anti_gaming": {"requires_real_runtime": True},
+                    "required_capabilities": ["python", "subprocess"],
+                },
             }
         ],
     )
@@ -323,7 +424,8 @@ def test_propose_subtasks_requires_executable_success_tests(tmp_path):
         ],
     )
 
-    assert result.startswith("ERROR: subtask proposal violates workspace policy")
+    assert result.startswith("ERROR: subtask proposal contract rejected")
+    assert "missing_proof" in result
     assert not (tmp_path / "state" / "subtask_proposal_latest.json").exists()
 
 
@@ -401,6 +503,85 @@ def test_phase_tool_discovery_lists_only_phase_enableable_tools(tmp_path):
     denied = registry.execute("enable_tools", {"tools": "update_workspace_seed"})
     assert denied.startswith("ERROR:")
     assert "Not allowed in this phase" in denied
+
+
+def test_dynamic_tool_note_hidden_when_enable_tools_not_allowed(tmp_path):
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import (
+        _apply_tool_filter_in_place,
+        _phase_tool_filter_sets,
+        _preload_phase_tool_schemas,
+        _setup_dynamic_tools,
+    )
+    from ouroboros.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(tmp_path, tmp_path / "drive", tmp_path)
+    schemas = registry.schemas(core_only=True)
+    allowed, denied = _phase_tool_filter_sets(
+        "phase_run",
+        {"allow": ["read_file", "submit_micro_review"]},
+    )
+    _preload_phase_tool_schemas(
+        registry,
+        schemas,
+        allowed=allowed,
+        denied=denied,
+        drive_logs=tmp_path,
+        task_id="t-no-enable",
+    )
+    messages = []
+    _setup_dynamic_tools(
+        registry,
+        schemas,
+        messages,
+        phase_allowed_tools=allowed,
+        phase_denied_tools=denied,
+    )
+    _apply_tool_filter_in_place(schemas, allowed=allowed, denied=denied)
+
+    assert not any("enable_tools" in str(msg.get("content") or "") for msg in messages)
+
+
+def test_dynamic_tool_note_excludes_preloaded_allowed_tools(tmp_path):
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import (
+        _phase_tool_filter_sets,
+        _preload_phase_tool_schemas,
+        _setup_dynamic_tools,
+    )
+    from ouroboros.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(tmp_path, tmp_path / "drive", tmp_path)
+    schemas = registry.schemas(core_only=True)
+    allowed, denied = _phase_tool_filter_sets(
+        "phase_run",
+        {"allow": ["list_available_tools", "enable_tools", "palace_search"]},
+    )
+    _preload_phase_tool_schemas(
+        registry,
+        schemas,
+        allowed=allowed,
+        denied=denied,
+        drive_logs=tmp_path,
+        task_id="t-preloaded",
+    )
+    messages = []
+    _setup_dynamic_tools(
+        registry,
+        schemas,
+        messages,
+        phase_allowed_tools=allowed,
+        phase_denied_tools=denied,
+    )
+
+    assert messages == []
+    assert "palace_search" not in registry.execute("list_available_tools", {})
 
 
 def test_required_phase_completion_nudge_forces_submit_tool():
@@ -521,6 +702,30 @@ def test_required_phase_completion_nudge_forces_submit_after_palace_prerequisite
     assert forced == "submit_research_summary"
     assert messages
     assert "REQUIRED_PHASE_COMPLETION_PENDING" in messages[-1]["content"]
+
+
+def test_rejected_completion_nudge_explains_inline_capability_probe():
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import _format_rejected_termination_nudge
+
+    message = _format_rejected_termination_nudge(
+        {
+            "submit_capability_declaration": (
+                "ERROR: capability_declaration rejected: capability "
+                "`desktop_gui_runtime` is marked unavailable because it still "
+                "needs verification. Run a failed same-slug probe "
+                "(capabilities.desktop_gui_runtime.probe or "
+                "probes.desktop_gui_runtime) before declaring it unavailable."
+            )
+        }
+    )
+
+    assert "Recovery hint" in message
+    assert "probes.desktop_gui_runtime" in message
+    assert "not a separate shell step" in message
 
 
 def test_required_phase_completion_nudge_waits_for_prior_tool_call():
@@ -844,6 +1049,91 @@ def test_required_phase_completion_nudge_forces_mark_after_typed_proof(tmp_path)
     assert "completion_contract_hint" in messages[-1]["content"]
 
 
+def test_required_phase_completion_nudge_ignores_shell_success_for_typed_proof(tmp_path):
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import _maybe_force_required_phase_completion
+
+    drive_root = tmp_path / "drive"
+    state_dir = drive_root / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "subtasks": [
+                            {
+                                "id": "runtime-smoke",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_guismoke.py",
+                                            "-q",
+                                            "-s",
+                                        ],
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace_tool_calls = [
+        {
+            "tool": "shell",
+            "args": {
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/test_guismoke.py",
+                    "-q",
+                    "-s",
+                ]
+            },
+            "result": '{"exit_code": 0, "output": "2 passed"}',
+            "is_error": False,
+        },
+        {
+            "tool": "run_subtask_proof",
+            "args": {"subtask_id": "runtime-smoke"},
+            "result": json.dumps(
+                {
+                    "passed": False,
+                    "subtask_id": "runtime-smoke",
+                    "completion_contract_hint": {"status": "failed"},
+                }
+            ),
+            "is_error": False,
+        },
+    ]
+    messages = []
+    forced = _maybe_force_required_phase_completion(
+        terminating_tools=frozenset({"mark_subtask_complete"}),
+        tool_calls=[{"function": {"name": "read_file"}}],
+        messages=messages,
+        rounds_in_phase=16,
+        forced_progress_tool_choice=None,
+        drive_root=drive_root,
+        phase_write_tool_calls=1,
+        trace_tool_calls=trace_tool_calls,
+    )
+    assert forced is None
+    assert messages == []
+
+
 def test_phase_required_tools_are_part_of_phase_filter():
     import sys
     import pathlib
@@ -889,6 +1179,9 @@ def test_submit_final_review_ok_requires_current_phase_e2e(tmp_path):
     }
     ctx.loop_state_view = {
         "phase_label": "final_review",
+        "last_verify_passed": True,
+        "last_verify_failed_count": 0,
+        "last_verify_run_id": "verify-ok",
         "last_e2e_passed": False,
         "last_e2e_failed_count": 0,
         "last_e2e_phase_label": "",
@@ -899,6 +1192,34 @@ def test_submit_final_review_ok_requires_current_phase_e2e(tmp_path):
 
     assert result.startswith("ERROR:")
     assert "run_real_e2e" in result
+
+
+def test_submit_final_review_ok_requires_workspace_verify(tmp_path):
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_control import _submit_final_review
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.current_task_type = "phase_run"
+    ctx.context_overlays = {
+        "phase_node": {"id": "final_review", "manifest_id": "final_review"}
+    }
+    ctx.loop_state_view = {
+        "phase_label": "final_review",
+        "last_verify_passed": False,
+        "last_verify_failed_count": 0,
+        "last_verify_run_id": "",
+        "last_e2e_passed": True,
+        "last_e2e_failed_count": 0,
+        "last_e2e_phase_label": "final_review",
+        "last_e2e_run_id": "verify-e2e-1",
+    }
+
+    result = _submit_final_review(ctx, outcome="ok")
+
+    assert result.startswith("ERROR:")
+    assert "run_workspace_verify" in result
 
 
 def test_submit_final_review_ok_accepts_current_phase_e2e(tmp_path):
@@ -914,6 +1235,9 @@ def test_submit_final_review_ok_accepts_current_phase_e2e(tmp_path):
     }
     ctx.loop_state_view = {
         "phase_label": "final_review",
+        "last_verify_passed": True,
+        "last_verify_failed_count": 0,
+        "last_verify_run_id": "verify-ok",
         "last_e2e_passed": True,
         "last_e2e_failed_count": 0,
         "last_e2e_phase_label": "final_review",
@@ -955,12 +1279,29 @@ def test_submit_final_review_ok_accepts_same_round_logged_e2e(tmp_path):
         "failed_step_count": 0,
     }
     (logs / "tools.jsonl").write_text(
-        json.dumps(
-            {
-                "task_id": "run-1:final_review",
-                "tool": "run_real_e2e",
-                "result_preview": json.dumps(payload),
-            }
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "task_id": "run-1:final_review",
+                        "tool": "run_workspace_verify",
+                        "result_preview": json.dumps(
+                            {
+                                "passed": True,
+                                "verify_run_id": "verify-workspace-logged",
+                                "failed_step_count": 0,
+                            }
+                        ),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "task_id": "run-1:final_review",
+                        "tool": "run_real_e2e",
+                        "result_preview": json.dumps(payload),
+                    }
+                ),
+            ]
         )
         + "\n",
         encoding="utf-8",
@@ -1107,8 +1448,16 @@ def test_submit_preflight_report_ready(tmp_path):
     from unittest.mock import MagicMock
     ctx = MagicMock()
     ctx.drive_root = tmp_path
+    ctx.repo_dir = tmp_path
+    ctx.host_repo_root = tmp_path
     (tmp_path / "state").mkdir(exist_ok=True)
-    result = _submit_preflight_report(ctx, status="ready", blockers=[])
+    result = _submit_preflight_report(
+        ctx,
+        status="ready",
+        blockers=[],
+        research_depth="none",
+        research_depth_rationale="No external research needed for this fixture.",
+    )
     assert "ready" in result
     assert result.startswith("OK:")
     assert "ERROR" not in result
@@ -1283,6 +1632,8 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from ouroboros.tools.phase_control import _mark_subtask_complete
     from ouroboros.tools.registry import ToolContext
+    from umbrella.contracts.hashing import diff_hash, hash_value, workspace_hash
+    from umbrella.enforcement.ledger import append_supervisor_ledger_event
     from umbrella.memory.palace import facade
 
     captured_memory: list[dict] = []
@@ -1305,22 +1656,73 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
         ],
         "edits_log": [],
     }
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
+    workspace = tmp_path / "workspaces" / "ws1"
+    drive = workspace / ".memory" / "drive"
+    state_dir = drive / "state"
+    state_dir.mkdir(parents=True)
     (state_dir / "phase_plan.json").write_text(json.dumps(plan))
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.host_repo_root = tmp_path
+    ctx.drive_root = drive
     ctx.task_id = "run-1:execute"
     ctx.current_task_type = "phase_run"
     ctx.context_overlays = {"phase_node": {"id": "execute", "manifest_id": "execute"}}
     ctx.loop_state_view = {"phase_label": "linear"}
 
+    ws_hash = workspace_hash(workspace)
+    diff_h = diff_hash(workspace, [])
+    report_hash = hash_value({"passed": True})
+    report_result = {
+        "report_hash": report_hash,
+        "passed": True,
+        "workspace_hash": ws_hash,
+        "diff_hash": diff_h,
+    }
+    event = append_supervisor_ledger_event(
+        repo_root=tmp_path,
+        workspace_id="ws1",
+        actor="verifier",
+        phase="execute",
+        tool="run_subtask_proof",
+        result=report_result,
+    )
+    completion_contract = {
+        "subtask_id": "build-core",
+        "status": "done",
+        "completed_claims": [
+            {
+                "claim_id": "build-core.claim.1",
+                "text": "Built the core models.",
+                "proof_refs": [
+                    {
+                        "ref_type": "ledger_event",
+                        "ref_id": event.event_id,
+                        "hash": event.event_hash,
+                        "produced_by": "verifier",
+                        "phase": "execute",
+                        "subtask_id": "build-core",
+                    }
+                ],
+            }
+        ],
+        "changed_files": [],
+        "verification_report": {
+            "report_id": event.event_id,
+            "report_hash": report_hash,
+            "workspace_hash": ws_hash,
+            "diff_hash": diff_h,
+            "produced_after_event_id": "",
+            "verifier_id": "verifier",
+            "passed": True,
+            "ledger_hash": event.event_hash,
+        },
+        "notes": "Built the core models.",
+    }
+
     result = _mark_subtask_complete(
         ctx,
-        subtask_id="build-core",
-        status="done",
-        summary="Built the core models.",
-        evidence=["pytest tests/test_core.py -v: 12 passed"],
+        completion_contract=completion_contract,
     )
 
     assert result == "OK: Subtask 'build-core' marked complete"
@@ -1329,14 +1731,18 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
     assert payload["subtask_id"] == "build-core"
     assert payload["status"] == "done"
     assert payload["summary"] == "Built the core models."
-    assert payload["evidence"] == ["pytest tests/test_core.py -v: 12 passed"]
+    assert payload["evidence"] == [
+        f"ledger_event:{event.event_id}",
+        f"verification_report:{event.event_id}",
+    ]
 
     updated = json.loads((state_dir / "phase_plan.json").read_text())
     subtask = updated["nodes"][0]["subtasks"][0]
     assert subtask["status"] == "done"
     assert subtask["completion"]["summary"] == "Built the core models."
     assert subtask["completion"]["evidence"] == [
-        "pytest tests/test_core.py -v: 12 passed"
+        f"ledger_event:{event.event_id}",
+        f"verification_report:{event.event_id}",
     ]
     assert captured_memory
     mirrored = captured_memory[-1]
@@ -1348,7 +1754,7 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
     assert mirrored["verified"] is True
     assert "subtask_complete" in mirrored["tags"]
     assert "Built the core models." in mirrored["content"]
-    assert "pytest tests/test_core.py -v: 12 passed" in mirrored["content"]
+    assert f"verification_report:{event.event_id}" in mirrored["content"]
 
 
 def test_mark_subtask_complete_rejects_failed_status_for_phase_subtask(tmp_path):
@@ -1396,7 +1802,7 @@ def test_mark_subtask_complete_rejects_failed_status_for_phase_subtask(tmp_path)
     assert not (state_dir / "phase_control_signal.json").exists()
 
 
-def test_mark_subtask_complete_rejects_empty_completion_memory_after_success_test(
+def test_mark_subtask_complete_rejects_untyped_empty_completion_after_success_test(
     tmp_path,
 ):
     import sys, json
@@ -1407,6 +1813,8 @@ def test_mark_subtask_complete_rejects_empty_completion_memory_after_success_tes
     # Reduced from phase_web_25dbf47b: a first completion call had useful
     # summary/evidence but quoted the subtask id; the retry used only
     # {"subtask_id": "1.1"} and was accepted with empty subtask memory.
+    # Phase-run completion now rejects this earlier: it must carry the typed
+    # verifier-backed completion contract so proof metadata cannot be dropped.
     plan = {
         "plan_id": "p1",
         "workspace_id": "civilization",
@@ -1469,8 +1877,8 @@ def test_mark_subtask_complete_rejects_empty_completion_memory_after_success_tes
 
     result = _mark_subtask_complete(ctx, subtask_id="1.1")
 
-    assert result.startswith("ERROR: mark_subtask_complete rejected")
-    assert "must include non-empty summary, evidence" in result
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
+    assert "completion_contract is required" in result
     updated = json.loads((state_dir / "phase_plan.json").read_text(encoding="utf-8"))
     assert updated["nodes"][0]["subtasks"][0]["status"] == "pending"
     assert not (state_dir / "phase_control_signal.json").exists()
@@ -2011,10 +2419,11 @@ def test_mark_subtask_complete_requires_declared_harness_tool(tmp_path):
         evidence=["harness_run passed"],
     )
 
-    assert result.startswith("OK:")
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
+    assert "completion_contract is required" in result
 
 
-def test_workspace_write_guard_blocks_before_declared_harness_tool(tmp_path):
+def test_workspace_write_guard_does_not_block_declared_harness_tool(tmp_path):
     import sys, json
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from ouroboros.tools.registry import ToolContext
@@ -2049,10 +2458,7 @@ def test_workspace_write_guard_blocks_before_declared_harness_tool(tmp_path):
     ctx.current_task_type = "phase_run"
     ctx.context_overlays = {"phase_node": {"id": "execute", "manifest_id": "execute"}}
 
-    block = _phase_plan_write_order_block(ctx)
-
-    assert block is not None
-    assert block["reason"] == "phase_subtask_order_before_write"
+    assert _phase_plan_write_order_block(ctx) is None
 
     (logs_dir / "tools.jsonl").write_text(
         json.dumps({
@@ -2129,7 +2535,8 @@ def test_mark_subtask_complete_requires_passing_workspace_verify(tmp_path):
         evidence=["verify passed"],
     )
 
-    assert result.startswith("OK:")
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
+    assert "completion_contract is required" in result
 
 
 def test_mark_subtask_complete_defers_full_verify_failures_owned_by_later_leaf(
@@ -2230,9 +2637,10 @@ def test_mark_subtask_complete_defers_full_verify_failures_owned_by_later_leaf(
         evidence=[success_test + " passed"],
     )
 
-    assert result.startswith("OK:"), result
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected"), result
+    assert "completion_contract is required" in result
     updated = json.loads((state_dir / "phase_plan.json").read_text())
-    assert updated["nodes"][0]["subtasks"][0]["status"] == "done"
+    assert updated["nodes"][0]["subtasks"][0]["status"] == "pending"
     assert updated["nodes"][0]["subtasks"][1]["status"] == "pending"
 
 
@@ -2417,7 +2825,8 @@ def test_mark_subtask_complete_parses_truncated_workspace_verify_preview(tmp_pat
         evidence=["workspace verify passed"],
     )
 
-    assert result.startswith("OK:")
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
+    assert "completion_contract is required" in result
 
 
 def test_mark_subtask_complete_rejects_skipped_only_pytest_success(tmp_path):
@@ -2496,7 +2905,8 @@ def test_mark_subtask_complete_rejects_skipped_only_pytest_success(tmp_path):
         evidence=["pytest passed"],
     )
 
-    assert result.startswith("OK:")
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
+    assert "completion_contract is required" in result
 
 
 def test_mark_subtask_complete_rejects_stale_success_after_later_failure(tmp_path):
@@ -2683,9 +3093,10 @@ def test_phase_mark_subtask_complete_blocks_red_verify_even_with_internal_plan(t
         ],
     )
 
-    assert result.startswith("OK:")
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
+    assert "completion_contract is required" in result
     updated = json.loads((state_dir / "phase_plan.json").read_text())
-    assert updated["nodes"][0]["subtasks"][0]["status"] == "done"
+    assert updated["nodes"][0]["subtasks"][0]["status"] == "pending"
 
 
 def test_mark_subtask_complete_accepts_split_success_test_commands(tmp_path):
@@ -2753,7 +3164,8 @@ def test_mark_subtask_complete_accepts_split_success_test_commands(tmp_path):
         evidence=["both commands passed"],
     )
 
-    assert result.startswith("OK:")
+    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
+    assert "completion_contract is required" in result
 
 
 def test_propose_phase_plan_persists_review_artifact(tmp_path, monkeypatch):
@@ -2765,7 +3177,9 @@ def test_propose_phase_plan_persists_review_artifact(tmp_path, monkeypatch):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     (tmp_path / "umbrella").mkdir()
 
     captured: list[dict] = []
@@ -2790,13 +3204,15 @@ def test_propose_phase_plan_persists_review_artifact(tmp_path, monkeypatch):
         ctx,
         plan={
             "phases": [
-                {
-                    "id": "execute",
-                    "title": "Build",
-                    "success_test": "python -m pytest tests -q",
-                }
-            ]
-        },
+                    {
+                        "id": "execute",
+                        "title": "Build",
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ]
+            },
         notes="test plan",
     )
 
@@ -2806,7 +3222,7 @@ def test_propose_phase_plan_persists_review_artifact(tmp_path, monkeypatch):
             encoding="utf-8"
         )
     )
-    assert latest["plan"]["phases"][0]["id"] == "execute"
+    assert latest["plan"]["subtasks"][0]["id"] == "execute"
     assert latest["plan_id"] == "phase_plan:execute"
     assert "plan_id: phase_plan:execute" in result
     assert captured
@@ -2817,7 +3233,7 @@ def test_propose_phase_plan_persists_review_artifact(tmp_path, monkeypatch):
     assert "phase_plan" not in captured[0]["tags"]
 
 
-def test_propose_phase_plan_rejects_root_test_files(tmp_path):
+def test_propose_phase_plan_accepts_typed_root_test_file(tmp_path):
     import sys
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from ouroboros.tools.phase_contract import _propose_phase_plan
@@ -2825,7 +3241,9 @@ def test_propose_phase_plan_rejects_root_test_files(tmp_path):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
 
     ctx = MagicMock()
     ctx.drive_root = drive
@@ -2838,18 +3256,20 @@ def test_propose_phase_plan_rejects_root_test_files(tmp_path):
         ctx,
         plan={
             "subtasks": [
-                {
-                    "id": "e2e",
-                    "files": ["test_integration.py"],
-                    "verification": "pytest",
-                }
-            ]
-        },
+                    {
+                        "id": "e2e",
+                        "files": ["test_integration.py"],
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "test_integration.py", "-q"],
+                            target="test_integration.py",
+                        ),
+                    }
+                ]
+            },
     )
 
-    assert result.startswith("ERROR:")
-    assert "root diagnostic/test file" in result
-    assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
+    assert result.startswith("OK:")
+    assert (drive / "state" / "phase_plan_proposal_latest.json").exists()
 
 
 def test_propose_phase_plan_rejects_stale_optional_param_claim(tmp_path):
@@ -2860,7 +3280,9 @@ def test_propose_phase_plan_rejects_stale_optional_param_claim(tmp_path):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     (ws_root / "game_engine.py").write_text(
         "class GameEngine:\n"
         "    def __init__(self, game, ai_controller=None):\n"
@@ -2881,13 +3303,15 @@ def test_propose_phase_plan_rejects_stale_optional_param_claim(tmp_path):
             "plan_id": "repair",
             "overview": "Fix GameEngine.__init__() missing ai_controller parameter.",
             "subtasks": [
-                {
-                    "id": "repair-api",
-                    "goal": "Fix GameEngine.__init__() missing ai_controller.",
-                    "success_test": "python -m pytest tests -q",
-                }
-            ],
-        },
+                    {
+                        "id": "repair-api",
+                        "goal": "Fix GameEngine.__init__() missing ai_controller.",
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ],
+            },
     )
 
     assert result.startswith("ERROR:")
@@ -2902,7 +3326,9 @@ def test_propose_phase_plan_rejects_stale_symbol_mismatch_claim(tmp_path):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     tools = ws_root / "backend" / "bots"
     tools.mkdir(parents=True)
     (tools / "bot_tools.py").write_text(
@@ -2948,7 +3374,9 @@ def test_propose_phase_plan_rejects_stub_intent(tmp_path):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
 
     ctx = MagicMock()
     ctx.drive_root = drive
@@ -2983,7 +3411,9 @@ def test_propose_phase_plan_rejects_unknown_declared_tools(tmp_path):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
 
     ctx = MagicMock()
     ctx.drive_root = drive
@@ -2996,17 +3426,19 @@ def test_propose_phase_plan_rejects_unknown_declared_tools(tmp_path):
         ctx,
         plan={
             "subtasks": [
-                {
-                    "id": "execute",
-                    "allowed_tools": "read_workspace_file, shell",
-                    "verification": "shell",
-                }
-            ]
-        },
-    )
+                    {
+                        "id": "execute",
+                        "allowed_tools": "imaginary_tool, shell",
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ]
+            },
+        )
 
     assert result.startswith("ERROR:")
-    assert "unknown phase tool `read_workspace_file`" in result
+    assert "unknown phase tool `imaginary_tool`" in result
     assert "unknown phase tool `shell`" not in result
     assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
 
@@ -3019,7 +3451,9 @@ def test_propose_phase_plan_rejects_unknown_tools_field_names(tmp_path):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
 
     ctx = MagicMock()
     ctx.drive_root = drive
@@ -3032,17 +3466,19 @@ def test_propose_phase_plan_rejects_unknown_tools_field_names(tmp_path):
         ctx,
         plan={
             "subtasks": [
-                {
-                    "id": "execute",
-                    "tools": ["run_workspace_command", "shell"],
-                    "verification": "shell",
-                }
-            ]
-        },
-    )
+                    {
+                        "id": "execute",
+                        "tools": ["imaginary_tool", "shell"],
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ]
+            },
+        )
 
     assert result.startswith("ERROR:")
-    assert "unknown phase tool `run_workspace_command`" in result
+    assert "unknown phase tool `imaginary_tool`" in result
     assert "unknown phase tool `shell`" not in result
 
 
@@ -3054,7 +3490,9 @@ def test_propose_phase_plan_allows_domain_runtime_tools(tmp_path):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
 
     ctx = MagicMock()
     ctx.drive_root = drive
@@ -3071,7 +3509,10 @@ def test_propose_phase_plan_allows_domain_runtime_tools(tmp_path):
                 {
                     "id": "wire-bots",
                     "goal": "Wire bot agents to the game state.",
-                    "success_test": "pytest tests/test_bots.py -q",
+                    "proof": _pytest_proof(
+                        ["python", "-m", "pytest", "tests/test_bots.py", "-q"],
+                        target="tests/test_bots.py",
+                    ),
                 }
             ],
             "gmas_usage": {
@@ -3106,7 +3547,9 @@ def test_propose_phase_plan_rejects_parallel_impl_root_without_migration(tmp_pat
     (ws_root / "game_core" / "__init__.py").write_text("", encoding="utf-8")
     (ws_root / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     (tmp_path / "umbrella").mkdir()
 
     ctx = MagicMock()
@@ -3149,7 +3592,9 @@ def test_propose_phase_plan_rejects_scaffold_over_existing_impl(tmp_path):
     (ws_root / "game_core").mkdir()
     (ws_root / "game_core" / "__init__.py").write_text("", encoding="utf-8")
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     (tmp_path / "umbrella").mkdir()
 
     ctx = MagicMock()
@@ -3183,6 +3628,93 @@ def test_propose_phase_plan_rejects_scaffold_over_existing_impl(tmp_path):
     assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
 
 
+def test_propose_phase_plan_allows_greenfield_scaffold_with_only_control_files(tmp_path):
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_contract import _propose_phase_plan
+    from unittest.mock import MagicMock
+
+    ws_root = tmp_path / "workspaces" / "ws1"
+    ws_root.mkdir(parents=True)
+    (ws_root / "TASK_MAIN.md").write_text("Build a calculator GUI.\n", encoding="utf-8")
+    (ws_root / "workspace.toml").write_text(
+        "[project]\nname = \"calculator\"\n",
+        encoding="utf-8",
+    )
+    drive = ws_root / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
+    (tmp_path / "umbrella").mkdir()
+
+    ctx = MagicMock()
+    ctx.drive_root = drive
+    ctx.host_repo_root = tmp_path
+    ctx.repo_dir = tmp_path
+    ctx.task_id = "run-1:plan"
+    ctx.loop_state_view = {"active_workspace_id": "ws1", "phase_label": "plan"}
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "greenfield-calculator",
+            "subtasks": [
+                {
+                    "id": "project-setup",
+                    "title": "Project setup",
+                    "goal": "Create the Python package scaffold and import test.",
+                    "files_to_create": [
+                        "pyproject.toml",
+                        "src/calculator/__init__.py",
+                        "tests/test_import.py",
+                    ],
+                    "proof": {
+                        "execution": {
+                            "kind": "pytest",
+                            "command": [
+                                "python",
+                                "-m",
+                                "pytest",
+                                "tests/test_import.py",
+                                "-q",
+                            ],
+                            "timeout_sec": 60,
+                            "shell": False,
+                        },
+                        "oracle": {
+                            "oracle_type": "import_check",
+                            "required_properties": [
+                                "module_imports",
+                                "no_test_tampering",
+                            ],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/calculator/__init__.py"],
+                            "changed_files_expected": [
+                                "pyproject.toml",
+                                "src/calculator/__init__.py",
+                                "tests/test_import.py",
+                            ],
+                            "pytest_targets": ["tests/test_import.py"],
+                        },
+                        "anti_gaming": {
+                            "allows_mock": False,
+                            "allows_snapshot_update": False,
+                            "allows_test_only_change": False,
+                            "requires_real_runtime": False,
+                        },
+                        "required_capabilities": ["python"],
+                        "human_claims": ["Calculator package scaffold imports."],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert result.startswith("OK:"), result
+    assert (drive / "state" / "phase_plan_proposal_latest.json").exists()
+
+
 def test_propose_phase_plan_allows_repair_plan_for_existing_impl(tmp_path):
     import sys
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -3198,7 +3730,9 @@ def test_propose_phase_plan_allows_repair_plan_for_existing_impl(tmp_path):
     (ws_root / "game_core").mkdir()
     (ws_root / "game_core" / "__init__.py").write_text("", encoding="utf-8")
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     (tmp_path / "umbrella").mkdir()
 
     ctx = MagicMock()
@@ -3214,18 +3748,166 @@ def test_propose_phase_plan_allows_repair_plan_for_existing_impl(tmp_path):
             "subtasks": [
                 {
                     "id": "repair_existing_runtime",
-                    "description": (
-                        "Fix and integrate existing frontend and game_core runtime "
-                        "without scaffolding a replacement project."
-                    ),
-                    "files": ["frontend/src/App.tsx", "game_core/__init__.py"],
-                    "success_test": "python -m pytest tests",
+                        "description": (
+                            "Fix and integrate existing frontend and game_core runtime "
+                            "without scaffolding a replacement project."
+                        ),
+                        "files": ["frontend/src/App.tsx", "game_core/__init__.py"],
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ]
+            },
+    )
+
+    assert result.startswith("OK:")
+
+
+def test_propose_phase_plan_rejects_new_root_python_file_with_existing_src(tmp_path):
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_contract import _propose_phase_plan
+    from unittest.mock import MagicMock
+
+    ws_root = tmp_path / "workspaces" / "ws1"
+    (ws_root / "src" / "calculator").mkdir(parents=True)
+    (ws_root / "src" / "calculator" / "__init__.py").write_text("", encoding="utf-8")
+    (ws_root / "pyproject.toml").write_text(
+        "[project]\nname = \"calculator\"\n",
+        encoding="utf-8",
+    )
+    drive = ws_root / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
+    (tmp_path / "umbrella").mkdir()
+
+    ctx = MagicMock()
+    ctx.drive_root = drive
+    ctx.host_repo_root = tmp_path
+    ctx.repo_dir = tmp_path
+    ctx.task_id = "run-1:plan"
+    ctx.loop_state_view = {"active_workspace_id": "ws1", "phase_label": "plan"}
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "subtasks": [
+                {
+                    "id": "entrypoint",
+                    "files_to_create": ["main.py"],
+                    "proof": {
+                        "execution": {
+                            "kind": "command",
+                            "command": ["python", "-c", "print('ok')"],
+                            "shell": False,
+                        },
+                        "oracle": {
+                            "oracle_type": "build",
+                            "required_properties": ["module_imports"],
+                        },
+                        "scope": {
+                            "files_under_test": ["main.py"],
+                            "changed_files_expected": ["main.py"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                        "required_capabilities": ["python"],
+                    },
                 }
             ]
         },
     )
 
-    assert result.startswith("OK:")
+    assert result.startswith("ERROR:"), result
+    assert "creates new top-level Python path" in result
+    assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
+
+
+def test_propose_phase_plan_rejects_desktop_runtime_without_cleanup(tmp_path):
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_contract import _propose_phase_plan
+    from unittest.mock import MagicMock
+
+    ws_root = tmp_path / "workspaces" / "ws1"
+    ws_root.mkdir(parents=True)
+    (ws_root / "workspace.toml").write_text(
+        "[policies]\ngreenfield_python_src_layout = true\n",
+        encoding="utf-8",
+    )
+    drive = ws_root / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "capability_declaration.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "status": "submitted",
+                "capabilities": {
+                    "python": {"available": True, "source": "probe"},
+                    "subprocess": {"available": True, "source": "probe"},
+                    "desktop_gui_runtime": {
+                        "available": True,
+                        "source": "platform_builtin",
+                    },
+                },
+                "probe_audit": {"python": True, "subprocess": True},
+                "notes": "Python subprocess and desktop GUI runtime are available.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "umbrella").mkdir()
+
+    ctx = MagicMock()
+    ctx.drive_root = drive
+    ctx.host_repo_root = tmp_path
+    ctx.repo_dir = tmp_path
+    ctx.task_id = "run-1:plan"
+    ctx.loop_state_view = {"active_workspace_id": "ws1", "phase_label": "plan"}
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "subtasks": [
+                {
+                    "id": "runtime",
+                    "files_to_create": ["src/app/main.py"],
+                    "proof": {
+                        "execution": {
+                            "kind": "command",
+                            "command": ["python", "src/app/main.py"],
+                            "shell": False,
+                        },
+                        "oracle": {
+                            "oracle_type": "build",
+                            "required_properties": ["runtime_started"],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/app/main.py"],
+                            "changed_files_expected": ["src/app/main.py"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                        "harness_profile": "desktop_gui_runtime",
+                        "harness_options": {
+                            "managed_runtime": True,
+                            "readiness": {"type": "process_alive"},
+                        },
+                        "required_capabilities": [
+                            "python",
+                            "subprocess",
+                            "desktop_gui_runtime",
+                        ],
+                    },
+                }
+            ]
+        },
+    )
+
+    assert result.startswith("ERROR:"), result
+    assert "must include cleanup instructions" in result
+    assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
 
 
 def test_propose_phase_plan_rejects_scaffold_subtask_even_when_other_subtasks_repair(
@@ -3609,7 +4291,9 @@ def test_propose_phase_plan_allows_new_impl_root_with_explicit_migration(tmp_pat
     (ws_root / "game_core" / "__init__.py").write_text("", encoding="utf-8")
     (ws_root / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     (tmp_path / "umbrella").mkdir()
 
     ctx = MagicMock()
@@ -3627,13 +4311,15 @@ def test_propose_phase_plan_allows_new_impl_root_with_explicit_migration(tmp_pat
                 "remove obsolete duplicate code after tests pass."
             ),
             "subtasks": [
-                {
-                    "id": "backend",
-                    "deliverables": ["backend/api.py", "backend/bots/gmas_config.py"],
-                    "verification": "python -m pytest tests",
-                }
-            ],
-        },
+                    {
+                        "id": "backend",
+                        "deliverables": ["backend/api.py", "backend/bots/gmas_config.py"],
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ],
+            },
     )
 
     assert result.startswith("OK:"), result
@@ -3650,7 +4336,9 @@ def test_submit_phase_plan_defaults_to_latest_proposal(tmp_path, monkeypatch):
 
     ws_root = tmp_path / "workspaces" / "ws1"
     drive = ws_root / ".memory" / "drive"
-    (drive / "state").mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     (tmp_path / "umbrella").mkdir()
 
     monkeypatch.setattr(facade.MemPalace, "add", lambda self, **kwargs: "memory-id")
@@ -3670,13 +4358,15 @@ def test_submit_phase_plan_defaults_to_latest_proposal(tmp_path, monkeypatch):
         plan={
             "phase_id": "llm_civ_game_implementation",
             "steps": [
-                {
-                    "id": "build",
-                    "title": "Build",
-                    "success_test": "python -m pytest tests -q",
-                }
-            ],
-        },
+                    {
+                        "id": "build",
+                        "title": "Build",
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ],
+            },
         notes="ready",
     )
     result = _submit_phase_plan(ctx)
@@ -3703,6 +4393,7 @@ def test_submit_phase_plan_invalidates_stale_plan_review_and_downstream(
     drive = ws_root / ".memory" / "drive"
     state = drive / "state"
     state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     monkeypatch.setattr(facade.MemPalace, "add", lambda self, **kwargs: "memory-id")
 
     (state / "phase_plan.json").write_text(
@@ -3764,13 +4455,15 @@ def test_submit_phase_plan_invalidates_stale_plan_review_and_downstream(
         plan={
             "phase_id": "revised_plan",
             "steps": [
-                {
-                    "id": "build",
-                    "title": "Build",
-                    "success_test": "python -m pytest tests -q",
-                }
-            ],
-        },
+                    {
+                        "id": "build",
+                        "title": "Build",
+                        "proof": _pytest_proof(
+                            ["python", "-m", "pytest", "tests", "-q"],
+                        ),
+                    }
+                ],
+            },
         notes="ready",
     )
     result = _submit_phase_plan(ctx)
@@ -3857,7 +4550,54 @@ def test_phase_completion_tracks_missing_required_tools_from_trace():
     }
 
 
-def test_propose_phase_plan_accepts_json_string_payload(tmp_path, monkeypatch):
+def test_accepted_phase_completion_returns_non_empty_final(tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import _handle_phase_tail_after_tool_round
+
+    state = SimpleNamespace(
+        llm_trace={
+            "tool_calls": [
+                {
+                    "tool": "submit_micro_review",
+                    "result": "OK: Micro-review submitted: ok (signal: s1)",
+                }
+            ]
+        },
+        accumulated_usage={},
+        last_text="",
+    )
+    tool_calls = [{"function": {"name": "submit_micro_review"}}]
+
+    result = _handle_phase_tail_after_tool_round(
+        state=state,
+        tool_calls=tool_calls,
+        terminating_tools=frozenset({"submit_micro_review"}),
+        messages=[],
+        phase_label="plan_review",
+        budget_remaining_usd=None,
+        llm=None,
+        max_retries=0,
+        drive_logs=tmp_path,
+        task_id="run:plan_review",
+        event_queue=None,
+        task_type="phase_run",
+        drive_root=None,
+        rounds_in_phase=1,
+        completion_prerequisites=(),
+    )
+
+    assert result is not None
+    final, reason = result
+    assert reason == "terminated"
+    assert final is not None
+    assert final[0] == "OK: Accepted phase-completion tool(s): submit_micro_review"
+    assert state.last_text == final[0]
+
+
+def test_propose_phase_plan_rejects_json_string_payload(tmp_path, monkeypatch):
     import sys, json
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from ouroboros.tools.phase_contract import _propose_phase_plan
@@ -3890,14 +4630,9 @@ def test_propose_phase_plan_accepts_json_string_payload(tmp_path, monkeypatch):
         notes="json string",
     )
 
-    assert result.startswith("OK:")
-    latest = json.loads(
-        (drive / "state" / "phase_plan_proposal_latest.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert latest["plan"]["phases"][0]["id"] == "execute"
-    assert "Payload warning" not in latest["notes"]
+    assert result.startswith("ERROR:")
+    assert "`plan` must be a typed object" in result
+    assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
 
 
 def test_propose_phase_plan_rejects_unparseable_string_without_work_items(
@@ -3933,7 +4668,7 @@ def test_propose_phase_plan_rejects_unparseable_string_without_work_items(
     )
 
     assert result.startswith("ERROR:")
-    assert "no executable subtasks/steps/phases" in result
+    assert "`plan` must be a typed object" in result
     assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
 
 
@@ -3948,6 +4683,7 @@ def test_submit_phase_plan_rejects_malformed_legacy_proposal(tmp_path):
     state = drive / "state"
     logs = drive / "logs"
     state.mkdir(parents=True)
+    _write_basic_capability_declaration(state)
     logs.mkdir(parents=True)
     (logs / "tools.jsonl").write_text("", encoding="utf-8")
     payload = {
@@ -3981,13 +4717,15 @@ def test_submit_phase_plan_rejects_malformed_legacy_proposal(tmp_path):
     result = _submit_phase_plan(ctx)
 
     assert result.startswith("ERROR:")
-    assert "no executable subtasks/steps/phases" in result
+    assert "missing_plan_subtasks" in result
 
 
 def test_subtask_success_test_text_ignores_kind_metadata():
     import sys
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-    from ouroboros.tools.phase_control import _subtask_success_test_text
+    from umbrella.deep_agent_tools.phase_control_legacy import (
+        _subtask_success_test_text,
+    )
 
     subtask = {
         "success_test": {
@@ -4002,7 +4740,7 @@ def test_subtask_success_test_text_ignores_kind_metadata():
     )
 
 
-def test_propose_phase_plan_accepts_yamlish_object_string(tmp_path, monkeypatch):
+def test_propose_phase_plan_rejects_yamlish_object_string(tmp_path, monkeypatch):
     import sys, json
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from ouroboros.tools.phase_contract import _propose_phase_plan
@@ -4040,15 +4778,9 @@ coordinates:
         notes="yamlish string",
     )
 
-    assert result.startswith("OK:")
-    latest = json.loads(
-        (drive / "state" / "phase_plan_proposal_latest.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert latest["plan"]["phases"][0]["id"] == "execute"
-    assert latest["plan"]["coordinates"]["tech_stack"] == ["python", "react"]
-    assert "YAML-compatible object" in latest["notes"]
+    assert result.startswith("ERROR:")
+    assert "`plan` must be a typed object" in result
+    assert not (drive / "state" / "phase_plan_proposal_latest.json").exists()
 
 
 def test_env_check_accepts_ouroboros_llm_key_alias(tmp_path, monkeypatch):

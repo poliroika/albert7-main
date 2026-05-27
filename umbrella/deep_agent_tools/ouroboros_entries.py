@@ -435,6 +435,29 @@ def get_ouroboros_tool_entries():
             is_code_tool=True,
         ),
         ToolEntry(
+            "replace_workspace_file",
+            {
+                "name": "replace_workspace_file",
+                "description": (
+                    "Atomically replace a workspace file after repeated patch hunk "
+                    "mismatches. Requires read_file digest match via expected_sha256."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "workspace_id": {"type": "string"},
+                        "path": {"type": "string"},
+                        "expected_sha256": {"type": "string"},
+                        "content": {"type": "string"},
+                        "validation_summary": {"type": "string", "default": ""},
+                    },
+                    "required": ["workspace_id", "path", "expected_sha256", "content"],
+                },
+            },
+            lambda ctx, **kw: replace_workspace_file(ctx, **kw),
+            is_code_tool=True,
+        ),
+        ToolEntry(
             "delete_workspace_file",
             {
                 "name": "delete_workspace_file",
@@ -763,15 +786,23 @@ def get_ouroboros_tool_entries():
             {
                 "name": "web_fetch",
                 "description": (
-                    "GET an HTTP(S) URL and return its (HTML-stripped) text body, "
-                    "head+tail truncated. Use after `web_search` to read a docs page or "
-                    "model card. Output is capped to ~20k chars by default."
+                    "GET an HTTP(S) URL; stores page + sections under "
+                    "`.memory/drive/memory/knowledge/web/pages/` and registers "
+                    "external_knowledge_catalog handles. Returns catalog_id + "
+                    "preview by default (not full body)."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {"type": "string"},
                         "max_chars": {"type": "integer", "default": 20000},
+                        "intent": {
+                            "type": "string",
+                            "default": "planner_research",
+                        },
+                        "register_catalog": {"type": "boolean", "default": True},
+                        "extract_sections": {"type": "boolean", "default": True},
+                        "include_content": {"type": "boolean", "default": False},
                     },
                     "required": ["url"],
                 },

@@ -80,3 +80,27 @@ def write_step_snapshots(
         after.get("bkb_yaml") or "",
         encoding="utf-8",
     )
+    (report_dir / f"core_files_before_{step_id}.json").write_text(
+        json.dumps(before.get("core_files") or {}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (report_dir / f"core_files_after_{step_id}.json").write_text(
+        json.dumps(after.get("core_files") or {}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (report_dir / f"drive_state_before_{step_id}.json").write_text(
+        json.dumps(before.get("drive_state") or {}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (report_dir / f"drive_state_after_{step_id}.json").write_text(
+        json.dumps(after.get("drive_state") or {}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    diff_lines = ["# Snapshot diff", ""]
+    if before.get("bkb_yaml") != after.get("bkb_yaml"):
+        diff_lines.append("- BKB yaml changed")
+    b_palace = (before.get("palace") or {}).get("count", 0)
+    a_palace = (after.get("palace") or {}).get("count", 0)
+    if b_palace != a_palace:
+        diff_lines.append(f"- Palace node count: {b_palace} -> {a_palace}")
+    (report_dir / f"diff_{step_id}.md").write_text("\n".join(diff_lines), encoding="utf-8")

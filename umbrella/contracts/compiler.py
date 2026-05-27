@@ -1,20 +1,40 @@
 """Compile persisted run artifacts into a ContractBundle."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Any
 
+from umbrella.contracts.capability_declaration import (
+    declaration_effective_capabilities,
+    load_capability_declaration,
+    proof_required_capabilities,
+)
 from umbrella.contracts.models import (
     CompletionContract,
     ContractBundle,
     ContractIssue,
+    PlanIR,
     ReviewContract,
+    TaskRiskProfile,
     VerificationReportRef,
 )
 from umbrella.contracts.plan_ir import compile_phase_plan
+from umbrella.contracts.subtask_recovery import (
+    review_superseded_by_recovery,
+    subtask_passing_recovery_at,
+)
+from umbrella.contracts.validators import _path_looks_like_test
 
+_LLM_RISK_CAPABILITIES = frozenset(
+    {
+        "llm_api",
+        "openai",
+        "openrouter",
+        "anthropic",
+        "gmas",
+        "multi_agent_gmas",
+    }
+)
 
 class ContractCompiler:
     """Build contract bundles from the current Umbrella drive layout."""
@@ -105,8 +125,44 @@ class ContractCompiler:
             )
         return None, []
 
+    def _build_risk_profile(self, plan: PlanIR | None) -> TaskRiskProfile:
+        if plan is None:
+            return TaskRiskProfile()
+        proofs = [subtask.proof for subtask in plan.subtasks if subtask.proof is not None]
+        kinds = {proof.execution.kind for proof in proofs}
+        paths: list[str] = []
+        for subtask in plan.subtasks:
+            paths.extend(subtask.files_to_change)
+            paths.extend(subtask.files_to_create)
+            affected = getattr(subtask, "files_affected", ())
+            if affected:
+                paths.extend(affected)
+        tests_changed = any(_path_looks_like_test(path) for path in paths)
+        code_changed = bool(paths)
+        declaration = load_capability_declaration(self.drive_root)
+        caps = declaration_effective_capabilities(declaration)
+        required_capability_sets = [proof_required_capabilities(proof) for proof in proofs]
+        llm_caps = any(
+            bool(required & _LLM_RISK_CAPABILITIES)
+            for required in required_capability_sets
+        )
+        return TaskRiskProfile(
+            code_changed=code_changed,
+            tests_changed=tests_changed,
+            external_api=bool(caps.get("network") or caps.get("external_api")),
+            llm_or_prompt_logic=bool(llm_caps),
+            web_or_http_runtime=bool(
+                caps.get("network")
+                or {"http_boot", "behavioral_http"} & kinds
+            ),
+            high_stub_risk=bool(
+                {"mutation_smoke", "input_sensitivity", "metamorphic"} & kinds
+            ),
+        )
+
     def compile(self, *, run_id: str = "") -> ContractBundle:
         plan, issues = self._compile_plan(run_id=run_id)
+        risk = self._build_risk_profile(plan if isinstance(plan, PlanIR) else None)
         latest_review: ReviewContract | None = None
         completions: list[CompletionContract] = []
         reports: list[VerificationReportRef] = []
@@ -116,6 +172,11 @@ class ContractCompiler:
             signal_rows,
             kind="submit_phase_plan",
             phase="plan",
+        )
+        plan_data = self._read_json(self.drive_root / "state" / "phase_plan.json")
+        recovery_at = subtask_passing_recovery_at(
+            plan_data=plan_data if isinstance(plan_data, dict) else None,
+            signal_rows=signal_rows,
         )
         for row in signal_rows:
             payload = row.get("payload")
@@ -129,7 +190,14 @@ class ContractCompiler:
                     and self._signal_created_at(row) < latest_plan_submit_at
                 ):
                     continue
-                latest_review = ReviewContract.from_mapping(payload)
+                candidate = ReviewContract.from_mapping(payload)
+                if review_superseded_by_recovery(
+                    candidate,
+                    recovery_at=recovery_at,
+                    review_created_at=self._signal_created_at(row),
+                ):
+                    continue
+                latest_review = candidate
             elif kind == "mark_subtask_complete":
                 contract = payload.get("completion_contract")
                 if isinstance(contract, dict):
@@ -138,6 +206,17 @@ class ContractCompiler:
                 ref = payload.get("verification_report_ref")
                 if isinstance(ref, dict):
                     reports.append(VerificationReportRef.from_mapping(ref))
+        latest_completion_by_subtask = {
+            completion.subtask_id: completion
+            for completion in completions
+            if completion.subtask_id
+        }
+        completions = [
+            completion
+            for completion in completions
+            if not completion.subtask_id
+            or latest_completion_by_subtask.get(completion.subtask_id) is completion
+        ]
         return ContractBundle(
             run_id=run_id,
             workspace_id=self.workspace_id,
@@ -147,4 +226,5 @@ class ContractCompiler:
             completions=tuple(completions),
             verification_reports=tuple(reports),
             issues=tuple(issues),
+            risk=risk,
         )

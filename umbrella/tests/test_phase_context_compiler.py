@@ -1,8 +1,13 @@
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 from umbrella.context.compiler import compile_phase_context
 from umbrella.context.render import bundle_to_overlay_dict, persist_llm_input_bundle
+from umbrella.orchestrator.worker import (
+    authoritative_artifacts_for_phase,
+    render_phase_user_prompt,
+)
 from umbrella.phases.base import PhaseNode
 from umbrella.phases.registry import get_registry
 
@@ -10,6 +15,65 @@ from umbrella.phases.registry import get_registry
 def _manifest(phase_id: str):
     repo = Path(__file__).resolve().parents[2]
     return get_registry(repo / "umbrella" / "phases" / "manifests").get(phase_id)
+
+
+def _empty_recall():
+    return SimpleNamespace(always_on=[], hot=[], warm=[])
+
+
+def test_plan_review_prompt_references_handoff_without_inlining(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan_submitted_latest.json").write_text(
+        json.dumps({"run_id": "run-1", "plan": {"notes": "BIG_PLAN_BODY"}}),
+        encoding="utf-8",
+    )
+    (state / "research_summary_latest.json").write_text(
+        json.dumps({"run_id": "run-1", "notes": "BIG_RESEARCH_BODY"}),
+        encoding="utf-8",
+    )
+
+    artifacts = authoritative_artifacts_for_phase(
+        manifest_id="plan_review",
+        drive_root=drive,
+        run_id="run-1",
+    )
+    prompt = render_phase_user_prompt(
+        _manifest("plan_review"),
+        _empty_recall(),
+        authoritative_artifacts=artifacts,
+    )
+
+    assert "BIG_PLAN_BODY" not in prompt
+    assert "BIG_RESEARCH_BODY" not in prompt
+    assert "READ REQUIRED" in prompt
+    assert 'read_file(file_path=".memory/drive/state/phase_plan_submitted_latest.json")' in prompt
+
+
+def test_research_review_prompt_references_summary_without_inlining(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "research_summary_latest.json").write_text(
+        json.dumps({"run_id": "run-2", "notes": "BIG_RESEARCH_BODY"}),
+        encoding="utf-8",
+    )
+
+    artifacts = authoritative_artifacts_for_phase(
+        manifest_id="research_review",
+        drive_root=drive,
+        run_id="run-2",
+    )
+    prompt = render_phase_user_prompt(
+        _manifest("research_review"),
+        _empty_recall(),
+        authoritative_artifacts=artifacts,
+    )
+
+    assert "BIG_RESEARCH_BODY" not in prompt
+    assert "READ REQUIRED" in prompt
+    assert 'read_file(file_path=".memory/drive/state/research_summary_latest.json")' in prompt
 
 
 def test_phase_context_compiler_execute_includes_active_subtask_scope(tmp_path: Path) -> None:
@@ -34,13 +98,35 @@ def test_phase_context_compiler_execute_includes_active_subtask_scope(tmp_path: 
         phase_prompt_sections=[{"path": "execute.system.md", "text": "Execute prompt"}],
         authoritative_artifacts=[],
         recall_bundle={"hot": [{"id": "mem-1", "content": "prior finding"}]},
+        capability_envelope={
+            "phase": "execute",
+            "workspace_write": {"allowed": True},
+            "shell": {"allowed": True},
+            "memory_write": {"allowed_kinds": ["observation"]},
+            "verification": {"candidate_workspace_writable": True},
+            "runtime_capabilities": {"python": True},
+            "active_subtask": {
+                "id": "scaffold",
+                "proof_contract": active["proof"],
+                "oracle_freeze_policy": {"no_test_tampering": False},
+            },
+        },
         drive_root=drive,
     )
+    assert bundle.active_subtask_id == "scaffold"
     assert bundle.active_subtask == active
     assert len(bundle.memory_items) == 1
-    assert any(item.role == "active_subtask" for item in bundle.user_sections)
+    assert any(item.role == "phase_envelope" for item in bundle.user_sections)
+    assert any(item.id == "current_phase_envelope" for item in bundle.user_sections)
     assert bundle.workspace_inventory is not None
     assert "src/demo/app.py" in bundle.workspace_inventory.missing_declared_files
+    overlay = bundle_to_overlay_dict(bundle)
+    assert overlay["active_subtask_id"] == "scaffold"
+    assert overlay["active_subtask"]["id"] == "scaffold"
+    capability_envelope = overlay["capability_envelope"]
+    assert capability_envelope["runtime_capabilities"] == {"python": True}
+    assert capability_envelope["active_subtask"]["id"] == "scaffold"
+    assert capability_envelope["active_subtask"]["proof_contract"] == active["proof"]
 
 
 def test_phase_context_compiler_execute_excludes_stale_proposal_as_authoritative(

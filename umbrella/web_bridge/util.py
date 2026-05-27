@@ -31,6 +31,12 @@ DEFAULT_MODELS = [
         "context": 200000,
     },
     {
+        "id": "GLM-4.7",
+        "name": "GLM-4.7",
+        "provider": "openai",
+        "context": 200000,
+    },
+    {
         "id": "umbrella-7b",
         "name": "Umbrella 7B (local)",
         "provider": "umbrella",

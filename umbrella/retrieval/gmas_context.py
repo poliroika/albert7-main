@@ -92,8 +92,10 @@ def build_gmas_context(
         "estimated_context_tokens": est_final,
         "token_budget": budget,
         "policy_hint": (
-            "Use this context before writing GMAS-based agents. Prefer copied "
-            "patterns from gmas/examples, gmas/docs, and gmas/src over memory-only code."
+            "Use this context before writing GMAS-based agents. Implement only "
+            "symbols/files shown here. Prefer gmas/examples and gmas/src patterns; "
+            "adapt them into workspace code. Do not guess helpers such as LLMClient "
+            "unless they appear in key_symbols or results."
         ),
     }
 

@@ -18,3 +18,5 @@ Steps:
 - Re-run the failing command first, then broader verification.
 
 Do not hide failures with bypasses or weaker checks.
+
+When a tool returns `allowed_next_tools`, only call tools from that list until the gate clears.

@@ -11,7 +11,7 @@ from umbrella.evals.memory_scenarios.llm_judge import judge_memory_behavior
 from umbrella.evals.memory_scenarios.runner import MemoryScenarioRunner
 from umbrella.evals.memory_scenarios.scenario_loader import load_scenario
 
-pytestmark = pytest.mark.memory_llm_real
+pytestmark = [pytest.mark.llm_memory, pytest.mark.memory_llm_real]
 
 LLM_SCENARIOS_DIR = (
     REPO_ROOT / "umbrella" / "evals" / "memory_scenarios" / "scenarios" / "llm"
@@ -19,7 +19,9 @@ LLM_SCENARIOS_DIR = (
 
 
 def _enabled() -> bool:
-    return os.environ.get("UMBRELLA_MEMORY_LLM_REAL_TESTS", "").strip() == "1"
+    return os.environ.get("UMBRELLA_MEMORY_LLM_REAL_TESTS", "").strip() == "1" or (
+        os.environ.get("UMBRELLA_RUN_LLM_MEMORY_SCENARIOS", "").strip() == "1"
+    )
 
 
 @pytest.mark.skipif(not _enabled(), reason="Set UMBRELLA_MEMORY_LLM_REAL_TESTS=1")

@@ -11,8 +11,6 @@ boundary that must hold for all domains:
 * phase/tool/path decisions return typed issue codes for regression tests.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
@@ -23,6 +21,7 @@ from typing import Any, Iterable
 
 _WRITE_TOOLS = {
     "apply_workspace_patch",
+    "replace_workspace_file",
     "delete_workspace_file",
     "sandbox_self_edit",
     "claude_code_edit",
@@ -115,15 +114,32 @@ def phase_from_context(ctx: Any) -> str:
     """Return the current phase id from a PhaseRunner/Ouroboros context."""
 
     for attr in ("phase", "phase_id", "current_phase"):
-        value = str(getattr(ctx, attr, "") or "").strip()
+        value = str(getattr(ctx, attr, "") or "").strip().lower()
         if value in _KNOWN_PHASES:
             return value
+    overlays = getattr(ctx, "context_overlays", None)
+    if isinstance(overlays, dict):
+        for key in ("phase_node", "phase_manifest"):
+            value = overlays.get(key)
+            if not isinstance(value, dict):
+                continue
+            for field in ("id", "manifest_id"):
+                phase_id = str(value.get(field) or "").strip().lower()
+                if phase_id in _KNOWN_PHASES:
+                    return phase_id
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if ":" in task_id:
-        suffix = task_id.rsplit(":", 1)[-1].strip()
-        if suffix in _KNOWN_PHASES:
-            return suffix
-    label = str(getattr(ctx, "phase_label", "") or "").strip()
+        for part in reversed(task_id.split(":")):
+            phase_id = part.strip().lower()
+            if phase_id in _KNOWN_PHASES:
+                return phase_id
+    view = getattr(ctx, "loop_state_view", None)
+    if isinstance(view, dict):
+        for key in ("umbrella_phase_id", "phase_id", "current_phase_id", "phase_label"):
+            phase_id = str(view.get(key) or "").strip().lower()
+            if phase_id in _KNOWN_PHASES:
+                return phase_id
+    label = str(getattr(ctx, "phase_label", "") or "").strip().lower()
     if label in _KNOWN_PHASES:
         return label
     return ""

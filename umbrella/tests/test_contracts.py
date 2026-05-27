@@ -28,7 +28,7 @@ from umbrella.contracts import (
     workspace_hash,
 )
 from umbrella.contracts.compiler import ContractCompiler
-from umbrella.contracts.plan_ir import compile_phase_plan
+from umbrella.contracts.plan_ir import canonicalize_phase_plan, compile_phase_plan
 from umbrella.contracts.schemas import REVIEW_ISSUE_SCHEMA, VALID_REVIEW_CODES
 from umbrella.contracts.validators import VALID_REVIEW_CODES as VALIDATOR_REVIEW_CODES
 from umbrella.enforcement.ledger import append_supervisor_ledger_event
@@ -83,6 +83,136 @@ def test_review_issue_schema_enum_matches_validator_codes():
     assert "greenfield_python_src_layout_policy" in schema_codes
 
 
+def test_compile_phase_plan_preserves_context_contract_fields():
+    plan, issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "gui-runtime-proof",
+                    "title": "GUI runtime proof",
+                    "goal": "Launch the desktop calculator and verify one click path.",
+                    "files_to_change": ["src/calculator_app.py"],
+                    "allowed_tools": ["shell"],
+                    "allowed_skills": ["desktop-gui-testing"],
+                    "codeptr_refs": ["ek:tkinter-button-grid"],
+                    "mcp_refs": ["display-server"],
+                    "memory_scope": {
+                        "assets": [
+                            {
+                                "kind": "knowledge_md",
+                                "ref": "ek:tkinter-button-grid",
+                                "inject_mode": "preload",
+                            }
+                        ],
+                        "notes": "Load GUI testing guidance before proof.",
+                    },
+                    "proof": {
+                        "execution": {
+                            "kind": "command",
+                            "command": ["python", "scripts/gui_smoke.py"],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": ["runtime_started"],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/calculator_app.py"],
+                            "changed_files_expected": ["src/calculator_app.py"],
+                        },
+                    },
+                }
+            ]
+        },
+        run_id="run-1",
+        workspace_id="calculator",
+    )
+
+    assert issues == []
+    assert plan is not None
+    subtask = plan.subtasks[0]
+    assert subtask.memory_scope["notes"] == "Load GUI testing guidance before proof."
+    assert subtask.allowed_tools == ("shell",)
+    assert subtask.allowed_skills == ("desktop-gui-testing",)
+    assert subtask.codeptr_refs == ("ek:tkinter-button-grid",)
+    assert subtask.mcp_refs == ("display-server",)
+
+
+def test_canonicalize_phase_plan_flattens_legacy_phase_aliases():
+    plan = canonicalize_phase_plan(
+        {
+            "plan_id": "demo",
+            "workspace_id": "calculator",
+            "phases": [
+                {
+                    "id": "gui",
+                    "title": "GUI wrapper",
+                    "subtasks": [
+                        {
+                            "id": "gui-runtime",
+                            "title": "GUI runtime",
+                            "goal": "Launch and click the calculator.",
+                            "proof": {
+                                "execution": {
+                                    "kind": "command",
+                                    "command": ["python", "tests/gui_smoke.py"],
+                                },
+                                "oracle": {
+                                    "oracle_type": "unit_assertions",
+                                    "required_properties": ["runtime_started"],
+                                },
+                                "scope": {
+                                    "files_under_test": ["src/calculator_app.py"],
+                                    "changed_files_expected": ["src/calculator_app.py"],
+                                },
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert plan["plan_id"] == "demo"
+    assert plan["workspace_id"] == "calculator"
+    assert "phases" not in plan
+    assert [item["id"] for item in plan["subtasks"]] == ["gui-runtime"]
+
+
+def test_compile_phase_plan_rejects_unknown_proof_metadata_key():
+    plan, issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "gui-runtime",
+                    "title": "GUI runtime",
+                    "goal": "Launch and click the calculator.",
+                    "proof": {
+                        "execution": {
+                            "kind": "command",
+                            "command": ["python", "tests/gui_smoke.py"],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": ["runtime_started"],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/calculator_app.py"],
+                            "changed_files_expected": ["src/calculator_app.py"],
+                        },
+                        "ant i_gaming": {"requires_real_runtime": True},
+                    },
+                }
+            ]
+        },
+        run_id="run-1",
+        workspace_id="calculator",
+    )
+
+    assert plan is not None
+    assert any(issue.code == "invalid_plan_contract" for issue in issues)
+    assert "`ant i_gaming`" in " ".join(issue.message for issue in issues)
+
+
 def test_unknown_contract_version_fails():
     envelope = ContractEnvelope(
         schema_name="plan",
@@ -123,7 +253,11 @@ def test_plan_contract_blocks_candidate_control_paths_and_workspace_escapes():
                     "id": "control",
                     "title": "control file",
                     "goal": "bad plan",
-                    "files_to_change": ["workspace.toml", ".git/config"],
+                    "files_to_change": [
+                        "workspace.toml",
+                        ".git/config",
+                        "workspaces/calculator/workspace.toml",
+                    ],
                     "proof": {
                         "execution": {
                             "kind": "pytest",
@@ -154,6 +288,227 @@ def test_plan_contract_blocks_candidate_control_paths_and_workspace_escapes():
     codes = _codes(issues)
     assert "candidate_control_path_forbidden" in codes
     assert "candidate_path_outside_workspace" in codes
+    assert any(
+        "workspaces/calculator/workspace.toml" in issue.message
+        and "repository-relative" in issue.message
+        for issue in issues
+    )
+
+
+def test_plan_contract_requires_no_test_tampering_on_test_changing_subtask():
+    plan, compile_issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "core",
+                    "title": "Core",
+                    "goal": "Implement core and tests.",
+                    "files_to_create": ["src/app.py", "tests/test_app.py"],
+                    "proof": {
+                        "execution": {
+                            "kind": "pytest",
+                            "command": ["python", "-m", "pytest", "tests/test_app.py", "-q"],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": ["distinct_inputs_distinct_outputs"],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/app.py"],
+                            "changed_files_expected": ["src/app.py", "tests/test_app.py"],
+                            "pytest_targets": ["tests/test_app.py"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert compile_issues == []
+    assert plan is not None
+    issues = ContractValidator.validate(
+        ContractBundle(run_id="r", workspace_id="ws", plan=plan)
+    )
+
+    assert "test_tampering_risk" in _codes(issues)
+    assert any(issue.subtask_id == "core" for issue in issues)
+
+
+def test_plan_contract_accepts_no_test_tampering_on_same_subtask():
+    plan, compile_issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "core",
+                    "title": "Core",
+                    "goal": "Implement core and tests.",
+                    "files_to_create": ["src/app.py", "tests/test_app.py"],
+                    "proof": {
+                        "execution": {
+                            "kind": "pytest",
+                            "command": ["python", "-m", "pytest", "tests/test_app.py", "-q"],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": [
+                                "distinct_inputs_distinct_outputs",
+                                "no_test_tampering",
+                            ],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/app.py"],
+                            "changed_files_expected": ["src/app.py", "tests/test_app.py"],
+                            "pytest_targets": ["tests/test_app.py"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert compile_issues == []
+    assert plan is not None
+    issues = ContractValidator.validate(
+        ContractBundle(run_id="r", workspace_id="ws", plan=plan)
+    )
+
+    assert "test_tampering_risk" not in _codes(issues)
+
+
+def test_no_test_tampering_scope_cannot_overlap_only_changed_test_file():
+    plan, compile_issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "setup",
+                    "title": "Setup",
+                    "goal": "Create package and tests.",
+                    "files_to_create": [
+                        "pyproject.toml",
+                        "src/app/__init__.py",
+                        "tests/__init__.py",
+                    ],
+                    "proof": {
+                        "execution": {
+                            "kind": "import_check",
+                            "command": [
+                                "python",
+                                "-c",
+                                "import sys; sys.path.insert(0, 'src'); import app",
+                            ],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": ["module_imports", "no_test_tampering"],
+                        },
+                        "scope": {
+                            "files_under_test": ["tests/__init__.py"],
+                            "changed_files_expected": [
+                                "pyproject.toml",
+                                "src/app/__init__.py",
+                                "tests/__init__.py",
+                            ],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert compile_issues == []
+    assert plan is not None
+    issues = ContractValidator.validate(
+        ContractBundle(run_id="r", workspace_id="ws", plan=plan)
+    )
+
+    assert "proof_scope_mismatch" in _codes(issues)
+    assert any(
+        issue.subtask_id == "setup"
+        and "test-file overlap alone" in issue.message
+        for issue in issues
+    )
+
+
+def test_no_test_tampering_scope_allows_pure_test_verification_subtask():
+    plan, compile_issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "e2e-tests",
+                    "title": "E2E tests",
+                    "goal": "Add a verification-only test.",
+                    "files_to_create": ["tests/test_e2e.py"],
+                    "proof": {
+                        "execution": {
+                            "kind": "pytest",
+                            "command": ["python", "-m", "pytest", "tests/test_e2e.py", "-q"],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": ["runtime_started", "no_test_tampering"],
+                        },
+                        "scope": {
+                            "files_under_test": ["tests/test_e2e.py"],
+                            "changed_files_expected": ["tests/test_e2e.py"],
+                            "pytest_targets": ["tests/test_e2e.py"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert compile_issues == []
+    assert plan is not None
+    issues = ContractValidator.validate(
+        ContractBundle(run_id="r", workspace_id="ws", plan=plan)
+    )
+
+    assert "proof_scope_mismatch" not in _codes(issues)
+
+
+def test_plan_contract_allows_workspace_toml_as_workspace_manifest_path():
+    plan, compile_issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "workspace-manifest",
+                    "title": "workspace manifest",
+                    "goal": "Add workspace verification metadata.",
+                    "files_to_change": ["workspace.toml"],
+                    "proof": {
+                        "execution": {
+                            "kind": "pytest",
+                            "command": ["python", "-m", "pytest", "tests/test_app.py", "-q"],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": ["distinct_inputs_distinct_outputs"],
+                            "negative_cases_required": True,
+                        },
+                        "scope": {
+                            "files_under_test": ["src/app.py"],
+                            "changed_files_expected": ["src/app.py", "workspace.toml"],
+                            "pytest_targets": ["tests/test_app.py"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert compile_issues == []
+    assert plan is not None
+    issues = ContractValidator.validate(
+        ContractBundle(run_id="r", workspace_id="ws", plan=plan)
+    )
+
+    assert "candidate_control_path_forbidden" not in _codes(issues)
 
 
 def test_valid_pytest_proof_passes_contract_validation():
@@ -481,6 +836,99 @@ def test_contract_compiler_keeps_plan_review_after_latest_submitted_plan(
     assert len(bundle.reviews) == 1
     assert "weak_proof" in _codes(
         ContractValidator.validate(bundle, context=context)
+    )
+
+
+def test_contract_compiler_does_not_treat_available_llm_as_llm_task(
+    tmp_path: Path,
+) -> None:
+    repo, workspace, workspace_id = _workspace(tmp_path)
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "capability_declaration.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "status": "submitted",
+                "workspace_id": workspace_id,
+                "capabilities": {
+                    "python": {"available": True, "source": "probe"},
+                    "subprocess": {"available": True, "source": "probe"},
+                    "llm_api": {"available": True, "source": "probe"},
+                },
+                "notes": "LLM runtime is available to the runner, but this plan is ordinary Python code.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state / "phase_plan_submitted_latest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "workspace_id": workspace_id,
+                "plan_id": "phase_plan:calculator",
+                "plan": {
+                    "subtasks": [
+                        {
+                            "id": "core",
+                            "title": "Calculator core",
+                            "goal": "Implement deterministic arithmetic.",
+                            "files_to_create": [
+                                "src/calculator/core.py",
+                                "tests/test_calculator_core.py",
+                            ],
+                            "proof": {
+                                "execution": {
+                                    "kind": "pytest",
+                                    "command": [
+                                        "python",
+                                        "-m",
+                                        "pytest",
+                                        "tests/test_calculator_core.py",
+                                        "-q",
+                                    ],
+                                },
+                                "oracle": {
+                                    "oracle_type": "unit_assertions",
+                                    "required_properties": [
+                                        "distinct_inputs_distinct_outputs",
+                                        "no_test_tampering",
+                                    ],
+                                },
+                                "scope": {
+                                    "files_under_test": ["src/calculator/core.py"],
+                                    "changed_files_expected": [
+                                        "src/calculator/core.py",
+                                        "tests/test_calculator_core.py",
+                                    ],
+                                    "pytest_targets": ["tests/test_calculator_core.py"],
+                                },
+                                "anti_gaming": {"requires_real_runtime": True},
+                            },
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = ContractCompiler.from_run(
+        repo_root=repo,
+        drive_root=drive,
+        workspace_id=workspace_id,
+        run_id="run-1",
+    )
+    context = build_workspace_context(
+        repo_root=repo,
+        workspace_root=workspace,
+        workspace_id=workspace_id,
+    )
+
+    assert bundle.risk.llm_or_prompt_logic is False
+    assert "missing_behavioral_oracle" not in _codes(
+        ContractValidator.validate(bundle, context=context, exit_phase="plan")
     )
 
 
@@ -823,7 +1271,7 @@ def test_verification_report_hash_and_workspace_mismatch_fail(tmp_path: Path):
     assert "verification_report_hash_mismatch" in _codes(
         validate_verification_report_ref(bad_hash, context=context)
     )
-    assert "workspace_hash_mismatch" in _codes(
+    assert "proof_stale_rerun_required" in _codes(
         validate_verification_report_ref(stale_workspace, context=context)
     )
 

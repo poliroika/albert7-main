@@ -1,5 +1,6 @@
 """BKB parsing, lifecycle filtering, and conflict resolution."""
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,10 @@ from typing import Any
 import yaml
 
 from umbrella.memory.proactive.models import BeliefRule, BkbConflictError
+
+log = logging.getLogger(__name__)
+
+_PLATFORM_BKB_PATH = Path(__file__).with_name("platform_bkb_rules.yaml")
 
 _SCOPE_PRECEDENCE = {
     "constitution": 0,
@@ -250,6 +255,85 @@ def resolve_bkb_conflicts(
             pool = [r for r in pool if r not in losers]
         winners.append(winner)
     return winners, conflicts
+
+
+def _belief_rule_to_mapping(rule: BeliefRule) -> dict[str, Any]:
+    payload = {
+        "id": rule.id,
+        "title": rule.title,
+        "scope": rule.scope,
+        "type": rule.rule_type,
+        "status": rule.status,
+        "trust": rule.trust,
+        "applies_to": rule.applies_to or {},
+        "rule": rule.rule or {},
+    }
+    if rule.source_evidence:
+        payload["source_evidence"] = rule.source_evidence
+    if rule.supersedes:
+        payload["supersedes"] = rule.supersedes
+    if rule.superseded_by:
+        payload["superseded_by"] = rule.superseded_by
+    for key, value in (
+        ("strength", rule.strength),
+        ("confidence", rule.confidence),
+        ("support_count", rule.support_count),
+        ("contradiction_count", rule.contradiction_count),
+        ("created_at", rule.created_at),
+        ("last_verified_at", rule.last_verified_at),
+        ("expires_at", rule.expires_at),
+        ("source_backend", rule.source_backend),
+        ("lifecycle_reason", rule.lifecycle_reason),
+    ):
+        if value not in ("", None, 0, 0.0):
+            payload[key] = value
+    return payload
+
+
+def _raw_bkb_rules(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    raw_rules = data.get("rules") if isinstance(data, dict) else data
+    if not isinstance(raw_rules, list):
+        return []
+    return [dict(item) for item in raw_rules if isinstance(item, dict)]
+
+
+def merge_bkb_rules(path: Path, rules: list[dict[str, Any]]) -> None:
+    """Merge raw BKB rule mappings into ``path`` by stable rule id."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    merged: dict[str, dict[str, Any]] = {}
+    anonymous: list[dict[str, Any]] = []
+    for item in [*_raw_bkb_rules(target), *rules]:
+        if not isinstance(item, dict):
+            continue
+        rule_id = str(item.get("id") or "").strip()
+        if not rule_id:
+            anonymous.append(dict(item))
+            continue
+        merged[rule_id] = dict(item)
+    payload = {"rules": [*anonymous, *merged.values()]}
+    target.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def ensure_platform_bkb_rules(manager_core_root: Path) -> None:
+    """Merge bundled platform rules into manager core bkb.yaml by rule id."""
+    platform_rules = load_bkb_rules(_PLATFORM_BKB_PATH)
+    if not platform_rules:
+        return
+    target = Path(manager_core_root) / "bkb.yaml"
+    try:
+        merge_bkb_rules(target, [_belief_rule_to_mapping(rule) for rule in platform_rules])
+    except OSError:
+        log.debug("failed to write merged platform BKB rules", exc_info=True)
 
 
 def format_bkb_section(rules: list[BeliefRule], *, max_chars: int) -> tuple[str, list[str]]:

@@ -38,3 +38,8 @@ assert:
     single_always_loaded: true
     contract:
       present: true
+    overlay:
+      max_tokens: 1000
+      required_sections:
+        - "Identity"
+        - "BKB (verified"

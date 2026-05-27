@@ -24,6 +24,7 @@ from ouroboros.llm import (
     LLMClient,
     normalize_reasoning_effort,
     add_usage,
+    format_llm_exception_for_user_log,
     llm_error_looks_like_html_tunnel_page,
 )
 from ouroboros.tools.registry import ToolRegistry
@@ -32,6 +33,13 @@ from ouroboros.deadline import (
     DEADLINE_AFTER_LLM_RESPONSE,
     DEADLINE_BEFORE_NEXT_ROUND,
     check_runtime_deadline,
+)
+from ouroboros.limits import (
+    DISCOVERY_CONTENT_CHARS,
+    PHASE_ERROR_ARTIFACT_CHARS,
+    TOOL_LOG_PREVIEW_CHARS,
+    TOOL_RESULT_TO_MODEL_CHARS,
+    TOOL_TRACE_SNIPPET_CHARS,
 )
 from ouroboros.utils import (
     utc_now_iso,
@@ -253,6 +261,32 @@ def _message_summary(message: dict[str, Any], index: int) -> dict[str, Any]:
     }
 
 
+def _message_full(message: dict[str, Any], index: int) -> dict[str, Any]:
+    content = _redact_sensitive(_content_to_text(message.get("content")))
+    tool_payloads = []
+    for tool_call in message.get("tool_calls") or []:
+        fn_name = str(tool_call.get("function", {}).get("name") or "")
+        args = _safe_tool_args_json(tool_call)
+        tool_payloads.append(
+            {
+                "id": str(tool_call.get("id") or ""),
+                "type": str(tool_call.get("type") or "function"),
+                "name": fn_name,
+                "args": sanitize_tool_args_for_log(fn_name, args),
+            }
+        )
+    return {
+        "index": index,
+        "role": message.get("role"),
+        "name": message.get("name"),
+        "tool_call_id": message.get("tool_call_id"),
+        "content": content,
+        "content_chars": len(content),
+        "tool_call_count": len(tool_payloads),
+        "tool_calls": tool_payloads,
+    }
+
+
 def _round_input_snapshot(messages: list[dict[str, Any]]) -> dict[str, Any]:
     role_counts: dict[str, int] = {}
     for message in messages:
@@ -271,6 +305,21 @@ def _round_input_snapshot(messages: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _round_full_input_snapshot(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    role_counts: dict[str, int] = {}
+    for message in messages:
+        role = str(message.get("role") or "unknown")
+        role_counts[role] = role_counts.get(role, 0) + 1
+    return {
+        "message_count": len(messages),
+        "estimated_tokens": estimate_tokens(messages),
+        "role_counts": role_counts,
+        "messages": [
+            _message_full(message, idx) for idx, message in enumerate(messages)
+        ],
+    }
+
+
 def _round_output_snapshot(msg: dict[str, Any]) -> dict[str, Any]:
     content = _redact_sensitive(_content_to_text(msg.get("content")))
     tool_payloads = []
@@ -283,7 +332,7 @@ def _round_output_snapshot(msg: dict[str, Any]) -> dict[str, Any]:
                 "args": sanitize_tool_args_for_log(fn_name, args),
             }
         )
-    preview = content[:4000]
+    preview = content[:DISCOVERY_CONTENT_CHARS]
     if len(content) > len(preview):
         preview += "\n[truncated]"
     return {
@@ -294,6 +343,71 @@ def _round_output_snapshot(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _full_round_io_enabled(task_type: str) -> bool:
+    raw = os.environ.get("OUROBOROS_FULL_ROUND_IO", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on", "all"}:
+        return True
+    return task_type == "phase_run"
+
+
+def _full_round_io_path(
+    drive_logs: pathlib.Path,
+    *,
+    task_id: str,
+    round_idx: int,
+    ts: str,
+) -> pathlib.Path:
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id or "task").strip("._-")
+    safe_ts = re.sub(r"[^A-Za-z0-9_.-]+", "_", ts or utc_now_iso()).strip("._-")
+    return (
+        drive_logs
+        / "round_io_full"
+        / f"{(safe_task or 'task')[:120]}_round_{round_idx:04d}_{safe_ts[:32]}.json"
+    )
+
+
+def _write_full_round_io(
+    drive_logs: pathlib.Path,
+    *,
+    task_id: str,
+    round_idx: int,
+    round_event: dict[str, Any],
+    input_snapshot: dict[str, Any],
+    output: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+) -> str:
+    ts = str(round_event.get("ts") or utc_now_iso())
+    path = _full_round_io_path(
+        drive_logs,
+        task_id=task_id,
+        round_idx=round_idx,
+        ts=ts,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "ts": ts,
+                "type": "round_io_full",
+                "task_id": task_id,
+                "round": round_idx,
+                "phase": round_event.get("phase"),
+                "model": round_event.get("model"),
+                "round_event": round_event,
+                "input": input_snapshot,
+                "output": output,
+                "error": error,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
 def _append_round_io(
     drive_logs: pathlib.Path,
     *,
@@ -302,8 +416,20 @@ def _append_round_io(
     round_event: dict[str, Any],
     input_snapshot: dict[str, Any],
     msg: dict[str, Any],
+    full_input_snapshot: dict[str, Any] | None = None,
 ) -> None:
     try:
+        output_snapshot = _round_output_snapshot(msg)
+        full_input_path = ""
+        if full_input_snapshot is not None:
+            full_input_path = _write_full_round_io(
+                drive_logs,
+                task_id=task_id,
+                round_idx=round_idx,
+                round_event=round_event,
+                input_snapshot=full_input_snapshot,
+                output=output_snapshot,
+            )
         append_jsonl(
             drive_logs / "round_io.jsonl",
             {
@@ -314,11 +440,49 @@ def _append_round_io(
                 "phase": round_event.get("phase"),
                 "model": round_event.get("model"),
                 "input": input_snapshot,
-                "output": _round_output_snapshot(msg),
+                "output": output_snapshot,
+                "full_input_path": full_input_path,
             },
         )
     except Exception:
         log.debug("Failed to append round IO trace", exc_info=True)
+
+
+def _append_round_io_error(
+    drive_logs: pathlib.Path,
+    *,
+    task_id: str,
+    round_idx: int,
+    round_event: dict[str, Any],
+    input_snapshot: dict[str, Any],
+    error: dict[str, Any],
+) -> None:
+    try:
+        full_input_path = _write_full_round_io(
+            drive_logs,
+            task_id=task_id,
+            round_idx=round_idx,
+            round_event=round_event,
+            input_snapshot=input_snapshot,
+            error=error,
+        )
+        append_jsonl(
+            drive_logs / "round_io.jsonl",
+            {
+                "ts": round_event.get("ts") or utc_now_iso(),
+                "type": "round_io",
+                "task_id": task_id,
+                "round": round_idx,
+                "phase": round_event.get("phase"),
+                "model": round_event.get("model"),
+                "input": _round_input_snapshot([]),
+                "output": None,
+                "error": error,
+                "full_input_path": full_input_path,
+            },
+        )
+    except Exception:
+        log.debug("Failed to append full round IO error trace", exc_info=True)
 
 
 def _register_transient_event_pointer(
@@ -397,7 +561,9 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
     if not current:
         return False
     return any(
-        current == requested or current.startswith(f"{requested}__")
+        current == requested
+        or current.startswith(f"{requested}:")
+        or current.startswith(f"{requested}__")
         for requested in requested_ids
     )
 
@@ -623,7 +789,7 @@ def _last_tool_result_payload(messages: list[dict[str, Any]], tool_call_id: str)
             continue
         if str(msg.get("tool_call_id") or "") == str(tool_call_id):
             content = msg.get("content")
-            return str(content)[:4000] if content else ""
+            return str(content)[:DISCOVERY_CONTENT_CHARS] if content else ""
     return ""
 
 
@@ -737,15 +903,13 @@ STATEFUL_BROWSER_TOOLS = frozenset({"browse_page", "browser_action"})
 
 
 def _truncate_tool_result(result: Any) -> str:
-    """
-    Hard-cap tool result string to 15000 characters.
-    If truncated, append a note with the original length.
-    """
+    """Hard-cap tool result string before it enters the LLM chat."""
     result_str = str(result)
-    if len(result_str) <= 15000:
+    cap = TOOL_RESULT_TO_MODEL_CHARS
+    if len(result_str) <= cap:
         return result_str
     original_len = len(result_str)
-    return result_str[:15000] + f"\n... (truncated from {original_len} chars)"
+    return result_str[:cap] + f"\n... (truncated from {original_len} chars)"
 
 
 _FULL_RESULT_TRACE_TOOLS = frozenset(
@@ -879,10 +1043,20 @@ def _missing_terminating_tools_from_trace(
 
 def _format_rejected_termination_nudge(rejected: dict[str, str]) -> str:
     rendered = []
+    probe_recovery: list[str] = []
     for name, result in sorted(rejected.items()):
         one_line = " ".join(str(result or "").split())
-        rendered.append(f"- `{name}` returned: {one_line[:700]}")
+        rendered.append(f"- `{name}` returned: {one_line[:TOOL_TRACE_SNIPPET_CHARS]}")
+        match = re.search(r"\bprobes\.([a-z][a-z0-9_-]*)\b", one_line)
+        if "same-slug probe" in one_line and match:
+            probe_recovery.append(
+                f"- For `{name}`, include `probes.{match.group(1)}` inside "
+                "the next completion-tool call; it is an allowed capability "
+                "probe, not a separate shell step."
+            )
     body = "\n".join(rendered)
+    if probe_recovery:
+        body = body + "\nRecovery hint:\n" + "\n".join(probe_recovery)
     return (
         "[COMPLETION_TOOL_REJECTED]\n"
         "A phase-completion tool was called, but the tool did not accept "
@@ -1204,7 +1378,7 @@ def _handle_forbidden_tool_call(
                 "task_id": task_id,
                 "args": {},
                 "result_preview": sanitize_tool_result_for_log(
-                    truncate_for_log(delegated_result, 2000)
+                    truncate_for_log(delegated_result, TOOL_LOG_PREVIEW_CHARS)
                 ),
             },
         )
@@ -1449,12 +1623,13 @@ def _execute_tool_after_preflight(
             "task_id": task_id,
             "args": args_for_log,
             "result_preview": sanitize_tool_result_for_log(
-                truncate_for_log(result, 2000)
+                truncate_for_log(result, TOOL_LOG_PREVIEW_CHARS)
             ),
         },
     )
 
-    is_error = (not tool_ok) or str(result).startswith("⚠️")
+    result_text = str(result or "")
+    is_error = (not tool_ok) or result_text.lstrip().startswith(("⚠️", "ERROR:"))
     if not is_error:
         try:
             _PREFLIGHT_TRACKER.record_success(task_id)
@@ -1469,6 +1644,60 @@ def _execute_tool_after_preflight(
         args_for_log=args_for_log,
         is_code_tool=is_code_tool,
     )
+
+
+def _typed_action_gate_block(
+    *,
+    tools: Any,
+    fn_name: str,
+    tool_call_id: str,
+    is_code_tool: bool,
+) -> dict[str, Any] | None:
+    ctx = getattr(tools, "_ctx", None)
+    view = getattr(ctx, "loop_state_view", None) if ctx is not None else None
+    if not isinstance(view, dict):
+        return None
+    gate = view.get("typed_action_gate")
+    if isinstance(gate, dict):
+        blocked = {str(item) for item in (gate.get("blocked_tools") or [])}
+        if fn_name in blocked:
+            allowed = list(gate.get("allowed_next_tools") or [])
+            return _tool_execution_result(
+                tool_call_id=tool_call_id,
+                fn_name=fn_name,
+                result=json.dumps(
+                    {
+                        "status": "blocked",
+                        "reason": gate.get("reason") or "typed_action_gate",
+                        "allowed_next_tools": allowed,
+                        "blocked_tools": sorted(blocked),
+                    },
+                    ensure_ascii=False,
+                ),
+                is_error=True,
+                args_for_log={},
+                is_code_tool=is_code_tool,
+            )
+    session = view.get("completion_session")
+    if isinstance(session, dict):
+        allowed = {str(item) for item in (session.get("allowed_tools") or [])}
+        if allowed and fn_name not in allowed and fn_name not in {"read_file", "read_workspace_file"}:
+            return _tool_execution_result(
+                tool_call_id=tool_call_id,
+                fn_name=fn_name,
+                result=json.dumps(
+                    {
+                        "status": "blocked",
+                        "reason": "proof_stale_rerun_required",
+                        "allowed_next_tools": sorted(allowed | {"run_subtask_proof"}),
+                    },
+                    ensure_ascii=False,
+                ),
+                is_error=True,
+                args_for_log={},
+                is_code_tool=is_code_tool,
+            )
+    return None
 
 
 def _execute_single_tool(
@@ -1522,6 +1751,14 @@ def _execute_single_tool(
     )
     if forbidden_result is not None:
         return forbidden_result
+    typed_gate_result = _typed_action_gate_block(
+        tools=tools,
+        fn_name=fn_name,
+        tool_call_id=tool_call_id,
+        is_code_tool=is_code_tool,
+    )
+    if typed_gate_result is not None:
+        return typed_gate_result
     fn_name = tc["function"]["name"]
 
     preflight_result = _handle_tool_preflight_error(
@@ -2195,44 +2432,57 @@ def _consume_ctx_overrides(
     )
 
 
+def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
+    total = 0
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            total += estimate_tokens(content)
+        elif isinstance(content, list):
+            total += sum(
+                estimate_tokens(str(block.get("text", "")))
+                for block in content
+                if isinstance(block, dict)
+            )
+    return total
+
+
 def _auto_set_pending_compaction_for_overflow(
     messages: list[dict[str, Any]],
     ctx: Any,
+    *,
+    reserved_output_tokens: int = 0,
 ) -> None:
-    """If message history is huge, request tool-history compaction for this round."""
+    """If history (+ reserved completion budget) nears the model window, compact."""
     try:
         from umbrella.llm_budget import get_model_context_tokens
 
-        def _msg_tokens(m: dict[str, Any]) -> int:
-            c = m.get("content", "")
-            if isinstance(c, str):
-                return estimate_tokens(c)
-            if isinstance(c, list):
-                return sum(
-                    estimate_tokens(str(b.get("text", "")))
-                    for b in c
-                    if isinstance(b, dict)
-                )
-            return 0
-
-        ctx_tok = sum(_msg_tokens(m) for m in messages)
+        ctx_tok = _estimate_messages_tokens(messages)
+        reserved = max(0, int(reserved_output_tokens))
+        effective = ctx_tok + reserved
         limit = int(get_model_context_tokens())
         if getattr(ctx, "_pending_compaction", None) is not None:
             return
         if limit <= 0:
             return
-        if ctx_tok > limit * 0.80:
+        if effective > limit * 0.85 or ctx_tok > limit * 0.80:
             ctx._pending_compaction = 3
             log.info(
-                "[LOOP] auto-compact (aggressive keep_last=3): ~%s tokens > 0.80 * %s",
+                "[LOOP] auto-compact (aggressive keep_last=3): "
+                "~%s effective tokens (history=%s + reserved=%s) vs window %s",
+                effective,
                 ctx_tok,
+                reserved,
                 limit,
             )
-        elif ctx_tok > limit * 0.65:
+        elif effective > limit * 0.70 or ctx_tok > limit * 0.65:
             ctx._pending_compaction = 5
             log.info(
-                "[LOOP] auto-compact (keep_last=5): ~%s tokens > 0.65 * %s",
+                "[LOOP] auto-compact (keep_last=5): "
+                "~%s effective tokens (history=%s + reserved=%s) vs window %s",
+                effective,
                 ctx_tok,
+                reserved,
                 limit,
             )
     except Exception:
@@ -2280,6 +2530,11 @@ def _resolve_max_rounds() -> tuple[int, str]:
     if max_rounds == 0:
         log.info("[LOOP] MAX_ROUNDS unlimited (OUROBOROS_MAX_ROUNDS<=0)")
     return max_rounds, "∞" if max_rounds == 0 else str(max_rounds)
+
+
+def _rounds_label_for_log(label: str) -> str:
+    """ASCII-safe round cap label for console logging (Windows cp1252)."""
+    return "inf" if label == "∞" else label
 
 
 def _maybe_inject_self_check(
@@ -2535,11 +2790,7 @@ def _setup_dynamic_tools(
         return name not in phase_denied_tools
 
     def _handle_list_tools(ctx=None, **kwargs):
-        non_core = [
-            t
-            for t in tools_registry.list_non_core_tools()
-            if _phase_can_enable(str(t.get("name") or ""))
-        ]
+        non_core = _enableable_non_core_tools()
         if not non_core:
             if phase_allowed_tools is not None:
                 return (
@@ -2565,6 +2816,9 @@ def _setup_dynamic_tools(
             if name in phase_denied_tools:
                 not_allowed.append(name)
                 continue
+            if name in _active_schema_names():
+                enabled.append(f"{name} (already active)")
+                continue
             schema = tools_registry.get_schema_by_name(name)
             if schema and name not in enabled_extra:
                 tool_schemas.append(schema)
@@ -2586,19 +2840,32 @@ def _setup_dynamic_tools(
     tools_registry.override_handler("list_available_tools", _handle_list_tools)
     tools_registry.override_handler("enable_tools", _handle_enable_tools)
 
-    non_core_count = len(
-        [
+    def _active_schema_names() -> set[str]:
+        names: set[str] = set()
+        for schema in tool_schemas:
+            name = str((schema.get("function") or {}).get("name") or "")
+            if name and _phase_can_enable(name):
+                names.add(name)
+        return names
+
+    def _enableable_non_core_tools() -> list[dict[str, str]]:
+        active = _active_schema_names()
+        return [
             t
             for t in tools_registry.list_non_core_tools()
-            if _phase_can_enable(str(t.get("name") or ""))
+            if (name := str(t.get("name") or ""))
+            and _phase_can_enable(name)
+            and name not in active
         ]
-    )
-    if non_core_count > 0:
+
+    active_names = _active_schema_names()
+    non_core_count = len(_enableable_non_core_tools())
+    if "enable_tools" in active_names and non_core_count > 0:
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    f"Note: {len(tool_schemas)} tools are pre-loaded in your active set. "
+                    f"Note: {len(active_names)} tools are pre-loaded in your active set. "
                     f"Another {non_core_count} phase-available specialised tools exist but are not "
                     f"loaded by default — call `list_available_tools` to inspect them "
                     f"and `enable_tools` to activate any you need (their schemas will "
@@ -3765,7 +4032,19 @@ def _may_force_mark_subtask_complete(
 ) -> bool:
     if phase_write_tool_calls <= 0:
         return False
-    if _trace_has_passing_subtask_proof(trace_tool_calls):
+    active_subtask = _current_execute_subtask(drive_root)
+    active_subtask_id = ""
+    if isinstance(active_subtask, dict):
+        active_subtask_id = str(active_subtask.get("id") or "").strip()
+        if isinstance(active_subtask.get("proof"), dict):
+            return _trace_has_passing_subtask_proof(
+                trace_tool_calls,
+                subtask_id=active_subtask_id,
+            )
+    if _trace_has_passing_subtask_proof(
+        trace_tool_calls,
+        subtask_id=active_subtask_id,
+    ):
         return True
     success_text = _current_execute_success_test_text(drive_root)
     return _execute_success_test_observed(
@@ -3787,23 +4066,45 @@ def _trace_json_payload(item: dict[str, Any]) -> dict[str, Any]:
 
 def _latest_passing_subtask_proof_hint(
     trace_tool_calls: list[dict[str, Any]],
+    *,
+    subtask_id: str = "",
 ) -> dict[str, Any] | None:
+    expected_subtask = str(subtask_id or "").strip()
     for item in reversed(trace_tool_calls or []):
         if str(item.get("tool") or "") != "run_subtask_proof":
             continue
-        if not _tool_trace_entry_succeeded(item):
+        if item.get("is_error") is True:
             continue
         payload = _trace_json_payload(item)
-        if payload.get("passed") is not True:
-            continue
         hint = payload.get("completion_contract_hint")
+        args = item.get("args") if isinstance(item.get("args"), dict) else {}
+        payload_subtask = str(
+            payload.get("subtask_id")
+            or (hint.get("subtask_id") if isinstance(hint, dict) else "")
+            or args.get("subtask_id")
+            or ""
+        ).strip()
+        if expected_subtask and payload_subtask != expected_subtask:
+            continue
+        if payload.get("passed") is not True:
+            return None
         if isinstance(hint, dict) and hint:
             return hint
     return None
 
 
-def _trace_has_passing_subtask_proof(trace_tool_calls: list[dict[str, Any]]) -> bool:
-    return _latest_passing_subtask_proof_hint(trace_tool_calls) is not None
+def _trace_has_passing_subtask_proof(
+    trace_tool_calls: list[dict[str, Any]],
+    *,
+    subtask_id: str = "",
+) -> bool:
+    return (
+        _latest_passing_subtask_proof_hint(
+            trace_tool_calls,
+            subtask_id=subtask_id,
+        )
+        is not None
+    )
 
 
 def _mark_subtask_complete_forced_nudge_extra(
@@ -3811,8 +4112,11 @@ def _mark_subtask_complete_forced_nudge_extra(
     drive_root: pathlib.Path | None,
     trace_tool_calls: list[dict[str, Any]] | None,
 ) -> str:
-    hint = _latest_passing_subtask_proof_hint(list(trace_tool_calls or []))
     subtask_id = _current_execute_subtask_id(drive_root)
+    hint = _latest_passing_subtask_proof_hint(
+        list(trace_tool_calls or []),
+        subtask_id=subtask_id,
+    )
     if hint:
         hint_subtask = str(hint.get("subtask_id") or subtask_id or "").strip()
         return (
@@ -4465,7 +4769,7 @@ def _maybe_trip_completion_impasse(
         result = str(item.get("result") or "")
         is_error = (
             bool(item.get("is_error"))
-            or result.startswith("⚠️")
+            or result.lstrip().startswith(("⚠️", "ERROR:"))
             or '"status": "control_plane_error"' in result
         )
         if not is_error:
@@ -4495,7 +4799,7 @@ def _maybe_trip_completion_impasse(
             "tool": tool,
             "repeat_count": count,
             "normalized_error": normalized,
-            "last_error": result[:2000],
+            "last_error": result[:PHASE_ERROR_ARTIFACT_CHARS],
             "tool_args_preview": args_preview,
         }
         if drive_root:
@@ -4984,12 +5288,19 @@ def _handle_phase_tail_after_tool_round(
                 )
                 missing = set(terminating_tools) - accepted_total
                 if not missing:
+                    accepted_names = ", ".join(sorted(accepted_total))
+                    state.last_text = (
+                        "OK: Accepted phase-completion tool(s): " + accepted_names
+                    )
                     log.info(
                         "[LOOP] <<< Phase '%s' exited: accepted terminating tool(s) %s",
                         phase_label,
                         ",".join(sorted(accepted_total)),
                     )
-                    return None, "terminated"
+                    return (
+                        (state.last_text, state.accumulated_usage, state.llm_trace),
+                        "terminated",
+                    )
                 messages.append(
                     {
                         "role": "system",
@@ -5130,6 +5441,7 @@ def _prepare_llm_phase_round(
     max_global_rounds: int,
     memory_hooks: Any,
     available_tool_names: set[str] | None = None,
+    reserved_output_tokens: int = 0,
 ) -> None:
     _maybe_inject_self_check(
         state.round_idx,
@@ -5169,7 +5481,11 @@ def _prepare_llm_phase_round(
     _drain_incoming_messages(
         messages, incoming_messages, drive_root, task_id, event_queue, owner_msg_seen
     )
-    _auto_set_pending_compaction_for_overflow(messages, tools._ctx)
+    _auto_set_pending_compaction_for_overflow(
+        messages,
+        tools._ctx,
+        reserved_output_tokens=reserved_output_tokens,
+    )
     messages[:] = _maybe_compact_history(messages, tools._ctx, state.round_idx)
 
 
@@ -5199,7 +5515,7 @@ def _start_llm_phase_round(
     log.info(
         "[LOOP] === Round %d/%s | phase=%s | model=%s | effort=%s | cost=$%.4f ===",
         state.round_idx,
-        max_rounds_label,
+        _rounds_label_for_log(max_rounds_label),
         phase_label,
         state.active_model,
         state.active_effort,
@@ -5397,6 +5713,10 @@ def _run_llm_phase(
             max_global_rounds=max_global_rounds,
             memory_hooks=memory_hooks,
             available_tool_names=allowed_tool_names,
+            reserved_output_tokens=_resolve_tool_round_max_tokens(
+                state.active_max_tokens,
+                bool(tool_schemas),
+            ),
         )
 
         (
@@ -6765,8 +7085,11 @@ def _call_llm_with_retry(
     last_error: Exception | None = None
 
     for attempt in range(max_retries):
+        full_input_snapshot: dict[str, Any] | None = None
         try:
             input_snapshot = _round_input_snapshot(messages)
+            if _full_round_io_enabled(task_type):
+                full_input_snapshot = _round_full_input_snapshot(messages)
             kwargs = {
                 "messages": messages,
                 "model": model,
@@ -6859,12 +7182,35 @@ def _call_llm_with_retry(
                 round_event=_round_event,
                 input_snapshot=input_snapshot,
                 msg=msg,
+                full_input_snapshot=full_input_snapshot,
             )
             return msg, cost
 
         except Exception as e:
             last_error = e
             error_kind = _classify_llm_error(e)
+            error_preview = format_llm_exception_for_user_log(e)
+            if full_input_snapshot is not None:
+                _append_round_io_error(
+                    drive_logs,
+                    task_id=task_id,
+                    round_idx=round_idx,
+                    round_event={
+                        "ts": utc_now_iso(),
+                        "type": "llm_api_error",
+                        "task_id": task_id,
+                        "round": round_idx,
+                        "attempt": attempt + 1,
+                        "phase": phase_label,
+                        "model": model,
+                    },
+                    input_snapshot=full_input_snapshot,
+                    error={
+                        "kind": error_kind,
+                        "attempt": attempt + 1,
+                        "message": error_preview,
+                    },
+                )
             if error_kind in {"context_limit", "model_not_found"}:
                 accumulated_usage["_last_llm_error_kind"] = error_kind
                 append_jsonl(
@@ -6876,7 +7222,7 @@ def _call_llm_with_retry(
                         "round": round_idx,
                         "attempt": attempt + 1,
                         "model": model,
-                        "error": repr(e),
+                        "error": error_preview,
                         "error_kind": error_kind,
                         "backoff_sec": 0,
                         "retryable": False,
@@ -6887,7 +7233,7 @@ def _call_llm_with_retry(
                     attempt + 1,
                     max_retries,
                     round_idx,
-                    e,
+                    error_preview,
                 )
                 break
             is_server_error = error_kind == "server_transient"
@@ -6898,7 +7244,7 @@ def _call_llm_with_retry(
                 attempt + 1,
                 max_retries,
                 round_idx,
-                e,
+                error_preview,
                 f"Retrying in {sleep_sec}s..."
                 if attempt < max_retries - 1
                 else "No more retries.",
@@ -6912,7 +7258,7 @@ def _call_llm_with_retry(
                     "round": round_idx,
                     "attempt": attempt + 1,
                     "model": model,
-                    "error": repr(e),
+                    "error": error_preview,
                     "backoff_sec": sleep_sec,
                 },
             )
@@ -6927,7 +7273,7 @@ def _call_llm_with_retry(
                 time.sleep(sleep_sec)
 
     if last_error is not None:
-        accumulated_usage["_last_llm_error"] = repr(last_error)
+        accumulated_usage["_last_llm_error"] = format_llm_exception_for_user_log(last_error)
     return None, 0.0
 
 
@@ -6971,7 +7317,9 @@ def _process_tool_results(
         trace_entry = {
             "tool": fn_name,
             "args": _safe_args(exec_result["args_for_log"]),
-            "result": truncate_for_log(exec_result["result"], 700),
+            "result": truncate_for_log(
+                exec_result["result"], TOOL_TRACE_SNIPPET_CHARS
+            ),
             "is_error": is_error,
         }
         if fn_name in _FULL_RESULT_TRACE_TOOLS:

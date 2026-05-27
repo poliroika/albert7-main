@@ -28,8 +28,30 @@ Configuration is spread across environment variables, CLI flags, YAML files, and
 |----------|---------|---------|
 | `OUROBOROS_WATCHER_MODEL` | inherit from `OUROBOROS_MODEL` / `LLM_MODEL` | Separate model for Watcher |
 | `OUROBOROS_WATCHER_STALL_SEC` | `180` | Stall trigger threshold (seconds) |
-| `OUROBOROS_WATCHER_REPEAT_M` | `3` | Repeat error trigger: same error in M rounds |
+| `OUROBOROS_WATCHER_REPEAT_M` | `30` | Legacy alias for semantic abort threshold when `SEMANTIC_ABORT_M` unset |
+| `OUROBOROS_WATCHER_SEMANTIC_INJECT_M` | `3` | Consecutive semantic failures before `inject_lesson` |
+| `OUROBOROS_WATCHER_SEMANTIC_RESTART_M` | `15` | Consecutive semantic failures before `restart_phase` |
+| `OUROBOROS_WATCHER_SEMANTIC_ABORT_M` | `30` | Consecutive semantic failures before `abort_phase` |
+| `OUROBOROS_WATCHER_USE_LLM_ON_SEMANTIC` | unset | When `1`, optional LLM refinement of semantic inject lessons |
 | `OUROBOROS_WATCHER_POLL_SEC` | `5` | Watcher poll interval (seconds) |
+
+### Truncation / previews
+
+Logs and control-plane checks read `tools.jsonl` previews; the LLM chat uses separate caps. When history grows, the agent can call `compact_context` (summarize) before hitting model limits.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OUROBOROS_TOOL_LOG_PREVIEW_CHARS` | `16000` | `tools.jsonl` `result_preview` (was 2000) |
+| `OUROBOROS_TOOL_RESULT_TO_MODEL_CHARS` | `48000` | Tool message body in active chat (was 15000) |
+| `OUROBOROS_TOOL_TRACE_SNIPPET_CHARS` | `2400` | `llm_trace` / completion nudge snippets |
+| `OUROBOROS_TOOL_ARGS_LOG_CHARS` | `12000` | Large fields in logged tool args |
+| `OUROBOROS_TRUNCATE_FOR_LOG_DEFAULT` | `16000` | Default for `truncate_for_log()` |
+| `OUROBOROS_DISCOVERY_CONTENT_CHARS` | `12000` | web/deep_search/github excerpt payloads |
+| `OUROBOROS_MEMORY_HIT_PREVIEW_CHARS` | `8000` | Palace search hits in tool responses |
+| `OUROBOROS_RECALL_DRAWER_PREVIEW_CHARS` | `1200` | Inline recall drawer snippets |
+| `OUROBOROS_RECALL_LESSON_PREVIEW_CHARS` | `2000` | Inline recall lesson snippets |
+| `OUROBOROS_MODEL_CONTEXT_TOKENS` | `200000` | Soft model window (see `umbrella/llm_budget.py`) |
+| `OUROBOROS_GMAS_CONTEXT_TOKENS` | `60000` | Aggregated GMAS retrieval budget |
 
 ### Memory
 

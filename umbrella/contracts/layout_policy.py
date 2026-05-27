@@ -328,11 +328,23 @@ def _issue_for_single_path(
     return None
 
 
+def _greenfield_layout_policy_enabled(context: "WorkspaceContext | None") -> bool:
+    if context is None or not getattr(context, "workspace_root", None):
+        return False
+    from umbrella.workspace_registry.charter import load_workspace_charter
+
+    charter = load_workspace_charter(Path(context.workspace_root))
+    policies = charter.get("policies") if isinstance(charter.get("policies"), dict) else {}
+    return bool(policies.get("greenfield_python_src_layout"))
+
+
 def validate_plan_layout_policy(
     plan: PlanIR,
     *,
     context: "WorkspaceContext | None" = None,
 ) -> list[ContractIssue]:
+    if not _greenfield_layout_policy_enabled(context):
+        return []
     issues: list[ContractIssue] = []
     all_paths = collect_plan_paths(plan)
     planned_set = set(all_paths)

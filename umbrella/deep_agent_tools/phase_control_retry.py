@@ -1,6 +1,32 @@
 ﻿"""Retry watcher state, escalation blocks, and structured review payloads."""
 
 from umbrella.deep_agent_tools.phase_control_common import *
+from umbrella.contracts import hash_value
+
+_SUCCESS_TEST_TOOL_NAMES = (
+    "harness_run",
+    "run_workspace_verify",
+    "run_unit_tests",
+    "run_real_e2e",
+    "web_search",
+    "deep_search",
+    "github_project_search",
+    "mcp_discover",
+)
+_SUCCESS_TEST_TRAILING_OUTCOME_RE = (
+    re.compile(
+        r"(?is)\s+"
+        r"(?:must\s+)?(?:exit|exits|return|returns)"
+        r"(?:\s+successfully)?(?:\s+with)?(?:\s+exit)?(?:\s+code)?\s+0\b.*$"
+    ),
+    re.compile(r"(?is)\s+(?:has|with)\s+exit\s+code\s+0\b.*$"),
+    re.compile(r"(?is)\s+(?:passes|succeeds|is\s+successful)\b.*$"),
+    re.compile(r"(?is)\s+prints?\s+[`'\"]?[A-Za-z0-9_.:/ -]{1,120}[`'\"]?\s*$"),
+)
+_SUCCESS_TEST_LEADING_COMMAND_LABEL_RE = re.compile(
+    r"(?is)^\s*(?:command|cmd|shell|terminal|run|success[_\s-]*test)\s*:\s*"
+)
+
 from umbrella.deep_agent_tools.phase_control_base import *
 from umbrella.deep_agent_tools.phase_control_legacy import _subtask_success_test_text
 
@@ -25,6 +51,9 @@ def _final_review_e2e_gate(ctx: ToolContext) -> str:
         return ""
     view = _loop_state_view(ctx)
     phase_label = str(view.get("phase_label") or "")
+    verify_gate = _final_review_workspace_verify_gate(ctx)
+    if verify_gate:
+        return verify_gate
     logged = _latest_logged_e2e_result(ctx)
     if (
         not logged
@@ -52,6 +81,34 @@ def _final_review_e2e_gate(ctx: ToolContext) -> str:
     return ""
 
 
+def _final_review_workspace_verify_gate(ctx: ToolContext) -> str:
+    view = _loop_state_view(ctx)
+    logged = _latest_logged_tool_result(ctx, "run_workspace_verify")
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if task_id and not logged:
+        return (
+            "ERROR: submit_final_review(outcome='ok') requires a fresh "
+            "`run_workspace_verify` result from this final_review phase. "
+            "Prior verify evidence is not enough."
+        )
+    if logged:
+        passed = bool(logged.get("passed"))
+        failed_count = int(logged.get("failed_step_count") or 0)
+        run_id = str(logged.get("verify_run_id") or "").strip()
+    else:
+        passed = bool(view.get("last_verify_passed"))
+        failed_count = int(view.get("last_verify_failed_count") or 0)
+        run_id = str(view.get("last_verify_run_id") or "").strip()
+    if not passed or failed_count > 0 or not run_id:
+        return (
+            "ERROR: submit_final_review(outcome='ok') requires passing "
+            "`run_workspace_verify` evidence with zero failed required steps "
+            "from the final_review gate. Fix the reported verification gaps "
+            "or call loop_back_to."
+        )
+    return ""
+
+
 def _latest_logged_e2e_result(ctx: ToolContext) -> dict[str, Any] | None:
     """Return the latest same-task ``run_real_e2e`` payload from tools.jsonl.
 
@@ -62,6 +119,10 @@ def _latest_logged_e2e_result(ctx: ToolContext) -> dict[str, Any] | None:
     strict without forcing an unnecessary extra round.
     """
 
+    return _latest_logged_tool_result(ctx, "run_real_e2e")
+
+
+def _latest_logged_tool_result(ctx: ToolContext, tool_name: str) -> dict[str, Any] | None:
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not task_id:
         return None
@@ -79,7 +140,7 @@ def _latest_logged_e2e_result(ctx: ToolContext) -> dict[str, Any] | None:
             continue
         if str(record.get("task_id") or "") != task_id:
             continue
-        if str(record.get("tool") or "") != "run_real_e2e":
+        if str(record.get("tool") or "") != tool_name:
             continue
         raw = record.get("result_preview")
         if not isinstance(raw, str) or not raw.strip():
@@ -656,6 +717,10 @@ _VERIFY_DEFERABLE_SKILL_RE = re.compile(
 _SUBTASK_LLM_SURFACE_RE = re.compile(
     r"(?i)\b(?:gmas|llm|multi[-_\s]?agent|agent|bot|ai)\b|(?:^|/)ai(?:/|$)"
 )
+_PYTEST_NODE_REF_RE = re.compile(
+    r"(?i)(?P<target>(?:[A-Za-z0-9_.-]+/)*test[A-Za-z0-9_./-]*\.py"
+    r"(?:::[A-Za-z0-9_./<>\[\]-]+)*)"
+)
 
 
 def _normalise_verify_text(value: Any) -> str:
@@ -764,6 +829,66 @@ def _subtask_referenced_paths(subtask: dict[str, Any]) -> set[str]:
     return paths
 
 
+def _normalise_pytest_target_token(value: Any) -> str:
+    target = str(value or "").strip().strip("`'\"()[]{}.,;")
+    target = target.replace("\\", "/").lower()
+    if target.startswith("./"):
+        target = target[2:]
+    return target
+
+
+def _pytest_targets_from_command_text(value: str) -> set[str]:
+    targets: set[str] = set()
+    for candidate in _success_test_command_candidates(value):
+        for token in _split_command_tokens_for_retry(candidate):
+            if not _looks_like_pytest_target_token(token):
+                continue
+            target = _normalise_pytest_target_token(token)
+            if target:
+                targets.add(target)
+    return targets
+
+
+def _subtask_pytest_targets(subtask: dict[str, Any]) -> set[str]:
+    targets = set(_pytest_targets_from_command_text(_subtask_success_test_text(subtask)))
+    targets.update(_pytest_targets_from_command_text(_subtask_typed_proof_command_text(subtask)))
+    return targets
+
+
+def _pytest_targets_from_failure_text(value: str) -> set[str]:
+    targets: set[str] = set()
+    for match in _PYTEST_NODE_REF_RE.finditer(str(value or "")):
+        target = _normalise_pytest_target_token(match.group("target"))
+        if target:
+            targets.add(target)
+    return targets
+
+
+def _pytest_target_covers(candidate: str, target: str) -> bool:
+    owner = _normalise_pytest_target_token(candidate)
+    wanted = _normalise_pytest_target_token(target)
+    if not owner or not wanted:
+        return False
+    return owner == wanted or wanted.startswith(f"{owner}::")
+
+
+def _future_subtask_owns_pytest_target(
+    subtasks: list[dict[str, Any]], *, subtask_id: str, target: str
+) -> bool:
+    seen_current = False
+    for item in subtasks:
+        if str(item.get("id") or "").strip() == subtask_id:
+            seen_current = True
+            continue
+        if not seen_current:
+            continue
+        if _subtask_status(item) == "done":
+            continue
+        if any(_pytest_target_covers(candidate, target) for candidate in _subtask_pytest_targets(item)):
+            return True
+    return False
+
+
 def _retry_success_test_target_files(success_text: str) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
@@ -835,6 +960,23 @@ def _workspace_verify_relevant_failure_texts(
     relevant: list[str] = []
     for text in failed:
         norm_text = _normalise_verify_text(text)
+        failed_pytest_targets = _pytest_targets_from_failure_text(text)
+        if failed_pytest_targets:
+            current_owns_pytest_target = any(
+                _pytest_target_covers(candidate, target)
+                for target in failed_pytest_targets
+                for candidate in _subtask_pytest_targets(subtask)
+            )
+            future_owns_pytest_target = any(
+                _future_subtask_owns_pytest_target(
+                    subtasks,
+                    subtask_id=subtask_id,
+                    target=target,
+                )
+                for target in failed_pytest_targets
+            )
+            if future_owns_pytest_target and not current_owns_pytest_target:
+                continue
         if any(path and path in norm_text for path in paths):
             relevant.append(text)
             continue
@@ -1051,6 +1193,11 @@ def _tool_row_is_successful_repair_write(row: dict[str, Any]) -> bool:
             str(payload.get("status") or "").lower() == "applied"
             and bool(payload.get("applied"))
         )
+    if row_tool == "replace_workspace_file":
+        return (
+            str(payload.get("status") or "").lower() == "ok"
+            and bool(str(payload.get("path") or "").strip())
+        )
     if row_tool == "update_workspace_seed":
         text = str(row.get("result_preview") or row.get("result") or "").strip()
         return (
@@ -1171,6 +1318,11 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
     exact_groups = _success_test_command_groups(success_text)
 
     rows = _tool_log_rows_for_task(ctx, task_id)
+    mutate_cutoff: float | None = None
+    for row in _phase_control_signal_rows_for_task(ctx, task_id, kind="mutate_phase_plan"):
+        ts = _tool_row_time(row)
+        if ts is not None and (mutate_cutoff is None or ts > mutate_cutoff):
+            mutate_cutoff = ts
     failures = 0
     latest_failure_time: float | None = None
     latest_failure_pos = -1
@@ -1179,6 +1331,8 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
     latest_failure_evidence_row: dict[str, Any] | None = None
     latest_failure_evidence_reason = ""
     failure_events: list[tuple[float | None, int]] = []
+    latest_declared_success_time: float | None = None
+    latest_declared_success_pos = -1
     latest_watcher_time: float | None = None
     latest_watcher_pos = -1
     watcher_review_keys: set[str] = set()
@@ -1206,6 +1360,50 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
             latest_repair_pos = idx
             continue
         if row_tool not in _PHASE_SUBTASK_COMMAND_TOOLS:
+            if latest_declared_success_pos >= 0 and _row_position_after(
+                row_time,
+                idx,
+                latest_declared_success_time,
+                latest_declared_success_pos,
+            ):
+                payload = _tool_row_result_payload(row)
+                preview = str(row.get("result_preview") or row.get("result") or "")
+                try:
+                    failed_step_count = int(payload.get("failed_step_count") or 0)
+                except (TypeError, ValueError):
+                    failed_step_count = 0
+                is_verify_failure = (
+                    row_tool == "run_workspace_verify"
+                    and (
+                        payload.get("passed") is False
+                        or failed_step_count > 0
+                    )
+                )
+                is_completion_verify_failure = (
+                    row_tool == "mark_subtask_complete"
+                    and preview.lstrip().startswith("ERROR:")
+                    and "verify" in preview.lower()
+                    and "fail" in preview.lower()
+                )
+                if is_verify_failure or is_completion_verify_failure:
+                    ok, reason = _tool_row_success_status(row)
+                    if ok:
+                        continue
+                    failures += 1
+                    if row_time is not None:
+                        latest_failure_time = row_time
+                    latest_failure_pos = idx
+                    latest_failure_row = row
+                    latest_failure_reason = reason
+                    latest_failure_evidence_row = row
+                    latest_failure_evidence_reason = reason
+                    failure_events.append((row_time, idx))
+            continue
+        if (
+            mutate_cutoff is not None
+            and row_time is not None
+            and row_time < mutate_cutoff
+        ):
             continue
         norms = _tool_row_command_norms(row)
         if not any(
@@ -1215,7 +1413,7 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
         ):
             continue
         exact_declared_match = any(
-            alt and any(alt in norm for norm in norms)
+            alt and any(alt == norm for norm in norms)
             for alternatives in exact_groups
             for alt in alternatives
         )
@@ -1230,6 +1428,8 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
             latest_failure_reason = ""
             latest_failure_evidence_row = None
             latest_failure_evidence_reason = ""
+            latest_declared_success_time = row_time
+            latest_declared_success_pos = idx
             continue
         failures += 1
         if row_time is not None:
@@ -1328,6 +1528,41 @@ def _phase_subtask_retry_recommendation(
     )
 
 
+def _retry_path_is_test_path(path: Any) -> bool:
+    text = str(path or "").replace("\\", "/").strip().lower()
+    if not text:
+        return False
+    leaf = text.rsplit("/", 1)[-1]
+    return (
+        text.startswith("tests/")
+        or "/tests/" in text
+        or leaf.startswith("test_")
+        or leaf.endswith("_test.py")
+        or ".spec." in leaf
+        or ".test." in leaf
+    )
+
+
+def _implementation_retry_recommendation(paths: list[str]) -> str:
+    source_paths = [
+        str(path)
+        for path in paths
+        if str(path).strip() and not _retry_path_is_test_path(path)
+    ]
+    source_part = (
+        " Source focus: " + ", ".join(source_paths[:8]) + "."
+        if source_paths
+        else ""
+    )
+    return (
+        "Watcher classified this as an implementation repair. Do not edit the "
+        "declared test/proof oracle and do not loop back only to escape a write "
+        "guard. Read the source/test context if needed, apply one focused "
+        "implementation patch in the active subtask scope, then rerun the exact "
+        f"declared success_test.{source_part}"
+    )
+
+
 _BAD_GENERATED_SUCCESS_TEST_REASON_RE = re.compile(
     r"\b("
     r"bad\s+generated\s+(?:success[-_\s]?test|test|test\s+contract)|"
@@ -1387,10 +1622,65 @@ def _contract_migration_retry_recommendation(contract_payload: dict[str, Any]) -
     return (
         "Watcher classified the latest failure as a bad generated success-test "
         f"contract{target}. Call `mutate_phase_plan` with "
-        "`contract_migration_reason` and `contract_migration_files` before "
-        "editing the declared success-test file; keep the migration minimal and "
-        "preserve the intended behavior."
+        "`contract_migration_reason` and `contract_migration_files` (top-level "
+        "aliases apply to the active execute subtask) before editing the "
+        "declared success-test file; keep the migration minimal and preserve "
+        "the intended behavior."
     )
+
+
+def _retry_watcher_verdict_payload(
+    *,
+    status: str,
+    failed_attempts: int,
+    contract_migration_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the typed retry-watcher decision surfaced to the agent."""
+
+    if status != "review_recorded":
+        return {
+            "verdict": "not_required",
+            "can_edit_tests": False,
+            "requires_plan_mutation": False,
+            "allowed_next_actions": [
+                "read active files",
+                "repair implementation",
+                "rerun run_subtask_proof",
+            ],
+            "forbidden_next_actions": [
+                "test-only oracle edits after a failing proof",
+            ],
+        }
+    if contract_migration_payload:
+        return {
+            "verdict": "bad_test_contract",
+            "can_edit_tests": False,
+            "requires_plan_mutation": True,
+            "allowed_next_actions": [
+                "call mutate_phase_plan with contract_migration_reason",
+                "include contract_migration_files for the affected test/proof files",
+                "rerun run_subtask_proof after the plan mutation",
+            ],
+            "forbidden_next_actions": [
+                "direct test-file edits before mutate_phase_plan records the migration",
+                "mark_subtask_complete without a fresh post-migration proof",
+            ],
+        }
+    return {
+        "verdict": "implementation_bug",
+        "can_edit_tests": False,
+        "requires_plan_mutation": False,
+        "allowed_next_actions": [
+            "read the declared proof/test and related source files",
+            "repair implementation files in active scope",
+            "rerun run_subtask_proof after the repair",
+        ],
+        "forbidden_next_actions": [
+            "test-only oracle edits",
+            "weakening assertions or proof selection",
+        ],
+        "confidence": "medium" if failed_attempts else "low",
+    }
 
 
 def _tool_row_args_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -1430,7 +1720,7 @@ def _patch_text_contains_escaped_line_endings(text: str) -> bool:
     return False
 
 
-def _recent_patch_hunk_mismatch_guidance(ctx: ToolContext, task_id: str) -> str:
+def _recent_patch_hunk_mismatch_signal(ctx: ToolContext, task_id: str) -> dict[str, Any]:
     rows = _tool_log_rows_for_task(ctx, task_id)
     for row in reversed(rows[-300:]):
         if str(row.get("tool") or "") != "apply_workspace_patch":
@@ -1438,7 +1728,7 @@ def _recent_patch_hunk_mismatch_guidance(ctx: ToolContext, task_id: str) -> str:
         payload = _tool_row_result_payload(row)
         status = str(payload.get("status") or "").lower()
         if status == "applied":
-            return ""
+            return {}
         reason = str(payload.get("reason") or "")
         if reason not in {"patch_hunk_mismatch", "patch_parse_error"}:
             continue
@@ -1457,23 +1747,39 @@ def _recent_patch_hunk_mismatch_guidance(ctx: ToolContext, task_id: str) -> str:
         if escaped:
             target = f" for `{file_path}`" if file_path else ""
             hint = f" Use `{read_hint}` first." if read_hint else ""
-            return (
+            guidance = (
                 f"Recent `apply_workspace_patch` mismatch{target} appears to "
                 "come from JSON-rendered line endings copied into the hunk. "
                 "Do not paste literal `\\r` or `\\n`; re-read the smallest "
                 "line slice, then emit a tiny `*** Update File:` hunk with "
                 f"real patch line breaks and exact source context.{hint}"
             )
+            return {
+                "guidance": guidance,
+                "file_path": file_path,
+                "reason": reason,
+                "targets_test_path": _retry_path_is_test_path(file_path),
+            }
         if reason == "patch_hunk_mismatch":
             target = f" for `{file_path}`" if file_path else ""
             hint = f" Use `{read_hint}` first." if read_hint else ""
-            return (
+            guidance = (
                 f"Recent `apply_workspace_patch` mismatch{target} needs an "
                 "exact-context repair. Re-read the target with `read_file` "
                 "using `line_start`/`line_count`, then retry one tiny hunk "
                 f"from the current file content.{hint}"
             )
-    return ""
+            return {
+                "guidance": guidance,
+                "file_path": file_path,
+                "reason": reason,
+                "targets_test_path": _retry_path_is_test_path(file_path),
+            }
+    return {}
+
+
+def _recent_patch_hunk_mismatch_guidance(ctx: ToolContext, task_id: str) -> str:
+    return str(_recent_patch_hunk_mismatch_signal(ctx, task_id).get("guidance") or "")
 
 
 def _phase_subtask_retry_watcher_review_payload(
@@ -1498,9 +1804,11 @@ def _phase_subtask_retry_watcher_review_payload(
 
     failed_attempts = int(state.get("failures") or 0)
     watcher_reviews = int(state.get("watcher_reviews") or 0)
-    patch_guidance = _recent_patch_hunk_mismatch_guidance(
+    patch_signal = _recent_patch_hunk_mismatch_signal(
         ctx, str(state.get("task_id") or "")
     )
+    patch_guidance = str(patch_signal.get("guidance") or "")
+    patch_guidance_targets_test = bool(patch_signal.get("targets_test_path"))
     latest_failure_row = state.get("latest_failure_evidence_row") or state.get(
         "latest_failure_row"
     )
@@ -1552,13 +1860,14 @@ def _phase_subtask_retry_watcher_review_payload(
         )
         else "review_not_required"
     )
+    required_context_reads = list(state.get("required_context_reads") or [])[:20]
     review = {
         **base,
         "status": status,
         "subtask_id": str(state.get("subtask_id") or ""),
         "success_test": str(state.get("success_test") or ""),
         "proof_command": str(state.get("proof_command") or ""),
-        "required_context_reads": list(state.get("required_context_reads") or [])[:20],
+        "required_context_reads": required_context_reads,
         "failed_attempts": failed_attempts,
         "prior_watcher_reviews": watcher_reviews,
         "latest_failure": latest_failure,
@@ -1570,12 +1879,80 @@ def _phase_subtask_retry_watcher_review_payload(
         ),
     }
     if status == "review_recorded" and contract_migration_payload:
+        contract_migration_payload = dict(contract_migration_payload)
+        contract_migration_payload.setdefault(
+            "contract_migration_id",
+            hash_value(
+                {
+                    "subtask_id": state.get("subtask_id") or "",
+                    "success_test": state.get("success_test") or "",
+                    "target_files": contract_migration_payload.get("target_files") or [],
+                    "evidence": contract_migration_payload.get("evidence") or "",
+                }
+            )[:16],
+        )
         review["contract_migration"] = contract_migration_payload
         review["recommendation"] = _contract_migration_retry_recommendation(
             contract_migration_payload
         )
-    if status == "review_not_required":
+    review.update(
+        _retry_watcher_verdict_payload(
+            status=status,
+            failed_attempts=failed_attempts,
+            contract_migration_payload=(
+                review.get("contract_migration")
+                if isinstance(review.get("contract_migration"), dict)
+                else None
+            ),
+        )
+    )
+    if (
+        patch_guidance
+        and patch_guidance_targets_test
+        and not review.get("can_edit_tests")
+        and review.get("verdict") != "bad_test_contract"
+    ):
+        review["patch_guidance"] = ""
+        review["suppressed_patch_guidance"] = patch_guidance
+        review["patch_guidance_suppressed_reason"] = (
+            "latest patch mismatch targets a protected test/proof oracle while "
+            "test edits are not allowed"
+        )
+        review["recommendation"] = _implementation_retry_recommendation(
+            required_context_reads
+        )
+    if review.get("verdict") == "implementation_bug":
+        source_paths = [
+            path for path in required_context_reads if not _retry_path_is_test_path(path)
+        ]
+        review["repair_focus"] = {
+            "kind": "implementation_bug",
+            "source_files": source_paths,
+            "test_oracle_files": [
+                path for path in required_context_reads if _retry_path_is_test_path(path)
+            ],
+            "proof_command": str(state.get("proof_command") or ""),
+        }
         if patch_guidance:
+            review["secondary_patch_guidance"] = patch_guidance
+        review["recommendation"] = _implementation_retry_recommendation(
+            required_context_reads
+        )
+    if status == "review_not_required":
+        if review.get("verdict") == "implementation_bug":
+            review["message"] = (
+                "The active subtask has not yet reached the repeated-failure "
+                "threshold, but the next allowed direction is implementation "
+                "repair, not test/proof oracle editing."
+            )
+        elif review.get("suppressed_patch_guidance"):
+            review["message"] = (
+                "The active subtask has not yet reached the repeated-failure "
+                "threshold, and the latest patch mismatch targets a protected "
+                "test/proof oracle. Continue with implementation repair and "
+                "rerun the declared proof instead of retrying the test patch."
+            )
+        elif patch_guidance:
             review["message"] = (
                 "The active subtask has not yet reached the repeated-failure "
                 "threshold, but Umbrella found a patch-mismatch repair signal "
@@ -1621,8 +1998,9 @@ def _phase_subtask_retry_escalation_block(
             next_step = (
                 "If you need source context, use `read_file` or `repo_read` "
                 "(not shell/grep/python -c). Then apply one focused "
-                "implementation repair with `apply_workspace_patch` before "
-                "rerunning the declared success_test."
+                "implementation repair with `apply_workspace_patch` or "
+                "`replace_workspace_file` before rerunning the declared "
+                "success_test."
             )
             if (
                 failures >= _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD + 2
@@ -1634,7 +2012,7 @@ def _phase_subtask_retry_escalation_block(
                     "or `repo_read` (not shell/grep/python -c), audit the "
                     "schema/API/field contract end-to-end, then apply one "
                     "comprehensive implementation repair with "
-                    "`apply_workspace_patch`."
+                    "`apply_workspace_patch` or `replace_workspace_file`."
                 )
             return {
                 "status": "blocked",
@@ -1709,8 +2087,9 @@ def _phase_subtask_retry_escalation_block(
                 "next_step": (
                     "If you need source context, use `read_file` or `repo_read` "
                     "(not shell/grep/python -c). Then apply one focused "
-                    "implementation repair with `apply_workspace_patch`, then "
-                    "rerun the declared success_test. A new watcher review is "
+                    "implementation repair with `apply_workspace_patch` or "
+                    "`replace_workspace_file`, then rerun the declared "
+                    "success_test. A new watcher review is "
                     "only required if several post-watcher repair/test cycles "
                     "keep failing."
                 ),

@@ -7,6 +7,7 @@ from typing import Any
 
 from umbrella.memory.paths import manager_core_root, workspace_core_root
 from umbrella.memory.proactive.bkb import (
+    ensure_platform_bkb_rules,
     format_bkb_section,
     load_bkb_rules,
     partition_bkb_rules,
@@ -53,6 +54,7 @@ class ProactiveMemoryCompiler:
 
         manager_root = manager_core_root(repo_root)
         ensure_core_seed_files(manager_root, kind="manager")
+        ensure_platform_bkb_rules(manager_root)
         sections: list[OverlaySection] = []
         sections.extend(load_manager_core(manager_root, budget_tokens=min(1500, budget // 3)))
 

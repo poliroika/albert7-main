@@ -19,7 +19,89 @@ from umbrella.enforcement import (
     phase_from_context,
 )
 from umbrella.enforcement.ledger import supervisor_ledger_ref
+from umbrella.enforcement.workspace_toml import (
+    verification_steps_from_toml as _verification_steps_from_toml,
+    workspace_toml_verification_weakening_block,
+)
 from umbrella.contracts import hash_value, workspace_hash
+from umbrella.contracts.harness_profiles import (
+    validator_flags_for_subtask,
+    validator_flags_from_overlays,
+)
+
+
+def _set_typed_action_gate(ctx: Any, gate: dict[str, Any]) -> None:
+    view = getattr(ctx, "loop_state_view", None)
+    if not isinstance(view, dict):
+        view = {}
+        ctx.loop_state_view = view
+    view["typed_action_gate"] = gate
+
+
+def _completion_session_write_block(ctx: Any, tool_name: str) -> dict[str, Any] | None:
+    view = getattr(ctx, "loop_state_view", None)
+    if not isinstance(view, dict):
+        return None
+    session = view.get("completion_session")
+    if not isinstance(session, dict):
+        return None
+    allowed = {str(item) for item in (session.get("allowed_tools") or [])}
+    if tool_name in allowed:
+        return None
+    if allowed:
+        allowed_next = sorted(allowed)
+    else:
+        from umbrella.deep_agent_tools.phase_control_base import (
+            _completion_tools_after_passed_proof,
+        )
+
+        allowed_next = sorted(_completion_tools_after_passed_proof(ctx))
+    return {
+        "status": "blocked",
+        "reason": "proof_stale_rerun_required",
+        "message": (
+            "Proof passed and writes are frozen until the phase completion tool. "
+            "Rerun proof if the workspace changed."
+        ),
+        "allowed_next_tools": allowed_next,
+    }
+
+
+def _persist_patch_protocol_state(
+    ctx: Any, *, rel_path: str, reason: str, mismatch_count: int
+) -> None:
+    view = getattr(ctx, "loop_state_view", None)
+    if not isinstance(view, dict):
+        view = {}
+        ctx.loop_state_view = view
+    raw_state = view.get("patch_protocol_state")
+    state = raw_state if isinstance(raw_state, dict) else {}
+    files = state.get("files")
+    if not isinstance(files, dict):
+        files = {}
+    norm = _norm_workspace_rel_path(rel_path)
+    entry = files.get(norm) if isinstance(files.get(norm), dict) else {}
+    entry["last_reason"] = reason
+    entry["mismatch_count"] = mismatch_count
+    files[norm] = entry
+    state["files"] = files
+    view["patch_protocol_state"] = state
+
+
+def _patch_protocol_gate(
+    ctx: Any,
+    *,
+    workspace_id: str,
+    rel_path: str,
+) -> dict[str, Any] | None:
+    if block := _fresh_read_after_hunk_mismatch_block(
+        ctx, workspace_id=workspace_id, rel_path=rel_path
+    ):
+        block["required_mode"] = "fresh_read"
+        return block
+    if block := _patch_hunk_mismatch_replacement_required_block(ctx, rel_path):
+        return block
+    return None
 
 def _workspace_layout_policy_block(rel_path: str) -> dict[str, Any] | None:
     norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
@@ -1178,98 +1260,6 @@ def _record_subtask_discovery_tool_call(ctx: Any, tool_name: str) -> None:
         log.debug("Failed to record subtask discovery call", exc_info=True)
 
 
-def _verification_steps_from_toml(text: str) -> list[dict[str, Any]]:
-    try:
-        data = tomllib.loads(text or "")
-    except Exception:
-        return []
-    verification = data.get("verification") if isinstance(data, dict) else None
-    if not isinstance(verification, dict):
-        return []
-    steps = verification.get("steps")
-    if not isinstance(steps, list):
-        return []
-    return [step for step in steps if isinstance(step, dict)]
-
-
-def _verification_step_name(step: dict[str, Any], index: int) -> str:
-    value = (
-        step.get("name")
-        or step.get("id")
-        or step.get("command")
-        or step.get("path")
-        or index
-    )
-    return str(value).strip()
-
-
-def _verification_step_kind(step: dict[str, Any]) -> str:
-    return str(step.get("kind") or step.get("type") or "").strip().lower()
-
-
-def _workspace_toml_verification_guard(
-    seed_path: Path,
-    rel_path: str,
-    new_content: str,
-) -> dict[str, Any] | None:
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    if norm != "workspace.toml":
-        return None
-    old_path = seed_path / "workspace.toml"
-    if not old_path.is_file():
-        return None
-    try:
-        old_content = old_path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-    old_steps = _verification_steps_from_toml(old_content)
-    new_steps = _verification_steps_from_toml(new_content)
-    if not old_steps:
-        return None
-    dropped_count = len(new_steps) < len(old_steps)
-    old_by_name = {
-        _verification_step_name(step, idx): _verification_step_kind(step)
-        for idx, step in enumerate(old_steps)
-    }
-    new_by_name = {
-        _verification_step_name(step, idx): _verification_step_kind(step)
-        for idx, step in enumerate(new_steps)
-    }
-    missing_names = [name for name in old_by_name if name and name not in new_by_name]
-    downgraded = [
-        name
-        for name, old_kind in old_by_name.items()
-        if old_kind in _STRONG_VERIFICATION_KINDS
-        and new_by_name.get(name) == "file_exists"
-    ]
-    replacement_strong_count = sum(
-        1 for kind in new_by_name.values() if kind in _STRONG_VERIFICATION_KINDS
-    )
-    old_strong_count = sum(
-        1 for kind in old_by_name.values() if kind in _STRONG_VERIFICATION_KINDS
-    )
-    dropped_strong = bool(missing_names) and replacement_strong_count < old_strong_count
-    if dropped_count or downgraded or dropped_strong:
-        return {
-            "status": "blocked",
-            "reason": "verification_self_weakening_blocked",
-            "file_path": norm,
-            "old_step_count": len(old_steps),
-            "new_step_count": len(new_steps),
-            "missing_steps": missing_names[:10],
-            "downgraded_steps": downgraded[:10],
-            "message": (
-                "workspace.toml verification cannot be weakened during a run. "
-                "Add stronger checks or fix existing checks instead of deleting/downgrading them."
-            ),
-            "next_step": (
-                "Keep prior shell/pytest/smoke verification coverage and let "
-                "umbrella.verification.spec_loader augment safety-critical local tests."
-            ),
-        }
-    return None
-
-
 def update_workspace_seed(
     ctx: Any,
     workspace_id: str,
@@ -1342,7 +1332,7 @@ def update_workspace_seed(
             declared_paths=_active_declared_paths_from_ctx(ctx),
         ):
             return _json(src_layout_block)
-        if verification_block := _workspace_toml_verification_guard(
+        if verification_block := workspace_toml_verification_weakening_block(
             seed_path, file_path, new_content
         ):
             return _json(verification_block)
@@ -1355,6 +1345,10 @@ def update_workspace_seed(
         target = _workspace_path(seed_path, file_path)
         if syntax_block := _python_syntax_block(file_path, new_content):
             return _json(syntax_block)
+        if tamper_block := _no_test_tampering_static_block(
+            ctx, rel_path=file_path, new_content=new_content
+        ):
+            return _json(tamper_block)
         if import_block := _python_import_resolution_block(
             seed_path,
             file_path,
@@ -1368,6 +1362,18 @@ def update_workspace_seed(
         if target.exists() and target.is_file():
             old_content = target.read_text(encoding="utf-8", errors="replace")
             old_content_for_diff = old_content
+            if oracle_block := _no_test_tampering_oracle_freeze_block(
+                ctx,
+                planned=[
+                    {
+                        "path": file_path,
+                        "action": "update",
+                        "old_content": old_content,
+                        "new_content": new_content,
+                    }
+                ],
+            ):
+                return _json(oracle_block)
             if truncation_block := _source_truncation_block(
                 file_path,
                 old_content,
@@ -1597,8 +1603,27 @@ def _patch_hunk_mismatch_payload(
         in {"patch_hunk_mismatch", "patch_hunk_mismatch_replacement_required"}
     ]
     recent_count = len(recent) + 1
+    if recent_count >= 3:
+        payload = {
+            "status": "blocked",
+            "reason": "patch_protocol_loop",
+            "file_path": norm,
+            "error": error,
+            "recent_mismatches": recent_count,
+            "message": "Repeated patch hunk mismatches — watcher may restart this phase.",
+            "next_step": (
+                "Stop retrying Update hunks. Use one apply_workspace_patch "
+                "with paired same-path Delete/Add entries for an audited replacement."
+            ),
+            "required_patch_shape": _required_replacement_patch_shape(norm),
+            "forbidden_next_write": f"*** Update File: {norm}",
+        }
+        _persist_patch_protocol_state(
+            ctx, rel_path=norm, reason="patch_protocol_loop", mismatch_count=recent_count
+        )
+        return payload
     if recent_count >= 2:
-        return {
+        payload = {
             "status": "blocked",
             "reason": "patch_hunk_mismatch_replacement_required",
             "file_path": norm,
@@ -1615,20 +1640,32 @@ def _patch_hunk_mismatch_payload(
             "required_patch_shape": _required_replacement_patch_shape(norm),
             "forbidden_next_write": f"*** Update File: {norm}",
         }
-    return {
+        _persist_patch_protocol_state(
+            ctx,
+            rel_path=norm,
+            reason="patch_hunk_mismatch_replacement_required",
+            mismatch_count=recent_count,
+        )
+        return payload
+    payload = {
         "status": "blocked",
         "reason": "patch_hunk_mismatch",
         "file_path": norm,
         "error": error,
         "recent_mismatches": recent_count,
+        "required_mode": "fresh_read",
         "old_line_count": len(str(old_content or "").splitlines()),
         "hunk_count": len(hunks or []),
         "next_step": (
-            "Re-read the file and retry once with a smaller exact hunk. If the "
-            "next Update hunk still mismatches, use a paired same-path Delete/Add "
-            "replacement; do not create a `.new`, `_fixed`, or sidecar file."
+            "Re-read the file and retry once with a smaller exact hunk. "
+            "If another hunk mismatch occurs, use paired same-path Delete/Add "
+            "replacement; do not create .new sidecar files."
         ),
     }
+    _persist_patch_protocol_state(
+        ctx, rel_path=norm, reason="patch_hunk_mismatch", mismatch_count=recent_count
+    )
+    return payload
 
 
 def _patch_hunk_mismatch_replacement_required_block(
@@ -1826,7 +1863,7 @@ def _plan_workspace_patch_replacement_operation(
     old_content = target.read_text(encoding="utf-8", errors="replace")
     new_content = text_from_add_lines(add_op.content_lines)
 
-    if verification_block := _workspace_toml_verification_guard(
+    if verification_block := workspace_toml_verification_weakening_block(
         seed_path, rel_path, new_content
     ):
         return None, _json(verification_block)
@@ -1838,6 +1875,10 @@ def _plan_workspace_patch_replacement_operation(
         return None, _json(behavior_fallback_block)
     if syntax_block := _python_syntax_block(rel_path, new_content):
         return None, _json(syntax_block)
+    if tamper_block := _no_test_tampering_static_block(
+        ctx, rel_path=rel_path, new_content=new_content
+    ):
+        return None, _json(tamper_block)
     if truncation_block := _source_truncation_block(
         rel_path,
         old_content,
@@ -1927,11 +1968,11 @@ def _plan_workspace_patch_operation(
             }
         )
     if op.action in {"update", "delete"} and (
-        fresh_read_block := _fresh_read_after_hunk_mismatch_block(
+        protocol_block := _patch_protocol_gate(
             ctx, workspace_id=workspace_id, rel_path=rel_path
         )
     ):
-        return None, _json(fresh_read_block)
+        return None, _json(protocol_block)
 
     target = _workspace_path(seed_path, rel_path)
     if op.action in {"update", "delete"} and target.is_file():
@@ -1951,10 +1992,6 @@ def _plan_workspace_patch_operation(
                     "next_step": "Use `*** Add File:` for new files or read/list the workspace to find the right path.",
                 }
             )
-        if mismatch_block := _patch_hunk_mismatch_replacement_required_block(
-            ctx, rel_path
-        ):
-            return None, _json(mismatch_block)
         old_content = target.read_text(encoding="utf-8", errors="replace")
         try:
             new_content = apply_update_to_text(old_content, op.hunks, rel_path)
@@ -2016,7 +2053,7 @@ def _plan_workspace_patch_operation(
             rel_path, new_content
         ):
             return None, _json(placeholder_bridge_block)
-        if verification_block := _workspace_toml_verification_guard(
+        if verification_block := workspace_toml_verification_weakening_block(
             seed_path, rel_path, new_content
         ):
             return None, _json(verification_block)
@@ -2028,6 +2065,10 @@ def _plan_workspace_patch_operation(
             return None, _json(behavior_fallback_block)
         if syntax_block := _python_syntax_block(rel_path, new_content):
             return None, _json(syntax_block)
+        if tamper_block := _no_test_tampering_static_block(
+            ctx, rel_path=rel_path, new_content=new_content
+        ):
+            return None, _json(tamper_block)
         if op.action == "update" and (
             truncation_block := _source_truncation_block(
                 rel_path,
@@ -2138,6 +2179,11 @@ def _plan_workspace_patch_operations(
             planned_content_by_path=planned_content_by_path,
         ):
             return None, _json(import_block)
+    if oracle_block := _no_test_tampering_oracle_freeze_block(
+        ctx,
+        planned=planned,
+    ):
+        return None, _json(oracle_block)
     return planned, None
 
 
@@ -2239,101 +2285,218 @@ def _future_subtask_path_owners(
     return owners
 
 
-def _workspace_toml_additive_verification_patch(
-    seed_path: Path,
-    planned: list[dict[str, Any]],
-) -> bool:
-    """True when every planned workspace.toml change only strengthens verification."""
-    toml_items = [
-        item
-        for item in planned
-        if _norm_workspace_rel_path(item.get("path")) == "workspace.toml"
-    ]
-    if not toml_items:
-        return False
-    for item in toml_items:
-        if str(item.get("action") or "") == "delete":
-            return False
-        new_content = str(item.get("new_content") or "")
-        if not new_content.strip():
-            return False
-        if _workspace_toml_verification_guard(
-            seed_path, "workspace.toml", new_content
-        ):
-            return False
-    return True
-
-
-def _workspace_toml_additive_scope_allowed(
-    seed_path: Path,
-    planned: list[dict[str, Any]],
-    *,
-    out_of_scope: list[str],
-) -> bool:
-    """Allow execute patches to workspace.toml outside subtask scope when only strengthening verification."""
-    if set(out_of_scope) != {"workspace.toml"}:
-        return False
-    return _workspace_toml_additive_verification_patch(seed_path, planned)
-
-
 def _execute_subtask_write_scope_block(
     ctx: Any,
     *,
     planned: list[dict[str, Any]],
     seed_path: Path | None = None,
 ) -> dict[str, Any] | None:
-    task_id = str(getattr(ctx, "task_id", "") or "")
-    if ":execute" not in task_id:
-        return None
-    active, subtasks, active_index = _active_execute_subtask_for_write_scope(ctx)
-    if not active or active_index < 0:
-        return None
-    allowed = _subtask_declared_paths(active)
-    if not allowed:
-        return None
-    planned_paths = sorted(
-        {
-            _norm_workspace_rel_path(item.get("path"))
-            for item in planned
-            if _norm_workspace_rel_path(item.get("path"))
-        }
-    )
-    out_of_scope = [path for path in planned_paths if path not in allowed]
-    if not out_of_scope:
-        return None
-    if (
-        seed_path is not None
-        and _workspace_toml_additive_scope_allowed(
-            seed_path,
-            planned,
-            out_of_scope=out_of_scope,
-        )
-    ):
-        return None
-    future_owners = _future_subtask_path_owners(subtasks, current_index=active_index)
-    future_hits = {
-        path: future_owners[path]
-        for path in out_of_scope
-        if path in future_owners
+    # PhasePlan file lists are focus/proof metadata, not a hard source-edit
+    # sandbox. Shared project files such as package __init__, routes, config,
+    # and entrypoints often need to move across leaves as the implementation
+    # becomes coherent. Hard-blocking those edits created scope-mutation loops;
+    # the durable safety boundaries live in read freshness, workspace
+    # enforcement, shell mutation guards, and no-test-tampering.
+    return None
+
+
+_NO_TEST_TAMPERING_STATIC_CODES = frozenset(
+    {
+        "pytest_skip_or_xfail",
+        "js_test_skip",
+        "assert_true",
+        "weak_truthy_assertion",
+        "weak_not_none_assertion",
+        "early_return_in_test",
+        "broad_try_except_pass",
+        "target_behavior_mock",
+        "native_gui_root_in_test",
+        "implicit_native_gui_root_in_test",
+        "subprocess_check_false",
     }
-    active_id = str(active.get("id") or "").strip()
+)
+
+_NO_TEST_TAMPERING_HARNESS_GATED_CODES = {
+    "native_gui_root_in_test": "no_native_gui_root_in_unit_proof",
+    "implicit_native_gui_root_in_test": "no_native_gui_root_in_unit_proof",
+}
+
+
+def _active_subtask_requires_no_test_tampering(ctx: Any) -> bool:
+    active, _, _ = _active_execute_subtask_for_write_scope(ctx)
+    if not active:
+        return False
+    proof = active.get("proof")
+    oracle = proof.get("oracle") if isinstance(proof, dict) else None
+    raw_props = oracle.get("required_properties") if isinstance(oracle, dict) else []
+    if isinstance(raw_props, str):
+        props = {raw_props}
+    elif isinstance(raw_props, Iterable):
+        props = {str(item) for item in raw_props}
+    else:
+        props = set()
+    return "no_test_tampering" in props
+
+
+def _active_subtask_allows_test_only_change(ctx: Any) -> bool:
+    active, _, _ = _active_execute_subtask_for_write_scope(ctx)
+    if not active:
+        return False
+    proof = active.get("proof")
+    anti = proof.get("anti_gaming") if isinstance(proof, dict) else None
+    return bool(isinstance(anti, dict) and anti.get("allows_test_only_change"))
+
+
+def _active_harness_validator_flags(ctx: Any) -> frozenset[str]:
+    flags: set[str] = set(validator_flags_from_overlays(getattr(ctx, "context_overlays", None)))
+    active, _, _ = _active_execute_subtask_for_write_scope(ctx)
+    if active:
+        flags.update(validator_flags_for_subtask(active))
+    return frozenset(flags)
+
+
+def _workspace_rel_path_is_test(rel_path: str) -> bool:
+    rel = _norm_workspace_rel_path(rel_path).lower()
+    name = rel.rsplit("/", 1)[-1]
+    return (
+        "/tests/" in f"/{rel}"
+        or name.startswith("test_")
+        or name.endswith((".test.js", ".test.jsx", ".test.ts", ".test.tsx"))
+        or name.endswith((".spec.js", ".spec.jsx", ".spec.ts", ".spec.tsx"))
+    )
+
+
+def _no_test_tampering_oracle_freeze_block(
+    ctx: Any, *, planned: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Block test-only oracle rewrites after a failing no-test-tampering proof."""
+
+    if not _active_subtask_requires_no_test_tampering(ctx):
+        return None
+    if _active_subtask_allows_test_only_change(ctx):
+        return None
+    writes = [
+        item
+        for item in planned
+        if _norm_workspace_rel_path(item.get("path")) and item.get("action") != "delete"
+    ]
+    if not writes:
+        return None
+    if any(not _workspace_rel_path_is_test(str(item.get("path") or "")) for item in writes):
+        return None
+    updated_tests = [
+        _norm_workspace_rel_path(item.get("path"))
+        for item in writes
+        if item.get("action") == "update"
+        and str(item.get("old_content") or "") != str(item.get("new_content") or "")
+    ]
+    if not updated_tests:
+        return None
+    try:
+        from umbrella.deep_agent_tools.phase_control_retry import (
+            _phase_subtask_retry_state,
+        )
+
+        state = _phase_subtask_retry_state(ctx)
+    except Exception:
+        log.debug("no_test_tampering oracle-freeze state lookup failed", exc_info=True)
+        return None
+    if not state or int(state.get("failures") or 0) < 1:
+        return None
+    active, _, _ = _active_execute_subtask_for_write_scope(ctx)
+    active_id = str((active or {}).get("id") or state.get("subtask_id") or "").strip()
+    gate = {
+        "reason": "no_test_tampering_oracle_freeze",
+        "allowed_next_tools": ["read_file", "repo_read", "request_watcher_review", "mutate_phase_plan"],
+        "blocked_tools": [
+            "apply_workspace_patch",
+            "replace_workspace_file",
+            "delete_workspace_file",
+        ],
+    }
+    _set_typed_action_gate(ctx, gate)
     return {
         "status": "blocked",
-        "reason": "active_subtask_write_scope",
+        "reason": "no_test_tampering_oracle_freeze",
         "active_subtask_id": active_id,
-        "allowed_paths": sorted(allowed),
-        "blocked_paths": out_of_scope,
-        "future_subtask_owners": future_hits,
+        "test_paths": sorted(set(updated_tests)),
+        "failed_attempts": int(state.get("failures") or 0),
+        "success_test": str(state.get("success_test") or ""),
         "message": (
-            "Execute must work one phase-plan leaf at a time. This patch writes "
-            "file(s) not declared on the active subtask."
+            "`no_test_tampering` is active and the declared proof has already "
+            "failed. A test-only patch would change the proof oracle after "
+            "seeing the failure."
         ),
         "next_step": (
-            f"Finish `{active_id}` using only its declared files. If a blocked "
-            "file truly belongs to this subtask, first call `mutate_phase_plan` "
-            "to add that workspace-relative path to the active subtask's "
-            "`files_to_create`, `files_to_change`, or `files_affected`; otherwise "
-            "wait until the owning future subtask is active."
+            "Repair the implementation, or if the generated test contract is "
+            "internally contradictory, call `request_watcher_review` and then "
+            "`mutate_phase_plan` with `contract_migration_reason` and "
+            "`contract_migration_files` before editing test/proof oracle files."
+        ),
+        "allowed_next_tools": gate["allowed_next_tools"],
+    }
+
+
+def _no_test_tampering_static_block(
+    ctx: Any, *, rel_path: str, new_content: str
+) -> dict[str, Any] | None:
+    if not _active_subtask_requires_no_test_tampering(ctx):
+        return None
+    rel = _norm_workspace_rel_path(rel_path)
+    if not _workspace_rel_path_is_test(rel):
+        return None
+    try:
+        if rel.lower().endswith(".py"):
+            from umbrella.analysis import analyze_python_test_source
+
+            issues = analyze_python_test_source(new_content, path=rel)
+        elif rel.lower().endswith(
+            (".test.js", ".test.jsx", ".test.ts", ".test.tsx", ".spec.js", ".spec.jsx", ".spec.ts", ".spec.tsx")
+        ):
+            from umbrella.analysis import analyze_jsts_test_source
+
+            issues = analyze_jsts_test_source(new_content, path=rel)
+        else:
+            issues = []
+    except Exception:
+        log.debug("no_test_tampering static scan failed open", exc_info=True)
+        return None
+    harness_flags = _active_harness_validator_flags(ctx)
+    blocked = []
+    for issue in issues:
+        code = str(getattr(issue, "code", ""))
+        if code not in _NO_TEST_TAMPERING_STATIC_CODES:
+            continue
+        required_flag = _NO_TEST_TAMPERING_HARNESS_GATED_CODES.get(code)
+        if required_flag and required_flag not in harness_flags:
+            continue
+        blocked.append(issue)
+    if not blocked:
+        return None
+    return {
+        "status": "blocked",
+        "reason": "no_test_tampering_static_guard",
+        "file_path": rel,
+        "issues": [
+            {
+                "code": str(getattr(issue, "code", "")),
+                "line": int(getattr(issue, "line", 0) or 0),
+                "snippet": str(getattr(issue, "snippet", ""))[:240],
+                "message": str(getattr(issue, "message", "")),
+            }
+            for issue in blocked[:8]
+        ],
+        "message": (
+            "`no_test_tampering` is active for this subtask; proof tests may "
+            "not be weakened with skip/xfail, trivial assertions, broad "
+            "exception bypasses, subprocess check=False, target-behavior mocks, "
+            "or native GUI roots in a headless GUI proof."
+        ),
+        "next_step": (
+            "Keep the behavioral assertions active. For real desktop UI launch, "
+            "mutate the subtask to the `desktop_gui_runtime` harness with a "
+            "declared runtime capability. Otherwise move behavior behind a "
+            "headless testable adapter or model and assert that adapter directly."
         ),
     }
 
@@ -2471,6 +2634,170 @@ def _apply_workspace_patch_plan(
     return applied, backups, None
 
 
+def replace_workspace_file(
+    ctx: Any,
+    workspace_id: str,
+    path: str,
+    expected_sha256: str,
+    content: str,
+    validation_summary: str = "",
+) -> str:
+    try:
+        from umbrella.control_plane.workspace_code_update import update_seed_workspace_file
+
+        repo_root = _resolve_umbrella_repo_root(ctx)
+        seed_path = _workspace_root(repo_root, workspace_id, ctx)
+        if stop_payload := _stop_requested_block(
+            ctx, tool_name="replace_workspace_file", workspace_id=workspace_id
+        ):
+            return _json(stop_payload)
+        if session_block := _completion_session_write_block(ctx, "replace_workspace_file"):
+            return _json(session_block)
+        if not seed_path.exists():
+            return f"Workspace not found: {workspace_id}"
+        if gmas_block := _gmas_context_before_write_block(ctx, workspace_id, seed_path):
+            return _json(gmas_block)
+        if phase_order_block := _phase_plan_write_order_block(ctx):
+            return _json(phase_order_block)
+        if retry_block := _phase_subtask_retry_escalation_block(
+            ctx, tool_name="replace_workspace_file"
+        ):
+            return _json(retry_block)
+        rel_path = _norm_workspace_rel_path(path)
+        if protocol_block := _patch_protocol_gate(
+            ctx, workspace_id=workspace_id, rel_path=rel_path
+        ):
+            if str(protocol_block.get("required_mode") or "") != "replace_workspace_file":
+                return _json(protocol_block)
+        if not _workspace_file_was_read(ctx, workspace_id, rel_path):
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": "read_before_patch_required",
+                    "file_path": rel_path,
+                }
+            )
+        target = _workspace_path(seed_path, rel_path)
+        if not target.is_file():
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": "patch_target_missing",
+                    "file_path": rel_path,
+                }
+            )
+        import hashlib
+
+        current_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+        expected = str(expected_sha256 or "").strip().lower()
+        if expected and current_sha != expected:
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": "stale_read_before_patch",
+                    "file_path": rel_path,
+                    "current_sha256": current_sha,
+                    "expected_sha256": expected,
+                    "next_step": "Re-read the file and use the fresh sha256.",
+                }
+            )
+        planned = [{"path": rel_path, "action": "update"}]
+        if scope_block := _execute_subtask_write_scope_block(
+            ctx, planned=planned, seed_path=seed_path
+        ):
+            return _json(scope_block)
+        if syntax_block := _python_syntax_block(rel_path, content):
+            return _json(syntax_block)
+        if tamper_block := _no_test_tampering_static_block(
+            ctx, rel_path=rel_path, new_content=content
+        ):
+            return _json(tamper_block)
+        old_content = target.read_text(encoding="utf-8", errors="replace")
+        if oracle_block := _no_test_tampering_oracle_freeze_block(
+            ctx,
+            planned=[
+                {
+                    "path": rel_path,
+                    "action": "update",
+                    "old_content": old_content,
+                    "new_content": content,
+                }
+            ],
+        ):
+            return _json(oracle_block)
+        phase = phase_from_context(ctx)
+        if enforcement_issues := check_workspace_paths(
+            "replace_workspace_file",
+            phase,
+            [rel_path],
+            write_kind="patch",
+        ):
+            return _json(
+                blocked_payload(
+                    enforcement_issues,
+                    tool_name="replace_workspace_file",
+                    phase=phase,
+                    touched_files=[rel_path],
+                )
+            )
+        result = update_seed_workspace_file(
+            seed_path=seed_path,
+            relative_file_path=rel_path,
+            new_content=content,
+            create_backup=True,
+            backup_dir=repo_root / ".umbrella" / "backups",
+        )
+        if not result.applied:
+            return _json(
+                {
+                    "status": "error",
+                    "reason": "replace_failed",
+                    "error": result.error or "unknown error",
+                }
+            )
+        _record_workspace_diff(
+            ctx,
+            file_path=rel_path,
+            old_content=old_content,
+            new_content=content,
+            added_file=False,
+        )
+        replace_ledger = None
+        try:
+            replace_ledger = append_supervisor_ledger_event(
+                repo_root=repo_root,
+                workspace_id=workspace_id,
+                actor="agent",
+                phase=phase,
+                tool="replace_workspace_file",
+                args={"path": rel_path, "validation_summary": validation_summary},
+                result={"status": "ok", "path": rel_path},
+                touched_files=[rel_path],
+            )
+        except Exception:
+            log.debug("supervisor ledger append failed for replace file", exc_info=True)
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "workspace_id": workspace_id,
+            "path": rel_path,
+            "backup": str(result.backup_path or ""),
+            "validation_summary": validation_summary,
+        }
+        if replace_ledger is not None:
+            payload.update(supervisor_ledger_ref(replace_ledger))
+            payload["ledger_ref"] = {
+                "ref_type": "ledger_event",
+                "ref_id": replace_ledger.event_id,
+                "hash": replace_ledger.event_hash,
+                "produced_by": "agent",
+                "phase": phase,
+            }
+        return _json(payload)
+    except Exception as exc:
+        log.debug("replace_workspace_file failed", exc_info=True)
+        return _json({"status": "error", "reason": "replace_failed", "error": str(exc)})
+
+
 def apply_workspace_patch(
     ctx: Any,
     workspace_id: str,
@@ -2493,6 +2820,8 @@ def apply_workspace_patch(
             ctx, tool_name="apply_workspace_patch", workspace_id=workspace_id
         ):
             return _json(stop_payload)
+        if session_block := _completion_session_write_block(ctx, "apply_workspace_patch"):
+            return _json(session_block)
         if not seed_path.exists():
             return f"Workspace not found: {workspace_id}"
         if gmas_block := _gmas_context_before_write_block(ctx, workspace_id, seed_path):
@@ -2577,20 +2906,11 @@ def apply_workspace_patch(
             return _json(context_block)
         phase = phase_from_context(ctx)
         planned_paths = [str(item.get("path") or "") for item in planned]
-        planned_norm = {
-            _norm_workspace_rel_path(path)
-            for path in planned_paths
-            if _norm_workspace_rel_path(path)
-        }
-        allow_verifier_policy = planned_norm == {"workspace.toml"} and (
-            _workspace_toml_additive_verification_patch(seed_path, planned)
-        )
         if enforcement_issues := check_workspace_paths(
             "apply_workspace_patch",
             phase,
             planned_paths,
             write_kind="patch",
-            allow_verifier_policy_edit=allow_verifier_policy,
         ):
             return _json(
                 blocked_payload(
@@ -3487,14 +3807,28 @@ def delegate_to_ouroboros(
         return f"WARNING: Ouroboros delegation error: {e}"
 
 
-def web_fetch(ctx: Any, url: str, max_chars: int = 20000) -> str:
-    """Fetch a URL (GET) and return cleaned text (HTML stripped, head+tail truncated)."""
+def web_fetch(
+    ctx: Any,
+    url: str,
+    max_chars: int = 20000,
+    intent: str = "planner_research",
+    register_catalog: bool = True,
+    extract_sections: bool = True,
+    include_content: bool = False,
+) -> str:
+    """Fetch URL; full body on disk + catalog; slim JSON unless include_content."""
     try:
         _record_subtask_discovery_tool_call(ctx, "web_fetch")
         import re as _re
         import httpx
+        from umbrella.discovery.external_catalog import (
+            mirror_preview_body,
+            persist_fetched_page,
+        )
+        from umbrella.discovery.web_page_chunks import canonical_url, preview_text
+        from umbrella.memory.external_findings import mirror_external_finding_to_memory
 
-        u = (url or "").strip()
+        u = canonical_url((url or "").strip())
         if not u:
             return _json({"error": "empty url"})
         if not u.lower().startswith(("http://", "https://")):
@@ -3521,20 +3855,51 @@ def web_fetch(ctx: Any, url: str, max_chars: int = 20000) -> str:
             body = _re.sub(r"<[^>]+>", " ", body)
             body = _re.sub(r"\s+", " ", body).strip()
 
-        truncated = False
-        if len(body) > cap:
-            truncated = True
+        store_body = body
+        truncated = len(store_body) > cap
+        if truncated:
             half = cap // 2
-            body = body[:half] + "\n...(truncated)...\n" + body[-half:]
-        return _json(
-            {
-                "url": str(r.url),
-                "status": r.status_code,
-                "content_type": ct,
-                "truncated": truncated,
-                "content": body,
-            }
-        )
+            store_body = store_body[:half] + "\n...(truncated)...\n" + store_body[-half:]
+
+        page_meta: dict[str, Any] = {}
+        if register_catalog:
+            page_meta = persist_fetched_page(
+                ctx,
+                url=str(r.url),
+                body=store_body,
+                intent=str(intent or "").strip() or "planner_research",
+                extract_sections=bool(extract_sections),
+            )
+            try:
+                mirror_external_finding_to_memory(
+                    ctx,
+                    kind="web_page",
+                    title=f"web_fetch:{u}",
+                    body=mirror_preview_body(
+                        source_id=f"web_fetch:{u}",
+                        url=u,
+                        preview=store_body,
+                        storage_ref=str(page_meta.get("page_storage_ref") or ""),
+                    ),
+                    tags=["web", "web_page", "external_research"],
+                    palace_room="web_pages",
+                    palace_subpath="web/pages",
+                )
+            except Exception:
+                log.debug("web_fetch mirror skipped", exc_info=True)
+
+        out: dict[str, Any] = {
+            "url": str(r.url),
+            "status": r.status_code,
+            "truncated": truncated,
+            "catalog_id": page_meta.get("catalog_id", ""),
+            "section_ids": page_meta.get("section_ids", []),
+            "page_storage_ref": page_meta.get("page_storage_ref", ""),
+            "preview": preview_text(store_body),
+        }
+        if include_content:
+            out["content"] = store_body
+        return _json(out)
     except Exception as e:
         log.error("web_fetch failed: %s", e, exc_info=True)
         return f"WARNING: web_fetch error: {e}"
@@ -3565,10 +3930,6 @@ __all__ = [
     '_source_truncation_block',
     '_record_workspace_diff',
     '_record_subtask_discovery_tool_call',
-    '_verification_steps_from_toml',
-    '_verification_step_name',
-    '_verification_step_kind',
-    '_workspace_toml_verification_guard',
     'update_workspace_seed',
     '_phase_plan_write_order_block',
     '_phase_subtask_retry_escalation_block',
@@ -3576,6 +3937,7 @@ __all__ = [
     '_plan_workspace_patch_operations',
     '_apply_workspace_patch_plan',
     'apply_workspace_patch',
+    'replace_workspace_file',
     '_gmas_first_write_advisory',
     '_source_repair_delete_block',
     '_delete_validate_path',

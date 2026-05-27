@@ -4,6 +4,7 @@ import time
 import pytest
 from umbrella.phases.base import WatcherSignal
 from umbrella.orchestrator.watcher import WatcherPollLoop
+from umbrella.orchestrator.watcher_semantic import accepted_research_finding_ids
 from umbrella.orchestrator.watcher_triggers import TriggerEvent
 
 
@@ -80,13 +81,16 @@ def test_stall_detection(tmp_drive):
     assert ev.kind == "stall"
 
 
-def test_repeat_semantic_failure_auto_aborts(tmp_drive):
+def test_repeat_semantic_failure_injects_lesson_at_default_threshold(tmp_drive, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_INJECT_M", "3")
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_RESTART_M", "15")
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_ABORT_M", "30")
     tools = tmp_drive / "logs" / "tools.jsonl"
     row = {
-        "tool": "submit_research_summary",
+        "tool": "palace_add",
         "result_preview": (
-            "ERROR: research summary references finding id(s) that were not "
-            "accepted by palace_add as research_finding for this task."
+            "ERROR: palace_add research_finding requires a source_id tied "
+            "to current research-phase evidence."
         ),
     }
     tools.write_text(
@@ -98,10 +102,67 @@ def test_repeat_semantic_failure_auto_aborts(tmp_drive):
     signal = watcher.tick(phase="research", phase_started_at=time.time() - 5)
 
     assert signal is not None
+    assert signal.kind == "inject_lesson"
+    assert signal.trigger == "repeat_semantic_failure"
+    assert "research_memory_provenance_error" in str(signal.payload.get("watcher_semantic_category") or "")
+    assert str(signal.payload.get("watcher_lesson") or "").strip()
+    assert watcher.read_pending_signal() is not None
+
+
+def test_accepted_research_finding_ids_ignores_observations(tmp_drive):
+    tools = tmp_drive / "logs" / "tools.jsonl"
+    rows = [
+        {
+            "tool": "palace_add",
+            "args": {"kind": "observation"},
+            "result_preview": json.dumps(
+                {"saved": True, "id": "observation-id", "kind": "observation"}
+            ),
+        },
+        {
+            "tool": "palace_add",
+            "args": {"kind": "research_finding"},
+            "result_preview": json.dumps(
+                {
+                    "saved": True,
+                    "id": "finding-id",
+                    "kind": "research_finding",
+                }
+            ),
+        },
+    ]
+    tools.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    assert accepted_research_finding_ids(tools) == ["finding-id"]
+
+
+def test_repeat_semantic_failure_aborts_at_configured_ceiling(tmp_drive, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_INJECT_M", "3")
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_RESTART_M", "15")
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_ABORT_M", "30")
+    tools = tmp_drive / "logs" / "tools.jsonl"
+    row = {
+        "tool": "palace_add",
+        "result_preview": (
+            "ERROR: palace_add research_finding requires a source_id tied "
+            "to current research-phase evidence."
+        ),
+    }
+    tools.write_text(
+        "\n".join(json.dumps(row) for _ in range(30)) + "\n",
+        encoding="utf-8",
+    )
+    watcher = WatcherPollLoop(tmp_drive, poll_sec=1)
+    watcher._semantic_emit_keys.clear()
+
+    signal = watcher.tick(phase="research", phase_started_at=time.time() - 5)
+
+    assert signal is not None
     assert signal.kind == "abort_phase"
     assert signal.trigger == "repeat_semantic_failure"
-    assert "research_memory_provenance_error" in signal.reason
-    assert watcher.read_pending_signal() is not None
 
 
 @pytest.mark.parametrize(
@@ -114,8 +175,11 @@ def test_repeat_semantic_failure_auto_aborts(tmp_drive):
     ],
 )
 def test_repeat_semantic_failure_category_mapping(
-    tmp_drive, category: str, expected_kind: str
+    tmp_drive, category: str, expected_kind: str, monkeypatch
 ) -> None:
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_INJECT_M", "3")
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_RESTART_M", "15")
+    monkeypatch.setenv("OUROBOROS_WATCHER_SEMANTIC_ABORT_M", "30")
     tools = tmp_drive / "logs" / "tools.jsonl"
     row = {
         "tool": "run_subtask_proof",
@@ -144,11 +208,13 @@ def test_repeat_semantic_failure_category_mapping(
                 }
             ),
         }
+    repeat_count = 30 if expected_kind == "abort_phase" else 15 if expected_kind == "restart_phase" else 3
     tools.write_text(
-        "\n".join(json.dumps(row) for _ in range(3)) + "\n",
+        "\n".join(json.dumps(row) for _ in range(repeat_count)) + "\n",
         encoding="utf-8",
     )
     watcher = WatcherPollLoop(tmp_drive, poll_sec=1)
+    watcher._semantic_emit_keys.clear()
     signal = watcher.tick(phase="execute", phase_started_at=time.time() - 5)
     assert signal is not None
     assert signal.kind == expected_kind

@@ -19,6 +19,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+from ouroboros.limits import (
+    DISCOVERY_CONTENT_CHARS,
+    TOOL_LOG_PREVIEW_CHARS,
+)
 from ouroboros.utils import (
     utc_now_iso,
     read_text,
@@ -29,6 +33,9 @@ from ouroboros.utils import (
     sanitize_task_for_event,
     task_artifact_stem,
 )
+
+_TASK_RESULT_ARTIFACT_CHARS = TOOL_LOG_PREVIEW_CHARS
+_CODE_REVIEW_FILE_PREVIEW_CHARS = DISCOVERY_CONTENT_CHARS
 from ouroboros.llm import LLMClient
 from ouroboros.tools import ToolRegistry
 from ouroboros.tools.registry import ToolContext
@@ -582,7 +589,7 @@ class OuroborosAgent:
                         "type": "task_error",
                         "task_id": task.get("id"),
                         "error": repr(e),
-                        "traceback": truncate_for_log(tb, 2000),
+                        "traceback": truncate_for_log(tb, TOOL_LOG_PREVIEW_CHARS),
                     },
                 )
                 text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
@@ -746,7 +753,7 @@ class OuroborosAgent:
                 "task_id": task.get("id"),
                 "parent_task_id": task.get("parent_task_id"),
                 "status": "failed" if is_model_response_failure(text) else "completed",
-                "result": text[:4000] if text else "",  # Truncate to avoid huge files
+                "result": text[:_TASK_RESULT_ARTIFACT_CHARS] if text else "",
                 "cost_usd": round(float(usage.get("cost") or 0), 6),
                 "total_rounds": int(usage.get("rounds") or 0),
                 "model": active_model or None,
@@ -796,7 +803,11 @@ class OuroborosAgent:
                         f"\n... ({len(sections) - files_added} more files, use repo_read)"
                     )
                     break
-                preview = content[:2000] if len(content) > 2000 else content
+                preview = (
+                    content[:_CODE_REVIEW_FILE_PREVIEW_CHARS]
+                    if len(content) > _CODE_REVIEW_FILE_PREVIEW_CHARS
+                    else content
+                )
                 file_block = f"\n### {path}\n```\n{preview}\n```\n"
                 total_chars += len(file_block)
                 parts.append(file_block)

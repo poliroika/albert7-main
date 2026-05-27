@@ -42,6 +42,165 @@ def _append_phase_tool_row(
         )
 
 
+def _write_basic_capability_declaration(drive):
+    state = drive / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    workspace = drive.parent.parent
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.toml").write_text(
+        "[policies]\ngreenfield_python_src_layout = true\n",
+        encoding="utf-8",
+    )
+    (state / "capability_declaration.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "status": "submitted",
+                "capabilities": {
+                    "python": {"available": True, "source": "probe"},
+                    "node": {"available": True, "source": "probe"},
+                    "subprocess": {"available": True, "source": "probe"},
+                },
+                "notes": "Python and Node runtimes are available.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _phase_plan_ctx(tmp_path, workspace_id="ws1"):
+    repo = tmp_path
+    workspace = repo / "workspaces" / workspace_id
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "app.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    (workspace / "tests").mkdir()
+    (workspace / "tests" / "test_app.py").write_text(
+        "from src.app import add\n\n"
+        "def test_add_behavior():\n"
+        "    assert add(1, 2) == 3\n",
+        encoding="utf-8",
+    )
+    drive = workspace / ".memory" / "drive"
+    _write_basic_capability_declaration(drive)
+    ctx = ToolContext(repo_dir=repo, host_repo_root=repo, drive_root=drive)
+    ctx.task_id = "run-1:plan"
+    ctx.current_task_type = "phase_run"
+    ctx.loop_state_view = {
+        "active_workspace_id": workspace_id,
+        "phase_label": "plan",
+    }
+    return ctx, drive
+
+
+def _typed_python_subtask(subtask_id="build-core"):
+    return {
+        "id": subtask_id,
+        "title": "Build core behavior",
+        "goal": "Implement calculator addition and prove varied inputs.",
+        "files_to_change": ["src/app.py", "tests/test_app.py"],
+        "proof": {
+            "execution": {
+                "kind": "pytest",
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/test_app.py::test_add_behavior",
+                    "-q",
+                ],
+                "shell": False,
+            },
+            "oracle": {
+                "oracle_type": "unit_assertions",
+                "required_properties": [
+                    "distinct_inputs_distinct_outputs",
+                    "no_test_tampering",
+                ],
+                "negative_cases_required": True,
+            },
+            "scope": {
+                "files_under_test": ["src/app.py"],
+                "changed_files_expected": ["src/app.py", "tests/test_app.py"],
+                "pytest_targets": ["tests/test_app.py::test_add_behavior"],
+            },
+            "anti_gaming": {"requires_real_runtime": True},
+            "required_capabilities": ["python"],
+        },
+    }
+
+
+def test_propose_phase_plan_records_canonical_subtasks_from_phase_alias(
+    tmp_path,
+    monkeypatch,
+):
+    ctx, drive = _phase_plan_ctx(tmp_path)
+    monkeypatch.setattr(MemPalace, "add", lambda self, **kwargs: "memory-id")
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "legacy-phase-container",
+            "workspace_id": "ws1",
+            "phases": [_typed_python_subtask("build-core")],
+        },
+        notes="legacy alias should not leak into stored plan",
+    )
+
+    assert result.startswith("OK:"), result
+    latest = json.loads(
+        (drive / "state" / "phase_plan_proposal_latest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "phases" not in latest["plan"]
+    assert latest["plan"]["subtasks"][0]["id"] == "build-core"
+
+
+def test_submit_phase_plan_records_canonical_subtasks_from_phase_alias(
+    tmp_path,
+    monkeypatch,
+):
+    ctx, drive = _phase_plan_ctx(tmp_path)
+    monkeypatch.setattr(MemPalace, "add", lambda self, **kwargs: "memory-id")
+    state = drive / "state"
+    payload = {
+        "created_at": 100.0,
+        "task_id": "run-1:plan",
+        "workspace_id": "ws1",
+        "run_id": "run-1",
+        "plan_id": "legacy-phase-container",
+        "plan": {
+            "workspace_id": "ws1",
+            "phases": [_typed_python_subtask("build-core")],
+        },
+        "notes": "legacy alias proposal",
+    }
+    (state / "phase_plan_proposal_latest.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    (state / "phase_plan_proposals.jsonl").write_text(
+        json.dumps(payload) + "\n",
+        encoding="utf-8",
+    )
+
+    result = phase_control._submit_phase_plan(
+        ctx,
+        plan_id="legacy-phase-container",
+        notes="submit canonicalized plan",
+    )
+
+    assert result.startswith("OK:"), result
+    submitted = json.loads(
+        (state / "phase_plan_submitted_latest.json").read_text(encoding="utf-8")
+    )
+    assert "phases" not in submitted["plan"]
+    assert submitted["plan"]["subtasks"][0]["id"] == "build-core"
+
+
 def test_research_provenance_contract_drives_schema_description():
     palace_add = next(tool for tool in get_tools() if tool.name == "palace_add")
 
@@ -303,18 +462,7 @@ def test_palace_add_rejects_unmatched_github_namespace_source(tmp_path):
     assert "does not match any repository returned" in result
 
 
-def test_palace_add_accepts_matched_github_namespace_source(tmp_path, monkeypatch):
-    called = False
-
-    def fake_save(ctx, **kwargs):
-        nonlocal called
-        called = True
-        return "OK: memory saved"
-
-    monkeypatch.setattr(
-        "ouroboros.tools.phase_contract.umbrella_tools.save_umbrella_memory",
-        fake_save,
-    )
+def test_palace_add_accepts_matched_github_namespace_source(tmp_path):
     (tmp_path / "umbrella").mkdir()
     drive = tmp_path / "workspaces" / "civilization" / ".memory" / "drive"
     drive.mkdir(parents=True)
@@ -351,7 +499,9 @@ def test_palace_add_accepts_matched_github_namespace_source(tmp_path, monkeypatc
     assert payload["saved"] is True
     assert payload["verified"] is True
     assert payload["source_path"] == "github:clxrityy/daily-set"
-    assert called is True
+    stored = MemPalace(tmp_path, "civilization").get(payload["id"])
+    assert stored["verified"] is True
+    assert stored["source_path"] == "github:clxrityy/daily-set"
 
 
 def test_palace_add_rejects_tool_qualified_github_source_with_empty_results(tmp_path):
@@ -741,7 +891,7 @@ def test_palace_add_keeps_explicit_research_observation_as_untrusted_note(
     assert payload["kind"] == "observation"
     assert payload["verified"] is False
     assert "research_finding" not in payload["tags"]
-    assert called is True
+    assert json.loads(result)["saved"] is True
 
 
 def test_palace_add_accepts_tool_qualified_deep_search_source(
@@ -798,10 +948,10 @@ def test_palace_add_accepts_tool_qualified_deep_search_source(
     payload = json.loads(result)
     assert payload["saved"] is True
     assert payload["source_path"] == "deep_search:planner_research"
-    assert called is True
+    assert json.loads(result)["saved"] is True
 
 
-def test_palace_add_accepts_tool_qualified_source_from_logged_args_when_preview_truncated(
+def test_palace_add_rejects_tool_qualified_source_when_preview_lacks_results(
     tmp_path, monkeypatch
 ):
     called = False
@@ -846,10 +996,8 @@ def test_palace_add_accepts_tool_qualified_source_from_logged_args_when_preview_
         source_id="deep_search:github_discovery",
     )
 
-    payload = json.loads(result)
-    assert payload["saved"] is True
-    assert payload["source_path"] == "deep_search:github_discovery"
-    assert called is True
+    assert "not a verifiable current discovery source" in result
+    assert called is False
 
 
 def test_palace_add_rejects_explicit_research_finding_progress_ledger(tmp_path):
@@ -947,6 +1095,7 @@ def test_phase_plan_proposal_memory_is_tagged_as_candidate(tmp_path, monkeypatch
 
     drive = tmp_path / "workspaces" / "test_ws" / ".memory" / "drive"
     drive.mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.current_task_type = "phase_run"
@@ -998,43 +1147,20 @@ def test_phase_plan_proposal_memory_is_tagged_as_candidate(tmp_path, monkeypatch
 
 
 def test_submit_phase_plan_persists_selected_plan_not_latest(tmp_path):
-    drive = tmp_path / "workspaces" / "test_ws" / ".memory" / "drive"
-    drive.mkdir(parents=True)
-    ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
-    ctx.task_id = "run-123:plan"
-    ctx.current_task_type = "phase_run"
-    ctx.loop_state_view = {
-        "phase_label": "plan",
-        "active_workspace_id": "test_ws",
-    }
-
+    ctx, drive = _phase_plan_ctx(tmp_path)
     first = {
         "plan_id": "selected-plan",
-        "subtasks": [
-            {
-                "id": "selected",
-                "title": "Selected plan",
-                "goal": "Build selected path.",
-                "files_to_create": ["src/demo/app.py", "tests/test_selected.py"],
-                "success_test": "python -m pytest tests/test_selected.py -q",
-            }
-        ],
+        "workspace_id": "ws1",
+        "subtasks": [_typed_python_subtask("selected")],
     }
     second = {
         "plan_id": "latest-unsubmitted",
-        "subtasks": [
-            {
-                "id": "latest",
-                "title": "Latest unsubmitted plan",
-                "goal": "Build a different path.",
-                "files_to_create": ["src/demo/other.py", "tests/test_latest.py"],
-                "success_test": "python -m pytest tests/test_latest.py -q",
-            }
-        ],
+        "workspace_id": "ws1",
+        "subtasks": [_typed_python_subtask("latest")],
     }
 
-    _propose_phase_plan(ctx, plan=first)
-    _propose_phase_plan(ctx, plan=second)
+    assert _propose_phase_plan(ctx, plan=first).startswith("OK:")
+    assert _propose_phase_plan(ctx, plan=second).startswith("OK:")
     result = phase_control._submit_phase_plan(ctx, plan_id="selected-plan")
 
     assert result.startswith("OK: Phase plan submitted")
@@ -1053,11 +1179,11 @@ def test_submit_phase_plan_persists_selected_plan_not_latest(tmp_path):
     assert submitted["plan"]["subtasks"][0]["id"] == "selected"
     from umbrella.memory.palace.facade import MemPalace
 
-    palace = MemPalace(tmp_path, "test_ws")
+    palace = MemPalace(tmp_path, "ws1")
     try:
         recall = palace.recall(
             "execute",
-            run_id="run-123",
+            run_id="run-1",
             hot_rules=[{"store": "palace.run", "tags": []}],
             n=10,
         )
@@ -1095,12 +1221,33 @@ def test_request_extra_subtask_rejects_captured_control_plane_workaround(tmp_pat
                 "Mark the multi_agent_gmas skill optional or add blocker_note "
                 "because GMAS integration is in st_005."
             ),
-            "success_test": {
-                "kind": "cmd",
-                "value": (
-                    "python -c \"import yaml; conf = yaml.safe_load(open("
-                    "'.umbrella/workspace.toml')); assert conf\""
-                ),
+            "proof": {
+                "execution": {
+                    "kind": "pytest",
+                    "command": [
+                        "python",
+                        "-m",
+                        "pytest",
+                        "tests/test_skill_policy.py",
+                        "-q",
+                    ],
+                    "shell": False,
+                },
+                "oracle": {
+                    "oracle_type": "unit_assertions",
+                    "required_properties": ["workspace_policy_enforced"],
+                    "negative_cases_required": True,
+                },
+                "scope": {
+                    "files_under_test": [".umbrella/workspace.toml"],
+                    "changed_files_expected": [
+                        ".umbrella/workspace.toml",
+                        "workspaces/civilization/.memory/blockers.md",
+                    ],
+                    "pytest_targets": ["tests/test_skill_policy.py"],
+                },
+                "anti_gaming": {"requires_real_runtime": True},
+                "required_capabilities": ["python"],
             },
             "files_to_change": [
                 ".umbrella/workspace.toml",
@@ -1110,7 +1257,7 @@ def test_request_extra_subtask_rejects_captured_control_plane_workaround(tmp_pat
     )
 
     assert result.startswith("ERROR: request_extra_subtask rejected")
-    assert "workspace policy" in result or "skill/verification gates" in result
+    assert "candidate_control_path_forbidden" in result
     assert not (drive / "state" / "phase_control_signals.jsonl").exists()
 
 
@@ -1118,6 +1265,19 @@ def test_request_extra_subtask_accepts_product_subtask(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     drive.mkdir(parents=True)
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "capability_declaration.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "status": "submitted",
+                "capabilities": {"python": {"available": True, "source": "probe"}},
+                "notes": "Python runtime is available.",
+            }
+        ),
+        encoding="utf-8",
+    )
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:execute"
     ctx.current_task_type = "phase_run"
@@ -1137,7 +1297,37 @@ def test_request_extra_subtask_accepts_product_subtask(tmp_path):
                 "src/test_ws/game/scoring.py",
                 "tests/test_scoring.py",
             ],
-            "success_test": "python -m pytest tests/test_scoring.py -q",
+            "proof": {
+                "execution": {
+                    "kind": "pytest",
+                    "command": [
+                        "python",
+                        "-m",
+                        "pytest",
+                        "tests/test_scoring.py",
+                        "-q",
+                    ],
+                    "shell": False,
+                },
+                "oracle": {
+                    "oracle_type": "unit_assertions",
+                    "required_properties": [
+                        "score_totals_visible",
+                        "no_test_tampering",
+                    ],
+                    "negative_cases_required": True,
+                },
+                "scope": {
+                    "files_under_test": ["src/test_ws/game/scoring.py"],
+                    "changed_files_expected": [
+                        "src/test_ws/game/scoring.py",
+                        "tests/test_scoring.py",
+                    ],
+                    "pytest_targets": ["tests/test_scoring.py"],
+                },
+                "anti_gaming": {"requires_real_runtime": True},
+                "required_capabilities": ["python"],
+            },
         },
     )
 
@@ -1148,6 +1338,7 @@ def test_request_extra_subtask_accepts_product_subtask(tmp_path):
 def test_propose_phase_plan_rejects_over_granular_greenfield_plan(tmp_path):
     drive = tmp_path / "workspaces" / "test_ws" / ".memory" / "drive"
     drive.mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.current_task_type = "phase_run"
@@ -1184,7 +1375,7 @@ def test_propose_phase_plan_rejects_over_granular_greenfield_plan(tmp_path):
     assert result.startswith("ERROR: phase plan violates workspace policy")
     assert "17 executable leaves" in result
     assert "8-16" in result
-    assert "[PHASE_PLAN_REPAIR_SCAFFOLD]" in result
+    assert "vertical slices" in result
     assert "12-14 leaves" in result
     assert "Do not oscillate" in result
 
@@ -1192,6 +1383,7 @@ def test_propose_phase_plan_rejects_over_granular_greenfield_plan(tmp_path):
 def test_propose_phase_plan_accepts_thirteen_narrow_greenfield_leaves(tmp_path):
     drive = tmp_path / "workspaces" / "test_ws" / ".memory" / "drive"
     drive.mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.current_task_type = "phase_run"
@@ -1261,6 +1453,7 @@ def test_propose_phase_plan_accepts_thirteen_narrow_greenfield_leaves(tmp_path):
 def test_propose_phase_plan_rejects_captured_broad_leaf_before_submit(tmp_path):
     drive = tmp_path / "workspaces" / "test_ws" / ".memory" / "drive"
     drive.mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_3bbfc06b:plan"
     ctx.current_task_type = "phase_run"
@@ -1377,6 +1570,7 @@ def test_propose_phase_plan_rejects_captured_broad_leaf_before_submit(tmp_path):
 def test_propose_phase_plan_accepts_split_version_of_captured_broad_leaf(tmp_path):
     drive = tmp_path / "workspaces" / "test_ws" / ".memory" / "drive"
     drive.mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_3bbfc06b:plan"
     ctx.current_task_type = "phase_run"
@@ -1545,7 +1739,7 @@ def test_palace_add_accepts_optional_metadata(tmp_path, monkeypatch):
         kind="research_finding",
         workspace_id="test_ws",
         source_id="github:example/civ-pattern",
-        evidence_kind="observation",
+        evidence_kind="relevant_prior_art",
         tags="research_finding",
     )
 
@@ -1555,14 +1749,10 @@ def test_palace_add_accepts_optional_metadata(tmp_path, monkeypatch):
     assert payload["tier"] == "hot"
     assert payload["verified"] is True
     assert payload["id"]
-    assert captured["title"] == "Finding"
-    assert captured["palace_path"] == "research"
-    assert "Concrete architecture note." in captured["content"]
-    assert "github:example/civ-pattern" in captured["content"]
-    assert "observation" in captured["content"]
-    assert "research_finding" in captured["tags"]
     stored = MemPalace(tmp_path, "test_ws").get(payload["id"])
     assert stored["verified"] is True
+    assert "Concrete architecture note." in stored["content"]
+    assert stored["source_path"] == "github:example/civ-pattern"
 
     recall = MemPalace(tmp_path, "test_ws").recall(
         "research",
@@ -1634,10 +1824,9 @@ def test_palace_add_research_defaults_concrete_observation_to_research_finding(
     assert payload["verified"] is True
     assert "research_finding" in payload["tags"]
     assert payload["store"] == "palace.run"
-    assert captured["kind"] == "research_finding"
-    assert "research_finding" in captured["tags"]
     stored = MemPalace(tmp_path, "test_ws").get(payload["id"])
     assert stored["verified"] is True
+    assert stored["memory_kind"] == "research_finding"
     recall = MemPalace(tmp_path, "test_ws").recall(
         "research",
         run_id="run-123",
@@ -1677,8 +1866,6 @@ def test_palace_add_research_progress_note_is_not_research_finding(
     assert payload["saved"] is True
     assert payload["kind"] == "observation"
     assert "research_finding" not in payload["tags"]
-    assert captured["kind"] == "observation"
-    assert "research_finding" not in captured["tags"]
     recall = MemPalace(tmp_path, "test_ws").recall(
         "research",
         run_id="run-123",
@@ -1723,8 +1910,6 @@ def test_palace_add_research_continue_note_is_not_research_finding(
     assert payload["saved"] is True
     assert payload["kind"] == "observation"
     assert "research_finding" not in payload["tags"]
-    assert captured["kind"] == "observation"
-    assert "research_finding" not in captured["tags"]
     recall = MemPalace(tmp_path, "test_ws").recall(
         "research",
         run_id="phase_web_e8afe5ca",
@@ -1765,7 +1950,6 @@ def test_palace_add_research_hypothesis_is_not_research_finding(
     assert payload["saved"] is True
     assert payload["kind"] == "observation"
     assert "research_finding" not in payload["tags"]
-    assert captured["kind"] == "observation"
 
 
 def test_palace_add_rejects_explicit_verified_false_research_finding(tmp_path):
@@ -1858,8 +2042,7 @@ def test_palace_add_routes_plan_subtask_card_to_subtask_store(tmp_path, monkeypa
     assert payload["store"] == "palace.subtask"
     assert payload["scope"] == "subtask_scoped"
     assert payload["subtask_id"] == "game-state"
-    assert captured["palace_path"] == "plan/subtasks"
-    assert captured["kind"] == "subtask_card"
+    assert payload["kind"] == "subtask_card"
 
     memories = MemPalace(tmp_path, "test_ws").list_all(stores=["palace.subtask"], n=10)
     assert any(
@@ -1898,7 +2081,8 @@ def test_palace_add_defaults_plan_subtask_path_from_phase(tmp_path, monkeypatch)
 
     payload = json.loads(result)
     assert payload["saved"] is True
-    assert captured["palace_path"] == "plan/subtasks"
+    assert payload["store"] == "palace.subtask"
+    assert payload["subtask_id"] == "api"
 
 
 def test_palace_add_defaults_linear_execute_task_to_execute_path(tmp_path, monkeypatch):
@@ -1930,7 +2114,8 @@ def test_palace_add_defaults_linear_execute_task_to_execute_path(tmp_path, monke
 
     payload = json.loads(result)
     assert payload["saved"] is True
-    assert captured["palace_path"] == "execute"
+    assert payload["phase"] == "execute"
+    assert payload["kind"] == "execution_artifact"
 
 
 def test_palace_add_does_not_treat_missing_imports_plural_as_symbol_s(tmp_path, monkeypatch):
@@ -1971,7 +2156,7 @@ def test_palace_add_does_not_treat_missing_imports_plural_as_symbol_s(tmp_path, 
     assert payload["saved"] is True
 
 
-def test_palace_add_rejects_research_llm_fallback_finding(tmp_path, monkeypatch):
+def test_palace_add_requires_source_before_llm_fallback_wording(tmp_path, monkeypatch):
     called = False
 
     def fake_save(ctx, **kwargs):
@@ -2004,11 +2189,11 @@ def test_palace_add_rejects_research_llm_fallback_finding(tmp_path, monkeypatch)
     )
 
     assert result.startswith("ERROR:")
-    assert "not saved" in result
+    assert "requires a source_id" in result
     assert called is False
 
 
-def test_palace_add_rejects_captured_research_fallback_with_linear_label(
+def test_palace_add_requires_source_before_captured_research_fallback_with_linear_label(
     tmp_path, monkeypatch
 ):
     called = False
@@ -2046,12 +2231,11 @@ def test_palace_add_rejects_captured_research_fallback_with_linear_label(
     )
 
     assert result.startswith("ERROR:")
-    assert "forbidden LLM fallback" in result
-    assert "not saved" in result
+    assert "requires a source_id" in result
     assert called is False
 
 
-def test_palace_add_rejects_captured_graceful_degradation_mock_mode(
+def test_palace_add_requires_source_before_captured_graceful_degradation_mock_mode(
     tmp_path, monkeypatch
 ):
     called = False
@@ -2098,12 +2282,11 @@ def test_palace_add_rejects_captured_graceful_degradation_mock_mode(
     )
 
     assert result.startswith("ERROR:")
-    assert "forbidden LLM fallback" in result
-    assert "not saved" in result
+    assert "requires a source_id" in result
     assert called is False
 
 
-def test_palace_add_rejects_captured_mock_llm_behavior_verification(
+def test_palace_add_requires_source_before_captured_mock_llm_behavior_verification(
     tmp_path, monkeypatch
 ):
     called = False
@@ -2142,12 +2325,11 @@ def test_palace_add_rejects_captured_mock_llm_behavior_verification(
     )
 
     assert result.startswith("ERROR:")
-    assert "mock/fake/dry-run LLM" in result
-    assert "not saved" in result
+    assert "requires a source_id" in result
     assert called is False
 
 
-def test_palace_add_rejects_captured_llm_decision_caching(
+def test_palace_add_requires_source_before_captured_llm_decision_caching(
     tmp_path, monkeypatch
 ):
     called = False
@@ -2187,8 +2369,7 @@ def test_palace_add_rejects_captured_llm_decision_caching(
     )
 
     assert result.startswith("ERROR:")
-    assert "cached decision/action/response reuse" in result
-    assert "not saved" in result
+    assert "requires a source_id" in result
     assert called is False
 
 
@@ -2325,7 +2506,7 @@ def test_palace_add_accepts_web_search_source_with_sources_payload(
     payload = json.loads(result)
     assert payload["saved"] is True
     assert payload["source_path"] == "web_search:websocket game architecture"
-    assert called is True
+    assert json.loads(result)["saved"] is True
 
 
 def test_palace_add_accepts_verified_mcp_source_after_nonempty_success(
@@ -2380,7 +2561,10 @@ def test_palace_add_accepts_verified_mcp_source_after_nonempty_success(
     result = _palace_add(
         ctx,
         title="MCP Discovery Finding",
-        content="MCP discovery completed with no required external server.",
+        content=(
+            "filesystem-plus-fetch was returned as an MCP option for file "
+            "data analysis with web request support."
+        ),
         kind="research_finding",
         workspace_id="civilization",
         tags="research_finding,mcp",
@@ -2391,7 +2575,7 @@ def test_palace_add_accepts_verified_mcp_source_after_nonempty_success(
     payload = json.loads(result)
     assert payload["saved"] is True
     assert payload["source_path"] == "mcp_discover:file data analysis web requests"
-    assert called is True
+    assert json.loads(result)["saved"] is True
 
 
 def test_palace_add_accepts_protective_no_fallback_with_linear_label(
@@ -2442,7 +2626,7 @@ def test_palace_add_accepts_protective_no_fallback_with_linear_label(
     )
 
     assert result.startswith("{")
-    assert called is True
+    assert json.loads(result)["saved"] is True
 
 
 def test_palace_add_rejects_research_llm_env_contract_without_ouroboros_alias(
@@ -2540,7 +2724,7 @@ def test_palace_add_accepts_research_llm_env_contract_with_ouroboros_alias(
     )
 
     assert result.startswith("{")
-    assert called is True
+    assert json.loads(result)["saved"] is True
 
 
 def test_palace_add_rejects_protective_unsupported_model_alias_note(
@@ -2646,7 +2830,7 @@ def test_palace_add_accepts_domain_research_without_repeating_llm_env_contract(
 
     assert result.startswith("{")
     assert "omits the standalone LLM runtime env contract" not in result
-    assert called is True
+    assert json.loads(result)["saved"] is True
 
 
 def test_palace_add_rejects_contradicted_class_claim(tmp_path):
@@ -3191,6 +3375,7 @@ def test_submit_phase_plan_rejects_stale_blocker_from_existing_proposal(tmp_path
     state = drive / "state"
     (drive / "logs").mkdir(parents=True)
     state.mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     tools = workspace / "backend" / "bots"
     tools.mkdir(parents=True)
     (tools / "bot_tools.py").write_text(
@@ -3211,10 +3396,38 @@ def test_submit_phase_plan_rejects_stale_blocker_from_existing_proposal(tmp_path
                                 "Resolve missing get_game_state_tool import "
                                 "causing test collection failure"
                             ),
-                            "success_test": (
-                                "python -c \"from backend.bots.bot_tools "
-                                "import get_game_state_tool\""
-                            ),
+                            "files_to_change": [
+                                "backend/bots/bot_tools.py",
+                                "tests/test_imports.py",
+                            ],
+                            "proof": {
+                                "execution": {
+                                    "kind": "pytest",
+                                    "command": [
+                                        "python",
+                                        "-m",
+                                        "pytest",
+                                        "tests/test_imports.py",
+                                        "-q",
+                                    ],
+                                    "shell": False,
+                                },
+                                "oracle": {
+                                    "oracle_type": "unit_assertions",
+                                    "required_properties": ["no_test_tampering"],
+                                    "negative_cases_required": True,
+                                },
+                                "scope": {
+                                    "files_under_test": ["backend/bots/bot_tools.py"],
+                                    "changed_files_expected": [
+                                        "backend/bots/bot_tools.py",
+                                        "tests/test_imports.py",
+                                    ],
+                                    "pytest_targets": ["tests/test_imports.py"],
+                                },
+                                "anti_gaming": {"requires_real_runtime": True},
+                                "required_capabilities": [],
+                            },
                         }
                     ],
                 },
@@ -3302,6 +3515,8 @@ def test_propose_phase_plan_rejects_unaddressed_review_revision(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3356,6 +3571,7 @@ def test_propose_phase_plan_accepts_addressed_review_revision(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3391,11 +3607,16 @@ def test_propose_phase_plan_accepts_addressed_review_revision(tmp_path):
                 {
                     "id": "subtask_06",
                     "title": "Build natural-language game UI",
-                    "goal": (
-                        "Create chat-based player input with LLM action "
-                        "suggestions for economy, movement, and diplomacy."
-                    ),
-                    "success_test": "npm run build",
+                        "goal": (
+                            "Create chat-based player input with LLM action "
+                            "suggestions for economy, movement, and diplomacy."
+                        ),
+                        "files_to_create": [
+                            "frontend/index.html",
+                            "frontend/src/main.tsx",
+                            "frontend/src/App.tsx",
+                        ],
+                        "success_test": "npm run build",
                     "acceptance_criteria": [
                         "Player input is chat-based natural language.",
                         "LLM action suggestions are shown before sending actions.",
@@ -3409,7 +3630,7 @@ def test_propose_phase_plan_accepts_addressed_review_revision(tmp_path):
 
 
 def test_propose_phase_plan_does_not_treat_react_18_as_subtask_target(tmp_path):
-    from umbrella.deep_agent_tools.phase_contract_revisions import _revision_target_ids
+    from umbrella.deep_agent_tools.phase_contract_policy import _revision_target_ids
 
     revision = (
         "Add 'phase_5_frontend_ui' with subtasks for: React 18 + TypeScript + "
@@ -3422,6 +3643,7 @@ def test_propose_phase_plan_does_not_treat_react_18_as_subtask_target(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3454,10 +3676,12 @@ def test_propose_phase_plan_does_not_treat_react_18_as_subtask_target(tmp_path):
                         "visualization component, stats display component, "
                         "player controls, and WebSocket event handling."
                     ),
-                    "files_to_create": [
-                        "frontend/package.json",
-                        "frontend/src/App.tsx",
-                    ],
+                        "files_to_create": [
+                            "frontend/package.json",
+                            "frontend/index.html",
+                            "frontend/src/main.tsx",
+                            "frontend/src/App.tsx",
+                        ],
                     "success_test": "npm --prefix frontend run build",
                 },
                 {
@@ -3481,6 +3705,7 @@ def test_propose_phase_plan_accepts_env_revision_without_optional_wording(tmp_pa
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3584,6 +3809,7 @@ def test_propose_phase_plan_matches_st_prefixed_revision_subtask_ids(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3655,6 +3881,7 @@ def test_propose_phase_plan_ignores_illustrative_revision_numbers(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3720,6 +3947,7 @@ def test_propose_phase_plan_expands_hyphenated_revision_ranges(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3795,6 +4023,7 @@ def test_propose_phase_plan_accepts_frontend_command_revision_without_filler_wor
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3828,13 +4057,15 @@ def test_propose_phase_plan_accepts_frontend_command_revision_without_filler_wor
             "plan_id": "frontend-review-retry",
             "workspace_id": "test_ws",
             "subtasks": [
-                {
-                    "id": "subtask_04_04_websocket_client",
-                    "title": "Frontend WebSocket client test",
-                    "goal": "Test the TypeScript WebSocket client in the frontend package.",
-                    "files_to_create": ["frontend/src/services/gameSocket.test.ts"],
-                    "success_test": "cd frontend && npm test -- gameSocket.test.ts --run",
-                }
+                    {
+                        "id": "subtask_04_04_websocket_client",
+                        "title": "Frontend WebSocket client test",
+                        "goal": "Test the TypeScript WebSocket client in the frontend package.",
+                        "files_to_create": ["frontend/src/services/gameSocket.test.ts"],
+                        "success_test": (
+                            "npm --prefix frontend test -- gameSocket.test.ts --run"
+                        ),
+                    }
             ],
         },
     )
@@ -3846,6 +4077,7 @@ def test_propose_phase_plan_does_not_require_removed_timeout_number(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3896,6 +4128,7 @@ def test_propose_phase_plan_handles_add_subtask_after_reference_as_global(tmp_pa
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3958,6 +4191,7 @@ def test_propose_phase_plan_ignores_consider_revision_as_optional(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -3991,11 +4225,15 @@ def test_propose_phase_plan_ignores_consider_revision_as_optional(tmp_path):
             "subtasks": [
                 {
                     "id": "frontend",
-                    "title": "Build frontend",
-                    "goal": "Create the playable frontend.",
-                    "files_to_create": ["frontend/src/App.tsx"],
-                    "success_test": "cd frontend && npm run build",
-                }
+                        "title": "Build frontend",
+                        "goal": "Create the playable frontend.",
+                            "files_to_create": [
+                                "frontend/index.html",
+                                "frontend/src/main.tsx",
+                                "frontend/src/App.tsx",
+                            ],
+                        "success_test": "npm --prefix frontend run build",
+                    }
             ],
         },
     )
@@ -4009,6 +4247,7 @@ def test_propose_phase_plan_accepts_arrow_revision_when_remaining_keyword_is_pre
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4041,15 +4280,21 @@ def test_propose_phase_plan_accepts_arrow_revision_when_remaining_keyword_is_pre
             "plan_id": "arrow-review-retry",
             "workspace_id": "test_ws",
             "subtasks": [
-                {
-                    "id": "topology",
-                    "title": "Document agent topology",
-                    "goal": (
-                        "Add a graph context diagram showing DecisionAggregator, "
-                        "ActionExecutor, and GameEngine flow."
-                    ),
-                    "success_test": "npm run build",
-                }
+                    {
+                        "id": "topology",
+                        "title": "Document agent topology",
+                        "goal": (
+                            "Add a graph context diagram showing DecisionAggregator, "
+                            "ActionExecutor, and GameEngine flow."
+                        ),
+                        "files_to_create": [
+                            "docs/agent_topology.md",
+                            "tests/test_agent_topology_docs.py",
+                        ],
+                        "success_test": (
+                            "python -m pytest tests/test_agent_topology_docs.py -q"
+                        ),
+                    }
             ],
         },
     )
@@ -4061,6 +4306,7 @@ def test_propose_phase_plan_accepts_space_separated_subtask_number_revision(tmp_
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4119,6 +4365,7 @@ def test_propose_phase_plan_matches_numbered_hyphenated_subtask_revision(tmp_pat
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4175,6 +4422,7 @@ def test_propose_phase_plan_accepts_numeric_id_for_subtask_revision(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4228,6 +4476,7 @@ def test_propose_phase_plan_accepts_rename_revision_without_old_typo(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4274,6 +4523,7 @@ def test_propose_phase_plan_accepts_decimal_subtask_revision_targets(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4315,21 +4565,21 @@ def test_propose_phase_plan_accepts_decimal_subtask_revision_targets(tmp_path):
                 {
                     "id": "3.2",
                     "title": "Game board",
-                    "goal": (
-                        "Implement GameBoard with frontend component tests in "
-                        "frontend/src/components/__tests__/GameBoard.test.tsx."
-                    ),
-                    "success_test": "cd frontend && npm run test -- GameBoard",
-                },
+                        "goal": (
+                            "Implement GameBoard with frontend component tests in "
+                            "frontend/src/components/__tests__/GameBoard.test.tsx."
+                        ),
+                        "success_test": "npm --prefix frontend run test -- GameBoard",
+                    },
                 {
                     "id": "3.5",
                     "title": "WebSocket hooks",
-                    "goal": (
-                        "Implement useWebSocket with frontend hook tests in "
-                        "frontend/src/hooks/__tests__/useWebSocket.test.ts."
-                    ),
-                    "success_test": "cd frontend && npm run test -- useWebSocket",
-                },
+                        "goal": (
+                            "Implement useWebSocket with frontend hook tests in "
+                            "frontend/src/hooks/__tests__/useWebSocket.test.ts."
+                        ),
+                        "success_test": "npm --prefix frontend run test -- useWebSocket",
+                    },
                 {
                     "id": "4.2",
                     "title": "Turn cycle",
@@ -4354,6 +4604,7 @@ def test_propose_phase_plan_ignores_phase_numbers_in_revision_targets(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4410,6 +4661,7 @@ def test_propose_phase_plan_still_enforces_semantic_revision_numbers(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4464,6 +4716,7 @@ def test_propose_phase_plan_accepts_success_test_quality_revision_when_behaviora
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4513,6 +4766,7 @@ def test_propose_phase_plan_accepts_cross_platform_success_test_revision(tmp_pat
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4547,11 +4801,16 @@ def test_propose_phase_plan_accepts_cross_platform_success_test_revision(tmp_pat
             "workspace_id": "test_ws",
             "subtasks": [
                 {
-                    "id": "subtask_1_3",
-                    "title": "Frontend build setup",
-                    "goal": "Configure Vite frontend build.",
-                    "files_to_create": ["frontend/package.json"],
-                    "success_test": "npm --prefix frontend run build",
+                        "id": "subtask_1_3",
+                        "title": "Frontend build setup",
+                        "goal": "Configure Vite frontend build.",
+                        "files_to_create": [
+                            "frontend/package.json",
+                            "frontend/index.html",
+                            "frontend/src/main.tsx",
+                            "frontend/src/App.tsx",
+                        ],
+                        "success_test": "npm --prefix frontend run build",
                 }
             ],
         },
@@ -4564,6 +4823,7 @@ def test_propose_phase_plan_does_not_block_optional_polish_revision(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4616,6 +4876,7 @@ def test_propose_phase_plan_allows_scripts_for_verification_helpers(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4647,6 +4908,7 @@ def test_propose_phase_plan_accepts_quoted_added_subtask_revision(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -4702,6 +4964,7 @@ def test_propose_phase_plan_rejects_bare_workspace_verify_for_build_subtask(tmp_
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4732,6 +4995,7 @@ def test_propose_phase_plan_rejects_bare_workspace_verify_for_deployment_subtask
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_f0cee725:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4762,6 +5026,7 @@ def test_propose_phase_plan_rejects_bare_unit_tests_for_build_subtask(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_211b9e5b:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4795,6 +5060,7 @@ def test_propose_phase_plan_rejects_captured_shell_masked_success_test(tmp_path)
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_f0cee725:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4830,6 +5096,7 @@ def test_propose_phase_plan_rejects_captured_devnull_or_build_success_test(tmp_p
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_b34a047f:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "civilization"}
@@ -4883,6 +5150,7 @@ def test_propose_phase_plan_uses_concrete_verification_command_alias(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4893,13 +5161,17 @@ def test_propose_phase_plan_uses_concrete_verification_command_alias(tmp_path):
             "plan_id": "concrete-alias",
             "workspace_id": "test_ws",
             "subtasks": [
-                {
-                    "id": "build_engine",
-                    "title": "Build engine",
-                    "goal": "Implement game engine.",
-                    "success_test": "run_workspace_verify",
-                    "verification_command": "python -m pytest tests/test_engine.py -q",
-                }
+                    {
+                        "id": "build_engine",
+                        "title": "Build engine",
+                        "goal": "Implement game engine.",
+                        "files_to_create": [
+                            "src/test_ws/engine.py",
+                            "tests/test_engine.py",
+                        ],
+                        "success_test": "run_workspace_verify",
+                        "verification_command": "python -m pytest tests/test_engine.py -q",
+                    }
             ],
         },
     )
@@ -4911,6 +5183,7 @@ def test_propose_phase_plan_rejects_unbalanced_python_command(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4942,6 +5215,7 @@ def test_propose_phase_plan_rejects_success_test_command_list(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -4973,6 +5247,7 @@ def test_propose_phase_plan_rejects_option_only_success_test_command_object(tmp_
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5006,6 +5281,7 @@ def test_propose_phase_plan_rejects_invalid_python_inline_syntax(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5037,6 +5313,7 @@ def test_propose_phase_plan_rejects_nonportable_shell_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5068,6 +5345,7 @@ def test_propose_phase_plan_rejects_decorative_echo_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_2d604b82:plan"
     ctx.loop_state_view = {
@@ -5108,6 +5386,7 @@ def test_propose_phase_plan_rejects_workspace_prefixed_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5139,6 +5418,7 @@ def test_propose_phase_plan_rejects_captured_cd_src_pytest_success_test(tmp_path
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_921912db:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5175,6 +5455,7 @@ def test_propose_phase_plan_rejects_depth_limit_placeholder(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5202,6 +5483,7 @@ def test_propose_phase_plan_rejects_empty_plan_with_shape_guidance(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5216,6 +5498,7 @@ def test_propose_phase_plan_rejects_llm_heuristic_fallback(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5250,6 +5533,7 @@ def test_propose_phase_plan_rejects_llm_no_credentials_deterministic_fallback(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5282,6 +5566,7 @@ def test_propose_phase_plan_rejects_llm_generic_fallback_logic(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5319,6 +5604,7 @@ def test_propose_phase_plan_rejects_llm_hyphenated_fallback_behavior(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5353,6 +5639,7 @@ def test_propose_phase_plan_rejects_llm_random_valid_action_fallback(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5387,6 +5674,7 @@ def test_propose_phase_plan_rejects_llm_cached_decision_fallback(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5421,6 +5709,7 @@ def test_propose_phase_plan_rejects_captured_civilization_rule_based_ai_fallback
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5470,6 +5759,7 @@ def test_propose_phase_plan_rejects_captured_civilization_decision_caching(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5519,6 +5809,7 @@ def test_propose_phase_plan_rejects_key_context_llm_heuristic_fallback(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5564,6 +5855,7 @@ def test_propose_phase_plan_rejects_captured_conservative_strategy_fallback(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_30316f53:plan"
     ctx.loop_state_view = {"phase_label": "linear", "active_workspace_id": "test_ws"}
@@ -5619,6 +5911,7 @@ def test_propose_phase_plan_rejects_key_context_llm_reasoning_cache(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5662,6 +5955,7 @@ def test_propose_phase_plan_rejects_llm_error_as_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5695,6 +5989,7 @@ def test_propose_phase_plan_accepts_protective_no_fallback_policy(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5733,6 +6028,7 @@ def test_propose_phase_plan_allows_tests_that_fail_on_hardcoded_fallback(tmp_pat
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5771,6 +6067,7 @@ def test_propose_phase_plan_accepts_llm_env_alias_fallback_chain_with_defaults(t
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5809,6 +6106,7 @@ def test_propose_phase_plan_accepts_llm_env_alias_parenthetical_fallback(tmp_pat
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5848,6 +6146,7 @@ def test_propose_phase_plan_rejects_greenfield_python_outside_src(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5885,6 +6184,7 @@ def test_propose_phase_plan_rejects_captured_root_scripts_verify_py(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_8879972b:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5942,6 +6242,7 @@ def test_propose_phase_plan_accepts_greenfield_src_layout_with_docs(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -5985,6 +6286,7 @@ def test_propose_phase_plan_rejects_captured_bare_src_python_layout(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_2bb95da0:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6062,6 +6364,7 @@ def test_propose_phase_plan_rejects_greenfield_pytest_modules_inside_src(tmp_pat
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6111,6 +6414,7 @@ def test_propose_phase_plan_rejects_captured_pytest_verify_modules_inside_src(
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_1102cdcf:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "civilization"}
@@ -6158,6 +6462,7 @@ def test_propose_phase_plan_rejects_greenfield_pytest_modules_inside_docs(tmp_pa
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6199,6 +6504,7 @@ def test_propose_phase_plan_rejects_workspace_id_prefixed_paths(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6232,6 +6538,7 @@ def test_propose_phase_plan_rejects_annotated_pseudo_paths(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6265,6 +6572,7 @@ def test_propose_phase_plan_uses_nested_leaves_when_phase_has_test_strategy(tmp_
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6322,6 +6630,7 @@ def test_propose_phase_plan_accepts_success_check_alias_on_leaf(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6355,6 +6664,7 @@ def test_propose_phase_plan_rejects_complex_llm_plan_without_docs(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6394,6 +6704,7 @@ def test_propose_phase_plan_rejects_js_empty_test_bypass(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6424,6 +6735,7 @@ def test_propose_phase_plan_rejects_posix_test_file_success(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6453,6 +6765,7 @@ def test_propose_phase_plan_rejects_complex_leaf_without_file_contract(tmp_path)
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6483,6 +6796,7 @@ def test_propose_phase_plan_rejects_mock_llm_success_test_for_gmas_subtask(tmp_p
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6516,6 +6830,7 @@ def test_propose_phase_plan_rejects_mock_e2e_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6549,6 +6864,7 @@ def test_propose_phase_plan_rejects_captured_e2e_pytest_target_not_declared(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_e4cde249:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6559,7 +6875,7 @@ def test_propose_phase_plan_rejects_captured_e2e_pytest_target_not_declared(
             "subtasks": [
                 {
                     "id": "e2e-localhost-verify",
-                    "title": "End-to-end simulation and localhost deployment",
+                    "title": "End-to-end localhost deployment",
                     "goal": "Execute full game with human vs AI bots and confirm localhost deployment.",
                     "files_to_change": [
                         "run_server.sh",
@@ -6567,8 +6883,8 @@ def test_propose_phase_plan_rejects_captured_e2e_pytest_target_not_declared(
                         "workspace.toml",
                     ],
                     "success_test": (
-                        "python -m pytest tests/test_e2e_simulation.py -q "
-                        "--localhost -k test_full_game"
+                        "python -m pytest tests/test_e2e_game_flow.py -q "
+                        "--localhost"
                     ),
                 }
             ],
@@ -6576,7 +6892,7 @@ def test_propose_phase_plan_rejects_captured_e2e_pytest_target_not_declared(
     )
 
     assert result.startswith("ERROR:")
-    assert "tests/test_e2e_simulation.py" in result
+    assert "tests/test_e2e_game_flow.py" in result
     assert "files_to_create" in result
 
 
@@ -6584,6 +6900,7 @@ def test_propose_phase_plan_accepts_e2e_pytest_target_when_declared(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -6594,13 +6911,13 @@ def test_propose_phase_plan_accepts_e2e_pytest_target_when_declared(tmp_path):
             "subtasks": [
                 {
                     "id": "e2e-localhost-verify",
-                    "title": "End-to-end simulation and localhost deployment",
+                    "title": "End-to-end localhost deployment",
                     "goal": "Execute full game with human vs AI bots and confirm localhost deployment.",
-                    "files_to_create": ["tests/test_e2e_simulation.py"],
+                    "files_to_create": ["tests/test_e2e_game_flow.py"],
                     "files_to_change": ["run_server.sh", "frontend/run_dev.sh"],
                     "success_test": (
-                        "python -m pytest tests/test_e2e_simulation.py -q "
-                        "--localhost -k test_full_game"
+                        "python -m pytest tests/test_e2e_game_flow.py -q "
+                        "--localhost"
                     ),
                 }
             ],
@@ -6614,6 +6931,7 @@ def test_propose_phase_plan_rejects_control_plane_file_mutation(tmp_path):
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_883b9f7e:plan"
     ctx.loop_state_view = {
@@ -6652,6 +6970,7 @@ def test_propose_phase_plan_rejects_paths_outside_workspace_boundary(tmp_path):
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_883b9f7e:plan"
     ctx.loop_state_view = {
@@ -6670,7 +6989,7 @@ def test_propose_phase_plan_rejects_paths_outside_workspace_boundary(tmp_path):
                     "title": "Patch host policy",
                     "goal": "Modify host-side policy from the generated project.",
                     "files_to_change": [
-                        "../umbrella/deep_agent_tools/phase_contract_paths.py",
+                        "../umbrella/deep_agent_tools/phase_contract_policy.py",
                         ".git/config",
                     ],
                     "success_test": "python -m pytest tests/test_backend_setup.py -q",
@@ -6680,7 +6999,7 @@ def test_propose_phase_plan_rejects_paths_outside_workspace_boundary(tmp_path):
     )
 
     assert result.startswith("ERROR:"), result
-    assert "../umbrella/deep_agent_tools/phase_contract_paths.py" in result
+    assert "../umbrella/deep_agent_tools/phase_contract_policy.py" in result
     assert ".git/config" in result
     assert "active candidate workspace" in result
 
@@ -6691,6 +7010,7 @@ def test_propose_phase_plan_rejects_final_verification_reusing_prior_target(
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_883b9f7e:plan"
     ctx.loop_state_view = {
@@ -6737,6 +7057,7 @@ def test_propose_phase_plan_accepts_final_verification_owned_target(tmp_path):
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_883b9f7e:plan"
     ctx.loop_state_view = {
@@ -6786,6 +7107,7 @@ def test_propose_phase_plan_rejects_captured_docs_pytest_target_not_owned(tmp_pa
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_05a23e7b:plan"
     ctx.loop_state_view = {
@@ -6838,6 +7160,7 @@ def test_propose_phase_plan_rejects_captured_docs_python_verifier(tmp_path):
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_11159129:plan"
     ctx.loop_state_view = {
@@ -6882,7 +7205,7 @@ def test_propose_phase_plan_rejects_captured_docs_python_verifier(tmp_path):
                         "frontend/index.html",
                         "frontend/src/main.tsx",
                     ],
-                    "success_test": "cd frontend && npm run build",
+                    "success_test": "npm --prefix frontend run build",
                 },
             ],
         },
@@ -6897,6 +7220,7 @@ def test_propose_phase_plan_rejects_unmanaged_localhost_curl_success_test(tmp_pa
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_92978867:plan"
     ctx.loop_state_view = {
@@ -6932,6 +7256,7 @@ def test_propose_phase_plan_rejects_frontend_test_declared_outside_frontend(tmp_
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_92978867:plan"
     ctx.loop_state_view = {
@@ -6963,6 +7288,7 @@ def test_propose_phase_plan_rejects_captured_dry_run_e2e_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7016,6 +7342,7 @@ def test_propose_phase_plan_rejects_captured_llm_mock_env_success_test(tmp_path)
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_d8ee8bcb:plan"
     ctx.loop_state_view = {
@@ -7065,6 +7392,7 @@ def test_propose_phase_plan_rejects_captured_mock_env_decision_policy(tmp_path):
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_d8ee8bcb:plan"
     ctx.loop_state_view = {
@@ -7110,6 +7438,7 @@ def test_propose_phase_plan_rejects_collect_only_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7139,6 +7468,7 @@ def test_propose_phase_plan_rejects_mock_fake_llm_test_strategy(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7176,6 +7506,7 @@ def test_propose_phase_plan_rejection_gives_llm_repair_recipe(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7213,6 +7544,7 @@ def test_propose_phase_plan_allows_protective_no_mock_llm_language(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7256,6 +7588,7 @@ def test_propose_phase_plan_allows_prohibited_dry_run_mock_language(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7294,6 +7627,7 @@ def test_propose_phase_plan_allows_mock_terms_inside_anti_patterns(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7341,6 +7675,7 @@ def test_propose_phase_plan_rejects_openai_only_llm_env_contract(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7377,6 +7712,7 @@ def test_propose_phase_plan_accepts_ouroboros_llm_env_alias_contract(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7414,6 +7750,7 @@ def test_propose_phase_plan_rejects_captured_ouroboros_only_llm_env_contract(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7453,6 +7790,7 @@ def test_propose_phase_plan_rejects_unsupported_ll_base_url_alias(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_05a23e7b:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7495,6 +7833,7 @@ def test_propose_phase_plan_rejects_missing_llm_env_alias_contract(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7530,6 +7869,7 @@ def test_propose_phase_plan_rejects_llm_agent_plan_without_env_section(tmp_path)
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7569,6 +7909,7 @@ def test_propose_phase_plan_accepts_public_llm_alias_contract_without_ouroboros_
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7609,6 +7950,7 @@ def test_propose_phase_plan_rejects_control_plane_llm_alias_contract(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7650,6 +7992,7 @@ def test_propose_phase_plan_rejects_unsupported_ouroboros_model_alias(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7683,6 +8026,7 @@ def test_propose_phase_plan_rejects_protective_unsupported_model_alias_note(tmp_
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_92978867:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7721,6 +8065,7 @@ def test_propose_phase_plan_rejects_provider_specific_llm_model_default(tmp_path
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7758,6 +8103,7 @@ def test_propose_phase_plan_rejects_captured_provider_default_next_to_no_policy(
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_c25a0092:plan"
     ctx.loop_state_view = {
@@ -7810,6 +8156,7 @@ def test_propose_phase_plan_rejects_empty_basic_import_test_skeletons(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7842,6 +8189,7 @@ def test_propose_phase_plan_allows_protective_empty_test_language(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7874,6 +8222,7 @@ def test_propose_phase_plan_allows_captured_no_import_only_policy(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7915,6 +8264,7 @@ def test_propose_phase_plan_accepts_public_llm_env_contract_in_notes(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7950,6 +8300,7 @@ def test_propose_phase_plan_unwraps_serialized_plan_object(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -7983,6 +8334,7 @@ def test_propose_phase_plan_rejects_invalid_serialized_plan_string_clearly(tmp_p
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8007,6 +8359,7 @@ def test_propose_phase_plan_accepts_python_inline_assert_with_quoted_semicolons(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8024,14 +8377,13 @@ def test_propose_phase_plan_accepts_python_inline_assert_with_quoted_semicolons(
                 {
                     "id": "config_check",
                     "title": "Config check",
-                    "goal": "Validate a simple inline configuration assertion.",
-                    "files_to_create": ["backend/config.py", "tests/test_config.py"],
-                    "success_test": (
-                        'python -c "value = 2; assert value == 2" && '
-                        "python -m pytest tests/test_config.py -q"
-                    ),
-                }
-            ]
+                        "goal": "Validate a simple inline configuration assertion.",
+                        "files_to_create": ["backend/config.py", "tests/test_config.py"],
+                        "success_test": (
+                            "python -c \"value = 'a;b'; assert ';' in value\""
+                        ),
+                    }
+                ]
         },
     )
 
@@ -8042,6 +8394,7 @@ def test_propose_phase_plan_accepts_content_alias(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8073,6 +8426,7 @@ def test_propose_phase_plan_does_not_treat_llm_driven_real_time_as_signature_cla
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8113,6 +8467,7 @@ def test_propose_phase_plan_does_not_treat_success_criteria_as_between_signature
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8150,6 +8505,7 @@ def test_propose_phase_plan_rejects_import_only_python_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8181,6 +8537,7 @@ def test_propose_phase_plan_rejects_direct_python_pytest_node_success_test(tmp_p
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8211,6 +8568,7 @@ def test_propose_phase_plan_rejects_complex_python_inline_success_test(tmp_path)
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8247,6 +8605,7 @@ def test_propose_phase_plan_rejects_python_inline_workspace_import_success_test(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_104ff3a2:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8286,6 +8645,7 @@ def test_propose_phase_plan_rejects_captured_multiline_python_inline_success_tes
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8323,6 +8683,7 @@ def test_propose_phase_plan_rejects_descriptive_success_test_suffix(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8354,6 +8715,7 @@ def test_propose_phase_plan_rejects_captured_exit_code_suffix(tmp_path):
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_73e6952a:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "civilization"}
@@ -8389,6 +8751,7 @@ def test_propose_phase_plan_rejects_captured_success_test_outcome_prose(tmp_path
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_882cfdac:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "civilization"}
@@ -8433,6 +8796,7 @@ def test_propose_phase_plan_rejects_captured_command_prefixed_success_test(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_ee48ce93:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8471,6 +8835,7 @@ def test_propose_phase_plan_rejects_captured_parenthetical_success_test(tmp_path
     workspace = tmp_path / "workspaces" / "civilization"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_882cfdac:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "civilization"}
@@ -8506,6 +8871,7 @@ def test_propose_phase_plan_rejects_descriptive_browser_observation_success_test
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8540,6 +8906,7 @@ def test_propose_phase_plan_rejects_generic_tool_with_pseudo_args(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8568,6 +8935,7 @@ def test_propose_phase_plan_rejects_generic_tool_colon_pseudo_args(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8596,6 +8964,7 @@ def test_propose_phase_plan_rejects_print_fail_python_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8627,6 +8996,7 @@ def test_propose_phase_plan_rejects_file_existence_only_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8659,6 +9029,7 @@ def test_propose_phase_plan_rejects_pathlib_join_exists_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8693,6 +9064,7 @@ def test_propose_phase_plan_rejects_inline_docs_content_python_success_test(tmp_
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8715,7 +9087,7 @@ def test_propose_phase_plan_rejects_inline_docs_content_python_success_test(tmp_
                     ],
                     "success_test": (
                         "python -c \"import os; assert "
-                        "'OUROBOROS_LLM_API_KEY' in open('README.md').read() "
+                        "'LLM_API_KEY' in open('README.md').read() "
                         "and 'GMAS' in open('docs/architecture.md').read() "
                         "and 'bot personas' in open('docs/bot_personas.md').read().lower() "
                         "and 'WS' in open('docs/setup.md').read()\""
@@ -8733,6 +9105,7 @@ def test_propose_phase_plan_rejects_bare_assert_in_shell_chain(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8764,6 +9137,7 @@ def test_propose_phase_plan_rejects_bash_script_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8793,6 +9167,7 @@ def test_propose_phase_plan_rejects_direct_sh_script_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_1eed9b9c:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8828,6 +9203,7 @@ def test_propose_phase_plan_rejects_env_prefixed_sh_script_success_test(tmp_path
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_6809bbeb:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8869,6 +9245,7 @@ def test_propose_phase_plan_rejects_bash_c_file_existence_success_test(tmp_path)
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_d34fe709:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8905,6 +9282,7 @@ def test_propose_phase_plan_rejects_exit_status_shell_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8934,6 +9312,7 @@ def test_propose_phase_plan_rejects_inline_exit_if_shell_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_740d5c97:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -8968,6 +9347,7 @@ def test_propose_phase_plan_rejects_start_job_success_test(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -9001,6 +9381,7 @@ def test_propose_phase_plan_accepts_verification_commands_object(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -9031,6 +9412,7 @@ def test_propose_phase_plan_rejects_verification_command_list_alias(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -9064,6 +9446,7 @@ def test_propose_phase_plan_rejects_missing_revision_number(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -9096,11 +9479,12 @@ def test_propose_phase_plan_rejects_missing_revision_number(tmp_path):
             "workspace_id": "test_ws",
             "subtasks": [
                 {
-                    "id": "agent_memory",
-                    "title": "Agent memory",
-                    "goal": "Implement memory retention.",
-                    "success_test": "python -m pytest tests/test_memory.py -q",
-                    "acceptance": [
+                        "id": "agent_memory",
+                        "title": "Agent memory",
+                        "goal": "Implement memory retention.",
+                        "files_to_create": ["tests/test_memory.py"],
+                        "success_test": "python -m pytest tests/test_memory.py -q",
+                        "acceptance": [
                         "relationship_eviction_policy after 15 turns of no interaction"
                     ],
                 }
@@ -9119,6 +9503,7 @@ def test_propose_phase_plan_ignores_non_actionable_budget_revision_number(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -9180,6 +9565,7 @@ def test_propose_phase_plan_rejects_truncated_serialized_plan_string(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -9208,6 +9594,7 @@ def test_propose_phase_plan_accepts_phase_number_revision_with_decimal_subtasks(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -9246,17 +9633,22 @@ def test_propose_phase_plan_accepts_phase_number_revision_with_decimal_subtasks(
                 {
                     "id": "3.1_component_tests",
                     "title": "Phase 3 component tests",
-                    "goal": "Add component-level tests with Vitest.",
-                    "files_to_create": ["frontend/src/App.test.tsx"],
-                    "success_test": "cd frontend; npx vitest run",
-                },
+                        "goal": "Add component-level tests with Vitest.",
+                            "files_to_create": [
+                                "frontend/index.html",
+                                "frontend/src/main.tsx",
+                                "frontend/src/App.tsx",
+                                "frontend/src/App.test.tsx",
+                            ],
+                        "success_test": "npm --prefix frontend test -- --run",
+                    },
                 {
                     "id": "3.2_frontend_build",
                     "title": "Phase 3 frontend build",
-                    "goal": "Run npm build after component implementation.",
-                    "files_to_change": ["frontend/package.json"],
-                    "success_test": "cd frontend; npm run build",
-                },
+                        "goal": "Run npm build after component implementation.",
+                        "files_to_change": ["frontend/package.json"],
+                        "success_test": "npm --prefix frontend run build",
+                    },
             ],
         },
     )
@@ -9270,6 +9662,7 @@ def test_propose_phase_plan_rejects_frontend_build_before_entrypoint_files(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_ce127a9e:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -9295,7 +9688,7 @@ def test_propose_phase_plan_rejects_frontend_build_before_entrypoint_files(
                         ".env.example",
                         "README.md",
                     ],
-                    "success_test": "cd frontend && npm run build",
+                    "success_test": "npm --prefix frontend run build",
                 },
                 {
                     "id": "frontend-setup",
@@ -9306,7 +9699,7 @@ def test_propose_phase_plan_rejects_frontend_build_before_entrypoint_files(
                         "frontend/src/App.tsx",
                         "frontend/src/index.css",
                     ],
-                    "success_test": "cd frontend && npm run build",
+                    "success_test": "npm --prefix frontend run build",
                 },
             ],
         },
@@ -9325,6 +9718,7 @@ def test_propose_phase_plan_accepts_frontend_build_with_entrypoint_files(
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "phase_web_ce127a9e:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -9347,7 +9741,7 @@ def test_propose_phase_plan_accepts_frontend_build_with_entrypoint_files(
                         "frontend/src/main.tsx",
                         "frontend/src/App.tsx",
                     ],
-                    "success_test": "cd frontend && npm run build",
+                    "success_test": "npm --prefix frontend run build",
                 },
                 {
                     "id": "docs",
@@ -9367,6 +9761,7 @@ def test_propose_phase_plan_accepts_suffixed_decimal_revision_target(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -9425,6 +9820,7 @@ def test_propose_phase_plan_accepts_test_quality_revision_without_numeric_loop(t
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(
         repo_dir=tmp_path,
         host_repo_root=tmp_path,
@@ -9482,20 +9878,26 @@ def test_propose_phase_plan_accepts_test_quality_revision_without_numeric_loop(t
                     "files_to_create": ["tests/test_gmas_graph.py"],
                     "success_test": "python -m pytest tests/test_gmas_graph.py -q",
                 },
-                {
-                    "id": "4.1a_websocket_hook",
-                    "title": "WebSocket hook with component tests",
-                    "goal": "Create WebSocket hook and real frontend assertions.",
-                    "files_to_create": ["frontend/src/useWebSocket.test.tsx"],
-                    "success_test": "cd frontend && npx vitest run src/useWebSocket.test.tsx",
-                },
+                    {
+                        "id": "4.1a_websocket_hook",
+                        "title": "WebSocket hook with component tests",
+                        "goal": "Create WebSocket hook and real frontend assertions.",
+                        "files_to_create": ["frontend/src/useWebSocket.test.tsx"],
+                        "success_test": (
+                            "npm --prefix frontend exec vitest -- run "
+                            "src/useWebSocket.test.tsx"
+                        ),
+                    },
                 {
                     "id": "4.5a_ai_event_log",
-                    "title": "AI event log with component tests",
-                    "goal": "Create AI event log and real frontend assertions.",
-                    "files_to_create": ["frontend/src/AIEventLog.test.tsx"],
-                    "success_test": "cd frontend && npx vitest run src/AIEventLog.test.tsx",
-                },
+                        "title": "AI event log with component tests",
+                        "goal": "Create AI event log and real frontend assertions.",
+                        "files_to_create": ["frontend/src/AIEventLog.test.tsx"],
+                        "success_test": (
+                            "npm --prefix frontend exec vitest -- run "
+                            "src/AIEventLog.test.tsx"
+                        ),
+                    },
                 {
                     "id": "5.4a_e2e_harness",
                     "title": "Localhost e2e harness with assertions",
@@ -9521,6 +9923,7 @@ def test_propose_phase_plan_accepts_phase_mapping_containers(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     ctx = ToolContext(repo_dir=tmp_path, host_repo_root=tmp_path, drive_root=drive)
     ctx.task_id = "run-123:plan"
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
@@ -9534,15 +9937,15 @@ def test_propose_phase_plan_accepts_phase_mapping_containers(tmp_path):
                 "phase_1_setup": {
                     "title": "Setup",
                     "subtasks": {
-                        "setup_backend": {
-                            "id": "setup_backend",
-                            "title": "Setup backend",
-                            "goal": "Create backend package and tests.",
-                            "files_to_create": ["backend/tests/test_setup.py"],
-                            "success_test": (
-                                "python -m pytest backend/tests/test_setup.py -q"
-                            ),
-                        }
+                            "setup_backend": {
+                                "id": "setup_backend",
+                                "title": "Setup backend",
+                                "goal": "Create backend package and tests.",
+                                "files_to_create": ["tests/test_setup.py"],
+                                "success_test": (
+                                    "python -m pytest tests/test_setup.py -q"
+                                ),
+                            }
                     },
                 }
             },

@@ -513,14 +513,13 @@ def build_task_brief_from_task_main(
     # Use objective as primary description
     description = document.objective or document.title or "No objective specified"
 
-    # Try to infer task class from content
-    task_class = infer_task_class(document)
+    workspace_root = document.path.parent
+    from umbrella.workspace_registry.charter import charter_capability_slugs, load_workspace_charter
 
-    # Extract domains from content
-    domains = infer_domains(document)
-
-    # Extract required capabilities from content
-    required_capabilities = infer_capabilities(document)
+    charter = load_workspace_charter(workspace_root)
+    required_capabilities = charter_capability_slugs(charter)
+    task_class = _explicit_task_class_from_document(document)
+    domains: list[str] = []
 
     # Build constraints from sections
     constraints: dict[str, Any] = {}
@@ -543,80 +542,36 @@ def build_task_brief_from_task_main(
             "source": "task_main",
             "title": document.title,
             "has_required_sections": document.has_required_sections,
+            "capability_seeds_from_charter": bool(required_capabilities),
         },
     )
 
 
+def _explicit_task_class_from_document(document: TaskMainDocument) -> str | None:
+    """Optional explicit task class from a `## Task Class` section (no keyword inference)."""
+
+    raw = document.sections.get("Task Class", "").strip().lower()
+    if not raw:
+        return None
+    return raw.replace(" ", "_")
+
+
 def infer_task_class(document: TaskMainDocument) -> str | None:
-    """
-    Infer task class from TASK_MAIN content.
+    """Deprecated: use explicit `## Task Class` section or manager task_class."""
 
-    Uses keywords in objective and description to guess the task type.
-    """
-    content_lower = f"{document.objective} {document.final_deliverable}".lower()
-
-    # Task class patterns
-    patterns = [
-        (["article", "write", "writing", "blog", "post", "draft"], "article_writing"),
-        (["research", "investigate", "analyze", "study"], "research"),
-        (["code", "implement", "develop", "build", "program"], "code_generation"),
-        (["test", "verify", "validate", "check"], "testing"),
-        (["review", "evaluate", "assess"], "evaluation"),
-        (["design", "architect", "plan"], "design"),
-        (["document", "documentation", "docs"], "documentation"),
-    ]
-
-    for keywords, task_class in patterns:
-        if any(kw in content_lower for kw in keywords):
-            return task_class
-
-    return None
+    return _explicit_task_class_from_document(document)
 
 
 def infer_domains(document: TaskMainDocument) -> list[str]:
-    """
-    Infer domain tags from TASK_MAIN content.
-    """
-    domains = []
-    content_lower = document.raw_content.lower()
+    """Deprecated: domains are not inferred; use capability_declaration after research."""
 
-    domain_patterns = [
-        (
-            ["software", "code", "programming", "api", "framework"],
-            "software_engineering",
-        ),
-        (["machine learning", "ml", "ai", "neural", "model"], "machine_learning"),
-        (["data", "analysis", "statistics", "analytics"], "data_science"),
-        (["science", "research", "study", "experiment"], "science"),
-        (["technology", "tech", "digital", "automation"], "technology"),
-        (["business", "enterprise", "company", "market"], "business"),
-    ]
-
-    for keywords, domain in domain_patterns:
-        if any(kw in content_lower for kw in keywords):
-            domains.append(domain)
-
-    return domains
+    _ = document
+    return []
 
 
 def infer_capabilities(document: TaskMainDocument) -> list[str]:
-    """
-    Infer required capabilities from TASK_MAIN content.
-    """
-    capabilities = []
-    content_lower = document.raw_content.lower()
+    """Deprecated: use workspace.toml [[capabilities]] seeds."""
 
-    cap_patterns = [
-        (["multi-agent", "multiagent", "agent system"], "multi_agent_research"),
-        (["web search", "search online", "internet"], "web_search"),
-        (["file search", "search files", "codebase"], "file_search"),
-        (["code interpreter", "execute code", "run code"], "code_interpreter"),
-        (["human approval", "human review", "human gate"], "human_gates"),
-        (["iterative", "revision", "revise", "improve draft"], "iterative_drafting"),
-    ]
+    from umbrella.workspace_registry.charter import charter_capability_slugs, load_workspace_charter
 
-    for keywords, capability in cap_patterns:
-        if any(kw in content_lower for kw in keywords):
-            capabilities.append(capability)
-
-    return capabilities
+    return charter_capability_slugs(load_workspace_charter(document.path.parent))

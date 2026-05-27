@@ -16,6 +16,7 @@ The repository clone directory name is not fixed (it may still be `albert7`); al
 | Durable memory backends | [memory-durable-backends.md](memory-durable-backends.md) | Canonical vs dual vs Hindsight env, product defaults, live smoke tests |
 | Ouroboros | [ouroboros.md](ouroboros.md) | Deep agent per phase, manifest consumption, tool registry, supervisor |
 | Technical Report | [technical-report/README.md](technical-report/README.md) | Multi-page deep dive: 15 chapters covering every aspect of the system |
+| JSON examples | [examples/README.md](examples/README.md) | Static drive-state samples (e.g. `capability_declaration.json`) for operators and manifest authors |
 
 ## Key Entrypoints
 

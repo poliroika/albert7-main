@@ -1,13 +1,17 @@
 """Research-summary and workspace-evidence validation helpers."""
 
 from umbrella.deep_agent_tools.phase_control_common import *
+from umbrella.deep_agent_tools.phase_control_claim_checks import *
 from umbrella.deep_agent_tools.phase_control_base import *
+from umbrella.deep_agent_tools.phase_control_text_quality import _HANDOFF_PLACEHOLDER_RE
+from umbrella.phases.identity import phase_id_from_task_id
 from umbrella.deep_agent_tools.research_provenance import (
     next_finding_source_hint as _research_summary_next_finding_hint,
     palace_add_source_paths_by_id as _shared_palace_add_source_paths_by_id,
     research_scarcity_handoff_issue as _research_scarcity_handoff_issue,
     research_source_coverage_report as _research_source_coverage_report,
     research_summary_source_claim_issue as _shared_research_summary_source_claim_issue,
+    tool_result_text,
 )
 
 def _stale_claim_context(text: str) -> bool:
@@ -154,8 +158,6 @@ _RESEARCH_FINDING_PLACEHOLDER_RE = re.compile(
     r"research\s+progress|phase\s+interrupted|incomplete\s+coverage|"
     r"pending\s+completion)\b"
 )
-
-
 def _palace_add_row_counts_as_research_finding(row: dict[str, Any]) -> bool:
     args = _coerce_log_payload(row.get("args") or {})
     if not isinstance(args, dict):
@@ -1128,6 +1130,11 @@ def _research_depth(ctx: ToolContext) -> str:
 
 
 def _research_summary_min_valid_findings(ctx: ToolContext) -> int:
+    depth = _research_depth(ctx)
+    if depth == "none":
+        return 0
+    if depth == "light":
+        return 1
     manifest = _phase_manifest_payload(ctx)
     criteria = (
         manifest.get("exit_criteria")
@@ -1157,71 +1164,41 @@ def _research_summary_min_valid_findings(ctx: ToolContext) -> int:
 def _research_discovery_validation_issue(
     ctx: ToolContext, rows: list[dict[str, Any]]
 ) -> str:
+    _ = rows
     if _research_depth(ctx) != "full":
         return ""
+    from umbrella.contracts.capability_declaration import (
+        load_capability_declaration,
+        validate_discovery_coverage,
+    )
+    from umbrella.deep_agent_tools.phase_control_actions import _repo_root_from_phase_ctx
+    from umbrella.workspace_registry.charter import load_workspace_charter
+
     manifest = _phase_manifest_payload(ctx)
     allowed = manifest.get("allowed_tools") if isinstance(manifest, dict) else []
-    if not isinstance(allowed, list):
-        return ""
-    allowed_tools = {str(item) for item in allowed if str(item).strip()}
-    called_tools = {
-        str(row.get("tool") or "")
-        for row in rows
-        if _research_discovery_row_counts(row)
-    }
-    missing: list[str] = []
-    if (
-        _RESEARCH_GITHUB_DISCOVERY_TOOL in allowed_tools
-        and _RESEARCH_GITHUB_DISCOVERY_TOOL not in called_tools
-    ):
-        missing.append(_RESEARCH_GITHUB_DISCOVERY_TOOL)
-    internet_tools = _RESEARCH_INTERNET_DISCOVERY_TOOLS & allowed_tools
-    if internet_tools and not (internet_tools & called_tools):
-        missing.append(
-            "one internet search tool "
-            f"({', '.join(sorted(internet_tools))})"
-        )
-    if (
-        _RESEARCH_MCP_DISCOVERY_TOOL in allowed_tools
-        and _RESEARCH_MCP_DISCOVERY_TOOL not in called_tools
-    ):
-        missing.append(_RESEARCH_MCP_DISCOVERY_TOOL)
-    if missing:
-        return (
-            "ERROR: research summary cannot be submitted before discovery "
-            f"coverage has a successful or recoverable attempt: missing "
-            f"{', '.join(missing)}. Call the available discovery tools with "
-            "task-specific queries and record empty/no-result outcomes as "
-            "evidence when applicable. TOOL_ARG_ERROR and query-less calls do "
-            "not count as discovery coverage."
-        )
+    allowed_tools = (
+        {str(item) for item in allowed if str(item).strip()}
+        if isinstance(allowed, list)
+        else set()
+    )
+    workspace_id = _workspace_id_from_drive(ctx)
+    workspace_root = _repo_root_from_phase_ctx(ctx) / "workspaces" / workspace_id
+    charter = load_workspace_charter(workspace_root)
+    drive_root = getattr(ctx, "drive_root", None)
+    declaration = (
+        load_capability_declaration(pathlib.Path(drive_root))
+        if drive_root is not None
+        else None
+    )
+    issue = validate_discovery_coverage(
+        declaration,
+        charter=charter,
+        allowed_tools=allowed_tools,
+        research_depth="full",
+    )
+    if issue:
+        return f"ERROR: {issue}"
     return ""
-
-
-def _research_discovery_row_counts(row: dict[str, Any]) -> bool:
-    tool = str(row.get("tool") or "")
-    if tool not in (
-        _RESEARCH_GITHUB_DISCOVERY_TOOL,
-        _RESEARCH_MCP_DISCOVERY_TOOL,
-        *_RESEARCH_INTERNET_DISCOVERY_TOOLS,
-    ):
-        return False
-    args = _coerce_log_payload(row.get("args") or {})
-    if isinstance(args, dict) and not str(args.get("query") or "").strip():
-        return False
-    raw = str(row.get("result_preview") or row.get("result") or "")
-    if "TOOL_ARG_ERROR" in raw or "TOOL_PREFLIGHT_ERROR" in raw:
-        return False
-    payload = _json_obj_from_preview(raw)
-    status = str(payload.get("status") or "").strip().lower()
-    if not status:
-        return True
-    if (
-        status in {"provider_unavailable", "provider_error", "no_results"}
-        and tool in _RESEARCH_INTERNET_DISCOVERY_TOOLS
-    ):
-        return True
-    return status not in {"error", "failed", "failure"}
 
 
 def _unread_existing_workspace_path_issue(
@@ -1264,7 +1241,7 @@ def _research_review_validation_issue(
     notes: str,
 ) -> str:
     task_id = str(getattr(ctx, "task_id", "") or "")
-    phase = task_id.split(":", 1)[1] if ":" in task_id else ""
+    phase = phase_id_from_task_id(task_id)
     verdict_lc = str(verdict or "").strip().lower()
     if phase != "research_review":
         return ""
@@ -1289,31 +1266,6 @@ def _research_review_validation_issue(
                 + " Research review revisions must not reintroduce "
                 "contradicted code blockers; mark old memory as stale or cite "
                 "current file evidence."
-            )
-        if (
-            verdict_lc == "revise"
-            and _NON_BLOCKING_RESEARCH_REVISE_RE.search(review_text)
-            and not _BLOCKING_RESEARCH_REVISE_RE.search(review_text)
-        ):
-            return (
-                "ERROR: research_review revise is reserved for blocking "
-                "research defects that make planning unsafe. Prior-art wording, "
-                "citation, novelty, or minor summary corrections should be "
-                "submitted as verdict=ok notes unless they create a concrete "
-                "architecture or charter blocker."
-            )
-        if (
-            verdict_lc == "revise"
-            and _IMPLEMENTATION_OWNED_RESEARCH_REVISE_RE.search(review_text)
-            and not _BLOCKING_RESEARCH_REVISE_RE.search(review_text)
-        ):
-            return (
-                "ERROR: research_review revise is reserved for blocking "
-                "research defects that make planning unsafe. Exact schemas, "
-                "code snippets, module lists, endpoint contracts, test commands, "
-                "and other implementation-owned details belong in verdict=ok "
-                "notes for the plan/execute/verify phases when the research "
-                "already contains a viable architecture."
             )
         return ""
 
@@ -1394,9 +1346,11 @@ def _research_review_current_finding_revise_issue(
     issues: list[Any],
     notes: str,
 ) -> str:
-    task_id = str(getattr(ctx, "task_id", "") or "")
-    phase = task_id.split(":", 1)[1] if ":" in task_id else ""
-    if phase != "research_review" or str(verdict or "").strip().lower() != "revise":
+    from umbrella.phases.identity import resolve_phase_id
+
+    if resolve_phase_id(ctx) != "research_review":
+        return ""
+    if str(verdict or "").strip().lower() != "revise":
         return ""
     issue_codes = {
         str(getattr(item, "code", "") or "").strip()
@@ -1405,42 +1359,82 @@ def _research_review_current_finding_revise_issue(
     if "insufficient_research_evidence" not in issue_codes:
         return ""
     summary_payload = _latest_research_summary_payload(ctx)
-    if str(summary_payload.get("coverage_status") or "").strip() != "source_scarce":
-        return ""
     raw_ids = summary_payload.get("findings_ids")
     if not isinstance(raw_ids, list):
         return ""
     finding_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
     if not finding_ids:
         return ""
-    research_task_id = _research_task_id_for_review(task_id)
+    research_task_id = _research_task_id_for_review(
+        str(getattr(ctx, "task_id", "") or ""),
+        ctx=ctx,
+        summary_payload=summary_payload,
+    )
     accepted_aliases = _accepted_research_finding_aliases_for_task_id(
         ctx,
         research_task_id,
     )
-    current_ids = [item for item in finding_ids if item in accepted_aliases]
-    if not current_ids:
+    if not all(item in accepted_aliases for item in finding_ids):
         return ""
-    detail = str(notes or "").strip()
+    detail = str(notes or "").strip()[:300]
     return (
-        "ERROR: research_review revise cannot demote the latest source_scarce "
+        "ERROR: research_review revise cannot demote the latest "
         "research handoff as insufficient evidence when the current summary "
         "already cites accepted current-run research finding id(s): "
-        f"{', '.join(current_ids[:6])}. Treat source_scarce as a constrained "
-        "low-evidence handoff unless you cite a concrete source-policy, "
-        "fabrication, or unbacked-label blocker in typed issues. "
-        f"Review note: {detail[:300]}"
+        f"{', '.join(finding_ids[:6])}. Treat the research tool log and "
+        "research_summary_latest.json as authoritative for current-run "
+        "finding existence; palace_search recall can be incomplete. "
+        "Loop back only for a concrete source-policy, fabrication, or "
+        "unbacked-label blocker in typed issues."
+        + (f" Review note: {detail}" if detail else "")
     )
 
 
-def _research_task_id_for_review(task_id: str) -> str:
+def _research_task_id_for_review(
+    task_id: str,
+    *,
+    ctx: ToolContext | None = None,
+    summary_payload: dict[str, Any] | None = None,
+) -> str:
     text = str(task_id or "").strip()
     if ":" not in text:
         return text
-    run_id, phase = text.rsplit(":", 1)
-    if phase == "research_review":
-        return f"{run_id}:research"
-    return text
+    run_id = text.split(":", 1)[0]
+    if ctx is not None:
+        payload = summary_payload if isinstance(summary_payload, dict) else {}
+        candidate = str(payload.get("task_id") or "").strip()
+        if (
+            candidate
+            and candidate.split(":", 1)[0] == run_id
+            and phase_id_from_task_id(candidate) == "research"
+        ):
+            return candidate
+
+        path = pathlib.Path(ctx.drive_root) / "logs" / "tools.jsonl"
+        latest_task_id = ""
+        latest_time: float | None = None
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                row_task_id = str(row.get("task_id") or "").strip()
+                if (
+                    not row_task_id
+                    or row_task_id.split(":", 1)[0] != run_id
+                    or phase_id_from_task_id(row_task_id) != "research"
+                ):
+                    continue
+                row_time = _tool_row_time(row)
+                if latest_time is None or row_time is None or row_time >= latest_time:
+                    latest_task_id = row_task_id
+                    latest_time = row_time
+        except OSError:
+            pass
+        if latest_task_id:
+            return latest_task_id
+    return f"{run_id}:research"
 
 
 def _latest_research_summary_memory_policy_issue(
@@ -1472,7 +1466,11 @@ def _latest_research_summary_memory_policy_issue(
     if not finding_ids:
         return ""
     task_id = str(getattr(ctx, "task_id", "") or "")
-    research_task_id = _research_task_id_for_review(task_id)
+    research_task_id = _research_task_id_for_review(
+        task_id,
+        ctx=ctx,
+        summary_payload=summary_payload,
+    )
     rows = _tool_log_rows_for_task(ctx, research_task_id)
     if not rows:
         return ""
@@ -1526,6 +1524,232 @@ def _latest_research_summary_memory_policy_issue(
     return ""
 
 
+def _capability_declaration_handoff_issue(ctx: ToolContext) -> str:
+    from umbrella.contracts.capability_declaration import (
+        build_declaration_from_probes,
+        declaration_ready_for_handoff,
+        load_capability_declaration,
+        persist_capability_declaration,
+        ensure_probe_backed_declaration,
+    )
+    from umbrella.contracts.runtime_probes import baseline_runtime_capabilities
+
+    drive_root = getattr(ctx, "drive_root", None)
+    if drive_root is None:
+        return (
+            "ERROR: missing capability_declaration. After discovery (repo read, "
+            "web/github search, env checks), call submit_capability_declaration "
+            "before submit_research_summary."
+        )
+    declaration = load_capability_declaration(pathlib.Path(drive_root))
+    if declaration_ready_for_handoff(declaration):
+        return ""
+    if declaration is not None and declaration.status == "draft":
+        return (
+            "ERROR: capability_declaration exists but is still draft. Call "
+            "submit_capability_declaration with status=submitted, concrete "
+            "constraints, and notes from discovery before handoff."
+        )
+    return (
+        "ERROR: missing capability_declaration. After discovery (repo read, "
+        "web/github search, env checks), call submit_capability_declaration "
+        "before submit_research_summary."
+    )
+
+
+def _submit_capability_declaration(
+    ctx: ToolContext,
+    *,
+    capabilities: dict[str, Any] | None = None,
+    constraints: list[str] | None = None,
+    limitations: list[str] | None = None,
+    notes: str = "",
+    probes: dict[str, Any] | None = None,
+    discovery_channels: list[dict[str, Any]] | None = None,
+    discoveries: list[dict[str, Any]] | None = None,
+    recommended_skills: list[str] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+    status: str = "submitted",
+) -> str:
+    if stop := _stop_requested_message(ctx, "submit_capability_declaration"):
+        return stop
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    phase = phase_id_from_task_id(task_id)
+    if phase not in {"research", "preflight"}:
+        return (
+            "ERROR: submit_capability_declaration is only allowed in research "
+            "or preflight phases."
+        )
+    from umbrella.contracts.capability_declaration import (
+        _normalize_capability_tag,
+        persist_capability_declaration,
+        validate_declaration_payload,
+    )
+    from umbrella.contracts.runtime_probes import (
+        baseline_runtime_capabilities,
+        persist_runtime_capabilities,
+        run_capability_probes,
+    )
+
+    from umbrella.deep_agent_tools.phase_control_actions import (
+        _repo_root_from_phase_ctx,
+    )
+
+    workspace_id = _workspace_id_from_drive(ctx)
+    repo_root = _repo_root_from_phase_ctx(ctx)
+    workspace_root = repo_root / "workspaces" / workspace_id
+    drive_root = pathlib.Path(getattr(ctx, "drive_root", "") or "")
+    if not drive_root.is_dir():
+        return "ERROR: missing drive_root for capability_declaration."
+    persist_runtime_capabilities(drive_root, baseline_runtime_capabilities())
+
+    raw_caps: dict[str, Any] = {}
+    for tag, available in baseline_runtime_capabilities().items():
+        raw_caps[tag] = {
+            "available": bool(available),
+            "source": "probe",
+            "reason": "",
+        }
+    for tag, entry in (capabilities or {}).items():
+        name = _normalize_capability_tag(str(tag))
+        if not name:
+            return f"ERROR: invalid capability tag `{tag}`."
+        raw_caps[name] = entry
+    if isinstance(probes, dict):
+        for tag, probe_spec in probes.items():
+            name = _normalize_capability_tag(str(tag))
+            if not name:
+                return f"ERROR: invalid probe capability tag `{tag}`."
+            current = raw_caps.get(name)
+            if isinstance(current, dict):
+                current = dict(current)
+            elif isinstance(current, bool):
+                current = {"available": bool(current)}
+            else:
+                current = {}
+            current["probe"] = probe_spec
+            raw_caps[name] = current
+
+    merged_caps = run_capability_probes(raw_caps, workspace_root=workspace_root)
+    if not merged_caps:
+        return "ERROR: capability_declaration needs at least one capability entry."
+    for tag, raw_entry in raw_caps.items():
+        if (
+            not isinstance(raw_entry, dict)
+            or "available" not in raw_entry
+            or not isinstance(raw_entry.get("probe"), dict)
+        ):
+            continue
+        merged_entry = merged_caps.get(tag)
+        if not isinstance(merged_entry, dict) or str(merged_entry.get("source") or "") != "probe":
+            continue
+        declared = bool(raw_entry.get("available"))
+        probed = bool(merged_entry.get("available"))
+        if declared == probed:
+            continue
+        outcome = "succeeded" if probed else "failed"
+        expected = "true" if probed else "false"
+        actual = "true" if declared else "false"
+        return (
+            "ERROR: capability_declaration rejected: capability "
+            f"`{tag}` declared available={actual}, but its same-slug probe "
+            f"{outcome}. Set capabilities.{tag}.available={expected} and "
+            "align notes/constraints with that probe result, or omit "
+            "`available` and let the probe decide."
+        )
+    probe_audit = baseline_runtime_capabilities()
+    for tag, entry in merged_caps.items():
+        if isinstance(entry, dict) and str(entry.get("source") or "") == "probe":
+            probe_audit[str(tag)] = bool(entry.get("available"))
+
+    normalized_status = str(status or "submitted").strip().lower()
+    discovery_rows = _normalize_capability_discovery_rows(
+        [*(discovery_channels or []), *(discoveries or [])]
+    )
+    payload: dict[str, Any] = {
+        "schema_version": "1",
+        "status": normalized_status,
+        "run_id": _run_id(ctx),
+        "workspace_id": workspace_id,
+        "actor": "agent",
+        "capabilities": merged_caps,
+        "constraints": [str(item).strip() for item in (constraints or []) if str(item).strip()],
+        "limitations": [str(item).strip() for item in (limitations or []) if str(item).strip()],
+        "notes": str(notes or "").strip(),
+        "evidence_refs": evidence_refs or [],
+        "discovery_channels": discovery_rows,
+        "recommended_skills": [
+            str(item).strip()
+            for item in (recommended_skills or [])
+            if str(item).strip()
+        ],
+        "probe_audit": probe_audit,
+    }
+    errors = validate_declaration_payload(payload)
+    if errors:
+        return "ERROR: capability_declaration rejected: " + "; ".join(errors)
+    path = persist_capability_declaration(drive_root, payload)
+    signal_id = _write_control_signal(ctx, "submit_capability_declaration", {
+        "status": normalized_status,
+        "artifact": str(path.relative_to(drive_root)).replace("\\", "/"),
+        "capability_count": len(merged_caps),
+    })
+    return (
+        f"OK: Capability declaration {normalized_status} "
+        f"({len(merged_caps)} capabilities, signal: {signal_id})"
+    )
+
+
+_DISCOVERY_CHANNEL_TOOL_ALIASES = {
+    "github": "github_project_search",
+    "git": "github_project_search",
+    "github_search": "github_project_search",
+    "web": "web_search",
+    "internet": "web_search",
+    "search": "web_search",
+    "deep": "deep_search",
+    "deep_search": "deep_search",
+    "mcp": "mcp_discover",
+    "mcp_discovery": "mcp_discover",
+}
+
+
+def _normalize_capability_discovery_rows(rows: list[Any]) -> list[dict[str, str]]:
+    from umbrella.workspace_registry.charter import normalize_discovery_channel
+
+    normalized: list[dict[str, str]] = []
+    for row in rows:
+        candidate: dict[str, Any]
+        if isinstance(row, str):
+            candidate = {"tool": row}
+        elif isinstance(row, dict):
+            candidate = dict(row)
+            tool = str(
+                candidate.get("tool")
+                or candidate.get("channel")
+                or candidate.get("source")
+                or ""
+            ).strip()
+            if tool:
+                candidate["tool"] = _DISCOVERY_CHANNEL_TOOL_ALIASES.get(
+                    tool.lower(),
+                    tool,
+                )
+            note_parts = [str(candidate.get("notes") or "").strip()]
+            for key in ("search", "query", "results", "sources"):
+                value = candidate.get(key)
+                if value in (None, "", [], ()):
+                    continue
+                note_parts.append(f"{key}={value}")
+            candidate["notes"] = "; ".join(part for part in note_parts if part)
+        else:
+            continue
+        item = normalize_discovery_channel(candidate)
+        if item is not None:
+            normalized.append(item)
+    return normalized
+
+
 def _research_summary_validation_issue(
     ctx: ToolContext,
     *,
@@ -1535,9 +1759,12 @@ def _research_summary_validation_issue(
     coverage_status: str = "",
 ) -> str:
     task_id = str(getattr(ctx, "task_id", "") or "")
-    phase = task_id.split(":", 1)[1] if ":" in task_id else ""
+    phase = phase_id_from_task_id(task_id)
     if phase != "research":
         return ""
+    declaration_issue = _capability_declaration_handoff_issue(ctx)
+    if declaration_issue:
+        return declaration_issue
     architecture = str(architecture_id or "").strip()
     if not architecture:
         return "ERROR: research summary needs a non-empty architecture_id"
@@ -1560,10 +1787,52 @@ def _research_summary_validation_issue(
             "architecture id is an authoritative handoff label, not a proof "
             "shortcut or temporary implementation mode."
         )
-    note_text = str(notes or "").strip()
+    note_text = _normalize_handoff_text(str(notes or "").strip())
+    if len(note_text) < 20:
+        return "ERROR: research summary notes are too short for a useful handoff"
+    if _looks_like_mojibake(note_text):
+        return (
+            "ERROR: research summary notes look encoding-corrupted/mojibake. "
+            "Rewrite the handoff in readable text before submitting."
+        )
+    if _HANDOFF_PLACEHOLDER_RE.search(note_text):
+        return (
+            "ERROR: research summary notes look like placeholder/pending text; "
+            "write concrete findings before submitting the summary"
+        )
+    from umbrella.contracts.capability_declaration import (
+        capability_text_contradiction_errors,
+        load_capability_declaration,
+    )
+
+    declaration = load_capability_declaration(
+        pathlib.Path(getattr(ctx, "drive_root", "") or "")
+    )
+    if declaration is not None:
+        contradiction_errors = capability_text_contradiction_errors(
+            declaration.to_dict().get("capabilities", {}),
+            [note_text],
+        )
+        if contradiction_errors:
+            return (
+                "ERROR: research summary capability handoff contradicts "
+                "capability_declaration: "
+                + contradiction_errors[0]
+            )
+    for label, text in (("research summary notes", note_text),):
+        fallback_issue = _llm_fallback_handoff_issue(text, label=label)
+        if fallback_issue:
+            return fallback_issue
+        test_double_issue = _llm_test_double_handoff_issue(text, label=label)
+        if test_double_issue:
+            return test_double_issue
+        cached_issue = _llm_cached_decision_handoff_issue(text, label=label)
+        if cached_issue:
+            return cached_issue
     concrete_findings = [str(item).strip() for item in findings_ids if str(item).strip()]
     rows = _tool_log_rows_for_task(ctx, task_id)
-    if not concrete_findings:
+    min_findings = _research_summary_min_valid_findings(ctx)
+    if not concrete_findings and min_findings > 0:
         source_hint = _research_summary_next_finding_hint(rows)
         return (
             "ERROR: research summary needs findings_ids from accepted palace_add "
@@ -1583,7 +1852,6 @@ def _research_summary_validation_issue(
             f"concrete research_finding palace_add entry. Known ids: {known}."
             f"{source_hint}"
         )
-    min_findings = _research_summary_min_valid_findings(ctx)
     canonical_findings: list[str] = []
     duplicate_aliases: list[str] = []
     seen_canonical: set[str] = set()
@@ -1646,6 +1914,25 @@ def _research_summary_validation_issue(
     )
     if source_claim_issue:
         return source_claim_issue
+    for finding_id, finding_text in _palace_add_text_by_id(rows, finding_id_set).items():
+        for check in (
+            _llm_fallback_handoff_issue,
+            _llm_test_double_handoff_issue,
+            _llm_cached_decision_handoff_issue,
+        ):
+            handoff_issue = check(
+                finding_text,
+                label=f"research finding `{finding_id}` cited by summary",
+            )
+            if handoff_issue:
+                return handoff_issue
+    llm_env_issue = _llm_runtime_env_contract_handoff_issue(
+        rows,
+        finding_ids=finding_id_set,
+        notes=note_text,
+    )
+    if llm_env_issue:
+        return llm_env_issue
     contradiction = _negative_claim_contradiction_issue(
         ctx,
         rows=rows,
@@ -1667,6 +1954,46 @@ def _research_summary_validation_issue(
                 "or replace it with a corrected palace_add finding."
             )
     return ""
+
+
+def _llm_runtime_env_contract_handoff_issue(
+    rows: list[dict[str, Any]],
+    *,
+    finding_ids: set[str],
+    notes: str,
+) -> str:
+    cited_text = "\n".join(_palace_add_text_by_id(rows, finding_ids).values())
+    combined = "\n".join(part for part in (notes, cited_text) if part).strip()
+    runtime_claim_text = re.sub(
+        r"(?is)\bsearch\b.{0,240}\breturned\s+no\s+direct\s+results\b[^.]*\.?",
+        " ",
+        combined,
+    )
+    if not re.search(
+        r"(?is)\b(?:"
+        r"(?:real|live|runtime|generated|workspace|code|implementation|"
+        r"decisions?|actions?|calls?|analyz(?:e|es|ing)|client|provider|"
+        r"integration)\b.{0,120}\b(?:llm|model)\b|"
+        r"\b(?:llm|model)\b.{0,120}\b(?:runtime|generated|workspace|"
+        r"code|implementation|decisions?|actions?|calls?|analyz(?:e|es|ing)|"
+        r"client|provider|integration|agent|bot)\b|"
+        r"\bllm[-\s]?driven\b"
+        r")",
+        runtime_claim_text,
+    ):
+        return ""
+    required = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
+    missing = [alias for alias in required if alias not in combined]
+    if not missing:
+        return ""
+    return (
+        "ERROR: research summary omits the standalone LLM runtime env "
+        "contract for an LLM/GMAS/bot handoff. Save or cite a concrete "
+        "research finding that states generated workspace code resolves "
+        "`LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` from the inherited "
+        "runtime; do not rely on host-only OUROBOROS_* aliases. Missing: "
+        + ", ".join(missing)
+    )
 
 
 def _research_summary_allowed_skills(ctx: ToolContext) -> list[str]:
@@ -1714,15 +2041,29 @@ def _research_tool_row_succeeded(row: dict[str, Any]) -> bool:
     return True
 
 
-def _research_gmas_tool_row_succeeded(row: dict[str, Any]) -> bool:
-    if not _research_tool_row_succeeded(row):
-        return False
+def _gmas_payload_from_tool_row(row: dict[str, Any]) -> dict[str, Any]:
     raw = str(row.get("result_preview") or row.get("result") or "").strip()
     try:
         payload = json.loads(raw)
     except Exception:
+        payload = {}
+    if isinstance(payload, dict) and payload:
+        return payload
+    # tools.jsonl stores truncated previews; treat intact GMAS card fields as success.
+    lowered = raw.lower()
+    if '"recommended_pattern"' in lowered or '"key_symbols"' in lowered:
+        if '"fallback": true' not in lowered and '"fallback":true' not in lowered:
+            return {"recommended_pattern": "truncated_preview"}
+    if '"confidence"' in lowered and not lowered.startswith("error:"):
+        return {"confidence": 1.0}
+    return {}
+
+
+def _research_gmas_tool_row_succeeded(row: dict[str, Any]) -> bool:
+    if not _research_tool_row_succeeded(row):
         return False
-    if not isinstance(payload, dict):
+    payload = _gmas_payload_from_tool_row(row)
+    if not payload:
         return False
     results = payload.get("results") if isinstance(payload.get("results"), list) else []
     has_non_fallback_result = False
@@ -1744,9 +2085,18 @@ def _research_gmas_tool_row_succeeded(row: dict[str, Any]) -> bool:
             "example_usage",
             "doc_references",
             "retrieval_excerpt",
+            "content",
+            "answer",
+            "summary",
+            "context",
         )
     )
-    return bool(has_non_fallback_result or has_card_signal)
+    if has_card_signal:
+        return True
+    text_blob = tool_result_text(row).strip()
+    if len(text_blob) >= 80 and not text_blob.lower().startswith("error:"):
+        return True
+    return bool(has_non_fallback_result)
 
 
 def _research_summary_skill_coverage_issue(
@@ -1867,10 +2217,11 @@ __all__ = [
     '_research_summary_min_valid_findings',
     '_research_source_coverage_report',
     '_research_discovery_validation_issue',
-    '_research_discovery_row_counts',
     '_unread_existing_workspace_path_issue',
     '_latest_research_summary_payload',
     '_research_review_validation_issue',
     '_research_review_current_finding_revise_issue',
     '_research_summary_validation_issue',
+    '_submit_capability_declaration',
+    '_capability_declaration_handoff_issue',
 ]

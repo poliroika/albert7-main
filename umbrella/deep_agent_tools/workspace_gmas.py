@@ -1,13 +1,16 @@
 """GMAS and context-contract helpers for Umbrella workspace tools."""
 
 from umbrella.deep_agent_tools.workspace_common import *
+from umbrella.enforcement.kernel import phase_from_context
+
+_DISCOVERY_PHASES = frozenset({"research", "research_review", "plan"})
 
 
 def search_gmas_knowledge(
     ctx: Any,
     query: str,
     max_results: int = 6,
-    max_chars_per_hit: int = 8000,
+    max_chars_per_hit: int = 12000,
     limit: int | None = None,
     intent: str = "",
     slug: str = "",
@@ -21,7 +24,9 @@ def search_gmas_knowledge(
         repo_root = _resolve_umbrella_repo_root(ctx)
         active = _active_execute_subtask_info(ctx)
         subtask_id = str(active.get("id") or "").strip() if active else ""
-        if issue := _gmas_context_query_specificity_issue(query, active, ctx=ctx):
+        phase = phase_from_context(ctx)
+        issue = _gmas_context_query_specificity_issue(query, active, ctx=ctx)
+        if issue and phase not in _DISCOVERY_PHASES:
             return _json(
                 {
                     "status": "blocked",
@@ -40,7 +45,7 @@ def search_gmas_knowledge(
             repo_root,
             query,
             max_results=max(1, min(int(max_results), 12)),
-            max_chars_per_hit=max(1000, min(int(max_chars_per_hit), 30000)),
+            max_chars_per_hit=max(1000, min(int(max_chars_per_hit), 50000)),
         )
         if isinstance(result, dict):
             result = dict(result)
@@ -53,6 +58,13 @@ def search_gmas_knowledge(
                 result["slug"] = slug_norm
             if subtask_id:
                 result["active_subtask_id"] = subtask_id
+            result = _enrich_gmas_context_response(
+                result,
+                query=str(query or ""),
+                phase=phase,
+                active_subtask=active,
+                exploratory_query_issue=issue if phase in _DISCOVERY_PHASES else "",
+            )
         _mark_explicit_gmas_context_call(ctx, subtask_id=subtask_id)
         return _json(result)
     except Exception as e:
@@ -138,6 +150,8 @@ def _gmas_context_query_specificity_issue(
 def _gmas_context_specificity_required(
     active_subtask: dict[str, Any] | None, *, ctx: Any | None = None
 ) -> bool:
+    if ctx is not None and phase_from_context(ctx) in _DISCOVERY_PHASES:
+        return False
     if active_subtask and _subtask_requires_gmas_context(active_subtask):
         return True
     overlays = getattr(ctx, "context_overlays", None) if ctx is not None else None
@@ -161,6 +175,48 @@ def _gmas_context_specificity_required(
     except OSError:
         return False
     return bool(re.search(r"(?im)^\s*multi_agent_gmas\s*=\s*true\s*$", text))
+
+
+def _enrich_gmas_context_response(
+    result: dict[str, Any],
+    *,
+    query: str,
+    phase: str,
+    active_subtask: dict[str, Any] | None,
+    exploratory_query_issue: str,
+) -> dict[str, Any]:
+    """Add agent-facing guidance without changing retrieval hits."""
+    symbols = [str(s) for s in (result.get("key_symbols") or []) if str(s).strip()]
+    pattern = str(result.get("recommended_pattern") or "").strip()
+    guide: dict[str, Any] = {
+        "use_symbols_in_code": symbols[:8],
+        "recommended_pattern": pattern,
+        "discovery_phase": phase in _DISCOVERY_PHASES,
+        "before_first_write_in_execute": (
+            "Name concrete GMAS imports/classes you will use "
+            "(e.g. AgentProfile, MACPRunner, LLMCallerFactory) and "
+            "re-run get_gmas_context with those symbols plus the subtask goal."
+        ),
+        "do_not_guess_apis": (
+            "Do not invent helpers such as gmas.LLMClient unless they appear "
+            "in key_symbols/key_files/results for this query."
+        ),
+    }
+    if exploratory_query_issue:
+        guide["query_quality"] = "exploratory"
+        guide["query_refinement"] = (
+            "This broad query is allowed during research/plan. Before execute "
+            "writes on GMAS subtasks, retry with symbols from key_symbols."
+        )
+    subtask_id = str((active_subtask or {}).get("id") or "").strip()
+    if subtask_id:
+        guide["active_subtask_id"] = subtask_id
+    result["implementation_guide"] = guide
+    result["policy_hint"] = (
+        str(result.get("policy_hint") or "").strip()
+        or "Use retrieved gmas/examples and gmas/src patterns; adapt, do not guess API names."
+    )
+    return result
 
 
 def get_gmas_context(

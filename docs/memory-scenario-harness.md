@@ -6,10 +6,15 @@ Offline declarative tests for Umbrella memory injection, BKB filtering, MemPalac
 
 ```bash
 uv run memory-scenarios list
+uv run memory-scenarios list-llm
 uv run memory-scenarios run --all --verbose
 uv run memory-scenarios run --scenario 01_bkb_filtering
+uv run memory-scenarios run --phase verify
+uv run memory-scenarios run-llm --all
 uv run memory-scenarios inspect --scenario 01_bkb_filtering --open-report
 ```
+
+Deterministic `run --all` excludes `scenarios/llm/` (use `run-llm` for behavioral LLM checks).
 
 Reports: `.mrt/memory_scenarios/<scenario_id>/` (`report.md`, `result.json`, per-step prompts and injection reports).
 

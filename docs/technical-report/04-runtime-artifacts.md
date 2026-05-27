@@ -16,6 +16,9 @@ This chapter describes what appears on disk during execution. Runtime data lives
     state/
       state.json                      # Current run state (budget, drift)
       phase_plan.json                 # Active PhasePlan
+      capability_declaration.json     # Submitted research capability map (plan gate)
+      capability_declaration_latest.json  # Latest draft/submitted snapshot
+      runtime_capabilities.json       # Probe audit cache (not authoritative for gates)
       watcher_signal.json             # Watcher -> Runner control signal (atomic)
       watcher_signals.processed.jsonl # Audit trail of processed signals
     task_results/                     # Completed task outputs
@@ -76,12 +79,18 @@ logs/                                 # Detailed logs
 | File | Writer | Reader | Purpose |
 |------|--------|--------|---------|
 | `drive/state/phase_plan.json` | PhaseRunner, phase_control.py | PhaseRunner, Worker | Current PhasePlan state |
+| `drive/state/capability_declaration.json` | `submit_capability_declaration` (research) | Plan validator, Worker envelope | Declared/probed workspace capabilities; required before plan handoff |
+| `drive/state/runtime_capabilities.json` | Runtime probe runner | Diagnostics | Cached probe results; gates use `capability_declaration.json` |
 | `drive/state/watcher_signal.json` | Watcher | PhaseRunner | Control signals (atomic rename) |
 | `drive/state/state.json` | Ouroboros state manager | Ouroboros loop | Budget, drift, round count |
 | `palace/transient.sqlite` | MemPalace facade | Watcher, search | Events, tool I/O, terminal scrollback |
 | `palace/graph.sqlite` | MemPalace facade | recall, walk | Edge table linking memory nodes |
 | `runs/<id>/verification_report.json` | Verification runner | PhaseRunner, Web UI | Verification pass/fail details |
 | `runs/<id>/final_report.json` | FinalReport builder | Web UI, CLI | Evidence-based run report |
+
+## Documentation examples
+
+Sample payloads (not shipped in `umbrella/` and not read by the runtime) live under [docs/examples/](../examples/README.md), including [capability_declaration.json](../examples/capability_declaration.json).
 
 ## Atomic Writes
 

@@ -126,6 +126,10 @@ def _resolve_repo_root(ctx: Any) -> Path:
         seen.add(resolved)
         if (resolved / "umbrella").exists() and (resolved / "workspaces").exists():
             return resolved
+        if host_repo_root and resolved == Path(host_repo_root).resolve() and (
+            resolved / "workspaces"
+        ).exists():
+            return resolved
     return (Path(host_repo_root) if host_repo_root else Path.cwd()).resolve()
 
 

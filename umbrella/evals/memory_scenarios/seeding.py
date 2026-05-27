@@ -19,31 +19,16 @@ def _write_text_files(base: Path, files: dict[str, Any]) -> None:
         (base / name).write_text(str(content), encoding="utf-8")
 
 
-def _merge_bkb_rules(bkb_path: Path, rules: list[dict[str, Any]]) -> None:
-    existing: list[dict[str, Any]] = []
-    if bkb_path.is_file():
-        data = yaml.safe_load(bkb_path.read_text(encoding="utf-8")) or {}
-        existing = list(data.get("rules") or [])
-    by_id = {str(r.get("id")): r for r in existing if r.get("id")}
-    for rule in rules:
-        rid = str(rule.get("id") or "")
-        if rid:
-            by_id[rid] = rule
-    bkb_path.write_text(
-        yaml.safe_dump({"rules": list(by_id.values())}, sort_keys=False),
-        encoding="utf-8",
-    )
-
-
 def _apply_bkb_block(core_root: Path, bkb_data: Any) -> None:
+    from umbrella.memory.proactive.bkb import merge_bkb_rules
     core_root.mkdir(parents=True, exist_ok=True)
     bkb_path = core_root / "bkb.yaml"
     if isinstance(bkb_data, dict):
         rules = list(bkb_data.get("rules") or [])
-        _merge_bkb_rules(bkb_path, rules)
+        merge_bkb_rules(bkb_path, rules)
     elif isinstance(bkb_data, str):
         parsed = yaml.safe_load(bkb_data) or {}
-        _merge_bkb_rules(bkb_path, list(parsed.get("rules") or []))
+        merge_bkb_rules(bkb_path, list(parsed.get("rules") or []))
 
 
 def apply_seed(
