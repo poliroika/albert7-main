@@ -230,6 +230,7 @@ class ProofExecutionSpec:
     timeout_sec: int = 120
     shell: bool = False
     subdir: str = ""
+    env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ProofExecutionSpec":
@@ -240,6 +241,13 @@ class ProofExecutionSpec:
             timeout_sec=int(value.get("timeout_sec") or 120),
             shell=bool(value.get("shell")),
             subdir=str(value.get("subdir") or "").strip().strip("/\\"),
+            env={
+                str(key): str(raw)
+                for key, raw in (value.get("env") or {}).items()
+                if str(key).strip()
+            }
+            if isinstance(value.get("env"), dict)
+            else {},
         )
 
 

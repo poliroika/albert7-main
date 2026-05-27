@@ -1568,6 +1568,15 @@ _BAD_GENERATED_SUCCESS_TEST_REASON_RE = re.compile(
     r"bad\s+generated\s+(?:success[-_\s]?test|test|test\s+contract)|"
     r"generated\s+(?:success[-_\s]?test|test)\s+(?:contract\s+)?"
     r"(?:is\s+)?(?:wrong|invalid|contradictory|inconsistent|impossible)|"
+    r"(?:generated\s+)?(?:test|proof|oracle)\s+contract\s+"
+    r"(?:itself\s+)?(?:has|contains|is)\s+"
+    r"(?:bugs?|errors?|wrong|invalid|contradictory|inconsistent|impossible|unfixable)|"
+    r"(?:test|proof|oracle)\s+contract\b.{0,160}\b"
+    r"(?:bugs?|errors?|wrong|invalid|contradictory|inconsistent|impossible|unfixable)|"
+    r"generated\s+test\s+file\b.{0,160}\b"
+    r"(?:bugs?|errors?|wrong|invalid|contradictory|inconsistent|impossible|unfixable)|"
+    r"mathematically\s+(?:wrong|impossible)|"
+    r"expected\s+value\s+is\s+mathematically\s+wrong|"
     r"internally\s+(?:inconsistent|contradictory)|"
     r"contradicts?\s+(?:itself|the\s+accepted\s+plan)|"
     r"test\s+(?:needs|should|must)\s+(?:be\s+)?(?:changed|updated|repaired|"
@@ -1619,13 +1628,21 @@ def _contract_migration_retry_recommendation(contract_payload: dict[str, Any]) -
         files = [files]
     file_list = ", ".join(str(file_path) for file_path in files if str(file_path))
     target = f" for {file_list}" if file_list else ""
+    subtask_id = str(contract_payload.get("target_subtask_id") or "").strip()
+    selector = (
+        f'target_subtask_id="{subtask_id}", '
+        if subtask_id
+        else ""
+    )
     return (
-        "Watcher classified the latest failure as a bad generated success-test "
-        f"contract{target}. Call `mutate_phase_plan` with "
-        "`contract_migration_reason` and `contract_migration_files` (top-level "
-        "aliases apply to the active execute subtask) before editing the "
-        "declared success-test file; keep the migration minimal and preserve "
-        "the intended behavior."
+        "Watcher classified the latest failure as a plan contract issue in the "
+        f"generated test/proof oracle{target}. Route to `plan` and record the "
+        "contract migration before editing the declared success-test file. "
+        "Use "
+        f"`mutate_phase_plan({selector}patch={{"
+        "\"contract_migration_reason\": \"...\", "
+        "\"contract_migration_files\": [...]}})`; keep the migration minimal "
+        "and preserve the intended behavior."
     )
 
 
@@ -1633,6 +1650,7 @@ def _retry_watcher_verdict_payload(
     *,
     status: str,
     failed_attempts: int,
+    subtask_id: str,
     contract_migration_payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Return the typed retry-watcher decision surfaced to the agent."""
@@ -1652,12 +1670,50 @@ def _retry_watcher_verdict_payload(
             ],
         }
     if contract_migration_payload:
+        files = contract_migration_payload.get("target_files") or []
+        if isinstance(files, str):
+            files = [files]
+        evidence = str(contract_migration_payload.get("evidence") or "").strip()
+        target = str(
+            contract_migration_payload.get("target_subtask_id") or subtask_id or ""
+        ).strip()
+        issue = {
+            "code": "plan_contract_issue",
+            "severity": "blocking",
+            "target": target,
+            "message": (
+                "Generated test/proof oracle appears inconsistent with the "
+                "accepted plan or task contract; revise the subtask contract "
+                "in plan before another execute repair."
+            ),
+            "evidence_refs": [],
+        }
+        if evidence:
+            issue["evidence"] = evidence
         return {
             "verdict": "bad_test_contract",
             "can_edit_tests": False,
             "requires_plan_mutation": True,
+            "loop_back_target": "plan",
+            "issues": [issue],
+            "required_plan_changes": [
+                {
+                    "target_subtask_id": target,
+                    "change": (
+                        "Revise the generated test/proof/oracle contract before "
+                        "continuing execute."
+                    ),
+                    "contract_migration_files": [
+                        str(file_path)
+                        for file_path in files
+                        if str(file_path).strip()
+                    ],
+                    "evidence_refs": [],
+                }
+            ],
             "allowed_next_actions": [
-                "call mutate_phase_plan with contract_migration_reason",
+                "route to plan contract revision",
+                "call mutate_phase_plan with target_subtask_id and contract_migration_reason",
                 "include contract_migration_files for the affected test/proof files",
                 "rerun run_subtask_proof after the plan mutation",
             ],
@@ -1891,6 +1947,10 @@ def _phase_subtask_retry_watcher_review_payload(
                 }
             )[:16],
         )
+        contract_migration_payload.setdefault(
+            "target_subtask_id",
+            str(state.get("subtask_id") or ""),
+        )
         review["contract_migration"] = contract_migration_payload
         review["recommendation"] = _contract_migration_retry_recommendation(
             contract_migration_payload
@@ -1899,6 +1959,7 @@ def _phase_subtask_retry_watcher_review_payload(
         _retry_watcher_verdict_payload(
             status=status,
             failed_attempts=failed_attempts,
+            subtask_id=str(state.get("subtask_id") or ""),
             contract_migration_payload=(
                 review.get("contract_migration")
                 if isinstance(review.get("contract_migration"), dict)

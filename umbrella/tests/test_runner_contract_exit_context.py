@@ -1022,7 +1022,168 @@ def test_revision_contract_preserves_required_plan_changes(tmp_path: Path) -> No
         outcome={"task_id": task_id},
     )
 
+    assert contract["issues"] == [{"code": "weak_proof", "message": "proof is weak"}]
+    assert contract["loop_back_target"] == "plan"
+    assert contract["review_source"] == "submit_micro_review"
+    assert contract["review_phase_id"] == "plan_review"
+    assert contract["review_artifact_ref"] == "review-revise"
     assert contract["required_plan_changes"] == [
         "Strengthen launcher proof with observable command behavior."
     ]
     assert contract["revisions"] == []
+    rendered = json.dumps(contract, ensure_ascii=False, indent=2)
+    assert "weak_proof" in rendered
+    assert "proof is weak" in rendered
+    assert rendered.index('"issues"') < rendered.index('"notes"')
+
+
+def test_revision_contract_accepts_watcher_plan_contract_issue(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    task_id = "run-1:execute:200"
+    change = {
+        "target_subtask_id": "logic",
+        "change": "Revise generated oracle before execute retries.",
+        "contract_migration_files": ["tests/test_logic.py"],
+    }
+    (state / "phase_control_signals.jsonl").write_text(
+        json.dumps(
+            {
+                "signal_id": "watcher-contract",
+                "kind": "request_watcher_review",
+                "created_at": 200.0,
+                "task_id": task_id,
+                "phase": "execute",
+                "payload": {
+                    "status": "review_recorded",
+                    "verdict": "bad_test_contract",
+                    "loop_back_target": "plan",
+                    "issues": [
+                        {
+                            "code": "plan_contract_issue",
+                            "severity": "blocking",
+                            "target": "logic",
+                            "message": "generated oracle contradicts task",
+                        }
+                    ],
+                    "required_plan_changes": [change],
+                    "recommendation": "Route to plan contract revision.",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+    phase = PhaseNode(id="execute", manifest_id="execute", status="running")
+    phase.started_at = 100.0
+
+    contract = runner._latest_revision_contract(
+        phase_node=phase,
+        outcome={"task_id": task_id},
+    )
+
+    assert contract["review_source"] == "request_watcher_review"
+    assert contract["loop_back_target"] == "plan"
+    assert contract["issues"][0]["code"] == "plan_contract_issue"
+    assert contract["required_plan_changes"] == [change]
+    assert contract["notes"] == "Route to plan contract revision."
+
+
+def test_phase_loop_back_target_uses_watcher_plan_contract_issue(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    task_id = "run-1:execute:200"
+    (state / "phase_control_signals.jsonl").write_text(
+        json.dumps(
+            {
+                "signal_id": "watcher-contract",
+                "kind": "request_watcher_review",
+                "created_at": 200.0,
+                "task_id": task_id,
+                "phase": "execute",
+                "payload": {
+                    "status": "review_recorded",
+                    "verdict": "bad_test_contract",
+                    "loop_back_target": "plan",
+                    "issues": [{"code": "plan_contract_issue"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+    phase = PhaseNode(id="execute", manifest_id="execute", status="running")
+    phase.started_at = 100.0
+    plan = PhasePlan(
+        plan_id="p1",
+        workspace_id="demo",
+        run_id="run-1",
+        nodes=[PhaseNode(id="plan", manifest_id="plan"), phase],
+    )
+
+    target = runner._phase_loop_back_target(
+        phase_node=phase,
+        outcome={"task_id": task_id},
+        plan=plan,
+    )
+
+    assert target == "plan"
+
+
+def test_revision_contract_merges_typed_issues(tmp_path: Path) -> None:
+    runner = PhaseRunner(
+        repo_root=tmp_path / "repo",
+        workspace_id="demo",
+        drive_root=tmp_path / "drive",
+    )
+    existing = {
+        "source_phase": "subtask_review:s1",
+        "source_task_id": "run:review:1",
+        "issues": [
+            {
+                "code": "proof_scope_mismatch",
+                "severity": "blocking",
+                "message": "old proof missed the runtime target",
+            }
+        ],
+        "revisions": [],
+        "required_plan_changes": [],
+        "notes": "old note",
+    }
+    latest = {
+        "source_phase": "subtask_review:s1",
+        "source_task_id": "run:review:2",
+        "issues": [
+            {
+                "code": "proof_scope_mismatch",
+                "severity": "blocking",
+                "message": "old proof missed the runtime target",
+            },
+            {
+                "code": "weak_proof",
+                "severity": "error",
+                "message": "runtime proof duplicated headless checks",
+            },
+        ],
+        "revisions": [],
+        "required_plan_changes": [],
+        "notes": "new note",
+    }
+
+    merged = runner._merged_revision_contract(existing, latest)
+
+    assert [issue["code"] for issue in merged["issues"]] == [
+        "proof_scope_mismatch",
+        "weak_proof",
+    ]
+    assert "old note" in merged["notes"]
+    assert "new note" in merged["notes"]

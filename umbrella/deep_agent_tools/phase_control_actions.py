@@ -582,14 +582,39 @@ def _apply_phase_plan_subtask_patch(
     return applied, None
 
 
-def _mutate_phase_plan(ctx: ToolContext, *, patch: dict[str, Any]) -> str:
+def _mutate_phase_plan(
+    ctx: ToolContext,
+    *,
+    patch: dict[str, Any],
+    target_subtask_id: str = "",
+    subtask_id: str = "",
+) -> str:
     if stop := _stop_requested_message(ctx, "mutate_phase_plan"):
         return stop
     if not isinstance(patch, dict):
         return "ERROR: mutate_phase_plan patch must be an object"
+    if "subtask_id" in patch or "target_subtask_id" in patch:
+        return (
+            "ERROR: subtask_id is a selector, not a mutable patch field; pass "
+            "it as top-level target_subtask_id or top-level subtask_id."
+        )
     plan = _read_phase_plan(ctx)
     if plan is None:
         return "ERROR: no phase_plan.json found — cannot mutate"
+    selector = (
+        str(target_subtask_id or "").strip()
+        or str(subtask_id or "").strip()
+    )
+    if selector:
+        if "subtasks" in patch:
+            return (
+                "ERROR: target_subtask_id cannot be combined with patch.subtasks; "
+                "pass subtask fields directly in patch."
+            )
+        if "proof_contract" in patch and "proof" not in patch:
+            patch = {**patch, "proof": patch["proof_contract"]}
+            patch.pop("proof_contract", None)
+        patch = {"subtasks": [{"id": selector, **patch}]}
     contract_migration_keys = {
         *_CONTRACT_MIGRATION_REASON_KEYS,
         *_CONTRACT_MIGRATION_FILE_KEYS,
@@ -1770,6 +1795,25 @@ def _managed_runtime_readiness_specs(options: dict[str, Any]) -> list[dict[str, 
     return specs or [{"type": "process_alive"}]
 
 
+def _managed_runtime_env_overrides(proof: Any, options: dict[str, Any]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    execution_env = getattr(getattr(proof, "execution", None), "env", None)
+    for raw in (execution_env, options.get("env")):
+        if not isinstance(raw, dict):
+            continue
+        for key, value in raw.items():
+            name = str(key).strip()
+            if name:
+                env[name] = str(value)
+    from umbrella.deep_agent_tools.domain_policy import public_workspace_llm_env_bridge
+
+    bridged = public_workspace_llm_env_bridge({**os.environ, **env})
+    bridged.setdefault("PYTHONIOENCODING", "utf-8")
+    bridged.setdefault("PYTHONUTF8", "1")
+    bridged.update(env)
+    return bridged
+
+
 def _managed_runtime_spec_ready(
     spec: dict[str, Any],
     *,
@@ -1830,6 +1874,20 @@ def _run_managed_runtime_proof(
     )
     subdir = str(getattr(getattr(proof, "execution", None), "subdir", "") or "").strip().strip("/\\")
     cwd = workspace_root / subdir if subdir else workspace_root
+    repo_root = pathlib.Path(
+        getattr(ctx, "host_repo_root", None)
+        or getattr(ctx, "repo_dir", None)
+        or workspace_root.parent.parent
+    )
+    prepared_command = workspace_commands._rewrite_python_command_for_workspace(
+        list(command),
+        repo_root=repo_root,
+        workspace_root=workspace_root,
+    )
+    prepared_command = workspace_commands._wrap_compound_command_for_host(
+        prepared_command
+    )
+    env_overrides = _managed_runtime_env_overrides(proof, options)
     job_id = ""
     job = None
     readiness_results: list[dict[str, Any]] = []
@@ -1842,9 +1900,10 @@ def _run_managed_runtime_proof(
     try:
         job = _bg_jobs.start_background(
             pathlib.Path(getattr(ctx, "drive_root")),
-            argv=command,
+            argv=prepared_command,
             cwd=cwd,
             label=f"proof-{workspace_id}",
+            env_overrides=env_overrides,
         )
         job_id = job.job_id
         specs = _managed_runtime_readiness_specs(options)
@@ -1928,7 +1987,8 @@ def _run_managed_runtime_proof(
             "exit_code": exit_code,
             "status": status,
             "backend": "managed_runtime",
-            "command": command,
+            "command": prepared_command,
+            "declared_command": command,
             "job_id": job_id,
             "pid": getattr(job, "pid", 0) if job is not None else 0,
             "cwd": str(cwd),
@@ -1949,7 +2009,8 @@ def _run_managed_runtime_proof(
             "exit_code": 1,
             "status": "managed_runtime_error",
             "backend": "managed_runtime",
-            "command": command,
+            "command": prepared_command,
+            "declared_command": command,
             "job_id": job_id,
             "error": str(exc),
         }

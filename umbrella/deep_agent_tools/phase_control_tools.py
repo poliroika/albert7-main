@@ -49,7 +49,21 @@ def get_tools() -> list[ToolEntry]:
                                 "\"command\":[\"python\",\"-m\",\"pytest\","
                                 "\"tests/test_x.py\",\"-q\"]}}}]}"
                             ),
-                        }
+                        },
+                        "target_subtask_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional selector for the execute subtask to mutate. "
+                                "When set, patch contains subtask fields, not an id."
+                            ),
+                        },
+                        "subtask_id": {
+                            "type": "string",
+                            "description": (
+                                "Backward-compatible alias for target_subtask_id. "
+                                "Use only as a selector, not inside patch."
+                            ),
+                        },
                     },
                 },
             },

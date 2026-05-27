@@ -9,12 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from umbrella.contracts.models import CompletionContract
+from umbrella.contracts.models import CompletionContract, ProofSpec
 from umbrella.contracts.validators import ContractValidator
 from umbrella.contracts import ContractBundle, build_workspace_context
 from umbrella.deep_agent_tools.phase_control_actions import (
     _mark_subtask_complete,
     _request_watcher_review,
+    _run_managed_runtime_proof,
     _run_subtask_proof,
 )
 from umbrella.deep_agent_tools.phase_control_retry import (
@@ -460,6 +461,95 @@ def test_run_subtask_proof_managed_runtime_launches_and_cleans_up(
     assert shell_result["managed_runtime"]["cleanup"]["alive_after"] is False
 
 
+def test_managed_runtime_prepares_workspace_python_and_env(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    workspace.mkdir(parents=True)
+    venv_python = (
+        repo
+        / ".venv"
+        / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    )
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    drive = workspace / ".memory" / "drive"
+    drive.mkdir(parents=True)
+    proof = ProofSpec.from_mapping(
+        {
+            "harness_profile": "desktop_gui_runtime",
+            "harness_options": {
+                "managed_runtime": True,
+                "readiness": {"type": "log_contains", "text": "READY"},
+            },
+            "execution": {
+                "kind": "command",
+                "command": ["python", "-m", "calculator"],
+                "env": {"PYTHONPATH": "src", "CUSTOM_ENV": "present"},
+                "timeout_sec": 10,
+                "shell": False,
+            },
+            "oracle": {
+                "oracle_type": "unit_assertions",
+                "required_properties": ["runtime_started"],
+            },
+            "scope": {
+                "files_under_test": ["src/calculator/__main__.py"],
+                "changed_files_expected": ["src/calculator/__main__.py"],
+            },
+        }
+    )
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_start_background(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(job_id="job-1", pid=123)
+
+    def fake_status(*_args, **_kwargs):
+        return {"status": "running"}
+
+    def fake_tail(*_args, **_kwargs):
+        return {"tail": "READY", "log_path": "logs/job-1.log"}
+
+    with (
+        patch(
+            "ouroboros.tools.background_jobs.start_background",
+            side_effect=fake_start_background,
+        ),
+        patch("ouroboros.tools.background_jobs.status", side_effect=fake_status),
+        patch("ouroboros.tools.background_jobs.tail", side_effect=fake_tail),
+        patch(
+            "ouroboros.tools.background_jobs.kill",
+            return_value={"job_id": "job-1", "alive_after": False},
+        ),
+    ):
+        raw = _run_managed_runtime_proof(
+            ctx,
+            workspace_id=ws,
+            workspace_root=workspace,
+            proof=proof,
+            command=list(proof.execution.command),
+        )
+
+    payload = json.loads(raw)
+    assert payload["exit_code"] == 0
+    argv = captured["argv"]
+    assert argv == [str(venv_python), "-m", "calculator"]
+    assert payload["command"] == [str(venv_python), "-m", "calculator"]
+    assert payload["declared_command"] == ["python", "-m", "calculator"]
+    env_overrides = captured["env_overrides"]
+    assert env_overrides["PYTHONPATH"] == "src"
+    assert env_overrides["CUSTOM_ENV"] == "present"
+    assert captured["cwd"] == workspace
+
+
 def test_mark_subtask_complete_requires_typed_contract_for_phase_subtask(
     tmp_path: Path,
 ) -> None:
@@ -688,14 +778,22 @@ def test_retry_watcher_returns_typed_bad_test_contract_verdict(tmp_path: Path) -
 
     payload = _phase_subtask_retry_watcher_review_payload(
         ctx,
-        reason="bad generated success test contract: assertion is internally inconsistent",
+        reason=(
+            "Test contract for gmas-bot has unfixable bugs in generated test "
+            "file tests/test_bots.py: assertion is mathematically impossible."
+        ),
     )
 
     assert payload["status"] == "review_recorded"
     assert payload["verdict"] == "bad_test_contract"
     assert payload["can_edit_tests"] is False
     assert payload["requires_plan_mutation"] is True
+    assert payload["loop_back_target"] == "plan"
+    assert payload["issues"][0]["code"] == "plan_contract_issue"
+    assert payload["issues"][0]["target"] == "gmas-bot"
+    assert payload["required_plan_changes"][0]["target_subtask_id"] == "gmas-bot"
     assert payload["contract_migration"]["target_files"] == ["tests/test_bots.py"]
+    assert payload["contract_migration"]["target_subtask_id"] == "gmas-bot"
     assert payload["contract_migration"]["contract_migration_id"]
 
 

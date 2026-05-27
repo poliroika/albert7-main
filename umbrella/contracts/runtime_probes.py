@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 
 _RUNTIME_CAPABILITIES_FILENAME = "runtime_capabilities.json"
 _PROBE_KINDS = frozenset({"command"})
+_IMPORT_ONLY_CAPABILITY_PROBE_TAGS = frozenset({
+    "desktop_gui_headless",
+})
 _DESKTOP_GUI_RUNTIME_MARKERS = (
     "tk.tk(",
     "tkinter.tk(",
@@ -87,6 +90,11 @@ def validate_probe_spec(spec: Any, *, capability_tag: str = "") -> str | None:
         if runtime_issue:
             return runtime_issue
     for issue in validate_argv(argv, shell=bool(spec.get("shell"))):
+        if (
+            issue.code == "import_only_proof"
+            and tag in _IMPORT_ONLY_CAPABILITY_PROBE_TAGS
+        ):
+            continue
         if tag == "desktop_gui_runtime" and issue.code == "import_only_proof":
             continue
         return issue.message

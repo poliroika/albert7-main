@@ -495,9 +495,57 @@ class PhaseRunner:
             phase_started_at=phase_node.started_at,
         )
         for row in reversed(rows):
-            if str(row.get("kind") or "") != "submit_micro_review":
-                continue
+            kind = str(row.get("kind") or "")
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if kind == "request_watcher_review":
+                if str((payload or {}).get("status") or "") != "review_recorded":
+                    continue
+                raw_issues = payload.get("issues")
+                issues = (
+                    [
+                        json_ready(item)
+                        for item in raw_issues
+                        if isinstance(item, dict)
+                    ]
+                    if isinstance(raw_issues, list)
+                    else []
+                )
+                raw_changes = payload.get("required_plan_changes")
+                required_plan_changes: list[Any] = []
+                if isinstance(raw_changes, list):
+                    for item in raw_changes:
+                        if isinstance(item, dict):
+                            required_plan_changes.append(json_ready(item))
+                        else:
+                            text = str(item).strip()
+                            if text:
+                                required_plan_changes.append(text)
+                loop_target = str(
+                    (payload or {}).get("loop_back_target") or ""
+                ).strip()
+                if not loop_target and not issues and not required_plan_changes:
+                    continue
+                notes = str(
+                    (payload or {}).get("recommendation")
+                    or (payload or {}).get("operator_reason")
+                    or ""
+                ).strip()
+                return {
+                    "source_phase": phase_node.id,
+                    "source_task_id": task_id,
+                    "review_source": "request_watcher_review",
+                    "review_phase_id": phase_node.id,
+                    "review_artifact_ref": str(row.get("signal_id") or "").strip(),
+                    "verdict": str((payload or {}).get("verdict") or "revise").strip()
+                    or "revise",
+                    "loop_back_target": loop_target,
+                    "issues": issues,
+                    "revisions": [],
+                    "required_plan_changes": required_plan_changes,
+                    "notes": notes,
+                }
+            if kind != "submit_micro_review":
+                continue
             if str((payload or {}).get("verdict") or "").strip().lower() != "revise":
                 continue
             revisions = payload.get("revisions")
@@ -505,16 +553,37 @@ class PhaseRunner:
             if isinstance(revisions, list):
                 items = [str(item).strip() for item in revisions if str(item).strip()]
             changes = payload.get("required_plan_changes")
-            required_plan_changes: list[str] = []
+            required_plan_changes: list[Any] = []
             if isinstance(changes, list):
-                required_plan_changes = [
-                    str(item).strip() for item in changes if str(item).strip()
-                ]
+                for item in changes:
+                    if isinstance(item, dict):
+                        required_plan_changes.append(json_ready(item))
+                    else:
+                        text = str(item).strip()
+                        if text:
+                            required_plan_changes.append(text)
             notes = str((payload or {}).get("notes") or "").strip()
+            raw_issues = payload.get("issues")
+            issues = (
+                [
+                    json_ready(item)
+                    for item in raw_issues
+                    if isinstance(item, dict)
+                ]
+                if isinstance(raw_issues, list)
+                else []
+            )
             return {
                 "source_phase": phase_node.id,
                 "source_task_id": task_id,
+                "review_source": "submit_micro_review",
+                "review_phase_id": phase_node.id,
+                "review_artifact_ref": str(row.get("signal_id") or "").strip(),
                 "verdict": "revise",
+                "loop_back_target": str(
+                    (payload or {}).get("loop_back_target") or ""
+                ).strip(),
+                "issues": issues,
                 "revisions": items,
                 "required_plan_changes": required_plan_changes,
                 "notes": notes,
@@ -533,10 +602,24 @@ class PhaseRunner:
             contracts.append(existing)
         contracts.append(latest)
         revisions: list[str] = []
-        required_plan_changes: list[str] = []
+        required_plan_changes: list[Any] = []
+        issues: list[dict[str, Any]] = []
         notes: list[str] = []
         sources: list[dict[str, str]] = []
         for contract in contracts:
+            raw_issues = contract.get("issues")
+            if isinstance(raw_issues, list):
+                for item in raw_issues:
+                    if not isinstance(item, dict):
+                        continue
+                    issue = json_ready(item)
+                    key = json.dumps(issue, sort_keys=True, ensure_ascii=False)
+                    if not any(
+                        json.dumps(existing, sort_keys=True, ensure_ascii=False)
+                        == key
+                        for existing in issues
+                    ):
+                        issues.append(issue)
             raw_revisions = contract.get("revisions")
             if isinstance(raw_revisions, list):
                 for item in raw_revisions:
@@ -546,9 +629,25 @@ class PhaseRunner:
             raw_changes = contract.get("required_plan_changes")
             if isinstance(raw_changes, list):
                 for item in raw_changes:
-                    text = str(item or "").strip()
-                    if text and text not in required_plan_changes:
-                        required_plan_changes.append(text)
+                    change: Any
+                    if isinstance(item, dict):
+                        change = json_ready(item)
+                        key = json.dumps(
+                            change, sort_keys=True, ensure_ascii=False
+                        )
+                        if not any(
+                            isinstance(existing, dict)
+                            and json.dumps(
+                                existing, sort_keys=True, ensure_ascii=False
+                            )
+                            == key
+                            for existing in required_plan_changes
+                        ):
+                            required_plan_changes.append(change)
+                    else:
+                        text = str(item or "").strip()
+                        if text and text not in required_plan_changes:
+                            required_plan_changes.append(text)
             note = str(contract.get("notes") or "").strip()
             if note and note not in notes:
                 notes.append(note)
@@ -562,6 +661,7 @@ class PhaseRunner:
                 if source not in sources:
                     sources.append(source)
         merged = dict(latest)
+        merged["issues"] = issues
         merged["revisions"] = revisions
         merged["required_plan_changes"] = required_plan_changes
         if notes:
@@ -1516,6 +1616,24 @@ class PhaseRunner:
                 target = str(payload.get("phase") or "").strip()
                 if target:
                     return target
+        for row in reversed(records):
+            if str(row.get("kind") or "") != "request_watcher_review":
+                continue
+            created = row.get("created_at")
+            if (
+                supersede_after is not None
+                and isinstance(created, (int, float))
+                and float(created) <= supersede_after
+            ):
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if str((payload or {}).get("status") or "") != "review_recorded":
+                continue
+            explicit_target = str(
+                (payload or {}).get("loop_back_target") or ""
+            ).strip()
+            if explicit_target:
+                return explicit_target
         for row in reversed(records):
             if str(row.get("kind") or "") != "submit_micro_review":
                 continue

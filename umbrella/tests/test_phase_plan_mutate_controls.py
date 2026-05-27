@@ -380,6 +380,139 @@ def test_mutate_phase_plan_accepts_top_level_contract_migration_for_active_subta
     assert subtask["contract_migration_id"] == "migration-1"
 
 
+def test_mutate_phase_plan_accepts_target_subtask_id_selector(tmp_path) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "plan_id": "plan-1",
+                "workspace_id": "demo",
+                "run_id": "run-1",
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {"id": "setup", "status": "done"},
+                            {"id": "logic", "status": "pending"},
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _mutate_phase_plan(
+        ctx,
+        target_subtask_id="logic",
+        patch={
+            "contract_migration_reason": "Generated oracle contradicts task contract.",
+            "contract_migration_files": ["tests/test_logic.py"],
+        },
+    )
+
+    assert result.startswith("PhasePlan mutated")
+    plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    setup, logic = plan["nodes"][0]["subtasks"]
+    assert "contract_migration_reason" not in setup
+    assert logic["contract_migration_reason"] == (
+        "Generated oracle contradicts task contract."
+    )
+    assert logic["contract_migration_files"] == ["tests/test_logic.py"]
+
+
+def test_mutate_phase_plan_accepts_top_level_subtask_id_alias(tmp_path) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "plan_id": "plan-1",
+                "workspace_id": "demo",
+                "run_id": "run-1",
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [{"id": "logic", "status": "pending"}],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _mutate_phase_plan(
+        ctx,
+        subtask_id="logic",
+        patch={"contract_migration_files": ["tests/test_logic.py"]},
+    )
+
+    assert result.startswith("PhasePlan mutated")
+    plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    logic = plan["nodes"][0]["subtasks"][0]
+    assert logic["contract_migration_files"] == ["tests/test_logic.py"]
+
+
+def test_mutate_phase_plan_rejects_subtask_id_inside_patch(tmp_path) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [{"id": "logic", "status": "pending"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _mutate_phase_plan(
+        ctx,
+        patch={
+            "subtask_id": "logic",
+            "contract_migration_files": ["tests/test_logic.py"],
+        },
+    )
+
+    assert "subtask_id is a selector" in result
+
+
 def test_legacy_completion_checks_declared_files_before_accepting(tmp_path) -> None:
     repo = tmp_path / "repo"
     drive = repo / "workspaces" / "demo" / ".memory" / "drive"
