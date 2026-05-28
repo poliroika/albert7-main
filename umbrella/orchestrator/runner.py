@@ -159,7 +159,6 @@ class PhaseRunner:
         self,
         *,
         task_id: str,
-        run_id: str,
         reason: str,
     ) -> None:
         task_id = str(task_id or "").strip()
@@ -170,7 +169,7 @@ class PhaseRunner:
         payload = {
             "reason": reason,
             "task_id": task_id,
-            "run_id": run_id,
+            "scope": "task",
             "internal_recovery_route": True,
             "created_at": time.time(),
         }
@@ -535,7 +534,19 @@ class PhaseRunner:
             kind = str(row.get("kind") or "")
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
             if kind == "request_watcher_review":
-                if str((payload or {}).get("status") or "") != "review_recorded":
+                decision = payload.get("recovery_decision")
+                decision_payload = (
+                    json_ready(decision) if isinstance(decision, dict) else {}
+                )
+                is_recovery_route = (
+                    isinstance(decision, dict)
+                    and str(decision.get("kind") or "").strip()
+                    == "plan_contract_revision"
+                )
+                if (
+                    not is_recovery_route
+                    and str((payload or {}).get("status") or "") != "review_recorded"
+                ):
                     continue
                 raw_issues = payload.get("issues")
                 issues = (
@@ -558,19 +569,28 @@ class PhaseRunner:
                             if text:
                                 required_plan_changes.append(text)
                 loop_target = str(
-                    (payload or {}).get("loop_back_target") or ""
+                    (
+                        (
+                            decision.get("loop_back_target")
+                            if isinstance(decision, dict)
+                            else ""
+                        )
+                        or (payload or {}).get("loop_back_target")
+                        or ""
+                    )
                 ).strip()
-                if not loop_target and not issues and not required_plan_changes:
+                if (
+                    not is_recovery_route
+                    and not loop_target
+                    and not issues
+                    and not required_plan_changes
+                ):
                     continue
                 notes = str(
                     (payload or {}).get("recommendation")
                     or (payload or {}).get("operator_reason")
                     or ""
                 ).strip()
-                decision = payload.get("recovery_decision")
-                decision_payload = (
-                    json_ready(decision) if isinstance(decision, dict) else {}
-                )
                 ticket_payload = (
                     json_ready(decision.get("plan_mutation_ticket") or {})
                     if isinstance(decision, dict)
@@ -652,8 +672,6 @@ class PhaseRunner:
             if str(row.get("kind") or "") != "request_watcher_review":
                 continue
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            if str(payload.get("status") or "").strip() != "review_recorded":
-                continue
             decision = payload.get("recovery_decision")
             if not isinstance(decision, dict):
                 continue
@@ -1760,6 +1778,19 @@ class PhaseRunner:
             ):
                 continue
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            decision = payload.get("recovery_decision")
+            if (
+                isinstance(decision, dict)
+                and str(decision.get("kind") or "").strip()
+                == "plan_contract_revision"
+            ):
+                explicit_target = str(
+                    decision.get("loop_back_target")
+                    or payload.get("loop_back_target")
+                    or ""
+                ).strip()
+                if explicit_target:
+                    return explicit_target
             if str((payload or {}).get("status") or "") != "review_recorded":
                 continue
             explicit_target = str(
@@ -3358,7 +3389,6 @@ class PhaseRunner:
                 if route_decision:
                     self._write_task_scoped_stop_request(
                         task_id=str(task.get("id") or ""),
-                        run_id=run_id,
                         reason="recovery:plan_contract_revision",
                     )
                     return {

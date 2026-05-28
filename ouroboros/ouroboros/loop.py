@@ -531,6 +531,11 @@ def _check_stop_requested(
         payload = {}
     if not _stop_request_matches_task(payload, task_id):
         return None
+    if isinstance(payload, dict) and payload.get("internal_recovery_route"):
+        try:
+            stop_path.unlink(missing_ok=True)
+        except OSError:
+            log.debug("Failed to consume internal recovery stop request", exc_info=True)
     if content and content.strip():
         llm_trace["assistant_notes"].append(content.strip()[:320])
     reason = (
@@ -545,6 +550,13 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
     if not isinstance(payload, dict):
         return True
     current = str(task_id or "").strip()
+    if not current:
+        return False
+    if payload.get("internal_recovery_route") or str(payload.get("scope") or "") == "task":
+        requested = str(
+            payload.get("task_id") or payload.get("target_task_id") or ""
+        ).strip()
+        return bool(requested and current == requested)
     requested_ids: set[str] = set()
     for key in ("run_id", "task_id"):
         value = str(payload.get(key) or "").strip()
@@ -558,8 +570,6 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
             )
     if not requested_ids:
         return True
-    if not current:
-        return False
     return any(
         current == requested
         or current.startswith(f"{requested}:")
@@ -1222,6 +1232,11 @@ def _blocked_tool_result_if_stop_requested(
         stop_payload = {}
     if not _stop_request_matches_task(stop_payload, task_id):
         return None
+    if isinstance(stop_payload, dict) and stop_payload.get("internal_recovery_route"):
+        try:
+            stop_path.unlink(missing_ok=True)
+        except OSError:
+            log.debug("Failed to consume internal recovery stop request", exc_info=True)
     reason = (
         str(stop_payload.get("reason") or "manual stop requested")
         if isinstance(stop_payload, dict)

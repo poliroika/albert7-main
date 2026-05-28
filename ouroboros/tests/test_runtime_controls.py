@@ -620,6 +620,72 @@ def test_loop_stop_request_run_id_matches_phase_task(tmp_path: Path):
     assert result[0] == "Stop requested by dashboard: operator"
 
 
+def test_loop_internal_recovery_stop_matches_exact_task_and_is_consumed(tmp_path: Path):
+    from ouroboros.loop import _check_stop_requested
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    stop_path = state_dir / "stop_requested.json"
+    stop_path.write_text(
+        json.dumps(
+            {
+                "task_id": "run-1:execute:123",
+                "scope": "task",
+                "internal_recovery_route": True,
+                "reason": "recovery:plan_contract_revision",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ignored = _check_stop_requested(
+        tmp_path,
+        "run-1:plan:456",
+        {},
+        {"assistant_notes": []},
+    )
+    result = _check_stop_requested(
+        tmp_path,
+        "run-1:execute:123",
+        {},
+        {"assistant_notes": []},
+    )
+
+    assert ignored is None
+    assert result is not None
+    assert result[0] == (
+        "Stop requested by dashboard: recovery:plan_contract_revision"
+    )
+    assert not stop_path.exists()
+
+
+def test_loop_internal_recovery_stop_ignores_run_id_prefix(tmp_path: Path):
+    from ouroboros.loop import _check_stop_requested
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "stop_requested.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "task_id": "run-1:execute:123",
+                "internal_recovery_route": True,
+                "reason": "recovery:plan_contract_revision",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _check_stop_requested(
+        tmp_path,
+        "run-1:plan:456",
+        {},
+        {"assistant_notes": []},
+    )
+
+    assert result is None
+
+
 def test_handle_tool_calls_skips_remaining_batch_after_stop(monkeypatch, tmp_path: Path):
     import ouroboros.loop as loop
 

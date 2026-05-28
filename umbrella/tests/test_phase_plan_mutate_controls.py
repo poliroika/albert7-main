@@ -489,6 +489,154 @@ def test_mutate_phase_plan_rejects_metadata_only_contract_migration(tmp_path) ->
     assert plan["version"] == 1
 
 
+def test_mutate_phase_plan_rejects_same_semantic_contract_migration(
+    tmp_path,
+) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    proof = {
+        "execution": {
+            "kind": "pytest",
+            "command": ["python", "-m", "pytest", "tests/test_logic.py", "-q"],
+        },
+        "oracle": {
+            "required_properties": [
+                "distinct_inputs_distinct_outputs",
+                "no_test_tampering",
+            ],
+        },
+        "scope": {"pytest_targets": ["tests/test_logic.py"]},
+    }
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "plan_id": "plan-1",
+                "workspace_id": "demo",
+                "run_id": "run-1",
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "logic",
+                                "status": "pending",
+                                "proof": proof,
+                            }
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _mutate_phase_plan(
+        ctx,
+        target_subtask_id="logic",
+        patch={
+            "contract_migration_reason": "Generated oracle is invalid.",
+            "contract_migration_files": ["tests/test_logic.py"],
+            "proof": proof,
+        },
+    )
+
+    assert "did not change proof/test/oracle contract" in result
+    plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    assert plan["version"] == 1
+    assert "contract_migration_reason" not in plan["nodes"][0]["subtasks"][0]
+
+
+def test_mutate_phase_plan_rejects_unsatisfied_required_removal_ticket(
+    tmp_path,
+) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    proof = {
+        "execution": {
+            "kind": "pytest",
+            "command": ["python", "-m", "pytest", "tests/test_logic.py", "-q"],
+        },
+        "oracle": {
+            "required_properties": [
+                "distinct_inputs_distinct_outputs",
+                "no_test_tampering",
+            ],
+        },
+        "scope": {"pytest_targets": ["tests/test_logic.py"]},
+    }
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "plan_id": "plan-1",
+                "workspace_id": "demo",
+                "run_id": "run-1",
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "logic",
+                                "status": "pending",
+                                "proof": proof,
+                            }
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _mutate_phase_plan(
+        ctx,
+        target_subtask_id="logic",
+        patch={
+            "contract_migration_reason": "Generated oracle is invalid.",
+            "contract_migration_files": ["tests/test_logic.py"],
+            "plan_mutation_ticket": {
+                "required_removals": [
+                    {
+                        "path": "proof.required_properties",
+                        "values": ["distinct_inputs_distinct_outputs"],
+                    }
+                ]
+            },
+            "acceptance_criteria": ["Use task-derived examples."],
+        },
+    )
+
+    assert "incomplete" in result
+    assert "distinct_inputs_distinct_outputs" in result
+    plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    assert plan["version"] == 1
+    required = plan["nodes"][0]["subtasks"][0]["proof"]["oracle"][
+        "required_properties"
+    ]
+    assert "distinct_inputs_distinct_outputs" in required
+
+
 def test_mutate_phase_plan_accepts_top_level_subtask_id_alias_with_contract_change(
     tmp_path,
 ) -> None:
@@ -615,6 +763,14 @@ def test_mutate_phase_plan_contract_migration_can_remove_oracle_property(
                 "which is mathematically invalid for calculator operations."
             ),
             "contract_migration_files": ["tests/test_logic.py"],
+            "plan_mutation_ticket": {
+                "required_removals": [
+                    {
+                        "path": "proof.required_properties",
+                        "values": ["distinct_inputs_distinct_outputs"],
+                    }
+                ]
+            },
             "proof": {
                 "remove_required_properties": [
                     "distinct_inputs_distinct_outputs"
@@ -635,6 +791,91 @@ def test_mutate_phase_plan_contract_migration_can_remove_oracle_property(
     assert "invalid_input_rejected" in required
     assert "no_test_tampering" in required
     assert "operation_semantics_match_task_examples" in required
+
+
+def test_mutate_phase_plan_ticket_only_contract_migration_replaces_oracle_property(
+    tmp_path,
+) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "logic",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_logic.py",
+                                            "-q",
+                                        ],
+                                    },
+                                    "oracle": {
+                                        "required_properties": [
+                                            "distinct_inputs_distinct_outputs",
+                                            "no_test_tampering",
+                                        ],
+                                    },
+                                    "scope": {
+                                        "pytest_targets": ["tests/test_logic.py"],
+                                    },
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _mutate_phase_plan(
+        ctx,
+        target_subtask_id="logic",
+        patch={
+            "plan_mutation_ticket": {
+                "required_removals": [
+                    {
+                        "path": "proof.required_properties",
+                        "values": ["distinct_inputs_distinct_outputs"],
+                    }
+                ]
+            },
+            "proof": {
+                "oracle": {
+                    "required_properties": ["no_test_tampering"],
+                },
+            },
+        },
+    )
+
+    assert result.startswith("PhasePlan mutated")
+    plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    required = plan["nodes"][0]["subtasks"][0]["proof"]["oracle"][
+        "required_properties"
+    ]
+    assert required == ["no_test_tampering"]
+    assert "plan_mutation_ticket" not in plan["nodes"][0]["subtasks"][0]
 
 
 def test_mutate_phase_plan_rejects_subtask_id_inside_patch(tmp_path) -> None:

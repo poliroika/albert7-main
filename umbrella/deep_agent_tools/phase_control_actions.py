@@ -259,10 +259,7 @@ def _mutated_subtask_proof_issue(
     merged["proof"] = _merge_phase_plan_proof_patch(
         target.get("proof"),
         patch_item.get("proof"),
-        replace_required_properties=bool(
-            _contract_migration_reason_from_patch(patch_item)
-            and _contract_migration_files_from_patch(patch_item)
-        ),
+        replace_required_properties=_contract_migration_declared(patch_item),
     )
     try:
         proof = ProofSpec.from_mapping(merged.get("proof"))
@@ -499,12 +496,26 @@ _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS = frozenset(
 )
 
 
+_CONTRACT_MIGRATION_TICKET_KEYS = frozenset(
+    {
+        "plan_mutation_ticket",
+        "contract_migration_ticket",
+        "required_removals",
+        "invalid_required_properties",
+    }
+)
+
+
 def _contract_migration_declared(item: dict[str, Any]) -> bool:
     return bool(
         _contract_migration_reason_from_patch(item)
         or _contract_migration_files_from_patch(item)
         or str(item.get("contract_migration_id") or "").strip()
         or str(item.get("contract_migration_token") or "").strip()
+        or isinstance(item.get("plan_mutation_ticket"), dict)
+        or isinstance(item.get("contract_migration_ticket"), dict)
+        or isinstance(item.get("required_removals"), list)
+        or isinstance(item.get("invalid_required_properties"), list)
     )
 
 
@@ -522,6 +533,104 @@ def _contract_migration_has_semantic_patch(item: dict[str, Any]) -> bool:
         return True
     proof_contract = item.get("proof_contract")
     return isinstance(proof_contract, dict) and bool(proof_contract)
+
+
+def _semantic_contract_snapshot(subtask: dict[str, Any]) -> Any:
+    if not isinstance(subtask, dict):
+        return {}
+    return json_ready(
+        {
+            key: copy.deepcopy(subtask.get(key))
+            for key in _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS
+            if key in subtask
+        }
+    )
+
+
+def _contract_migration_ticket_from_patch(item: dict[str, Any]) -> dict[str, Any]:
+    ticket: dict[str, Any] = {}
+    for key in ("plan_mutation_ticket", "contract_migration_ticket"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            ticket.update(copy.deepcopy(value))
+    if "required_removals" in item:
+        ticket["required_removals"] = copy.deepcopy(item.get("required_removals"))
+    if "invalid_required_properties" in item:
+        ticket["invalid_required_properties"] = _phase_plan_string_items(
+            item.get("invalid_required_properties")
+        )
+    if ticket.get("invalid_required_properties") and not ticket.get("required_removals"):
+        ticket["required_removals"] = [
+            {
+                "path": "proof.required_properties",
+                "values": ticket["invalid_required_properties"],
+            }
+        ]
+    return ticket
+
+
+def _semantic_path_values(snapshot: Any, path: str) -> list[Any]:
+    path = str(path or "").strip()
+    if not path:
+        return []
+    if path in {"proof.required_properties", "proof.oracle.required_properties"}:
+        proof = snapshot.get("proof") if isinstance(snapshot, dict) else None
+        values: list[Any] = []
+        if isinstance(proof, dict):
+            values.extend(_phase_plan_string_items(proof.get("required_properties")))
+            oracle = proof.get("oracle")
+            if isinstance(oracle, dict):
+                values.extend(_phase_plan_string_items(oracle.get("required_properties")))
+        proof_contract = (
+            snapshot.get("proof_contract") if isinstance(snapshot, dict) else None
+        )
+        if isinstance(proof_contract, dict):
+            values.extend(
+                _phase_plan_string_items(proof_contract.get("required_properties"))
+            )
+            oracle = proof_contract.get("oracle")
+            if isinstance(oracle, dict):
+                values.extend(_phase_plan_string_items(oracle.get("required_properties")))
+        return values
+
+    current = snapshot
+    for part in path.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current.get(part)
+        else:
+            return []
+    if isinstance(current, list):
+        return list(current)
+    return [current]
+
+
+def _contract_migration_ticket_satisfied(
+    ticket: dict[str, Any] | None,
+    after_snapshot: Any,
+) -> str:
+    if not isinstance(ticket, dict) or not ticket:
+        return ""
+    removals = ticket.get("required_removals") or []
+    if not isinstance(removals, list):
+        return "required_removals must be a list"
+    for removal in removals:
+        if not isinstance(removal, dict):
+            return "required_removals entries must be objects"
+        path = str(removal.get("path") or "").strip()
+        values = set(_phase_plan_string_items(removal.get("values")))
+        if not path or not values:
+            return "required_removals entries require path and values"
+        remaining = [
+            value
+            for value in _phase_plan_string_items(_semantic_path_values(after_snapshot, path))
+            if value in values
+        ]
+        if remaining:
+            return (
+                f"required_removals for {path} still present: "
+                f"{sorted(set(remaining))!r}"
+            )
+    return ""
 
 
 def _legacy_phase_subtask_materialization_issue(
@@ -565,6 +674,8 @@ def _apply_phase_plan_subtask_patch(
         if isinstance(item, dict) and str(item.get("id") or "")
     }
     validated: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    before_migration_snapshots: dict[str, Any] = {}
+    migration_tickets: dict[str, dict[str, Any]] = {}
     seen_ids: set[str] = set()
     for item in subtask_patches:
         if not isinstance(item, dict):
@@ -590,6 +701,9 @@ def _apply_phase_plan_subtask_patch(
                 "metadata-only contract_migration_reason/files patches are "
                 "not accepted."
             )
+        if _contract_migration_declared(item):
+            before_migration_snapshots[subtask_id] = _semantic_contract_snapshot(target)
+            migration_tickets[subtask_id] = _contract_migration_ticket_from_patch(item)
         requested_status = str(item.get("status") or "").strip().lower()
         if requested_status in {"done", "ok", "complete", "completed"}:
             contract_payload = item.get("completion_contract")
@@ -643,7 +757,11 @@ def _apply_phase_plan_subtask_patch(
                     if path not in remove_set
                 ]
         for key, value in item.items():
-            if key == "id" or key in list_patch_ops:
+            if (
+                key == "id"
+                or key in list_patch_ops
+                or key in _CONTRACT_MIGRATION_TICKET_KEYS
+            ):
                 continue
             if key == "success_test":
                 target[key] = _patched_success_test(target.get(key), value)
@@ -668,13 +786,27 @@ def _apply_phase_plan_subtask_patch(
                 target[key] = _merge_phase_plan_proof_patch(
                     target.get(key),
                     value,
-                    replace_required_properties=bool(
-                        _contract_migration_reason_from_patch(item)
-                        and _contract_migration_files_from_patch(item)
-                    ),
+                    replace_required_properties=_contract_migration_declared(item),
                 )
             else:
                 target[key] = value
+        if subtask_id in before_migration_snapshots:
+            after = _semantic_contract_snapshot(target)
+            if before_migration_snapshots[subtask_id] == after:
+                return [], (
+                    "contract migration for subtask "
+                    f"'{subtask_id}' did not change proof/test/oracle "
+                    "contract; metadata-only migrations are not accepted."
+                )
+            ticket_issue = _contract_migration_ticket_satisfied(
+                migration_tickets.get(subtask_id),
+                after,
+            )
+            if ticket_issue:
+                return [], (
+                    f"contract migration for subtask '{subtask_id}' "
+                    f"incomplete: {ticket_issue}"
+                )
         applied.append(f"subtasks.{subtask_id}")
     return applied, None
 

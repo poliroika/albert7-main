@@ -702,7 +702,9 @@ def test_retry_state_counts_typed_run_subtask_proof_failures(tmp_path: Path) -> 
     assert "tests/test_bots.py" in block["required_context_reads"]
 
 
-def test_retry_watcher_returns_typed_bad_test_contract_verdict(tmp_path: Path) -> None:
+def test_retry_watcher_text_only_bad_oracle_does_not_route_to_plan(
+    tmp_path: Path,
+) -> None:
     repo = tmp_path
     ws = "demo"
     workspace = repo / "workspaces" / ws
@@ -786,18 +788,16 @@ def test_retry_watcher_returns_typed_bad_test_contract_verdict(tmp_path: Path) -
     )
 
     assert payload["status"] == "review_recorded"
-    assert payload["verdict"] == "bad_test_contract"
+    assert payload["verdict"] == "implementation_bug"
     assert payload["can_edit_tests"] is False
-    assert payload["requires_plan_mutation"] is True
-    assert payload["loop_back_target"] == "plan"
-    assert payload["issues"][0]["code"] == "plan_contract_issue"
-    assert payload["issues"][0]["target"] == "gmas-bot"
-    assert payload["required_plan_changes"][0]["target_subtask_id"] == "gmas-bot"
-    assert payload["contract_migration"]["target_files"] == ["tests/test_bots.py"]
-    assert payload["contract_migration"]["target_subtask_id"] == "gmas-bot"
-    assert payload["contract_migration"]["contract_migration_id"]
-    assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
-    assert payload["recovery_decision"]["plan_mutation_ticket"]["target_subtask_id"] == "gmas-bot"
+    assert payload["requires_plan_mutation"] is False
+    assert "loop_back_target" not in payload
+    assert "issues" not in payload
+    assert "contract_migration" not in payload
+    assert payload["recovery_decision"]["kind"] == "implementation_repair"
+    assert "plan_mutation_ticket" not in payload
+    assert "plan_mutation_ticket" not in payload["recovery_decision"]
+    assert payload["text_lints"][0]["code"] == "possible_bad_generated_oracle_text"
 
 
 def test_retry_watcher_contract_migration_overrides_threshold_and_patch_guidance(
@@ -870,6 +870,9 @@ def test_retry_watcher_contract_migration_overrides_threshold_and_patch_guidance
                         "E assert 3 == 4"
                     )
                 },
+                "invalid_required_properties": [
+                    "distinct_inputs_distinct_outputs"
+                ],
             }
         ),
     }
@@ -913,7 +916,17 @@ def test_retry_watcher_contract_migration_overrides_threshold_and_patch_guidance
     assert payload["issues"][0]["code"] == "plan_contract_issue"
     assert payload["contract_migration"]["target_files"] == ["tests/test_engine.py"]
     assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
-    assert payload["recovery_decision"]["plan_mutation_ticket"]["target_subtask_id"] == "calc-engine"
+    ticket = payload["recovery_decision"]["plan_mutation_ticket"]
+    assert ticket["target_subtask_id"] == "calc-engine"
+    assert ticket["invalid_required_properties"] == [
+        "distinct_inputs_distinct_outputs"
+    ]
+    assert ticket["required_removals"] == [
+        {
+            "path": "proof.required_properties",
+            "values": ["distinct_inputs_distinct_outputs"],
+        }
+    ]
     assert "suppressed_patch_guidance" not in payload
 
 
@@ -1105,6 +1118,20 @@ def test_bad_generated_oracle_flow_allows_plan_mutation_after_freeze(
                         "E assert 3 == 4"
                     )
                 },
+                "contract_issues": [
+                    {
+                        "code": "bad_generated_oracle",
+                        "target_subtask_id": "calc-engine",
+                        "contract_path": "proof.required_properties",
+                        "invalid_values": ["distinct_inputs_distinct_outputs"],
+                        "required_removals": [
+                            {
+                                "path": "proof.required_properties",
+                                "values": ["distinct_inputs_distinct_outputs"],
+                            }
+                        ],
+                    }
+                ],
             }
         ),
     }

@@ -51,6 +51,13 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
     if not isinstance(payload, dict):
         return True
     current = str(task_id or "").strip()
+    if not current:
+        return False
+    if payload.get("internal_recovery_route") or str(payload.get("scope") or "") == "task":
+        requested = str(
+            payload.get("task_id") or payload.get("target_task_id") or ""
+        ).strip()
+        return bool(requested and current == requested)
     requested_ids: set[str] = set()
     for key in ("run_id", "task_id"):
         value = str(payload.get(key) or "").strip()
@@ -64,8 +71,6 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
             )
     if not requested_ids:
         return True
-    if not current:
-        return False
     return any(
         current == requested
         or current.startswith(f"{requested}:")
@@ -87,6 +92,11 @@ def _stop_requested_message(ctx: ToolContext, tool_name: str) -> str:
         str(getattr(ctx, "task_id", "") or ""),
     ):
         return ""
+    if isinstance(payload, dict) and payload.get("internal_recovery_route"):
+        try:
+            stop_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     run_id = payload.get("run_id") if isinstance(payload, dict) else ""
     return (
         "ERROR: stop_requested: stop was requested from the web UI; "
