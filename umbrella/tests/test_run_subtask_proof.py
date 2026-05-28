@@ -14,6 +14,7 @@ from umbrella.contracts.validators import ContractValidator
 from umbrella.contracts import ContractBundle, build_workspace_context
 from umbrella.deep_agent_tools.phase_control_actions import (
     _mark_subtask_complete,
+    _mutate_phase_plan,
     _request_watcher_review,
     _run_managed_runtime_proof,
     _run_subtask_proof,
@@ -795,6 +796,396 @@ def test_retry_watcher_returns_typed_bad_test_contract_verdict(tmp_path: Path) -
     assert payload["contract_migration"]["target_files"] == ["tests/test_bots.py"]
     assert payload["contract_migration"]["target_subtask_id"] == "gmas-bot"
     assert payload["contract_migration"]["contract_migration_id"]
+    assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
+    assert payload["recovery_decision"]["plan_mutation_ticket"]["target_subtask_id"] == "gmas-bot"
+
+
+def test_retry_watcher_contract_migration_overrides_threshold_and_patch_guidance(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    task_id = "task:execute"
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "calc-engine",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_engine.py",
+                                            "-q",
+                                        ],
+                                    },
+                                    "scope": {
+                                        "files_under_test": [
+                                            "src/calculator/engine.py",
+                                            "tests/test_engine.py",
+                                        ],
+                                        "changed_files_expected": [
+                                            "src/calculator/engine.py",
+                                            "tests/test_engine.py",
+                                        ],
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = {
+        "task_id": task_id,
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "calc-engine"},
+        "result_preview": json.dumps(
+            {
+                "passed": False,
+                "exit_code": 1,
+                "subtask_id": "calc-engine",
+                "command": ["python", "-m", "pytest", "tests/test_engine.py", "-q"],
+                "shell_result": {
+                    "output": (
+                        "assert len(set(results)) == len(results)\n"
+                        "E assert 3 == 4"
+                    )
+                },
+            }
+        ),
+    }
+    protected_test_patch = {
+        "task_id": task_id,
+        "tool": "apply_workspace_patch",
+        "args": {"patch": "*** Update File: tests/test_engine.py\n@@\n"},
+        "result_preview": json.dumps(
+            {
+                "status": "blocked",
+                "reason": "patch_hunk_mismatch",
+                "file_path": "tests/test_engine.py",
+            }
+        ),
+    }
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in [failed, protected_test_patch]) + "\n",
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        task_id=task_id,
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    payload = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason=(
+            "The generated test contract for calc-engine is mathematically "
+            "impossible: different arithmetic inputs can produce the same output."
+        ),
+    )
+
+    assert payload["status"] == "review_recorded"
+    assert payload["verdict"] == "bad_test_contract"
+    assert payload["requires_plan_mutation"] is True
+    assert payload["loop_back_target"] == "plan"
+    assert payload["issues"][0]["code"] == "plan_contract_issue"
+    assert payload["contract_migration"]["target_files"] == ["tests/test_engine.py"]
+    assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
+    assert payload["recovery_decision"]["plan_mutation_ticket"]["target_subtask_id"] == "calc-engine"
+    assert "suppressed_patch_guidance" not in payload
+
+
+def test_retry_watcher_not_required_has_no_contract_migration_conflict(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    task_id = "task:execute"
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "core",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_core.py",
+                                            "-q",
+                                        ],
+                                    },
+                                    "scope": {
+                                        "files_under_test": [
+                                            "src/demo/core.py",
+                                            "tests/test_core.py",
+                                        ],
+                                        "changed_files_expected": [
+                                            "src/demo/core.py",
+                                            "tests/test_core.py",
+                                        ],
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = {
+        "task_id": task_id,
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "core"},
+        "result_preview": json.dumps(
+            {
+                "passed": False,
+                "exit_code": 1,
+                "subtask_id": "core",
+                "command": ["python", "-m", "pytest", "tests/test_core.py", "-q"],
+                "shell_result": {"output": "AssertionError: implementation returned 3"},
+            }
+        ),
+    }
+    patch_mismatch = {
+        "task_id": task_id,
+        "tool": "apply_workspace_patch",
+        "args": {"patch": "*** Update File: tests/test_core.py\n@@\n"},
+        "result_preview": json.dumps(
+            {
+                "status": "blocked",
+                "reason": "patch_hunk_mismatch",
+                "file_path": "tests/test_core.py",
+            }
+        ),
+    }
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in [failed, patch_mismatch]) + "\n",
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        task_id=task_id,
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    payload = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason="The current proof failed; I need guidance before editing tests.",
+    )
+
+    assert payload["status"] == "review_not_required"
+    assert payload["verdict"] == "not_required"
+    assert payload["requires_plan_mutation"] is False
+    assert "contract_migration" not in payload
+    assert "plan_mutation_ticket" not in payload
+    assert payload["recovery_decision"]["kind"] == "implementation_repair"
+
+
+def test_bad_generated_oracle_flow_allows_plan_mutation_after_freeze(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "calculator"
+    workspace = repo / "workspaces" / ws
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    task_id = "task:execute"
+    plan = {
+        "version": 0,
+        "nodes": [
+            {
+                "id": "execute",
+                "manifest_id": "execute",
+                "status": "running",
+                "subtasks": [
+                    {
+                        "id": "calc-engine",
+                        "status": "pending",
+                        "files_to_change": ["src/calculator/engine.py"],
+                        "files_to_create": ["tests/test_engine.py"],
+                        "proof": {
+                            "execution": {
+                                "kind": "pytest",
+                                "command": [
+                                    "python",
+                                    "-m",
+                                    "pytest",
+                                    "tests/test_engine.py",
+                                    "-q",
+                                ],
+                                "shell": False,
+                            },
+                            "oracle": {
+                                "oracle_type": "unit_assertions",
+                                "required_properties": [
+                                    "distinct_inputs_distinct_outputs",
+                                    "invalid_input_rejected",
+                                    "no_test_tampering",
+                                ],
+                            },
+                            "scope": {
+                                "files_under_test": [
+                                    "src/calculator/engine.py",
+                                    "tests/test_engine.py",
+                                ],
+                                "changed_files_expected": [
+                                    "src/calculator/engine.py",
+                                    "tests/test_engine.py",
+                                ],
+                                "pytest_targets": ["tests/test_engine.py"],
+                            },
+                            "anti_gaming": {"allows_test_only_change": False},
+                            "harness_profile": "python_src_layout",
+                            "required_capabilities": ["python"],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    (state / "phase_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    failed = {
+        "task_id": task_id,
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "calc-engine"},
+        "result_preview": json.dumps(
+            {
+                "passed": False,
+                "exit_code": 1,
+                "subtask_id": "calc-engine",
+                "command": ["python", "-m", "pytest", "tests/test_engine.py", "-q"],
+                "shell_result": {
+                    "output": (
+                        "assert len(set(results)) == len(results)\n"
+                        "E assert 3 == 4"
+                    )
+                },
+            }
+        ),
+    }
+    frozen_test_patch = {
+        "task_id": task_id,
+        "tool": "replace_workspace_file",
+        "args": {"path": "tests/test_engine.py"},
+        "result_preview": json.dumps(
+            {
+                "status": "blocked",
+                "reason": "no_test_tampering_oracle_freeze",
+                "test_paths": ["tests/test_engine.py"],
+                "failed_attempts": 1,
+                "success_test": "python -m pytest tests/test_engine.py -q",
+            }
+        ),
+    }
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in [failed, frozen_test_patch]) + "\n",
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        task_id=task_id,
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+        loop_state_view={
+            "typed_action_gate": {
+                "reason": "no_test_tampering_oracle_freeze",
+                "blocked_tools": ["replace_workspace_file"],
+            }
+        },
+    )
+
+    review = json.loads(
+        _request_watcher_review(
+            ctx,
+            reason=(
+                "The generated test contract is mathematically impossible: "
+                "distinct arithmetic inputs can produce identical outputs."
+            ),
+        )
+    )
+
+    assert review["status"] == "review_recorded"
+    assert review["issues"][0]["code"] == "plan_contract_issue"
+    assert review["requires_plan_mutation"] is True
+    assert "cleared_typed_action_gate" not in review
+
+    result = _mutate_phase_plan(
+        ctx,
+        subtask_id="calc-engine",
+        patch={
+            "proof": {
+                "oracle": {
+                    "oracle_type": "unit_assertions",
+                    "required_properties": [
+                        "invalid_input_rejected",
+                        "no_test_tampering",
+                    ],
+                },
+            },
+            "contract_migration_reason": (
+                "Generated oracle is mathematically impossible for arithmetic "
+                "operations; distinct input pairs can share the same result."
+            ),
+            "contract_migration_files": ["tests/test_engine.py"],
+        },
+    )
+
+    assert result.startswith("PhasePlan mutated")
+    mutated = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    subtask = mutated["nodes"][0]["subtasks"][0]
+    assert mutated["version"] == 1
+    assert subtask["contract_migration_files"] == ["tests/test_engine.py"]
+    assert subtask["proof"]["oracle"]["required_properties"] == [
+        "invalid_input_rejected",
+        "no_test_tampering",
+    ]
 
 
 def test_retry_watcher_prefers_exact_declared_proof_failure(tmp_path: Path) -> None:

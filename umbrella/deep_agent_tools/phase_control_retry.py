@@ -1,5 +1,8 @@
 ﻿"""Retry watcher state, escalation blocks, and structured review payloads."""
 
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
 from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.contracts import hash_value
 
@@ -1646,92 +1649,238 @@ def _contract_migration_retry_recommendation(contract_payload: dict[str, Any]) -
     )
 
 
+@dataclass(frozen=True)
+class RecoveryDecision:
+    """Single typed source for retry-watcher routing decisions."""
+
+    decision_id: str
+    kind: Literal[
+        "implementation_repair",
+        "plan_contract_revision",
+        "proof_execution_infra",
+        "need_more_context",
+        "blocked_no_valid_next_action",
+    ]
+    trigger_code: str
+    active_subtask_id: str
+    failure_hash: str = ""
+    loop_back_target: Literal[
+        "execute", "plan", "subtask_review", "research", "none"
+    ] = "execute"
+    issues: list[dict[str, Any]] = field(default_factory=list)
+    required_plan_changes: list[dict[str, Any]] = field(default_factory=list)
+    plan_mutation_ticket: dict[str, Any] | None = None
+    allowed_next_actions: list[str] = field(default_factory=list)
+    forbidden_next_actions: list[str] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
+    freshness_refs: list[str] = field(default_factory=list)
+    evidence: str = ""
+
+
+def _recovery_decision_payload(decision: RecoveryDecision) -> dict[str, Any]:
+    payload = {
+        "decision_id": decision.decision_id,
+        "kind": decision.kind,
+        "trigger_code": decision.trigger_code,
+        "active_subtask_id": decision.active_subtask_id,
+        "failure_hash": decision.failure_hash,
+        "loop_back_target": decision.loop_back_target,
+        "issues": decision.issues,
+        "required_plan_changes": decision.required_plan_changes,
+        "plan_mutation_ticket": decision.plan_mutation_ticket,
+        "allowed_next_actions": decision.allowed_next_actions,
+        "forbidden_next_actions": decision.forbidden_next_actions,
+        "evidence_refs": decision.evidence_refs,
+        "freshness_refs": decision.freshness_refs,
+    }
+    if decision.evidence:
+        payload["evidence"] = decision.evidence
+    return payload
+
+
+def _retry_failure_hash(latest_failure: dict[str, Any]) -> str:
+    if not latest_failure:
+        return ""
+    return hash_value({"latest_failure": latest_failure})[:16]
+
+
+def _materialize_contract_migration_payload(
+    state: dict[str, Any],
+    contract_migration_payload: dict[str, Any],
+) -> dict[str, Any]:
+    payload = dict(contract_migration_payload)
+    payload.setdefault(
+        "contract_migration_id",
+        hash_value(
+            {
+                "subtask_id": state.get("subtask_id") or "",
+                "success_test": state.get("success_test") or "",
+                "target_files": payload.get("target_files") or [],
+                "evidence": payload.get("evidence") or "",
+            }
+        )[:16],
+    )
+    payload.setdefault("target_subtask_id", str(state.get("subtask_id") or ""))
+    return payload
+
+
+def _plan_contract_revision_decision(
+    *,
+    subtask_id: str,
+    success_test: str,
+    latest_failure: dict[str, Any],
+    contract_migration_payload: dict[str, Any],
+) -> RecoveryDecision:
+    files = contract_migration_payload.get("target_files") or []
+    if isinstance(files, str):
+        files = [files]
+    target = str(contract_migration_payload.get("target_subtask_id") or subtask_id).strip()
+    evidence = str(contract_migration_payload.get("evidence") or "").strip()
+    failure_hash = _retry_failure_hash(latest_failure)
+    ticket = {
+        "ticket_id": str(contract_migration_payload.get("contract_migration_id") or ""),
+        "kind": "plan_contract_revision",
+        "target_subtask_id": target,
+        "success_test": success_test,
+        "contract_migration_id": str(
+            contract_migration_payload.get("contract_migration_id") or ""
+        ),
+        "contract_migration_files": [
+            str(file_path) for file_path in files if str(file_path).strip()
+        ],
+        "failure_hash": failure_hash,
+    }
+    if evidence:
+        ticket["evidence"] = evidence
+    issue = {
+        "code": "plan_contract_issue",
+        "severity": "blocking",
+        "target": target,
+        "message": (
+            "Generated test/proof oracle appears inconsistent with the accepted "
+            "plan or task contract; revise the subtask contract in plan before "
+            "another execute repair."
+        ),
+        "evidence_refs": [],
+    }
+    if evidence:
+        issue["evidence"] = evidence
+    required_change = {
+        "target_subtask_id": target,
+        "change": (
+            "Revise the generated test/proof/oracle contract before continuing "
+            "execute."
+        ),
+        "contract_migration_files": ticket["contract_migration_files"],
+        "evidence_refs": [],
+    }
+    return RecoveryDecision(
+        decision_id=hash_value(
+            {
+                "kind": "plan_contract_revision",
+                "subtask_id": target,
+                "success_test": success_test,
+                "failure_hash": failure_hash,
+                "ticket": ticket,
+            }
+        )[:16],
+        kind="plan_contract_revision",
+        trigger_code="bad_generated_success_test_contract",
+        active_subtask_id=target,
+        failure_hash=failure_hash,
+        loop_back_target="plan",
+        issues=[issue],
+        required_plan_changes=[required_change],
+        plan_mutation_ticket=ticket,
+        allowed_next_actions=[
+            "route to plan contract revision",
+            "call mutate_phase_plan with target_subtask_id and contract_migration_reason",
+            "include contract_migration_files for the affected test/proof files",
+            "rerun run_subtask_proof after the plan mutation",
+        ],
+        forbidden_next_actions=[
+            "direct test-file edits before mutate_phase_plan records the migration",
+            "mark_subtask_complete without a fresh post-migration proof",
+        ],
+        evidence=evidence,
+    )
+
+
+def _implementation_repair_decision(
+    *,
+    subtask_id: str,
+    trigger_code: str,
+    latest_failure: dict[str, Any],
+) -> RecoveryDecision:
+    failure_hash = _retry_failure_hash(latest_failure)
+    return RecoveryDecision(
+        decision_id=hash_value(
+            {
+                "kind": "implementation_repair",
+                "subtask_id": subtask_id,
+                "trigger_code": trigger_code,
+                "failure_hash": failure_hash,
+            }
+        )[:16],
+        kind="implementation_repair",
+        trigger_code=trigger_code,
+        active_subtask_id=subtask_id,
+        failure_hash=failure_hash,
+        loop_back_target="execute",
+        allowed_next_actions=[
+            "read active files",
+            "repair implementation",
+            "rerun run_subtask_proof",
+        ],
+        forbidden_next_actions=[
+            "test-only oracle edits after a failing proof",
+        ],
+    )
+
+
 def _retry_watcher_verdict_payload(
     *,
     status: str,
     failed_attempts: int,
     subtask_id: str,
-    contract_migration_payload: dict[str, Any] | None,
+    decision: RecoveryDecision,
 ) -> dict[str, Any]:
     """Return the typed retry-watcher decision surfaced to the agent."""
 
-    if status != "review_recorded":
+    base = {"recovery_decision": _recovery_decision_payload(decision)}
+    if decision.kind == "plan_contract_revision":
         return {
-            "verdict": "not_required",
-            "can_edit_tests": False,
-            "requires_plan_mutation": False,
-            "allowed_next_actions": [
-                "read active files",
-                "repair implementation",
-                "rerun run_subtask_proof",
-            ],
-            "forbidden_next_actions": [
-                "test-only oracle edits after a failing proof",
-            ],
-        }
-    if contract_migration_payload:
-        files = contract_migration_payload.get("target_files") or []
-        if isinstance(files, str):
-            files = [files]
-        evidence = str(contract_migration_payload.get("evidence") or "").strip()
-        target = str(
-            contract_migration_payload.get("target_subtask_id") or subtask_id or ""
-        ).strip()
-        issue = {
-            "code": "plan_contract_issue",
-            "severity": "blocking",
-            "target": target,
-            "message": (
-                "Generated test/proof oracle appears inconsistent with the "
-                "accepted plan or task contract; revise the subtask contract "
-                "in plan before another execute repair."
-            ),
-            "evidence_refs": [],
-        }
-        if evidence:
-            issue["evidence"] = evidence
-        return {
+            **base,
             "verdict": "bad_test_contract",
             "can_edit_tests": False,
             "requires_plan_mutation": True,
-            "loop_back_target": "plan",
-            "issues": [issue],
-            "required_plan_changes": [
-                {
-                    "target_subtask_id": target,
-                    "change": (
-                        "Revise the generated test/proof/oracle contract before "
-                        "continuing execute."
-                    ),
-                    "contract_migration_files": [
-                        str(file_path)
-                        for file_path in files
-                        if str(file_path).strip()
-                    ],
-                    "evidence_refs": [],
-                }
-            ],
-            "allowed_next_actions": [
-                "route to plan contract revision",
-                "call mutate_phase_plan with target_subtask_id and contract_migration_reason",
-                "include contract_migration_files for the affected test/proof files",
-                "rerun run_subtask_proof after the plan mutation",
-            ],
-            "forbidden_next_actions": [
-                "direct test-file edits before mutate_phase_plan records the migration",
-                "mark_subtask_complete without a fresh post-migration proof",
-            ],
+            "loop_back_target": decision.loop_back_target,
+            "issues": decision.issues,
+            "required_plan_changes": decision.required_plan_changes,
+            "plan_mutation_ticket": decision.plan_mutation_ticket,
+            "allowed_next_actions": decision.allowed_next_actions,
+            "forbidden_next_actions": decision.forbidden_next_actions,
+        }
+    if status != "review_recorded":
+        return {
+            **base,
+            "verdict": "not_required",
+            "can_edit_tests": False,
+            "requires_plan_mutation": False,
+            "allowed_next_actions": decision.allowed_next_actions,
+            "forbidden_next_actions": decision.forbidden_next_actions,
         }
     return {
+        **base,
         "verdict": "implementation_bug",
         "can_edit_tests": False,
         "requires_plan_mutation": False,
-        "allowed_next_actions": [
+        "allowed_next_actions": decision.allowed_next_actions or [
             "read the declared proof/test and related source files",
             "repair implementation files in active scope",
             "rerun run_subtask_proof after the repair",
         ],
-        "forbidden_next_actions": [
+        "forbidden_next_actions": decision.forbidden_next_actions or [
             "test-only oracle edits",
             "weakening assertions or proof selection",
         ],
@@ -1903,25 +2052,48 @@ def _phase_subtask_retry_watcher_review_payload(
         }
 
     has_latest_failure = bool(latest_failure)
+    subtask_id = str(state.get("subtask_id") or "")
+    success_test = str(state.get("success_test") or "")
     contract_migration_payload = _bad_generated_success_test_contract_payload(
         reason=str(reason or ""),
-        success_test=str(state.get("success_test") or ""),
+        success_test=success_test,
         latest_failure=latest_failure,
     )
-    status = (
-        "review_recorded"
-        if (
-            failed_attempts >= _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD
-            or (failed_attempts > 0 and has_latest_failure and not patch_guidance)
+    if contract_migration_payload:
+        contract_migration_payload = _materialize_contract_migration_payload(
+            state, contract_migration_payload
         )
-        else "review_not_required"
-    )
+        status = "review_recorded"
+        decision = _plan_contract_revision_decision(
+            subtask_id=subtask_id,
+            success_test=success_test,
+            latest_failure=latest_failure,
+            contract_migration_payload=contract_migration_payload,
+        )
+    else:
+        status = (
+            "review_recorded"
+            if (
+                failed_attempts >= _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD
+                or (failed_attempts > 0 and has_latest_failure and not patch_guidance)
+            )
+            else "review_not_required"
+        )
+        decision = _implementation_repair_decision(
+            subtask_id=subtask_id,
+            trigger_code=(
+                "retry_threshold_reached"
+                if status == "review_recorded"
+                else "below_retry_threshold"
+            ),
+            latest_failure=latest_failure,
+        )
     required_context_reads = list(state.get("required_context_reads") or [])[:20]
     review = {
         **base,
         "status": status,
-        "subtask_id": str(state.get("subtask_id") or ""),
-        "success_test": str(state.get("success_test") or ""),
+        "subtask_id": subtask_id,
+        "success_test": success_test,
         "proof_command": str(state.get("proof_command") or ""),
         "required_context_reads": required_context_reads,
         "failed_attempts": failed_attempts,
@@ -1934,23 +2106,7 @@ def _phase_subtask_retry_watcher_review_payload(
             patch_guidance=patch_guidance,
         ),
     }
-    if status == "review_recorded" and contract_migration_payload:
-        contract_migration_payload = dict(contract_migration_payload)
-        contract_migration_payload.setdefault(
-            "contract_migration_id",
-            hash_value(
-                {
-                    "subtask_id": state.get("subtask_id") or "",
-                    "success_test": state.get("success_test") or "",
-                    "target_files": contract_migration_payload.get("target_files") or [],
-                    "evidence": contract_migration_payload.get("evidence") or "",
-                }
-            )[:16],
-        )
-        contract_migration_payload.setdefault(
-            "target_subtask_id",
-            str(state.get("subtask_id") or ""),
-        )
+    if contract_migration_payload:
         review["contract_migration"] = contract_migration_payload
         review["recommendation"] = _contract_migration_retry_recommendation(
             contract_migration_payload
@@ -1959,12 +2115,8 @@ def _phase_subtask_retry_watcher_review_payload(
         _retry_watcher_verdict_payload(
             status=status,
             failed_attempts=failed_attempts,
-            subtask_id=str(state.get("subtask_id") or ""),
-            contract_migration_payload=(
-                review.get("contract_migration")
-                if isinstance(review.get("contract_migration"), dict)
-                else None
-            ),
+            subtask_id=subtask_id,
+            decision=decision,
         )
     )
     if (

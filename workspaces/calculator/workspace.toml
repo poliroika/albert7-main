@@ -1,8 +1,0 @@
-[project]
-name = "calculator"
-description = "A simple calculator application with GUI"
-version = "0.1.0"
-[verification]
-steps = []
-[skills]
-enabled = []

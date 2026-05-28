@@ -257,7 +257,12 @@ def _mutated_subtask_proof_issue(
 
     merged = dict(target)
     merged["proof"] = _merge_phase_plan_proof_patch(
-        target.get("proof"), patch_item.get("proof")
+        target.get("proof"),
+        patch_item.get("proof"),
+        replace_required_properties=bool(
+            _contract_migration_reason_from_patch(patch_item)
+            and _contract_migration_files_from_patch(patch_item)
+        ),
     )
     try:
         proof = ProofSpec.from_mapping(merged.get("proof"))
@@ -427,7 +432,12 @@ def _no_test_tampering_proof_narrowing_issue(
     return ""
 
 
-def _merge_phase_plan_proof_patch(existing: Any, patch: Any) -> Any:
+def _merge_phase_plan_proof_patch(
+    existing: Any,
+    patch: Any,
+    *,
+    replace_required_properties: bool = False,
+) -> Any:
     if not isinstance(patch, dict):
         return patch
     merged: dict[str, Any] = (
@@ -438,9 +448,16 @@ def _merge_phase_plan_proof_patch(existing: Any, patch: Any) -> Any:
             isinstance(value, dict)
             and isinstance(merged.get(key), dict)
         ):
-            merged[key] = _merge_phase_plan_proof_patch(merged.get(key), value)
+            merged[key] = _merge_phase_plan_proof_patch(
+                merged.get(key),
+                value,
+                replace_required_properties=replace_required_properties,
+            )
         elif key == "required_properties":
-            merged[key] = _merge_phase_plan_string_list(merged.get(key), value)
+            if replace_required_properties:
+                merged[key] = _phase_plan_string_items(value)
+            else:
+                merged[key] = _merge_phase_plan_string_list(merged.get(key), value)
         else:
             merged[key] = copy.deepcopy(value)
     return merged
@@ -575,7 +592,14 @@ def _apply_phase_plan_subtask_patch(
             elif key in _PHASE_PLAN_MERGE_LIST_KEYS:
                 target[key] = _merge_phase_plan_string_list(target.get(key), value)
             elif key == "proof":
-                target[key] = _merge_phase_plan_proof_patch(target.get(key), value)
+                target[key] = _merge_phase_plan_proof_patch(
+                    target.get(key),
+                    value,
+                    replace_required_properties=bool(
+                        _contract_migration_reason_from_patch(item)
+                        and _contract_migration_files_from_patch(item)
+                    ),
+                )
             else:
                 target[key] = value
         applied.append(f"subtasks.{subtask_id}")
