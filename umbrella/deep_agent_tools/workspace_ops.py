@@ -2430,8 +2430,8 @@ def _no_test_tampering_oracle_freeze_block(
         "next_step": (
             "Repair the implementation, or if the generated test contract is "
             "internally contradictory, call `request_watcher_review` and then "
-            "`mutate_phase_plan` with `contract_migration_reason` and "
-            "`contract_migration_files` before editing test/proof oracle files."
+            "`mutate_phase_plan` with a typed proof patch and required_deltas "
+            "before editing test/proof oracle files."
         ),
         "allowed_next_tools": gate["allowed_next_tools"],
     }

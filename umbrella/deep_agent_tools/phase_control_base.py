@@ -1,5 +1,7 @@
 """State, signal, and log helpers for phase-control tools."""
 
+import shlex
+
 from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.deep_agent_tools.phase_control_text_quality import (
     _looks_like_mojibake,
@@ -17,6 +19,120 @@ def _drive_state(ctx: ToolContext) -> pathlib.Path:
     return p
 
 
+def _legacy_success_test_text(subtask: dict[str, Any]) -> str:
+    raw = subtask.get("success_test")
+    if isinstance(raw, dict):
+        for key in ("command", "value", "cmd", "pytest_id", "verification", "text"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
+def _legacy_success_test_proof(subtask: dict[str, Any]) -> dict[str, Any] | None:
+    if isinstance(subtask.get("proof"), dict):
+        return None
+    command_text = _legacy_success_test_text(subtask)
+    if not command_text:
+        return None
+    try:
+        command = shlex.split(command_text)
+    except ValueError:
+        command = command_text.split()
+    if not command:
+        return None
+    lowered = command_text.lower()
+    kind = "pytest" if "pytest" in lowered else "command"
+    if "npm" in lowered and "build" in lowered:
+        kind = "build"
+    paths: list[str] = []
+    for key in ("files_to_change", "files_to_create", "files_affected"):
+        raw = subtask.get(key)
+        values = raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) else [])
+        for value in values:
+            path = str(value or "").replace("\\", "/").strip().lstrip("/")
+            if path and path not in paths:
+                paths.append(path)
+    test_paths = [
+        path
+        for path in paths
+        if path.startswith("tests/")
+        or "/tests/" in path
+        or pathlib.PurePosixPath(path).name.startswith("test_")
+    ]
+    non_test_paths = [path for path in paths if path not in test_paths]
+    required_properties = ["no_test_tampering"] if test_paths else []
+    if kind == "build":
+        required_properties.append("build_succeeds")
+    return {
+        "execution": {"kind": kind, "command": command, "shell": False},
+        "oracle": {
+            "oracle_type": "build" if kind == "build" else "unit_assertions",
+            "required_properties": required_properties,
+            "negative_cases_required": kind != "build",
+        },
+        "scope": {
+            "files_under_test": non_test_paths or paths,
+            "changed_files_expected": paths,
+            "pytest_targets": [
+                token for token in command if "test" in str(token).lower()
+            ]
+            if kind == "pytest"
+            else [],
+        },
+        "anti_gaming": {"allows_test_only_change": False},
+    }
+
+
+def _migrate_loaded_legacy_phase_plan(plan: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    nodes = plan.get("nodes")
+    changed = False
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            subtasks = node.get("subtasks")
+            if not isinstance(subtasks, list):
+                continue
+            for subtask in subtasks:
+                if not isinstance(subtask, dict):
+                    continue
+                proof = _legacy_success_test_proof(subtask)
+                if proof is not None:
+                    subtask["proof"] = proof
+                    changed = True
+                for key in (
+                    "success_test",
+                    "success_check",
+                    "success_checks",
+                    "verification_command",
+                ):
+                    if key in subtask:
+                        subtask.pop(key, None)
+                        changed = True
+    subtasks = plan.get("subtasks")
+    if isinstance(subtasks, list):
+        for subtask in subtasks:
+            if not isinstance(subtask, dict):
+                continue
+            proof = _legacy_success_test_proof(subtask)
+            if proof is not None:
+                subtask["proof"] = proof
+                changed = True
+            for key in (
+                "success_test",
+                "success_check",
+                "success_checks",
+                "verification_command",
+            ):
+                if key in subtask:
+                    subtask.pop(key, None)
+                    changed = True
+    return plan, changed
+
+
 def _read_phase_plan(ctx: ToolContext) -> dict[str, Any] | None:
     plan_path = pathlib.Path(
         os.environ.get("OUROBOROS_PHASE_PLAN_PATH", str(_drive_state(ctx) / "phase_plan.json"))
@@ -24,9 +140,21 @@ def _read_phase_plan(ctx: ToolContext) -> dict[str, Any] | None:
     if not plan_path.exists():
         return None
     try:
-        return json.loads(plan_path.read_text(encoding="utf-8"))
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if not isinstance(plan, dict):
+        return None
+    plan, changed = _migrate_loaded_legacy_phase_plan(plan)
+    if changed:
+        try:
+            plan_path.write_text(
+                json.dumps(plan, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+    return plan
 
 
 def _write_phase_plan(ctx: ToolContext, plan: dict[str, Any]) -> None:

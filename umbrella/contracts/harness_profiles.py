@@ -393,6 +393,21 @@ def infer_harness_ids_for_subtask(
     return tuple(ids[:3])
 
 
+def _capability_envelope_includes_model_runtime(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).strip().lower()
+            if key_text in {"llm_api", "multi_agent_gmas", "gmas"}:
+                return True
+            if _capability_envelope_includes_model_runtime(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return any(_capability_envelope_includes_model_runtime(item) for item in value)
+    text = str(value or "").strip().lower()
+    return text in {"llm_api", "multi_agent_gmas", "gmas"}
+
+
 def build_harness_contract_payload(
     *,
     phase_id: str,
@@ -401,12 +416,19 @@ def build_harness_contract_payload(
 ) -> dict[str, Any]:
     phase = str(phase_id or "")
     if phase in {"plan", "plan_review"}:
+        caps = capability_envelope if isinstance(capability_envelope, dict) else {}
+        include_model_runtime = _capability_envelope_includes_model_runtime(caps)
+        profiles = [
+            profile.catalog_payload()
+            for profile in all_harness_profiles()
+            if include_model_runtime or profile.id != "llm_runtime"
+        ]
         return {
             "schema_version": HARNESS_PROFILE_SCHEMA_VERSION,
             "mode": "catalog",
             "selected_ids": [],
             "reason": "planning phases receive compact selectable profile catalog",
-            "profiles": [profile.catalog_payload() for profile in all_harness_profiles()],
+            "profiles": profiles,
         }
     if phase == "execute" and active_subtask:
         selected = infer_harness_ids_for_subtask(

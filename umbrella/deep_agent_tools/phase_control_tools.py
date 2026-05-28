@@ -32,9 +32,9 @@ def get_tools() -> list[ToolEntry]:
                     "continue to satisfy contract v1 typed proof validation. "
                     "Do not use this just to gain permission for an ordinary "
                     "source edit; PhasePlan file ownership is advisory during "
-                    "execute. Top-level contract_migration_reason and "
-                    "contract_migration_files are accepted as an alias for the "
-                    "active execute subtask."
+                    "execute. Plan-contract revisions must use a typed "
+                    "target_subtask_id plus a semantic proof patch; metadata "
+                    "or notes without a real contract diff are rejected."
                 ),
                 "parameters": {
                     "type": "object",
@@ -479,13 +479,64 @@ def get_tools() -> list[ToolEntry]:
                 "description": (
                     "Record a typed retry-watcher review/control signal for "
                     "the current phase. Returns verdict, allowed_next_actions, "
-                    "forbidden_next_actions, and any contract_migration token; "
-                    "it does not synchronously run a separate LLM."
+                    "forbidden_next_actions, and any typed plan_revision_patch; "
+                    "it does not synchronously run a separate LLM. Free-text "
+                    "reason is notes only; plan revision requires typed "
+                    "contract_issues with contract_path, invalid_values or "
+                    "required_deltas, and evidence_refs."
                 ),
                 "parameters": {
                     "type": "object",
                     "required": ["reason"],
-                    "properties": {"reason": {"type": "string"}},
+                    "properties": {
+                        "reason": {"type": "string"},
+                        "contract_issues": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["code", "contract_path"],
+                                "properties": {
+                                    "code": {
+                                        "type": "string",
+                                        "enum": [
+                                            "bad_generated_oracle",
+                                            "plan_contract_issue",
+                                        ],
+                                    },
+                                    "target_subtask_id": {"type": "string"},
+                                    "contract_path": {"type": "string"},
+                                    "invalid_values": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "required_deltas": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "required": ["op", "path"],
+                                            "properties": {
+                                                "op": {
+                                                    "type": "string",
+                                                    "enum": ["remove", "replace", "add"],
+                                                },
+                                                "path": {"type": "string"},
+                                                "values": {
+                                                    "type": "array",
+                                                    "items": {"type": "string"},
+                                                },
+                                                "replacement": {},
+                                            },
+                                        },
+                                    },
+                                    "evidence_refs": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "evidence": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
                 },
             },
             handler=_request_watcher_review,

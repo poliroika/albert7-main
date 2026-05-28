@@ -317,13 +317,20 @@ def test_recovery_decision_interrupts_running_execute_before_next_round(
                             ],
                             "recovery_decision": {
                                 "kind": "plan_contract_revision",
-                                "trigger_code": "bad_generated_success_test_contract",
+                                "trigger_code": "bad_generated_oracle",
                                 "active_subtask_id": "logic",
                                 "loop_back_target": "plan",
                                 "failure_hash": "abc123",
-                                "plan_mutation_ticket": {
-                                    "ticket_id": "ticket-1",
+                                "plan_revision_patch": {
+                                    "revision_id": "revision-1",
                                     "target_subtask_id": "logic",
+                                    "required_deltas": [
+                                        {
+                                            "op": "remove",
+                                            "path": "proof.required_properties",
+                                            "values": ["impossible_oracle"],
+                                        }
+                                    ],
                                 },
                             },
                         },
@@ -359,13 +366,7 @@ def test_recovery_decision_interrupts_running_execute_before_next_round(
         "plan_contract_revision"
     )
     assert fake.handle.calls == 1
-    stop_payload = json.loads(
-        (state / "stop_requested.json").read_text(encoding="utf-8")
-    )
-    assert stop_payload["internal_recovery_route"] is True
-    assert stop_payload["task_id"] == task_id
-    assert stop_payload["scope"] == "task"
-    assert "run_id" not in stop_payload
+    assert not (state / "stop_requested.json").exists()
     assert runner._stop_requested() is False
 
 
@@ -452,7 +453,7 @@ def test_recovery_route_overlay_carries_typed_decision(tmp_path: Path) -> None:
         "recovery_decision": {
             "kind": "plan_contract_revision",
             "loop_back_target": "plan",
-            "plan_mutation_ticket": {"ticket_id": "ticket-1"},
+            "plan_revision_patch": {"revision_id": "revision-1"},
         },
     }
 
@@ -469,7 +470,7 @@ def test_recovery_route_overlay_carries_typed_decision(tmp_path: Path) -> None:
     assert contract["required_plan_changes"] == [
         {"target_subtask_id": "logic", "change": "Revise oracle."}
     ]
-    assert contract["plan_mutation_ticket"] == {"ticket_id": "ticket-1"}
+    assert contract["plan_revision_patch"] == {"revision_id": "revision-1"}
     assert "do not continue execute" in " ".join(
         plan_node.overlay["required_next_actions"]
     )

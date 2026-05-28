@@ -684,7 +684,7 @@ def _effective_phase_allowed_tools(
     allowed = set(manifest.allowed_tools or ())
     denied = set(manifest.forbidden_tools or ())
     if (
-        manifest.id in {"research", "plan", "plan_review"}
+        manifest.id in {"research", "research_review", "plan", "plan_review"}
         and not gmas_prewrite_required
         and str(research_depth or "").strip().lower() != "full"
     ):
@@ -714,7 +714,7 @@ def _effective_phase_allowed_skills(
 ) -> list[str]:
     allowed = set(manifest.allowed_skills or ())
     if (
-        manifest.id in {"research", "plan"}
+        manifest.id in {"research", "research_review", "plan"}
         and not gmas_prewrite_required
         and str(research_depth or "").strip().lower() != "full"
     ):
@@ -997,9 +997,14 @@ def build_phase_task(
         gmas_prewrite_required=gmas_prewrite_required,
         research_depth=research_depth,
     )
+    effective_forbidden_tools = [
+        tool
+        for tool in (manifest.forbidden_tools or ())
+        if str(tool or "") != "enable_tools"
+    ]
     tool_filter = {
         "allow": effective_allowed_tools,
-        "deny": list(manifest.forbidden_tools),
+        "deny": effective_forbidden_tools,
         "required": list(manifest.exit_criteria.required_calls),
         "completion_prerequisites": {
             "required_tools": list(manifest.exit_criteria.required_prior_calls),

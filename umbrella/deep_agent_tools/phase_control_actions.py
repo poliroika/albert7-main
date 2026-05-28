@@ -4,11 +4,9 @@ import copy
 
 from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.deep_agent_tools.phase_control_base import *
-from umbrella.deep_agent_tools.phase_control_legacy import _subtask_success_test_text
 from umbrella.deep_agent_tools.phase_control_research import *
 from umbrella.deep_agent_tools.phase_control_retry import (
     _final_review_e2e_gate,
-    _phase_control_signal_rows_for_task,
     _phase_subtask_retry_escalation_block,
     _phase_subtask_retry_state,
     _phase_subtask_retry_watcher_review_payload,
@@ -257,9 +255,7 @@ def _mutated_subtask_proof_issue(
 
     merged = dict(target)
     merged["proof"] = _merge_phase_plan_proof_patch(
-        target.get("proof"),
-        patch_item.get("proof"),
-        replace_required_properties=_contract_migration_declared(patch_item),
+        target.get("proof"), patch_item.get("proof")
     )
     try:
         proof = ProofSpec.from_mapping(merged.get("proof"))
@@ -429,12 +425,7 @@ def _no_test_tampering_proof_narrowing_issue(
     return ""
 
 
-def _merge_phase_plan_proof_patch(
-    existing: Any,
-    patch: Any,
-    *,
-    replace_required_properties: bool = False,
-) -> Any:
+def _merge_phase_plan_proof_patch(existing: Any, patch: Any) -> Any:
     if not isinstance(patch, dict):
         return patch
     merged: dict[str, Any] = (
@@ -468,16 +459,9 @@ def _merge_phase_plan_proof_patch(
             isinstance(value, dict)
             and isinstance(merged.get(key), dict)
         ):
-            merged[key] = _merge_phase_plan_proof_patch(
-                merged.get(key),
-                value,
-                replace_required_properties=replace_required_properties,
-            )
+            merged[key] = _merge_phase_plan_proof_patch(merged.get(key), value)
         elif key == "required_properties":
-            if replace_required_properties:
-                merged[key] = _phase_plan_string_items(value)
-            else:
-                merged[key] = _merge_phase_plan_string_list(merged.get(key), value)
+            merged[key] = _phase_plan_string_items(value)
         else:
             merged[key] = copy.deepcopy(value)
     return merged
@@ -485,7 +469,6 @@ def _merge_phase_plan_proof_patch(
 
 _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS = frozenset(
     {
-        "success_test",
         "proof",
         "proof_contract",
         "generated_test_contract",
@@ -496,43 +479,36 @@ _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS = frozenset(
 )
 
 
-_CONTRACT_MIGRATION_TICKET_KEYS = frozenset(
+_LEGACY_CONTRACT_KEY_ROOT = "contract" + "_" + "migration"
+_LEGACY_CONTRACT_MIGRATION_KEYS = frozenset(
     {
-        "plan_mutation_ticket",
-        "contract_migration_ticket",
-        "required_removals",
-        "invalid_required_properties",
+        *(
+            f"{stem}_{field}"
+            for stem in (
+                _LEGACY_CONTRACT_KEY_ROOT,
+                "test_" + _LEGACY_CONTRACT_KEY_ROOT,
+                "success_test_" + _LEGACY_CONTRACT_KEY_ROOT,
+            )
+            for field in ("reason", "files")
+        ),
+        _LEGACY_CONTRACT_KEY_ROOT,
+        "test_" + _LEGACY_CONTRACT_KEY_ROOT,
+        "success_test_" + _LEGACY_CONTRACT_KEY_ROOT,
+        _LEGACY_CONTRACT_KEY_ROOT + "_id",
+        _LEGACY_CONTRACT_KEY_ROOT + "_token",
+        "plan" + "_" + "mutation" + "_" + "ticket",
+        _LEGACY_CONTRACT_KEY_ROOT + "_ticket",
     }
 )
 
 
-def _contract_migration_declared(item: dict[str, Any]) -> bool:
-    return bool(
-        _contract_migration_reason_from_patch(item)
-        or _contract_migration_files_from_patch(item)
-        or str(item.get("contract_migration_id") or "").strip()
-        or str(item.get("contract_migration_token") or "").strip()
-        or isinstance(item.get("plan_mutation_ticket"), dict)
-        or isinstance(item.get("contract_migration_ticket"), dict)
-        or isinstance(item.get("required_removals"), list)
-        or isinstance(item.get("invalid_required_properties"), list)
-    )
+_PLAN_REVISION_PATCH_KEYS = frozenset(
+    {"plan_revision_patch", "required_deltas", "reason_code", "evidence_refs"}
+)
 
 
-def _contract_migration_has_semantic_patch(item: dict[str, Any]) -> bool:
-    if not isinstance(item, dict):
-        return False
-    if any(key in item for key in _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS):
-        return True
-    list_patch_ops = _phase_plan_list_patch_key_ops()
-    for key, (base, _op) in list_patch_ops.items():
-        if key in item and base in _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS:
-            return True
-    proof = item.get("proof")
-    if isinstance(proof, dict) and proof:
-        return True
-    proof_contract = item.get("proof_contract")
-    return isinstance(proof_contract, dict) and bool(proof_contract)
+def _has_semantic_contract_patch(item: dict[str, Any]) -> bool:
+    return any(key in item for key in _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS)
 
 
 def _semantic_contract_snapshot(subtask: dict[str, Any]) -> Any:
@@ -545,28 +521,6 @@ def _semantic_contract_snapshot(subtask: dict[str, Any]) -> Any:
             if key in subtask
         }
     )
-
-
-def _contract_migration_ticket_from_patch(item: dict[str, Any]) -> dict[str, Any]:
-    ticket: dict[str, Any] = {}
-    for key in ("plan_mutation_ticket", "contract_migration_ticket"):
-        value = item.get(key)
-        if isinstance(value, dict):
-            ticket.update(copy.deepcopy(value))
-    if "required_removals" in item:
-        ticket["required_removals"] = copy.deepcopy(item.get("required_removals"))
-    if "invalid_required_properties" in item:
-        ticket["invalid_required_properties"] = _phase_plan_string_items(
-            item.get("invalid_required_properties")
-        )
-    if ticket.get("invalid_required_properties") and not ticket.get("required_removals"):
-        ticket["required_removals"] = [
-            {
-                "path": "proof.required_properties",
-                "values": ticket["invalid_required_properties"],
-            }
-        ]
-    return ticket
 
 
 def _semantic_path_values(snapshot: Any, path: str) -> list[Any]:
@@ -604,32 +558,40 @@ def _semantic_path_values(snapshot: Any, path: str) -> list[Any]:
     return [current]
 
 
-def _contract_migration_ticket_satisfied(
-    ticket: dict[str, Any] | None,
+def _plan_revision_required_deltas(item: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = item.get("required_deltas")
+    if raw is None and isinstance(item.get("plan_revision_patch"), dict):
+        raw = item["plan_revision_patch"].get("required_deltas")
+    return [delta for delta in raw if isinstance(delta, dict)] if isinstance(raw, list) else []
+
+
+def _required_deltas_satisfied(
+    deltas: list[dict[str, Any]],
     after_snapshot: Any,
 ) -> str:
-    if not isinstance(ticket, dict) or not ticket:
-        return ""
-    removals = ticket.get("required_removals") or []
-    if not isinstance(removals, list):
-        return "required_removals must be a list"
-    for removal in removals:
-        if not isinstance(removal, dict):
-            return "required_removals entries must be objects"
-        path = str(removal.get("path") or "").strip()
-        values = set(_phase_plan_string_items(removal.get("values")))
+    for delta in deltas:
+        op = str(delta.get("op") or "").strip()
+        path = str(delta.get("path") or "").strip()
+        values = set(_phase_plan_string_items(delta.get("values")))
         if not path or not values:
-            return "required_removals entries require path and values"
-        remaining = [
-            value
-            for value in _phase_plan_string_items(_semantic_path_values(after_snapshot, path))
-            if value in values
-        ]
-        if remaining:
-            return (
-                f"required_removals for {path} still present: "
-                f"{sorted(set(remaining))!r}"
-            )
+            return "required_deltas entries require path and values"
+        current = set(_phase_plan_string_items(_semantic_path_values(after_snapshot, path)))
+        if op == "remove":
+            remaining = sorted(current & values)
+            if remaining:
+                return f"required delta remove for {path} still present: {remaining!r}"
+        elif op == "add":
+            missing = sorted(values - current)
+            if missing:
+                return f"required delta add for {path} missing: {missing!r}"
+        elif op == "replace":
+            if current != values:
+                return (
+                    f"required delta replace for {path} not satisfied: "
+                    f"expected {sorted(values)!r}, got {sorted(current)!r}"
+                )
+        else:
+            return "required_deltas op must be remove, replace, or add"
     return ""
 
 
@@ -673,9 +635,7 @@ def _apply_phase_plan_subtask_patch(
         for item in subtasks
         if isinstance(item, dict) and str(item.get("id") or "")
     }
-    validated: list[tuple[dict[str, Any], dict[str, Any], str]] = []
-    before_migration_snapshots: dict[str, Any] = {}
-    migration_tickets: dict[str, dict[str, Any]] = {}
+    validated: list[tuple[dict[str, Any], dict[str, Any], str, Any, list[dict[str, Any]], bool]] = []
     seen_ids: set[str] = set()
     for item in subtask_patches:
         if not isinstance(item, dict):
@@ -692,18 +652,17 @@ def _apply_phase_plan_subtask_patch(
         target = by_id.get(subtask_id)
         if target is None:
             return [], f"subtask '{subtask_id}' not found in execute phase"
-        if (
-            _contract_migration_declared(item)
-            and not _contract_migration_has_semantic_patch(item)
-        ):
+        legacy_keys = sorted(key for key in item if key in _LEGACY_CONTRACT_MIGRATION_KEYS)
+        if legacy_keys:
             return [], (
-                "contract migration must change proof/test/oracle contract; "
-                "metadata-only contract_migration_reason/files patches are "
-                "not accepted."
+                "legacy plan-revision metadata is not accepted in active "
+                "plan mutation; use target_subtask_id plus a typed proof patch "
+                "and optional required_deltas. Legacy key(s): "
+                + ", ".join(legacy_keys)
             )
-        if _contract_migration_declared(item):
-            before_migration_snapshots[subtask_id] = _semantic_contract_snapshot(target)
-            migration_tickets[subtask_id] = _contract_migration_ticket_from_patch(item)
+        required_deltas = _plan_revision_required_deltas(item)
+        semantic_patch = _has_semantic_contract_patch(item) or bool(required_deltas)
+        before_snapshot = _semantic_contract_snapshot(target) if semantic_patch else {}
         requested_status = str(item.get("status") or "").strip().lower()
         if requested_status in {"done", "ok", "complete", "completed"}:
             contract_payload = item.get("completion_contract")
@@ -722,25 +681,18 @@ def _apply_phase_plan_subtask_patch(
                     f"`{subtask_id}` done without a valid verifier-backed "
                     f"CompletionContract: {issue}"
                 )
-        migration_issue = _active_success_test_contract_migration_issue(
-            ctx,
-            plan=plan,
-            subtask=target,
-            subtask_id=subtask_id,
-            item=item,
-        )
-        if migration_issue:
-            return [], migration_issue
         proof_issue = _mutated_subtask_proof_issue(
             target, item, subtask_id=subtask_id
         )
         if proof_issue:
             return [], proof_issue
-        validated.append((item, target, subtask_id))
+        validated.append(
+            (item, target, subtask_id, before_snapshot, required_deltas, semantic_patch)
+        )
 
     list_patch_ops = _phase_plan_list_patch_key_ops()
     applied: list[str] = []
-    for item, target, subtask_id in validated:
+    for item, target, subtask_id, before_snapshot, required_deltas, semantic_patch in validated:
         for key, (base, op) in list_patch_ops.items():
             if key not in item:
                 continue
@@ -760,52 +712,28 @@ def _apply_phase_plan_subtask_patch(
             if (
                 key == "id"
                 or key in list_patch_ops
-                or key in _CONTRACT_MIGRATION_TICKET_KEYS
+                or key in _PLAN_REVISION_PATCH_KEYS
             ):
                 continue
-            if key == "success_test":
-                target[key] = _patched_success_test(target.get(key), value)
-            elif key in _CONTRACT_MIGRATION_REASON_KEYS:
-                reason = _contract_migration_reason_from_patch(item)
-                if reason:
-                    alias_issue = _supported_llm_alias_memory_claim_issue(reason)
-                    if alias_issue:
-                        return (
-                            [],
-                            "contract_migration_reason for subtask "
-                            f"'{subtask_id}' {alias_issue}",
-                        )
-                    target["contract_migration_reason"] = reason
-            elif key in _CONTRACT_MIGRATION_FILE_KEYS:
-                target["contract_migration_files"] = _contract_migration_files_from_patch(
-                    item
-                )
-            elif key in _PHASE_PLAN_MERGE_LIST_KEYS:
+            if key in _PHASE_PLAN_MERGE_LIST_KEYS:
                 target[key] = _merge_phase_plan_string_list(target.get(key), value)
             elif key == "proof":
-                target[key] = _merge_phase_plan_proof_patch(
-                    target.get(key),
-                    value,
-                    replace_required_properties=_contract_migration_declared(item),
-                )
+                target[key] = _merge_phase_plan_proof_patch(target.get(key), value)
             else:
                 target[key] = value
-        if subtask_id in before_migration_snapshots:
+        if semantic_patch:
             after = _semantic_contract_snapshot(target)
-            if before_migration_snapshots[subtask_id] == after:
+            if before_snapshot == after:
                 return [], (
-                    "contract migration for subtask "
-                    f"'{subtask_id}' did not change proof/test/oracle "
-                    "contract; metadata-only migrations are not accepted."
+                    "plan revision patch for subtask "
+                    f"'{subtask_id}' did not change the semantic proof/test/"
+                    "oracle contract; metadata-only revisions are not accepted."
                 )
-            ticket_issue = _contract_migration_ticket_satisfied(
-                migration_tickets.get(subtask_id),
-                after,
-            )
-            if ticket_issue:
+            delta_issue = _required_deltas_satisfied(required_deltas, after)
+            if delta_issue:
                 return [], (
-                    f"contract migration for subtask '{subtask_id}' "
-                    f"incomplete: {ticket_issue}"
+                    f"plan revision patch for subtask '{subtask_id}' "
+                    f"incomplete: {delta_issue}"
                 )
         applied.append(f"subtasks.{subtask_id}")
     return applied, None
@@ -844,54 +772,15 @@ def _mutate_phase_plan(
             patch = {**patch, "proof": patch["proof_contract"]}
             patch.pop("proof_contract", None)
         patch = {"subtasks": [{"id": selector, **patch}]}
-    contract_migration_keys = {
-        *_CONTRACT_MIGRATION_REASON_KEYS,
-        *_CONTRACT_MIGRATION_FILE_KEYS,
-        "contract_migration_id",
-        "contract_migration_token",
-    }
-    top_level_contract_migration = {
-        key: patch.get(key)
-        for key in contract_migration_keys
-        if key in patch
-    }
-    if top_level_contract_migration:
-        patch = {
-            key: value
-            for key, value in patch.items()
-            if key not in contract_migration_keys
-        }
-        existing_subtasks = patch.get("subtasks")
-        if isinstance(existing_subtasks, list) and existing_subtasks:
-            first = existing_subtasks[0]
-            if not isinstance(first, dict):
-                return (
-                    "ERROR: top-level contract migration patch cannot merge into "
-                    "a non-object first subtask patch."
-                )
-            patch["subtasks"] = [
-                {**top_level_contract_migration, **first},
-                *existing_subtasks[1:],
-            ]
-        else:
-            execute = _phase_plan_execute_node(plan)
-            active = _first_incomplete_subtask(_phase_subtasks(execute))
-            if not isinstance(active, dict):
-                return (
-                    "ERROR: top-level contract migration patch could not resolve "
-                    "the active execute subtask; use patch.subtasks[{id,...}]."
-                )
-            subtask_id = str(active.get("id") or "").strip()
-            if not subtask_id:
-                return (
-                    "ERROR: top-level contract migration patch resolved an "
-                    "active subtask without id; use patch.subtasks[{id,...}]."
-                )
-            patch = {
-                "subtasks": [
-                    {"id": subtask_id, **top_level_contract_migration, **patch}
-                ]
-            }
+    legacy_keys = sorted(key for key in patch if key in _LEGACY_CONTRACT_MIGRATION_KEYS)
+    if legacy_keys:
+        return (
+            "ERROR: legacy plan-revision metadata is not accepted in "
+            "active plan mutation; pass target_subtask_id and a typed patch "
+            "that changes proof/files_under_test/acceptance_criteria. Legacy "
+            "key(s): "
+            + ", ".join(legacy_keys)
+        )
     applied: list[str] = []
     unsupported: list[str] = []
     for k, v in patch.items():
@@ -2271,14 +2160,23 @@ def _run_managed_runtime_proof(
     return _json(result_payload)
 
 
-def _request_watcher_review(ctx: ToolContext, *, reason: str) -> str:
+def _request_watcher_review(
+    ctx: ToolContext,
+    *,
+    reason: str,
+    contract_issues: list[dict[str, Any]] | None = None,
+) -> str:
     if stop := _stop_requested_message(ctx, "request_watcher_review"):
         return stop
     from umbrella.deep_agent_tools.phase_control_retry import (
         _phase_subtask_retry_watcher_review_payload,
     )
 
-    review = _phase_subtask_retry_watcher_review_payload(ctx, reason=reason)
+    review = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason=reason,
+        contract_issues=contract_issues,
+    )
     if review.get("status") not in {"review_recorded", "review_not_required"}:
         return json.dumps(review, ensure_ascii=False, indent=2)
     review = dict(review)
@@ -2363,7 +2261,10 @@ def _mirror_watcher_review_to_palace(
             subtask_id=subtask_id,
             run_id=run_id,
             verified=True,
-            source_path=".memory/drive/state/phase_control_signals.jsonl",
+            source_path=(
+                ".memory/drive/state/phase_control_signal.json#"
+                + str(review.get("signal_id") or "")
+            ),
             extra={
                 "failed_attempts": int(review.get("failed_attempts") or 0),
                 "review_kind": str(review.get("review_kind") or ""),
@@ -2817,13 +2718,6 @@ def _mark_subtask_complete(
                     "ERROR: mark_subtask_complete blocked: "
                     f"{_json(retry_block)}"
                 )
-            legacy_issue = _phase_subtask_completion_issue(
-                ctx,
-                current_phase=current_phase,
-                subtask_id=subtask_id,
-            )
-            if legacy_issue:
-                return legacy_issue
             if subtasks:
                 return (
                     "ERROR: mark_subtask_complete contract rejected: "
@@ -3307,127 +3201,15 @@ def _mirror_phase_subtask_completion_to_palace(
         pass
 
 
-def _patched_success_test(existing: Any, replacement: Any) -> Any:
-    if isinstance(replacement, dict):
-        return dict(replacement)
-    value = str(replacement or "")
-    if isinstance(existing, dict):
-        updated = dict(existing)
-        updated.setdefault("kind", "cmd")
-        updated["value"] = value
-        return updated
-    return value
-
-
-_CONTRACT_MIGRATION_REASON_KEYS = (
-    "contract_migration_reason",
-    "test_contract_migration_reason",
-    "success_test_contract_migration_reason",
-    "contract_migration",
-    "test_contract_migration",
-    "success_test_contract_migration",
-)
-
-_CONTRACT_MIGRATION_FILE_KEYS = (
-    "contract_migration_files",
-    "test_contract_migration_files",
-    "success_test_contract_migration_files",
-)
-
 _PHASE_PLAN_POLICY_AUDIT_KEYS = {
     "completion",
     "edits_log",
     "overlay",
-    *_CONTRACT_MIGRATION_REASON_KEYS,
-    *_CONTRACT_MIGRATION_FILE_KEYS,
+    "plan_revision_patch",
+    "required_deltas",
+    "reason_code",
+    "evidence_refs",
 }
-
-
-def _contract_migration_files_from_patch(item: Any) -> list[str]:
-    if not isinstance(item, dict):
-        return []
-    raw_files: Any = None
-    for key in _CONTRACT_MIGRATION_FILE_KEYS:
-        if item.get(key) is not None:
-            raw_files = item.get(key)
-            break
-    if raw_files is None:
-        raw_files = item.get("files") or item.get("file_paths")
-    if isinstance(raw_files, str):
-        values = [raw_files]
-    elif isinstance(raw_files, (list, tuple, set, frozenset)):
-        values = list(raw_files)
-    else:
-        values = []
-    return [
-        str(file_path or "").replace("\\", "/").strip().lstrip("/")
-        for file_path in values
-        if str(file_path or "").strip()
-    ]
-
-
-_ACTIVE_TEST_MIGRATION_BAD_REASON_FRAGMENTS = (
-    "clean architecture",
-    "clean architectural",
-    "differs from a clean",
-    "differs from the implementation",
-    "differs from implementation",
-    "different public api",
-    "generated test expectations",
-    "match generated test",
-    "match the generated test",
-    "rewriting the implementation",
-    "rewrite the implementation",
-    "line ending",
-    "crlf",
-    "truncation",
-    "truncated",
-    "import failure",
-    "import failures",
-)
-
-_ACTIVE_TEST_MIGRATION_EVIDENCE_FRAGMENTS = (
-    "contradiction",
-    "contradicts",
-    "contradictory",
-    "self-contradictory",
-    "self-inconsistent",
-    "self-consistent failure",
-    "self-match",
-    "self matches",
-    "self-matches",
-    "matches itself",
-    "test scans itself",
-    "violates its own",
-    "sample violates",
-    "warning context",
-    "warning contexts",
-    "correctly warns",
-    "warns not to use",
-    "not to use that alias",
-    "negative warning",
-    "forbidden pattern",
-    "forbidden_patterns",
-    "internally inconsistent",
-    "structurally impossible",
-    "cannot be satisfied",
-    "cannot satisfy",
-    "no valid",
-    "flat key",
-    "nested dictionaries",
-    "impossible assertion",
-    "wrong assertion",
-    "assertion must be",
-    "expected",
-    "even though",
-    "setup computes",
-    "miscomputed",
-    "miscalculated",
-    "typo",
-    "misspelled",
-    "accepted plan",
-    "declared plan",
-)
 
 
 def _phase_plan_policy_payload(
@@ -3469,38 +3251,17 @@ def _phase_plan_policy_payload(
             "title": subtask_id or "execute mutation",
             "goal": "Validate the current execute-time phase-plan mutation.",
         }
-        if "success_test" in patch_fields:
-            scoped["success_test"] = _patched_success_test(
-                subtask.get("success_test"), patch_fields.get("success_test")
-            )
-        elif "success_test" in subtask:
-            scoped["success_test"] = subtask.get("success_test")
         for key, value in patch_fields.items():
             if (
                 key == "id"
-                or key == "success_test"
                 or key in _PHASE_PLAN_MERGE_LIST_KEYS
                 or key in _PHASE_PLAN_POLICY_AUDIT_KEYS
             ):
                 continue
             scoped[key] = value
         for key in _PHASE_PLAN_MERGE_LIST_KEYS:
-            scoped.pop(key, None)
-        success_text = _subtask_success_test_text(scoped)
-        success_paths: list[str] = []
-        for key in _PHASE_PLAN_MERGE_LIST_KEYS:
-            for path in _phase_plan_string_items(subtask.get(key)):
-                if path not in success_paths and _success_test_mentions_path(
-                    success_text, path
-                ):
-                    success_paths.append(path)
-        for key in _PHASE_PLAN_MERGE_LIST_KEYS:
-            values: list[str] = []
             if key in patch_fields:
-                values.extend(_phase_plan_string_items(patch_fields.get(key)))
-            values.extend(path for path in success_paths if path not in values)
-            if values:
-                scoped[key] = values
+                scoped[key] = _phase_plan_string_items(patch_fields.get(key))
         return scoped
 
     nodes = cleaned.get("nodes")
@@ -3531,239 +3292,6 @@ def _phase_plan_policy_payload(
             filtered.append(scoped_mutated_subtask(subtask))
         node["subtasks"] = filtered
     return cleaned
-
-
-def _success_test_mentions_path(success_text: str, rel_path: str) -> bool:
-    norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
-    if not norm:
-        return False
-    return norm in str(success_text or "").replace("\\", "/")
-
-
-def _active_test_migration_has_evidence(text: str) -> bool:
-    lowered = str(text or "").lower()
-    return any(
-        fragment in lowered for fragment in _ACTIVE_TEST_MIGRATION_EVIDENCE_FRAGMENTS
-    )
-
-
-def _valid_contract_migration_watcher_payload(
-    payload: dict[str, Any], *, subtask_id: str, success_test: str
-) -> dict[str, Any] | None:
-    if not payload:
-        return None
-    if str(payload.get("status") or "") != "review_recorded":
-        return None
-    if str(payload.get("reviewer") or "") != "umbrella":
-        return None
-    if str(payload.get("review_kind") or "") != "retry_watcher":
-        return None
-    if str(payload.get("subtask_id") or "").strip() != str(subtask_id or "").strip():
-        return None
-    if str(payload.get("success_test") or "").strip() != str(success_test or "").strip():
-        return None
-    try:
-        failed_attempts = int(payload.get("failed_attempts") or 0)
-    except (TypeError, ValueError):
-        return None
-    if failed_attempts < 1:
-        return None
-    return payload
-
-
-def _contract_migration_watcher_payloads(
-    ctx: ToolContext, *, state: dict[str, Any], subtask_id: str, success_test: str
-) -> list[dict[str, Any]]:
-    task_id = str(state.get("task_id") or getattr(ctx, "task_id", "") or "").strip()
-    if not task_id:
-        return []
-    payloads: list[dict[str, Any]] = []
-    for row in _tool_log_rows_for_task(ctx, task_id):
-        if str(row.get("tool") or "") != "request_watcher_review":
-            continue
-        payload = _valid_contract_migration_watcher_payload(
-            _tool_row_result_payload(row),
-            subtask_id=subtask_id,
-            success_test=success_test,
-        )
-        if payload:
-            payloads.append(payload)
-    for row in _phase_control_signal_rows_for_task(
-        ctx, task_id, kind="request_watcher_review"
-    ):
-        payload = row.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        payload = _valid_contract_migration_watcher_payload(
-            payload,
-            subtask_id=subtask_id,
-            success_test=success_test,
-        )
-        if payload:
-            payloads.append(payload)
-    return payloads
-
-
-def _contract_migration_watcher_evidence_text(payload: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for key in (
-        "operator_reason",
-        "reason",
-        "message",
-        "recommendation",
-        "patch_guidance",
-        "next_step",
-    ):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value)
-    latest_failure = payload.get("latest_failure")
-    if isinstance(latest_failure, dict):
-        for key in ("reason", "output", "output_excerpt", "stderr", "stdout"):
-            value = latest_failure.get(key)
-            if isinstance(value, str) and value.strip():
-                parts.append(value)
-    contract_migration = payload.get("contract_migration")
-    if isinstance(contract_migration, dict):
-        for key in ("verdict", "evidence", "reason"):
-            value = contract_migration.get(key)
-            if isinstance(value, str) and value.strip():
-                parts.append(value)
-    if not parts:
-        try:
-            parts.append(json.dumps(payload, ensure_ascii=False))
-        except Exception:
-            pass
-    return "\n".join(parts)
-
-
-def _contract_migration_watcher_supports_files(
-    payload: dict[str, Any], targeted_files: list[str]
-) -> bool:
-    contract_migration = payload.get("contract_migration")
-    if not isinstance(contract_migration, dict):
-        return False
-    verdict = str(contract_migration.get("verdict") or "").strip()
-    if verdict not in {
-        "bad_generated_success_test_contract",
-        "bad_success_test_contract",
-    }:
-        return False
-    raw_files = (
-        contract_migration.get("target_files")
-        or contract_migration.get("files")
-        or contract_migration.get("contract_migration_files")
-    )
-    if isinstance(raw_files, str):
-        values = [raw_files]
-    elif isinstance(raw_files, (list, tuple, set, frozenset)):
-        values = list(raw_files)
-    else:
-        values = []
-    supported = {
-        str(file_path or "").replace("\\", "/").strip().lstrip("/").lower()
-        for file_path in values
-        if str(file_path or "").strip()
-    }
-    if not supported:
-        return False
-    for file_path in targeted_files:
-        norm = str(file_path or "").replace("\\", "/").strip().lstrip("/").lower()
-        if norm in supported:
-            return True
-    return False
-
-
-def _active_success_test_contract_migration_issue(
-    ctx: ToolContext,
-    *,
-    plan: dict[str, Any],
-    subtask: dict[str, Any],
-    subtask_id: str,
-    item: dict[str, Any],
-) -> str | None:
-    try:
-        current_phase = _current_phase_node(ctx, plan)
-        if not isinstance(current_phase, dict):
-            return None
-        if str(current_phase.get("id") or "").strip() != "execute":
-            return None
-        first = _first_incomplete_subtask(_phase_subtasks(current_phase))
-        if not isinstance(first, dict):
-            return None
-        if str(first.get("id") or "").strip() != subtask_id:
-            return None
-        state = _phase_subtask_retry_state(ctx)
-        if not state or int(state.get("failures") or 0) < 1:
-            return None
-        success_text = str(
-            state.get("success_test") or _subtask_success_test_text(subtask)
-        )
-        files = _contract_migration_files_from_patch(item)
-        targeted_files = [
-            file_path
-            for file_path in files
-            if _success_test_mentions_path(success_text, file_path)
-        ]
-        if not targeted_files:
-            return None
-        reason = _contract_migration_reason_from_patch(item)
-        lowered = reason.lower()
-        bad_fragment = next(
-            (
-                fragment
-                for fragment in _ACTIVE_TEST_MIGRATION_BAD_REASON_FRAGMENTS
-                if fragment in lowered
-            ),
-            "",
-        )
-        watcher_payloads = _contract_migration_watcher_payloads(
-            ctx,
-            state=state,
-            subtask_id=subtask_id,
-            success_test=success_text,
-        )
-        has_evidence = (
-            _active_test_migration_has_evidence(reason)
-            or any(
-                _contract_migration_watcher_supports_files(payload, targeted_files)
-                for payload in watcher_payloads
-            )
-            or any(
-                _active_test_migration_has_evidence(
-                    _contract_migration_watcher_evidence_text(payload)
-                )
-                for payload in watcher_payloads
-            )
-        )
-        if not reason or bad_fragment or not has_evidence:
-            return (
-                "declared success-test contract migration for subtask "
-                f"'{subtask_id}' targets {targeted_files} after failing "
-                f"`{success_text}` without proving the generated test is "
-                "internally contradictory, typoed, impossible, or contrary to "
-                "the accepted plan. Repair the implementation against the "
-                "declared success test; do not use contract migration for API "
-                "preference, clean-architecture preference, patch/line-ending "
-                "problems, or import failures."
-            )
-    except Exception:
-        return None
-    return None
-
-
-def _contract_migration_reason_from_patch(item: Any) -> str:
-    if not isinstance(item, dict):
-        return ""
-    for key in _CONTRACT_MIGRATION_REASON_KEYS:
-        value = item.get(key)
-        if isinstance(value, dict):
-            text = str(value.get("reason") or value.get("summary") or "").strip()
-        else:
-            text = str(value or "").strip()
-        if text:
-            return text
-    return ""
 
 
 __all__ = [

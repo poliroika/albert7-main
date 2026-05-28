@@ -547,6 +547,11 @@ def _palace_add(
 ) -> str:
     if stop := _stop_requested_message(ctx, "palace_add"):
         return stop
+    if not str(title or "").strip() and not str(content or "").strip():
+        return (
+            "ERROR: palace_add requires non-empty title or content; empty "
+            "memory writes are rejected."
+        )
     blocked_kinds = {"core_lesson", "accepted_lesson"}
     if str(kind or "").strip().lower() in blocked_kinds:
         return (
@@ -1878,90 +1883,6 @@ def _plan_revision_contract_issues(ctx: ToolContext, plan: dict[str, Any]) -> li
     return issues
 
 
-def _legacy_success_test_to_proof(subtask: dict[str, Any]) -> dict[str, Any] | None:
-    if isinstance(subtask.get("proof"), dict):
-        return None
-    raw = (
-        subtask.get("verification_command")
-        or subtask.get("success_test")
-        or subtask.get("success_checks")
-        or subtask.get("success_check")
-    )
-    if raw is None and isinstance(subtask.get("verification"), dict):
-        verification = subtask["verification"]
-        commands = verification.get("commands")
-        if isinstance(commands, list) and len(commands) == 1:
-            raw = commands[0]
-        elif isinstance(commands, str):
-            raw = commands
-        elif isinstance(verification.get("command"), str):
-            raw = verification.get("command")
-    command_text = ""
-    if isinstance(raw, str):
-        command_text = raw.strip()
-    elif isinstance(raw, dict):
-        for key in ("command", "value", "cmd"):
-            value = raw.get(key)
-            if isinstance(value, str) and value.strip():
-                command_text = value.strip()
-                break
-    if not command_text:
-        return None
-    try:
-        command = shlex.split(command_text)
-    except ValueError:
-        command = command_text.split()
-    lowered = command_text.lower()
-    kind = "pytest" if "pytest" in lowered else "command"
-    if re.search(r"\bnpm\b.{0,40}\b(?:build|run\s+build)\b", lowered):
-        kind = "build"
-    paths = _plan_subtask_declared_paths(subtask)
-    test_paths = [path for path in paths if _plan_path_looks_like_test(path)]
-    non_test_paths = [path for path in paths if path not in test_paths]
-    files_under_test = non_test_paths or paths
-    required_properties = ["no_test_tampering"] if test_paths else []
-    if kind == "build":
-        required_properties.append("build_succeeds")
-    return {
-        "execution": {"kind": kind, "command": command, "shell": False},
-        "oracle": {
-            "oracle_type": "build" if kind == "build" else "unit_assertions",
-            "required_properties": required_properties,
-            "negative_cases_required": kind != "build",
-        },
-        "scope": {
-            "files_under_test": files_under_test,
-            "changed_files_expected": paths,
-            "pytest_targets": [item for item in command if "test" in item.lower()]
-            if kind == "pytest"
-            else [],
-        },
-        "anti_gaming": {"requires_real_runtime": False},
-        "required_capabilities": [],
-    }
-
-
-def _migrate_legacy_success_tests(plan: dict[str, Any]) -> dict[str, Any]:
-    subtasks = plan.get("subtasks")
-    if not isinstance(subtasks, list):
-        return plan
-    changed = False
-    migrated: list[Any] = []
-    for item in subtasks:
-        if not isinstance(item, dict):
-            migrated.append(item)
-            continue
-        proof = _legacy_success_test_to_proof(item)
-        if proof is None:
-            migrated.append(item)
-            continue
-        migrated.append({**item, "proof": proof})
-        changed = True
-    if not changed:
-        return plan
-    return {**plan, "subtasks": migrated}
-
-
 def _validate_phase_plan_contract(
     ctx: ToolContext,
     plan: dict[str, Any],
@@ -2147,7 +2068,6 @@ def _propose_phase_plan(
             )
         plan = decoded
     plan = canonicalize_phase_plan(plan)
-    plan = _migrate_legacy_success_tests(plan)
     if not notes:
         for key in ("note", "rationale", "explanation", "summary"):
             value = extra.get(key)

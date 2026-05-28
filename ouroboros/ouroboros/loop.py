@@ -546,6 +546,51 @@ def _check_stop_requested(
     return f"Stop requested by dashboard: {reason}", accumulated_usage, llm_trace
 
 
+def _check_internal_phase_route_requested(
+    drive_root: pathlib.Path | None,
+    task_id: str,
+    accumulated_usage: dict[str, Any],
+    llm_trace: dict[str, Any],
+    content: str | None = None,
+) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+    if drive_root is None:
+        return None
+    signal_path = pathlib.Path(drive_root) / "state" / "phase_control_signal.json"
+    if not signal_path.exists():
+        return None
+    try:
+        signal = json.loads(signal_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(signal, dict):
+        return None
+    current = str(task_id or "").strip()
+    if not current or str(signal.get("task_id") or "").strip() != current:
+        return None
+    if str(signal.get("kind") or "") != "request_watcher_review":
+        return None
+    payload = signal.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    decision = payload.get("recovery_decision")
+    if not isinstance(decision, dict):
+        return None
+    if str(decision.get("kind") or "").strip() != "plan_contract_revision":
+        return None
+    loop_target = str(
+        decision.get("loop_back_target") or payload.get("loop_back_target") or ""
+    ).strip()
+    if loop_target != "plan":
+        return None
+    if content and content.strip():
+        llm_trace["assistant_notes"].append(content.strip()[:320])
+    return (
+        "Internal recovery route requested: plan_contract_revision -> plan",
+        accumulated_usage,
+        llm_trace,
+    )
+
+
 def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
     if not isinstance(payload, dict):
         return True
@@ -2880,7 +2925,7 @@ def _setup_dynamic_tools(
             {
                 "role": "system",
                 "content": (
-                    f"Note: {len(active_names)} tools are pre-loaded in your active set. "
+                    f"Active tool schemas this round: {len(active_names)}. "
                     f"Another {non_core_count} phase-available specialised tools exist but are not "
                     f"loaded by default — call `list_available_tools` to inspect them "
                     f"and `enable_tools` to activate any you need (their schemas will "
@@ -3953,14 +3998,6 @@ def _current_execute_success_test_text(drive_root: pathlib.Path | None) -> str:
     subtask = _current_execute_subtask(drive_root)
     if not isinstance(subtask, dict):
         return ""
-    raw = subtask.get("success_test")
-    if isinstance(raw, dict):
-        for key in ("value", "command", "cmd", "pytest_id", "verification", "text"):
-            value = raw.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
     from umbrella.deep_agent_tools.phase_control_retry import (
         _subtask_typed_proof_command_text,
     )
@@ -4907,6 +4944,21 @@ def _process_tool_call_round_after_execution(
         allowed_tool_names=allowed_tool_names,
         phase_label=phase_label,
     )
+    internal_route_result = _check_internal_phase_route_requested(
+        drive_root,
+        task_id,
+        state.accumulated_usage,
+        state.llm_trace,
+    )
+    if internal_route_result is not None:
+        return (
+            (internal_route_result, "final"),
+            phase_write_tool_calls,
+            no_write_tool_nudges,
+            last_no_write_tool_nudge_round,
+            forced_progress_tool_choice,
+            preflight_repair_rounds,
+        )
     if _recent_tool_results_have_stop_requested(state.llm_trace, len(tool_calls)):
         stop_result = _check_stop_requested(
             drive_root,
@@ -5544,6 +5596,14 @@ def _start_llm_phase_round(
     )
     if deadline_result is not None:
         return rounds_in_phase, (deadline_result, "final")
+    internal_route_result = _check_internal_phase_route_requested(
+        drive_root,
+        task_id,
+        state.accumulated_usage,
+        state.llm_trace,
+    )
+    if internal_route_result is not None:
+        return rounds_in_phase, (internal_route_result, "final")
     stop_result = _check_stop_requested(
         drive_root,
         task_id,

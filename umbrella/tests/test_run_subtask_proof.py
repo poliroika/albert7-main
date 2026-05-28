@@ -794,13 +794,15 @@ def test_retry_watcher_text_only_bad_oracle_does_not_route_to_plan(
     assert "loop_back_target" not in payload
     assert "issues" not in payload
     assert "contract_migration" not in payload
+    assert "plan_revision_patch" not in payload
     assert payload["recovery_decision"]["kind"] == "implementation_repair"
     assert "plan_mutation_ticket" not in payload
+    assert "plan_revision_patch" not in payload["recovery_decision"]
     assert "plan_mutation_ticket" not in payload["recovery_decision"]
     assert payload["text_lints"][0]["code"] == "possible_bad_generated_oracle_text"
 
 
-def test_retry_watcher_contract_migration_overrides_threshold_and_patch_guidance(
+def test_retry_watcher_typed_contract_issue_overrides_threshold_and_patch_guidance(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path
@@ -913,16 +915,17 @@ def test_retry_watcher_contract_migration_overrides_threshold_and_patch_guidance
     assert payload["verdict"] == "bad_test_contract"
     assert payload["requires_plan_mutation"] is True
     assert payload["loop_back_target"] == "plan"
-    assert payload["issues"][0]["code"] == "plan_contract_issue"
-    assert payload["contract_migration"]["target_files"] == ["tests/test_engine.py"]
+    assert payload["issues"][0]["code"] == "bad_generated_oracle"
+    assert payload["plan_revision_patch"]["target_files"] == ["tests/test_engine.py"]
     assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
-    ticket = payload["recovery_decision"]["plan_mutation_ticket"]
-    assert ticket["target_subtask_id"] == "calc-engine"
-    assert ticket["invalid_required_properties"] == [
+    patch = payload["recovery_decision"]["plan_revision_patch"]
+    assert patch["target_subtask_id"] == "calc-engine"
+    assert patch["invalid_values"] == [
         "distinct_inputs_distinct_outputs"
     ]
-    assert ticket["required_removals"] == [
+    assert patch["required_deltas"] == [
         {
+            "op": "remove",
             "path": "proof.required_properties",
             "values": ["distinct_inputs_distinct_outputs"],
         }
@@ -930,7 +933,123 @@ def test_retry_watcher_contract_migration_overrides_threshold_and_patch_guidance
     assert "suppressed_patch_guidance" not in payload
 
 
-def test_retry_watcher_not_required_has_no_contract_migration_conflict(
+def test_request_watcher_review_contract_issue_routes_without_text_regex(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    task_id = "task:execute"
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "calc-engine",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_engine.py",
+                                            "-q",
+                                        ],
+                                    },
+                                    "scope": {
+                                        "files_under_test": [
+                                            "src/calculator/engine.py",
+                                            "tests/test_engine.py",
+                                        ],
+                                        "changed_files_expected": [
+                                            "src/calculator/engine.py",
+                                            "tests/test_engine.py",
+                                        ],
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = {
+        "task_id": task_id,
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "calc-engine"},
+        "result_preview": json.dumps(
+            {
+                "passed": False,
+                "exit_code": 1,
+                "subtask_id": "calc-engine",
+                "command": ["python", "-m", "pytest", "tests/test_engine.py", "-q"],
+                "shell_result": {"output": "assert 9 != 9"},
+                "proof_ref": {
+                    "ref_type": "ledger_event",
+                    "ref_id": "proof-1",
+                },
+            }
+        ),
+    }
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(failed) for _ in range(3)) + "\n",
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        task_id=task_id,
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    payload = json.loads(
+        _request_watcher_review(
+            ctx,
+            reason="notes only",
+            contract_issues=[
+                {
+                    "code": "bad_generated_oracle",
+                    "target_subtask_id": "calc-engine",
+                    "contract_path": "proof.required_properties",
+                    "invalid_values": ["distinct_inputs_distinct_outputs"],
+                    "required_deltas": [
+                        {
+                            "op": "remove",
+                            "path": "proof.required_properties",
+                            "values": ["distinct_inputs_distinct_outputs"],
+                        }
+                    ],
+                    "evidence_refs": ["ledger_event:proof-1"],
+                }
+            ],
+        )
+    )
+
+    assert payload["status"] == "review_recorded"
+    assert payload["requires_plan_mutation"] is True
+    assert payload["loop_back_target"] == "plan"
+    assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
+    assert payload["issues"][0]["contract_path"] == "proof.required_properties"
+    assert payload["issues"][0]["evidence_refs"] == ["ledger_event:proof-1"]
+
+
+def test_retry_watcher_not_required_has_no_plan_revision_conflict(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path
@@ -1033,6 +1152,7 @@ def test_retry_watcher_not_required_has_no_contract_migration_conflict(
     assert payload["requires_plan_mutation"] is False
     assert "contract_migration" not in payload
     assert "plan_mutation_ticket" not in payload
+    assert "plan_revision_patch" not in payload
     assert payload["recovery_decision"]["kind"] == "implementation_repair"
 
 
@@ -1179,14 +1299,22 @@ def test_bad_generated_oracle_flow_allows_plan_mutation_after_freeze(
     )
 
     assert review["status"] == "review_recorded"
-    assert review["issues"][0]["code"] == "plan_contract_issue"
+    assert review["issues"][0]["code"] == "bad_generated_oracle"
     assert review["requires_plan_mutation"] is True
+    assert review["plan_revision_patch"]["required_deltas"] == [
+        {
+            "op": "remove",
+            "path": "proof.required_properties",
+            "values": ["distinct_inputs_distinct_outputs"],
+        }
+    ]
     assert "cleared_typed_action_gate" not in review
 
     result = _mutate_phase_plan(
         ctx,
         subtask_id="calc-engine",
         patch={
+            "required_deltas": review["plan_revision_patch"]["required_deltas"],
             "proof": {
                 "oracle": {
                     "oracle_type": "unit_assertions",
@@ -1196,11 +1324,6 @@ def test_bad_generated_oracle_flow_allows_plan_mutation_after_freeze(
                     ],
                 },
             },
-            "contract_migration_reason": (
-                "Generated oracle is mathematically impossible for arithmetic "
-                "operations; distinct input pairs can share the same result."
-            ),
-            "contract_migration_files": ["tests/test_engine.py"],
         },
     )
 
@@ -1208,7 +1331,7 @@ def test_bad_generated_oracle_flow_allows_plan_mutation_after_freeze(
     mutated = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
     subtask = mutated["nodes"][0]["subtasks"][0]
     assert mutated["version"] == 1
-    assert subtask["contract_migration_files"] == ["tests/test_engine.py"]
+    assert "required_deltas" not in subtask
     assert subtask["proof"]["oracle"]["required_properties"] == [
         "invalid_input_rejected",
         "no_test_tampering",

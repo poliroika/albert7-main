@@ -155,28 +155,6 @@ class PhaseRunner:
             return False
         return True
 
-    def _write_task_scoped_stop_request(
-        self,
-        *,
-        task_id: str,
-        reason: str,
-    ) -> None:
-        task_id = str(task_id or "").strip()
-        if not task_id:
-            return
-        state = self._drive_root / "state"
-        state.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "reason": reason,
-            "task_id": task_id,
-            "scope": "task",
-            "internal_recovery_route": True,
-            "created_at": time.time(),
-        }
-        tmp = (state / "stop_requested.json").with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, state / "stop_requested.json")
-
     def _clear_pending_phase_signal(self) -> None:
         try:
             (self._drive_root / "state" / "phase_control_signal.json").unlink(
@@ -591,8 +569,8 @@ class PhaseRunner:
                     or (payload or {}).get("operator_reason")
                     or ""
                 ).strip()
-                ticket_payload = (
-                    json_ready(decision.get("plan_mutation_ticket") or {})
+                patch_payload = (
+                    json_ready(decision.get("plan_revision_patch") or {})
                     if isinstance(decision, dict)
                     else {}
                 )
@@ -609,7 +587,7 @@ class PhaseRunner:
                     "revisions": [],
                     "required_plan_changes": required_plan_changes,
                     "recovery_decision": decision_payload,
-                    "plan_mutation_ticket": ticket_payload,
+                    "plan_revision_patch": patch_payload,
                     "notes": notes,
                 }
             if kind != "submit_micro_review":
@@ -726,8 +704,8 @@ class PhaseRunner:
                 payload.get("required_plan_changes") or []
             ),
             "recovery_decision": decision,
-            "plan_mutation_ticket": json_ready(
-                decision.get("plan_mutation_ticket") or {}
+            "plan_revision_patch": json_ready(
+                decision.get("plan_revision_patch") or {}
             ),
             "notes": str(
                 payload.get("recommendation")
@@ -3366,6 +3344,22 @@ class PhaseRunner:
             while True:
                 outcome = handle.wait(timeout=float(poll_sec))
                 if outcome is not None:
+                    route_decision = self._latest_recovery_route_decision(
+                        task_id=str(task.get("id") or ""),
+                        phase_started_at=phase_started_at,
+                    )
+                    if route_decision:
+                        return {
+                            "status": "recovery_route",
+                            "task_id": task.get("id"),
+                            "loop_back_target": route_decision.get("loop_back_target")
+                            or "plan",
+                            "retry_reason": (
+                                "recovery:plan_contract_revision: "
+                                "bad generated test/proof contract"
+                            ),
+                            "route_decision": route_decision,
+                        }
                     outcome["event_count"] = len(outcome.get("events") or [])
                     return outcome
                 self._watcher.tick(
@@ -3387,10 +3381,6 @@ class PhaseRunner:
                     phase_started_at=phase_started_at,
                 )
                 if route_decision:
-                    self._write_task_scoped_stop_request(
-                        task_id=str(task.get("id") or ""),
-                        reason="recovery:plan_contract_revision",
-                    )
                     return {
                         "status": "recovery_route",
                         "task_id": task.get("id"),

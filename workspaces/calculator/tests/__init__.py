@@ -1,1 +1,1 @@
-"""Test suite for calculator."""
+"""Test package for calculator."""

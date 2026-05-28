@@ -1045,8 +1045,16 @@ def test_revision_contract_accepts_watcher_plan_contract_issue(tmp_path: Path) -
     task_id = "run-1:execute:200"
     change = {
         "target_subtask_id": "logic",
-        "change": "Revise generated oracle before execute retries.",
-        "contract_migration_files": ["tests/test_logic.py"],
+        "reason_code": "bad_generated_oracle",
+        "contract_path": "proof.required_properties",
+        "invalid_values": ["impossible_oracle"],
+        "required_deltas": [
+            {
+                "op": "remove",
+                "path": "proof.required_properties",
+                "values": ["impossible_oracle"],
+            }
+        ],
     }
     (state / "phase_control_signals.jsonl").write_text(
         json.dumps(

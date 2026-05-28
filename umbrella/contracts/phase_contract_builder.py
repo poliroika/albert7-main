@@ -111,10 +111,10 @@ def build_phase_contract(
                     isinstance(anti_gaming, dict)
                     and anti_gaming.get("allows_test_only_change")
                 ),
-                "test_contract_migration_requires": [
+                "proof_revision_requires": [
                     "request_watcher_review verdict=bad_test_contract",
-                    "mutate_phase_plan contract_migration_reason",
-                    "fresh run_subtask_proof after mutation",
+                    "mutate_phase_plan typed proof patch with required_deltas",
+                    "fresh run_subtask_proof after proof contract revision",
                 ],
             },
             "runtime_contract": {

@@ -217,17 +217,15 @@ def test_apply_phase_plan_subtask_patch_keeps_no_test_tampering_property() -> No
         SimpleNamespace(),
         plan,
         [
-            {
-                "id": "gui-core",
-                "proof": {
-                    "oracle": {
-                        "required_properties": [
+                {
+                    "id": "gui-core",
+                    "proof": {
+                        "add_required_properties": [
                             "distinct_inputs_distinct_outputs"
                         ]
-                    }
-                },
-            }
-        ],
+                    },
+                }
+            ],
     )
 
     assert issue is None
@@ -324,7 +322,7 @@ def test_request_scope_change_treats_future_subtask_owned_source_as_advisory(
     assert active["files_to_create"] == ["pyproject.toml"]
 
 
-def test_mutate_phase_plan_accepts_top_level_contract_migration_for_active_subtask(
+def test_mutate_phase_plan_rejects_top_level_legacy_plan_revision_metadata(
     tmp_path,
 ) -> None:
     drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
@@ -375,15 +373,12 @@ def test_mutate_phase_plan_accepts_top_level_contract_migration_for_active_subta
         },
     )
 
-    assert result.startswith("PhasePlan mutated")
+    assert "legacy plan-revision metadata is not accepted" in result
     plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
     subtask = plan["nodes"][0]["subtasks"][0]
-    assert subtask["contract_migration_reason"].startswith("Watcher proved")
-    assert subtask["contract_migration_files"] == ["tests/test_gui_state.py"]
-    assert subtask["contract_migration_id"] == "migration-1"
-    assert subtask["acceptance_criteria"] == [
-        "Revise generated GUI state oracle to match accepted task behavior."
-    ]
+    assert "contract_migration_reason" not in subtask
+    assert "acceptance_criteria" not in subtask
+    assert plan["version"] == 1
 
 
 def test_mutate_phase_plan_accepts_target_subtask_id_selector(tmp_path) -> None:
@@ -424,8 +419,6 @@ def test_mutate_phase_plan_accepts_target_subtask_id_selector(tmp_path) -> None:
         ctx,
         target_subtask_id="logic",
         patch={
-            "contract_migration_reason": "Generated oracle contradicts task contract.",
-            "contract_migration_files": ["tests/test_logic.py"],
             "acceptance_criteria": [
                 "Replace contradictory generated oracle with task-derived assertions."
             ],
@@ -435,17 +428,13 @@ def test_mutate_phase_plan_accepts_target_subtask_id_selector(tmp_path) -> None:
     assert result.startswith("PhasePlan mutated")
     plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
     setup, logic = plan["nodes"][0]["subtasks"]
-    assert "contract_migration_reason" not in setup
-    assert logic["contract_migration_reason"] == (
-        "Generated oracle contradicts task contract."
-    )
-    assert logic["contract_migration_files"] == ["tests/test_logic.py"]
+    assert "acceptance_criteria" not in setup
     assert logic["acceptance_criteria"] == [
         "Replace contradictory generated oracle with task-derived assertions."
     ]
 
 
-def test_mutate_phase_plan_rejects_metadata_only_contract_migration(tmp_path) -> None:
+def test_mutate_phase_plan_rejects_metadata_only_plan_revision(tmp_path) -> None:
     drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
     state = drive / "state"
     state.mkdir(parents=True)
@@ -479,17 +468,25 @@ def test_mutate_phase_plan_rejects_metadata_only_contract_migration(tmp_path) ->
     result = _mutate_phase_plan(
         ctx,
         subtask_id="logic",
-        patch={"contract_migration_files": ["tests/test_logic.py"]},
+        patch={
+            "required_deltas": [
+                {
+                    "op": "remove",
+                    "path": "proof.required_properties",
+                    "values": ["distinct_inputs_distinct_outputs"],
+                }
+            ]
+        },
     )
 
-    assert "contract migration must change proof/test/oracle contract" in result
+    assert "metadata-only revisions are not accepted" in result
     plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
     logic = plan["nodes"][0]["subtasks"][0]
     assert "contract_migration_files" not in logic
     assert plan["version"] == 1
 
 
-def test_mutate_phase_plan_rejects_same_semantic_contract_migration(
+def test_mutate_phase_plan_rejects_same_semantic_plan_revision(
     tmp_path,
 ) -> None:
     drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
@@ -545,13 +542,12 @@ def test_mutate_phase_plan_rejects_same_semantic_contract_migration(
         ctx,
         target_subtask_id="logic",
         patch={
-            "contract_migration_reason": "Generated oracle is invalid.",
-            "contract_migration_files": ["tests/test_logic.py"],
+            "reason_code": "bad_generated_oracle",
             "proof": proof,
         },
     )
 
-    assert "did not change proof/test/oracle contract" in result
+    assert "did not change the semantic proof/test/oracle contract" in result
     plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
     assert plan["version"] == 1
     assert "contract_migration_reason" not in plan["nodes"][0]["subtasks"][0]
@@ -613,16 +609,14 @@ def test_mutate_phase_plan_rejects_unsatisfied_required_removal_ticket(
         ctx,
         target_subtask_id="logic",
         patch={
-            "contract_migration_reason": "Generated oracle is invalid.",
-            "contract_migration_files": ["tests/test_logic.py"],
-            "plan_mutation_ticket": {
-                "required_removals": [
-                    {
-                        "path": "proof.required_properties",
-                        "values": ["distinct_inputs_distinct_outputs"],
-                    }
-                ]
-            },
+            "reason_code": "bad_generated_oracle",
+            "required_deltas": [
+                {
+                    "op": "remove",
+                    "path": "proof.required_properties",
+                    "values": ["distinct_inputs_distinct_outputs"],
+                }
+            ],
             "acceptance_criteria": ["Use task-derived examples."],
         },
     )
@@ -674,7 +668,6 @@ def test_mutate_phase_plan_accepts_top_level_subtask_id_alias_with_contract_chan
         ctx,
         subtask_id="logic",
         patch={
-            "contract_migration_files": ["tests/test_logic.py"],
             "acceptance_criteria": ["Use task-derived examples."],
         },
     )
@@ -682,11 +675,10 @@ def test_mutate_phase_plan_accepts_top_level_subtask_id_alias_with_contract_chan
     assert result.startswith("PhasePlan mutated")
     plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
     logic = plan["nodes"][0]["subtasks"][0]
-    assert logic["contract_migration_files"] == ["tests/test_logic.py"]
     assert logic["acceptance_criteria"] == ["Use task-derived examples."]
 
 
-def test_mutate_phase_plan_contract_migration_can_remove_oracle_property(
+def test_mutate_phase_plan_typed_patch_can_remove_oracle_property(
     tmp_path,
 ) -> None:
     drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
@@ -758,19 +750,14 @@ def test_mutate_phase_plan_contract_migration_can_remove_oracle_property(
         ctx,
         target_subtask_id="logic",
         patch={
-            "contract_migration_reason": (
-                "Generated oracle required distinct outputs for distinct inputs, "
-                "which is mathematically invalid for calculator operations."
-            ),
-            "contract_migration_files": ["tests/test_logic.py"],
-            "plan_mutation_ticket": {
-                "required_removals": [
-                    {
-                        "path": "proof.required_properties",
-                        "values": ["distinct_inputs_distinct_outputs"],
-                    }
-                ]
-            },
+            "reason_code": "bad_generated_oracle",
+            "required_deltas": [
+                {
+                    "op": "remove",
+                    "path": "proof.required_properties",
+                    "values": ["distinct_inputs_distinct_outputs"],
+                }
+            ],
             "proof": {
                 "remove_required_properties": [
                     "distinct_inputs_distinct_outputs"
@@ -793,7 +780,7 @@ def test_mutate_phase_plan_contract_migration_can_remove_oracle_property(
     assert "operation_semantics_match_task_examples" in required
 
 
-def test_mutate_phase_plan_ticket_only_contract_migration_replaces_oracle_property(
+def test_mutate_phase_plan_required_deltas_replaces_oracle_property(
     tmp_path,
 ) -> None:
     drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
@@ -853,14 +840,13 @@ def test_mutate_phase_plan_ticket_only_contract_migration_replaces_oracle_proper
         ctx,
         target_subtask_id="logic",
         patch={
-            "plan_mutation_ticket": {
-                "required_removals": [
-                    {
-                        "path": "proof.required_properties",
-                        "values": ["distinct_inputs_distinct_outputs"],
-                    }
-                ]
-            },
+            "required_deltas": [
+                {
+                    "op": "remove",
+                    "path": "proof.required_properties",
+                    "values": ["distinct_inputs_distinct_outputs"],
+                }
+            ],
             "proof": {
                 "oracle": {
                     "required_properties": ["no_test_tampering"],
@@ -875,7 +861,7 @@ def test_mutate_phase_plan_ticket_only_contract_migration_replaces_oracle_proper
         "required_properties"
     ]
     assert required == ["no_test_tampering"]
-    assert "plan_mutation_ticket" not in plan["nodes"][0]["subtasks"][0]
+    assert "required_deltas" not in plan["nodes"][0]["subtasks"][0]
 
 
 def test_mutate_phase_plan_rejects_subtask_id_inside_patch(tmp_path) -> None:
@@ -908,7 +894,7 @@ def test_mutate_phase_plan_rejects_subtask_id_inside_patch(tmp_path) -> None:
         ctx,
         patch={
             "subtask_id": "logic",
-            "contract_migration_files": ["tests/test_logic.py"],
+            "acceptance_criteria": ["Use task-derived examples."],
         },
     )
 

@@ -170,7 +170,7 @@ def test_light_depth_plan_retry_uses_compact_contract_without_gmas_tools(
     assert not (allowed & {"get_gmas_context", "search_gmas_knowledge"})
     assert not (skills & {"gmas-overview", "gmas-pattern-author"})
     assert "Active retry/revision contract" in prompt
-    assert "Do not read the full `.memory/drive/state/phase_control_signals.jsonl` ledger" in prompt
+    assert "Do not read raw phase-control ledgers" in prompt
 
 
 def test_research_depth_none_removes_finding_floor(test_workspace_copy) -> None:

@@ -31,7 +31,6 @@ _SUCCESS_TEST_LEADING_COMMAND_LABEL_RE = re.compile(
 )
 
 from umbrella.deep_agent_tools.phase_control_base import *
-from umbrella.deep_agent_tools.phase_control_legacy import _subtask_success_test_text
 
 def _is_final_review_context(ctx: ToolContext) -> bool:
     view = _loop_state_view(ctx)
@@ -659,7 +658,7 @@ def _latest_tool_result_for_task(
 def _completion_success_test_issue(
     ctx: ToolContext, *, subtask: dict[str, Any], subtask_id: str
 ) -> str:
-    success_text = _subtask_success_test_text(subtask)
+    success_text = _subtask_typed_proof_command_text(subtask)
     required_tool = _required_tool_from_success_test(success_text)
     if not required_tool:
         command_issue = _completion_command_success_issue(
@@ -778,7 +777,6 @@ def _subtask_referenced_paths(subtask: dict[str, Any]) -> set[str]:
         "files_to_create",
         "files_to_change",
         "files_affected",
-        "contract_migration_files",
     ):
         raw = subtask.get(key)
         if isinstance(raw, str):
@@ -791,17 +789,6 @@ def _subtask_referenced_paths(subtask: dict[str, Any]) -> set[str]:
             rel = str(value or "").replace("\\", "/").strip().strip("/").lower()
             if rel:
                 paths.add(rel)
-    for candidate in _success_test_command_candidates(_subtask_success_test_text(subtask)):
-        for token in _split_command_tokens_for_retry(candidate):
-            if not _looks_like_pytest_target_token(token):
-                continue
-            target = str(token).strip().strip("`'\"").replace("\\", "/").lower()
-            if "::" in target:
-                target = target.split("::", 1)[0]
-            if target.startswith("./"):
-                target = target[2:]
-            if target:
-                paths.add(target)
     proof = subtask.get("proof")
     scope = proof.get("scope") if isinstance(proof, dict) else None
     if isinstance(scope, dict):
@@ -853,9 +840,7 @@ def _pytest_targets_from_command_text(value: str) -> set[str]:
 
 
 def _subtask_pytest_targets(subtask: dict[str, Any]) -> set[str]:
-    targets = set(_pytest_targets_from_command_text(_subtask_success_test_text(subtask)))
-    targets.update(_pytest_targets_from_command_text(_subtask_typed_proof_command_text(subtask)))
-    return targets
+    return set(_pytest_targets_from_command_text(_subtask_typed_proof_command_text(subtask)))
 
 
 def _pytest_targets_from_failure_text(value: str) -> set[str]:
@@ -920,7 +905,6 @@ def _subtask_has_llm_surface(subtask: dict[str, Any]) -> bool:
         "name",
         "goal",
         "description",
-        "success_test",
         "files_to_create",
         "files_to_change",
         "files_affected",
@@ -1212,7 +1196,7 @@ def _tool_row_is_successful_repair_write(row: dict[str, Any]) -> bool:
 
 
 def _valid_retry_watcher_payload(
-    payload: dict[str, Any], *, subtask_id: str, success_test: str
+    payload: dict[str, Any], *, subtask_id: str, proof_command: str
 ) -> dict[str, Any] | None:
     if not payload:
         return None
@@ -1224,7 +1208,10 @@ def _valid_retry_watcher_payload(
         return None
     if str(payload.get("subtask_id") or "").strip() != str(subtask_id or "").strip():
         return None
-    if str(payload.get("success_test") or "").strip() != str(success_test or "").strip():
+    recorded_command = str(
+        payload.get("proof_command") or payload.get("success_test") or ""
+    ).strip()
+    if recorded_command != str(proof_command or "").strip():
         return None
     try:
         failed_attempts = int(payload.get("failed_attempts") or 0)
@@ -1236,7 +1223,7 @@ def _valid_retry_watcher_payload(
 
 
 def _tool_row_retry_watcher_payload(
-    row: dict[str, Any], *, subtask_id: str, success_test: str
+    row: dict[str, Any], *, subtask_id: str, proof_command: str
 ) -> dict[str, Any] | None:
     if str(row.get("tool") or "") != "request_watcher_review":
         return None
@@ -1244,33 +1231,8 @@ def _tool_row_retry_watcher_payload(
     return _valid_retry_watcher_payload(
         payload,
         subtask_id=subtask_id,
-        success_test=success_test,
+        proof_command=proof_command,
     )
-
-
-def _phase_control_signal_rows_for_task(
-    ctx: ToolContext, task_id: str, *, kind: str
-) -> list[dict[str, Any]]:
-    path = _drive_state(ctx) / "phase_control_signals.jsonl"
-    if not task_id or not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("task_id") or "") != task_id:
-                continue
-            if str(row.get("kind") or "") != kind:
-                continue
-            rows.append(row)
-    except OSError:
-        return rows
-    return rows
 
 
 def _phase_subtask_retry_context(ctx: ToolContext) -> dict[str, Any] | None:
@@ -1291,19 +1253,13 @@ def _phase_subtask_retry_context(ctx: ToolContext) -> dict[str, Any] | None:
     if not isinstance(first, dict):
         return None
     subtask_id = str(first.get("id") or "").strip()
-    success_text = _subtask_success_test_text(first)
     proof_command = _subtask_typed_proof_command_text(first)
-    groups = _success_test_retry_command_groups(success_text)
-    for group in _success_test_retry_command_groups(proof_command):
-        if group not in groups:
-            groups.append(group)
-    declared_text = success_text or proof_command
+    groups = _success_test_retry_command_groups(proof_command)
     if not subtask_id or not groups:
         return None
     return {
         "task_id": task_id,
         "subtask_id": subtask_id,
-        "success_test": declared_text,
         "proof_command": proof_command,
         "active_subtask": json_ready(first),
         "groups": groups,
@@ -1317,13 +1273,18 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
         return None
     task_id = str(context["task_id"])
     subtask_id = str(context["subtask_id"])
-    success_text = str(context["success_test"])
+    proof_command = str(context["proof_command"])
     groups = context["groups"]
-    exact_groups = _success_test_command_groups(success_text)
+    exact_groups = _success_test_command_groups(proof_command)
 
     rows = _tool_log_rows_for_task(ctx, task_id)
     mutate_cutoff: float | None = None
-    for row in _phase_control_signal_rows_for_task(ctx, task_id, kind="mutate_phase_plan"):
+    for row in rows:
+        if str(row.get("tool") or "") != "mutate_phase_plan":
+            continue
+        ok, _reason = _tool_row_success_status(row)
+        if not ok:
+            continue
         ts = _tool_row_time(row)
         if ts is not None and (mutate_cutoff is None or ts > mutate_cutoff):
             mutate_cutoff = ts
@@ -1349,7 +1310,7 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
         watcher_payload = _tool_row_retry_watcher_payload(
             row,
             subtask_id=subtask_id,
-            success_test=success_text,
+            proof_command=proof_command,
         )
         if watcher_payload:
             watcher_key = str(watcher_payload.get("signal_id") or f"tool:{idx}")
@@ -1445,31 +1406,6 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
             latest_failure_evidence_row = row
             latest_failure_evidence_reason = reason
         failure_events.append((row_time, idx))
-
-    for idx, row in enumerate(
-        _phase_control_signal_rows_for_task(
-            ctx, task_id, kind="request_watcher_review"
-        )
-    ):
-        payload = row.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        if not _valid_retry_watcher_payload(
-            payload,
-            subtask_id=subtask_id,
-            success_test=success_text,
-        ):
-            continue
-        watcher_key = str(row.get("signal_id") or f"signal:{idx}")
-        watcher_review_keys.add(watcher_key)
-        row_time = _tool_row_time(row)
-        if (
-            row_time is None
-            or latest_watcher_time is None
-            or row_time >= latest_watcher_time
-        ):
-            latest_watcher_time = row_time
-            latest_watcher_pos = len(rows) + idx
 
     post_watcher_failures = 0
     if latest_watcher_pos >= 0:
@@ -1596,12 +1532,13 @@ _BAD_GENERATED_SUCCESS_TEST_TEXT_LINT_RE = re.compile(
 class ContractDelta:
     """Typed contract change required before a recovery mutation can be accepted."""
 
+    op: Literal["remove", "replace", "add"]
     path: str
     values: tuple[str, ...] = ()
     replacement: Any | None = None
 
     def to_payload(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"path": self.path}
+        payload: dict[str, Any] = {"op": self.op, "path": self.path}
         if self.values:
             payload["values"] = list(self.values)
         if self.replacement is not None:
@@ -1643,14 +1580,9 @@ class RetryContractIssue:
             payload["contract_path"] = self.contract_path
         if self.invalid_values:
             payload["invalid_values"] = list(self.invalid_values)
-        if self.required_removals:
-            payload["required_removals"] = [
-                delta.to_payload() for delta in self.required_removals
-            ]
-        if self.required_replacements:
-            payload["required_replacements"] = [
-                delta.to_payload() for delta in self.required_replacements
-            ]
+        deltas = [*self.required_removals, *self.required_replacements]
+        if deltas:
+            payload["required_deltas"] = [delta.to_payload() for delta in deltas]
         if self.evidence_refs:
             payload["evidence_refs"] = list(self.evidence_refs)
         if self.failure_hash:
@@ -1666,13 +1598,18 @@ def _contract_delta_from_payload(raw: Any) -> ContractDelta | None:
     path = str(raw.get("path") or "").strip()
     if not path:
         return None
+    op = str(raw.get("op") or "remove").strip()
+    if op not in {"remove", "replace", "add"}:
+        return None
     values = tuple(
         str(item).strip()
         for item in (raw.get("values") or [])
         if str(item).strip()
     ) if isinstance(raw.get("values"), list) else ()
     replacement = raw.get("replacement") if "replacement" in raw else None
-    return ContractDelta(path=path, values=values, replacement=replacement)
+    return ContractDelta(
+        op=op, path=path, values=values, replacement=replacement
+    )
 
 
 def _typed_contract_issues_from_latest_failure(
@@ -1683,6 +1620,11 @@ def _typed_contract_issues_from_latest_failure(
     issues: list[RetryContractIssue] = []
     failure_hash = _retry_failure_hash(latest_failure)
     raw_issues = latest_failure.get("contract_issues")
+    default_evidence_refs = tuple(
+        str(item).strip()
+        for item in (latest_failure.get("evidence_refs") or [])
+        if str(item).strip()
+    ) if isinstance(latest_failure.get("evidence_refs"), list) else ()
     if isinstance(raw_issues, list):
         for raw in raw_issues:
             if not isinstance(raw, dict):
@@ -1693,14 +1635,17 @@ def _typed_contract_issues_from_latest_failure(
             target = str(raw.get("target_subtask_id") or subtask_id).strip()
             if not target:
                 continue
+            raw_deltas = raw.get("required_deltas")
+            if not isinstance(raw_deltas, list):
+                raw_deltas = raw.get("required_removals")
             removals = tuple(
                 delta
                 for delta in (
                     _contract_delta_from_payload(item)
-                    for item in (raw.get("required_removals") or [])
+                    for item in (raw_deltas or [])
                 )
                 if delta is not None
-            ) if isinstance(raw.get("required_removals"), list) else ()
+            ) if isinstance(raw_deltas, list) else ()
             invalid_values = tuple(
                 str(item).strip()
                 for item in (
@@ -1716,6 +1661,7 @@ def _typed_contract_issues_from_latest_failure(
             if invalid_values and not removals:
                 removals = (
                     ContractDelta(
+                        op="remove",
                         path=str(raw.get("contract_path") or "proof.required_properties"),
                         values=invalid_values,
                     ),
@@ -1738,7 +1684,7 @@ def _typed_contract_issues_from_latest_failure(
                         str(item).strip()
                         for item in (raw.get("evidence_refs") or [])
                         if str(item).strip()
-                    ) if isinstance(raw.get("evidence_refs"), list) else (),
+                    ) if isinstance(raw.get("evidence_refs"), list) else default_evidence_refs,
                     failure_hash=str(raw.get("failure_hash") or failure_hash),
                     evidence=str(raw.get("evidence") or "").strip(),
                 )
@@ -1749,18 +1695,22 @@ def _typed_contract_issues_from_latest_failure(
         for item in (latest_failure.get("invalid_required_properties") or [])
         if str(item).strip()
     ) if isinstance(latest_failure.get("invalid_required_properties"), list) else ()
+    raw_deltas = latest_failure.get("required_deltas")
+    if not isinstance(raw_deltas, list):
+        raw_deltas = latest_failure.get("required_removals")
     required_removals = tuple(
         delta
         for delta in (
             _contract_delta_from_payload(item)
-            for item in (latest_failure.get("required_removals") or [])
+            for item in (raw_deltas or [])
         )
         if delta is not None
-    ) if isinstance(latest_failure.get("required_removals"), list) else ()
+    ) if isinstance(raw_deltas, list) else ()
     if invalid_required_properties or required_removals:
         if invalid_required_properties and not required_removals:
             required_removals = (
                 ContractDelta(
+                    op="remove",
                     path="proof.required_properties",
                     values=invalid_required_properties,
                 ),
@@ -1777,6 +1727,75 @@ def _typed_contract_issues_from_latest_failure(
             )
         )
     return issues
+
+
+def _normalise_requested_contract_issues(
+    raw_issues: Any,
+    *,
+    subtask_id: str,
+    latest_failure: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(raw_issues, list):
+        return []
+    default_evidence_refs = [
+        str(item).strip()
+        for item in (latest_failure.get("evidence_refs") or [])
+        if str(item).strip()
+    ] if isinstance(latest_failure.get("evidence_refs"), list) else []
+    normalised: list[dict[str, Any]] = []
+    for raw in raw_issues:
+        if not isinstance(raw, dict):
+            continue
+        code = str(raw.get("code") or "").strip()
+        if code not in {"bad_generated_oracle", "plan_contract_issue"}:
+            continue
+        target = str(raw.get("target_subtask_id") or subtask_id).strip()
+        contract_path = str(raw.get("contract_path") or "").strip()
+        invalid_values = [
+            str(item).strip()
+            for item in (raw.get("invalid_values") or [])
+            if str(item).strip()
+        ] if isinstance(raw.get("invalid_values"), list) else []
+        deltas = [
+            delta.to_payload()
+            for delta in (
+                _contract_delta_from_payload(item)
+                for item in (raw.get("required_deltas") or [])
+            )
+            if delta is not None
+        ] if isinstance(raw.get("required_deltas"), list) else []
+        if not contract_path and deltas:
+            contract_path = str(deltas[0].get("path") or "").strip()
+        if not contract_path:
+            continue
+        if not deltas and invalid_values:
+            deltas = [
+                {
+                    "op": "remove",
+                    "path": contract_path,
+                    "values": invalid_values,
+                }
+            ]
+        if not deltas and not invalid_values:
+            continue
+        evidence_refs = [
+            str(item).strip()
+            for item in (raw.get("evidence_refs") or [])
+            if str(item).strip()
+        ] if isinstance(raw.get("evidence_refs"), list) else default_evidence_refs
+        item = {
+            "code": code,
+            "target_subtask_id": target,
+            "contract_path": contract_path,
+            "invalid_values": invalid_values,
+            "required_deltas": deltas,
+            "evidence_refs": evidence_refs,
+        }
+        evidence = str(raw.get("evidence") or "").strip()
+        if evidence:
+            item["evidence"] = evidence
+        normalised.append(item)
+    return normalised
 
 
 def _bad_generated_success_test_text_lints(
@@ -1796,28 +1815,25 @@ def _bad_generated_success_test_text_lints(
         return []
     return [
         {
-            "code": "possible_bad_generated_oracle_text",
-            "confidence": "low",
-            "source": "text_lint",
-            "message": (
-                "Free-text evidence resembles a bad generated oracle, but route "
-                "requires a typed contract issue with required_removals."
-            ),
-        }
+                "code": "possible_bad_generated_oracle_text",
+                "confidence": "low",
+                "source": "text_lint",
+                "message": (
+                    "Free-text evidence resembles a bad generated oracle, but route "
+                    "requires a typed contract issue with required_deltas."
+                ),
+            }
     ]
 
 
-def _bad_generated_success_test_contract_payload(
+def _plan_revision_patch_from_typed_contract_issues(
     *,
-    success_test: str,
+    proof_command: str,
     subtask_id: str,
     latest_failure: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Build a plan-contract recovery payload from typed oracle issues only."""
 
-    files = _retry_success_test_target_files(success_test)
-    if not files:
-        return None
     issues = _typed_contract_issues_from_latest_failure(
         subtask_id=subtask_id,
         latest_failure=latest_failure,
@@ -1825,57 +1841,59 @@ def _bad_generated_success_test_contract_payload(
     if not issues:
         return None
     primary = issues[0]
-    payload = {
-        "verdict": "bad_generated_success_test_contract",
-        "target_files": files,
+    required_deltas: list[dict[str, Any]] = []
+    for issue in issues:
+        for delta in issue.required_removals:
+            delta_payload = delta.to_payload()
+            if delta_payload not in required_deltas:
+                required_deltas.append(delta_payload)
+    if not required_deltas:
+        return None
+    evidence_refs: list[str] = []
+    for issue in issues:
+        for ref in issue.evidence_refs:
+            if ref and ref not in evidence_refs:
+                evidence_refs.append(ref)
+    files = _retry_success_test_target_files(proof_command)
+    payload: dict[str, Any] = {
+        "target_subtask_id": primary.target_subtask_id or subtask_id,
+        "reason_code": primary.code,
+        "contract_path": primary.contract_path,
+        "invalid_values": list(primary.invalid_values),
+        "required_deltas": required_deltas,
+        "evidence_refs": evidence_refs,
         "evidence": primary.evidence or _short_retry_excerpt(
             latest_failure.get("output_excerpt") or latest_failure.get("reason") or ""
         ),
         "contract_issues": [issue.to_payload() for issue in issues],
+        "proof_command": proof_command,
+        "failure_hash": _retry_failure_hash(latest_failure),
     }
-    if primary.invalid_values:
-        payload["invalid_required_properties"] = list(primary.invalid_values)
-    if primary.required_removals:
-        payload["required_removals"] = [
-            delta.to_payload() for delta in primary.required_removals
-        ]
+    if files:
+        payload["target_files"] = files
     return payload
 
 
-def _contract_migration_retry_recommendation(contract_payload: dict[str, Any]) -> str:
-    files = contract_payload.get("target_files") or []
+def _plan_revision_retry_recommendation(revision_patch: dict[str, Any]) -> str:
+    files = revision_patch.get("target_files") or []
     if isinstance(files, str):
         files = [files]
     file_list = ", ".join(str(file_path) for file_path in files if str(file_path))
     target = f" for {file_list}" if file_list else ""
-    subtask_id = str(contract_payload.get("target_subtask_id") or "").strip()
+    subtask_id = str(revision_patch.get("target_subtask_id") or "").strip()
     selector = (
         f'target_subtask_id="{subtask_id}", '
         if subtask_id
         else ""
     )
-    has_typed_delta = bool(contract_payload.get("required_removals")) or bool(
-        contract_payload.get("invalid_required_properties")
-    )
-    mutation_instruction = (
-        "\"contract_migration_reason\": \"...\", "
-        "\"contract_migration_files\": [...], "
-        "\"plan_mutation_ticket\": {\"required_removals\": [...]}"
-        if has_typed_delta
-        else (
-            "\"contract_migration_reason\": \"...\", "
-            "\"contract_migration_files\": [...], "
-            "\"proof\": { ... revised proof/test/oracle contract ... }"
-        )
-    )
     return (
-        "Watcher classified the latest failure as a plan contract issue in the "
-        f"generated test/proof oracle{target}. Route to `plan` and record the "
-        "contract migration before editing the declared success-test file. "
-        "Use "
+        "Watcher recorded a typed ContractIssue for the generated proof oracle"
+        f"{target}. Route to `plan` and revise the subtask proof contract with "
+        "a semantic proof patch that satisfies every required_delta. Use "
         f"`mutate_phase_plan({selector}patch={{"
-        f"{mutation_instruction}}})`; keep the migration minimal "
-        "and preserve the intended behavior."
+        "\"required_deltas\": [...], "
+        "\"proof\": { ... revised typed proof contract ... }"
+        "})`; metadata or notes alone will be rejected."
     )
 
 
@@ -1899,7 +1917,7 @@ class RecoveryDecision:
     ] = "execute"
     issues: list[dict[str, Any]] = field(default_factory=list)
     required_plan_changes: list[dict[str, Any]] = field(default_factory=list)
-    plan_mutation_ticket: dict[str, Any] | None = None
+    plan_revision_patch: dict[str, Any] | None = None
     allowed_next_actions: list[str] = field(default_factory=list)
     forbidden_next_actions: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
@@ -1922,8 +1940,8 @@ def _recovery_decision_payload(decision: RecoveryDecision) -> dict[str, Any]:
         "evidence_refs": decision.evidence_refs,
         "freshness_refs": decision.freshness_refs,
     }
-    if decision.plan_mutation_ticket:
-        payload["plan_mutation_ticket"] = decision.plan_mutation_ticket
+    if decision.plan_revision_patch:
+        payload["plan_revision_patch"] = decision.plan_revision_patch
     if decision.evidence:
         payload["evidence"] = decision.evidence
     return payload
@@ -1935,129 +1953,93 @@ def _retry_failure_hash(latest_failure: dict[str, Any]) -> str:
     return hash_value({"latest_failure": latest_failure})[:16]
 
 
-def _materialize_contract_migration_payload(
-    state: dict[str, Any],
-    contract_migration_payload: dict[str, Any],
-) -> dict[str, Any]:
-    payload = dict(contract_migration_payload)
-    payload.setdefault(
-        "contract_migration_id",
-        hash_value(
-            {
-                "subtask_id": state.get("subtask_id") or "",
-                "success_test": state.get("success_test") or "",
-                "target_files": payload.get("target_files") or [],
-                "evidence": payload.get("evidence") or "",
-            }
-        )[:16],
-    )
-    payload.setdefault("target_subtask_id", str(state.get("subtask_id") or ""))
-    return payload
-
-
 def _plan_contract_revision_decision(
     *,
     subtask_id: str,
-    success_test: str,
+    proof_command: str,
     latest_failure: dict[str, Any],
-    contract_migration_payload: dict[str, Any],
+    plan_revision_patch: dict[str, Any],
 ) -> RecoveryDecision:
-    files = contract_migration_payload.get("target_files") or []
+    patch = dict(plan_revision_patch)
+    files = patch.get("target_files") or []
     if isinstance(files, str):
         files = [files]
-    target = str(
-        contract_migration_payload.get("target_subtask_id") or subtask_id
-    ).strip()
-    evidence = str(contract_migration_payload.get("evidence") or "").strip()
+    target = str(patch.get("target_subtask_id") or subtask_id).strip()
+    evidence = str(patch.get("evidence") or "").strip()
     failure_hash = _retry_failure_hash(latest_failure)
-    ticket = {
-        "ticket_id": str(contract_migration_payload.get("contract_migration_id") or ""),
-        "kind": "plan_contract_revision",
-        "target_subtask_id": target,
-        "success_test": success_test,
-        "contract_migration_id": str(
-            contract_migration_payload.get("contract_migration_id") or ""
-        ),
-        "contract_migration_files": [
-            str(file_path) for file_path in files if str(file_path).strip()
-        ],
-        "failure_hash": failure_hash,
-    }
-    invalid_required_properties = []
-    if isinstance(contract_migration_payload.get("invalid_required_properties"), list):
-        invalid_required_properties = [
-            str(item).strip()
-            for item in contract_migration_payload.get(
-                "invalid_required_properties", []
-            )
-            if str(item).strip()
-        ]
-    required_removals = contract_migration_payload.get("required_removals")
-    if invalid_required_properties:
-        ticket["invalid_required_properties"] = invalid_required_properties
-    if isinstance(required_removals, list):
-        ticket["required_removals"] = required_removals
-    elif invalid_required_properties:
-        ticket["required_removals"] = [
+    patch["target_subtask_id"] = target
+    patch["reason_code"] = str(patch.get("reason_code") or "bad_generated_oracle")
+    patch["failure_hash"] = failure_hash
+    patch["proof_command"] = proof_command
+    patch.setdefault(
+        "revision_id",
+        hash_value(
             {
-                "path": "proof.required_properties",
-                "values": invalid_required_properties,
+                "kind": "plan_contract_revision",
+                "target_subtask_id": target,
+                "proof_command": proof_command,
+                "failure_hash": failure_hash,
+                "required_deltas": patch.get("required_deltas") or [],
+            }
+        )[:16],
+    )
+    if evidence:
+        patch["evidence"] = evidence
+    raw_issues = patch.get("contract_issues")
+    issues = (
+        [json_ready(item) for item in raw_issues if isinstance(item, dict)]
+        if isinstance(raw_issues, list)
+        else []
+    )
+    if not issues:
+        issues = [
+            {
+                "code": patch["reason_code"],
+                "severity": "blocking",
+                "target_subtask_id": target,
+                "contract_path": str(patch.get("contract_path") or ""),
+                "invalid_values": json_ready(patch.get("invalid_values") or []),
+                "required_deltas": json_ready(patch.get("required_deltas") or []),
+                "evidence_refs": json_ready(patch.get("evidence_refs") or []),
             }
         ]
-    has_typed_delta = bool(ticket.get("required_removals"))
-    if evidence:
-        ticket["evidence"] = evidence
-    issue = {
-        "code": "plan_contract_issue",
-        "severity": "blocking",
-        "target": target,
-        "message": (
-            "Generated test/proof oracle appears inconsistent with the accepted "
-            "plan or task contract; revise the subtask contract in plan before "
-            "another execute repair."
-        ),
-        "evidence_refs": [],
-    }
-    if evidence:
-        issue["evidence"] = evidence
     required_change = {
         "target_subtask_id": target,
-        "change": (
-            "Revise the generated test/proof/oracle contract before continuing "
-            "execute."
-        ),
-        "contract_migration_files": ticket["contract_migration_files"],
-        "evidence_refs": [],
+        "reason_code": patch["reason_code"],
+        "contract_path": str(patch.get("contract_path") or ""),
+        "invalid_values": json_ready(patch.get("invalid_values") or []),
+        "required_deltas": json_ready(patch.get("required_deltas") or []),
+        "evidence_refs": json_ready(patch.get("evidence_refs") or []),
     }
     return RecoveryDecision(
         decision_id=hash_value(
             {
                 "kind": "plan_contract_revision",
                 "subtask_id": target,
-                "success_test": success_test,
+                "proof_command": proof_command,
                 "failure_hash": failure_hash,
-                "ticket": ticket,
+                "revision_patch": patch,
             }
         )[:16],
         kind="plan_contract_revision",
-        trigger_code="bad_generated_success_test_contract",
+        trigger_code=patch["reason_code"],
         active_subtask_id=target,
         failure_hash=failure_hash,
         loop_back_target="plan",
-        issues=[issue],
+        issues=issues,
         required_plan_changes=[required_change],
-        plan_mutation_ticket=ticket if has_typed_delta else None,
+        plan_revision_patch=json_ready(patch),
         allowed_next_actions=[
             "route to plan contract revision",
             (
-                "call mutate_phase_plan only after deriving a typed "
-                "required_removals/revised proof contract delta"
+                "call mutate_phase_plan with a semantic typed proof patch "
+                "that satisfies every required_delta"
             ),
             "rerun run_subtask_proof after the plan mutation",
         ],
         forbidden_next_actions=[
-            "direct test-file edits before mutate_phase_plan records the migration",
-            "mark_subtask_complete without a fresh post-migration proof",
+            "direct test-file edits before mutate_phase_plan records the proof patch",
+            "mark_subtask_complete without a fresh proof after contract revision",
         ],
         evidence=evidence,
     )
@@ -2117,8 +2099,8 @@ def _retry_watcher_verdict_payload(
             "allowed_next_actions": decision.allowed_next_actions,
             "forbidden_next_actions": decision.forbidden_next_actions,
         }
-        if decision.plan_mutation_ticket:
-            payload["plan_mutation_ticket"] = decision.plan_mutation_ticket
+        if decision.plan_revision_patch:
+            payload["plan_revision_patch"] = decision.plan_revision_patch
         return payload
     if status != "review_recorded":
         return {
@@ -2247,7 +2229,10 @@ def _recent_patch_hunk_mismatch_guidance(ctx: ToolContext, task_id: str) -> str:
 
 
 def _phase_subtask_retry_watcher_review_payload(
-    ctx: ToolContext, *, reason: str
+    ctx: ToolContext,
+    *,
+    reason: str,
+    contract_issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     state = _phase_subtask_retry_state(ctx)
     base: dict[str, Any] = {
@@ -2309,6 +2294,18 @@ def _phase_subtask_retry_watcher_review_payload(
             ),
             "output_excerpt": _short_retry_excerpt(output_excerpt_source),
         }
+        evidence_refs: list[str] = []
+        for ref_key in ("proof_ref", "ledger_ref"):
+            ref = payload.get(ref_key)
+            if not isinstance(ref, dict):
+                continue
+            ref_id = str(ref.get("ref_id") or "").strip()
+            if not ref_id:
+                continue
+            ref_type = str(ref.get("ref_type") or ref_key).strip() or ref_key
+            evidence_refs.append(f"{ref_type}:{ref_id}")
+        if evidence_refs:
+            latest_failure["evidence_refs"] = evidence_refs
         for key in (
             "contract_issues",
             "invalid_required_properties",
@@ -2316,12 +2313,19 @@ def _phase_subtask_retry_watcher_review_payload(
         ):
             if isinstance(payload.get(key), list):
                 latest_failure[key] = payload.get(key)
+    requested_contract_issues = _normalise_requested_contract_issues(
+        contract_issues,
+        subtask_id=str(state.get("subtask_id") or ""),
+        latest_failure=latest_failure,
+    )
+    if requested_contract_issues:
+        latest_failure["contract_issues"] = requested_contract_issues
 
     has_latest_failure = bool(latest_failure)
     subtask_id = str(state.get("subtask_id") or "")
-    success_test = str(state.get("success_test") or "")
-    contract_migration_payload = _bad_generated_success_test_contract_payload(
-        success_test=success_test,
+    proof_command = str(state.get("proof_command") or "")
+    plan_revision_patch = _plan_revision_patch_from_typed_contract_issues(
+        proof_command=proof_command,
         subtask_id=subtask_id,
         latest_failure=latest_failure,
     )
@@ -2329,16 +2333,13 @@ def _phase_subtask_retry_watcher_review_payload(
         reason=str(reason or ""),
         latest_failure=latest_failure,
     )
-    if contract_migration_payload:
-        contract_migration_payload = _materialize_contract_migration_payload(
-            state, contract_migration_payload
-        )
+    if plan_revision_patch:
         status = "review_recorded"
         decision = _plan_contract_revision_decision(
             subtask_id=subtask_id,
-            success_test=success_test,
+            proof_command=proof_command,
             latest_failure=latest_failure,
-            contract_migration_payload=contract_migration_payload,
+            plan_revision_patch=plan_revision_patch,
         )
     else:
         status = (
@@ -2363,8 +2364,7 @@ def _phase_subtask_retry_watcher_review_payload(
         **base,
         "status": status,
         "subtask_id": subtask_id,
-        "success_test": success_test,
-        "proof_command": str(state.get("proof_command") or ""),
+        "proof_command": proof_command,
         "required_context_reads": required_context_reads,
         "failed_attempts": failed_attempts,
         "prior_watcher_reviews": watcher_reviews,
@@ -2377,10 +2377,10 @@ def _phase_subtask_retry_watcher_review_payload(
             patch_guidance=patch_guidance,
         ),
     }
-    if contract_migration_payload:
-        review["contract_migration"] = contract_migration_payload
-        review["recommendation"] = _contract_migration_retry_recommendation(
-            contract_migration_payload
+    if plan_revision_patch:
+        review["plan_revision_patch"] = plan_revision_patch
+        review["recommendation"] = _plan_revision_retry_recommendation(
+            plan_revision_patch
         )
     review.update(
         _retry_watcher_verdict_payload(
@@ -2454,13 +2454,13 @@ def _phase_subtask_retry_watcher_review_payload(
 def _phase_subtask_retry_escalation_block(
     ctx: ToolContext, *, tool_name: str
 ) -> dict[str, Any] | None:
-    """Require watcher review after repeated declared success-test failures."""
+    """Require watcher review after repeated typed proof failures."""
 
     state = _phase_subtask_retry_state(ctx)
     if not state:
         return None
     subtask_id = str(state.get("subtask_id") or "")
-    success_text = str(state.get("success_test") or "")
+    proof_command = str(state.get("proof_command") or "")
     required_context_reads = list(state.get("required_context_reads") or [])[:20]
     failures = int(state.get("failures") or 0)
     if failures < _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD:
@@ -2483,15 +2483,14 @@ def _phase_subtask_retry_escalation_block(
                 "If you need source context, use `read_file` or `repo_read` "
                 "(not shell/grep/python -c). Then apply one focused "
                 "implementation repair with `apply_workspace_patch` or "
-                "`replace_workspace_file` before rerunning the declared "
-                "success_test."
+                "`replace_workspace_file` before rerunning the declared proof."
             )
             if (
                 failures >= _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD + 2
                 or int(state.get("watcher_reviews") or 0) >= 2
             ):
                 next_step = (
-                    "Do not rerun the declared success_test yet. First read the "
+                    "Do not rerun the declared proof yet. First read the "
                     "full failing test and related source files with `read_file` "
                     "or `repo_read` (not shell/grep/python -c), audit the "
                     "schema/API/field contract end-to-end, then apply one "
@@ -2503,7 +2502,7 @@ def _phase_subtask_retry_escalation_block(
                 "reason": "phase_subtask_repair_required_after_watcher",
                 "tool": tool_name,
                 "subtask_id": subtask_id,
-                "success_test": success_text,
+                "proof_command": proof_command,
                 "required_context_reads": required_context_reads,
                 "failed_attempts": failures,
                 "threshold": _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD,
@@ -2549,7 +2548,7 @@ def _phase_subtask_retry_escalation_block(
                 "reason": "phase_subtask_repair_required_after_watcher",
                 "tool": tool_name,
                 "subtask_id": subtask_id,
-                "success_test": success_text,
+                "proof_command": proof_command,
                 "required_context_reads": required_context_reads,
                 "failed_attempts": failures,
                 "post_watcher_failed_attempts": post_watcher_failures,
@@ -2557,9 +2556,9 @@ def _phase_subtask_retry_escalation_block(
                 "prior_watcher_reviews": int(state.get("watcher_reviews") or 0),
                 "message": (
                     f"The current execute subtask `{subtask_id}` has a new "
-                    "declared success_test failure after the latest watcher "
+                    "declared proof failure after the latest watcher "
                     "review. Apply a focused repair before rerunning the same "
-                    "success_test."
+                    "proof."
                 ),
                 "allowed_context_tools": ["read_file", "repo_read", "list_files", "repo_list"],
                 "forbidden_until_repair": [
@@ -2573,7 +2572,7 @@ def _phase_subtask_retry_escalation_block(
                     "(not shell/grep/python -c). Then apply one focused "
                     "implementation repair with `apply_workspace_patch` or "
                     "`replace_workspace_file`, then rerun the declared "
-                    "success_test. A new watcher review is "
+                    "proof. A new watcher review is "
                     "only required if several post-watcher repair/test cycles "
                     "keep failing."
                 ),
@@ -2584,14 +2583,14 @@ def _phase_subtask_retry_escalation_block(
         "reason": "phase_subtask_retry_escalation_required",
         "tool": tool_name,
         "subtask_id": subtask_id,
-        "success_test": success_text,
+        "proof_command": proof_command,
         "required_context_reads": required_context_reads,
         "failed_attempts": failures,
         "post_watcher_failed_attempts": post_watcher_failures,
         "threshold": _PHASE_SUBTASK_RETRY_ESCALATION_THRESHOLD,
         "message": (
             f"The current execute subtask `{subtask_id}` has repeated failed "
-            "runs of its declared success_test without a fresh Umbrella "
+            "runs of its declared proof without a fresh Umbrella "
             "watcher review record for those failures."
         ),
         "next_step": (
@@ -2673,7 +2672,6 @@ __all__ = [
     '_supported_llm_alias_memory_claim_issue',
     '_completion_llm_memory_claim_issue',
     '_tool_row_retry_watcher_payload',
-    '_phase_control_signal_rows_for_task',
     '_phase_subtask_retry_context',
     '_phase_subtask_retry_state',
     '_phase_subtask_retry_watcher_review_payload',
