@@ -444,6 +444,29 @@ def _merge_phase_plan_proof_patch(
         copy.deepcopy(existing) if isinstance(existing, dict) else {}
     )
     for key, value in patch.items():
+        if key in {"remove_required_properties", "add_required_properties"}:
+            property_target = (
+                merged.setdefault("oracle", {})
+                if isinstance(merged.get("oracle"), dict)
+                or "oracle" in merged
+                else merged
+            )
+            if not isinstance(property_target, dict):
+                property_target = merged
+            current = _phase_plan_string_items(
+                property_target.get("required_properties")
+            )
+            if key == "remove_required_properties":
+                remove_set = set(_phase_plan_string_items(value))
+                property_target["required_properties"] = [
+                    item for item in current if item not in remove_set
+                ]
+            else:
+                property_target["required_properties"] = _merge_phase_plan_string_list(
+                    current,
+                    value,
+                )
+            continue
         if (
             isinstance(value, dict)
             and isinstance(merged.get(key), dict)
@@ -461,6 +484,44 @@ def _merge_phase_plan_proof_patch(
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+_PHASE_PLAN_SEMANTIC_CONTRACT_KEYS = frozenset(
+    {
+        "success_test",
+        "proof",
+        "proof_contract",
+        "generated_test_contract",
+        "files_under_test",
+        "test_oracle",
+        "acceptance_criteria",
+    }
+)
+
+
+def _contract_migration_declared(item: dict[str, Any]) -> bool:
+    return bool(
+        _contract_migration_reason_from_patch(item)
+        or _contract_migration_files_from_patch(item)
+        or str(item.get("contract_migration_id") or "").strip()
+        or str(item.get("contract_migration_token") or "").strip()
+    )
+
+
+def _contract_migration_has_semantic_patch(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if any(key in item for key in _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS):
+        return True
+    list_patch_ops = _phase_plan_list_patch_key_ops()
+    for key, (base, _op) in list_patch_ops.items():
+        if key in item and base in _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS:
+            return True
+    proof = item.get("proof")
+    if isinstance(proof, dict) and proof:
+        return True
+    proof_contract = item.get("proof_contract")
+    return isinstance(proof_contract, dict) and bool(proof_contract)
 
 
 def _legacy_phase_subtask_materialization_issue(
@@ -514,9 +575,21 @@ def _apply_phase_plan_subtask_patch(
         if subtask_id in seen_ids:
             return [], f"duplicate patch.subtasks entry for subtask '{subtask_id}'"
         seen_ids.add(subtask_id)
+        if "proof_contract" in item and "proof" not in item:
+            item = {**item, "proof": item["proof_contract"]}
+            item.pop("proof_contract", None)
         target = by_id.get(subtask_id)
         if target is None:
             return [], f"subtask '{subtask_id}' not found in execute phase"
+        if (
+            _contract_migration_declared(item)
+            and not _contract_migration_has_semantic_patch(item)
+        ):
+            return [], (
+                "contract migration must change proof/test/oracle contract; "
+                "metadata-only contract_migration_reason/files patches are "
+                "not accepted."
+            )
         requested_status = str(item.get("status") or "").strip().lower()
         if requested_status in {"done", "ok", "complete", "completed"}:
             contract_payload = item.get("completion_contract")
@@ -682,9 +755,11 @@ def _mutate_phase_plan(
                     "ERROR: top-level contract migration patch resolved an "
                     "active subtask without id; use patch.subtasks[{id,...}]."
                 )
-            patch["subtasks"] = [
-                {"id": subtask_id, **top_level_contract_migration}
-            ]
+            patch = {
+                "subtasks": [
+                    {"id": subtask_id, **top_level_contract_migration, **patch}
+                ]
+            }
     applied: list[str] = []
     unsupported: list[str] = []
     for k, v in patch.items():

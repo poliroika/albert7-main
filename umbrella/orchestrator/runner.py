@@ -139,7 +139,44 @@ class PhaseRunner:
     def _stop_requested(self) -> bool:
         """Check the canonical stop-file location."""
         stop_path = self._drive_root / "state" / "stop_requested.json"
-        return stop_path.exists()
+        if not stop_path.exists():
+            return False
+        try:
+            payload = json.loads(
+                stop_path.read_text(encoding="utf-8", errors="replace")
+            )
+        except Exception:
+            return True
+        if (
+            isinstance(payload, dict)
+            and payload.get("internal_recovery_route") is True
+            and str(payload.get("task_id") or "").strip()
+        ):
+            return False
+        return True
+
+    def _write_task_scoped_stop_request(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        reason: str,
+    ) -> None:
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            return
+        state = self._drive_root / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "reason": reason,
+            "task_id": task_id,
+            "run_id": run_id,
+            "internal_recovery_route": True,
+            "created_at": time.time(),
+        }
+        tmp = (state / "stop_requested.json").with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, state / "stop_requested.json")
 
     def _clear_pending_phase_signal(self) -> None:
         try:
@@ -530,6 +567,15 @@ class PhaseRunner:
                     or (payload or {}).get("operator_reason")
                     or ""
                 ).strip()
+                decision = payload.get("recovery_decision")
+                decision_payload = (
+                    json_ready(decision) if isinstance(decision, dict) else {}
+                )
+                ticket_payload = (
+                    json_ready(decision.get("plan_mutation_ticket") or {})
+                    if isinstance(decision, dict)
+                    else {}
+                )
                 return {
                     "source_phase": phase_node.id,
                     "source_task_id": task_id,
@@ -542,6 +588,8 @@ class PhaseRunner:
                     "issues": issues,
                     "revisions": [],
                     "required_plan_changes": required_plan_changes,
+                    "recovery_decision": decision_payload,
+                    "plan_mutation_ticket": ticket_payload,
                     "notes": notes,
                 }
             if kind != "submit_micro_review":
@@ -589,6 +637,91 @@ class PhaseRunner:
                 "notes": notes,
             }
         return {}
+
+    def _latest_recovery_route_decision(
+        self,
+        *,
+        task_id: str,
+        phase_started_at: float | None,
+    ) -> dict[str, Any]:
+        rows = self._read_phase_control_records(
+            task_id=task_id,
+            phase_started_at=phase_started_at,
+        )
+        for row in reversed(rows):
+            if str(row.get("kind") or "") != "request_watcher_review":
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if str(payload.get("status") or "").strip() != "review_recorded":
+                continue
+            decision = payload.get("recovery_decision")
+            if not isinstance(decision, dict):
+                continue
+            if str(decision.get("kind") or "").strip() != "plan_contract_revision":
+                continue
+            loop_target = str(
+                decision.get("loop_back_target")
+                or payload.get("loop_back_target")
+                or ""
+            ).strip()
+            if loop_target != "plan":
+                continue
+            return {
+                "signal_id": str(row.get("signal_id") or "").strip(),
+                "payload": json_ready(payload),
+                "recovery_decision": json_ready(decision),
+                "loop_back_target": loop_target,
+            }
+        return {}
+
+    def _apply_recovery_route_overlay(
+        self,
+        *,
+        target: PhaseNode | None,
+        route_decision: dict[str, Any],
+    ) -> None:
+        if target is None or not route_decision:
+            return
+        payload = route_decision.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        decision = route_decision.get("recovery_decision")
+        if not isinstance(decision, dict):
+            decision = {}
+        overlay = dict(target.overlay or {})
+        overlay["recovery_decision"] = decision
+        overlay["required_next_actions"] = [
+            "revise the phase plan/test/proof contract",
+            "submit the revised phase plan",
+            "do not continue execute under the stale proof contract",
+        ]
+        revision_contract = {
+            "source_phase": "execute",
+            "source_task_id": "",
+            "review_source": "request_watcher_review",
+            "review_artifact_ref": str(route_decision.get("signal_id") or ""),
+            "verdict": str(payload.get("verdict") or "bad_test_contract"),
+            "loop_back_target": "plan",
+            "issues": json_ready(payload.get("issues") or []),
+            "revisions": [],
+            "required_plan_changes": json_ready(
+                payload.get("required_plan_changes") or []
+            ),
+            "recovery_decision": decision,
+            "plan_mutation_ticket": json_ready(
+                decision.get("plan_mutation_ticket") or {}
+            ),
+            "notes": str(
+                payload.get("recommendation")
+                or payload.get("operator_reason")
+                or ""
+            ).strip(),
+        }
+        overlay["revision_contract"] = self._merged_revision_contract(
+            overlay.get("revision_contract"),
+            revision_contract,
+        )
+        target.overlay = overlay
 
     @staticmethod
     def _merged_revision_contract(
@@ -2779,6 +2912,37 @@ class PhaseRunner:
         if manifest.id == "execute":
             self._clear_stale_execute_retry_overlay(phase_node)
 
+        if outcome.get("status") == "recovery_route":
+            route_decision = (
+                outcome.get("route_decision")
+                if isinstance(outcome.get("route_decision"), dict)
+                else {}
+            )
+            loop_back_target = str(
+                outcome.get("loop_back_target")
+                or route_decision.get("loop_back_target")
+                or "plan"
+            ).strip()
+            if loop_back_target and plan.get_node(loop_back_target) is not None:
+                result, envelope = self._finish_phase_loop_back(
+                    phase_node=phase_node,
+                    plan=plan,
+                    run_id=run_id,
+                    outcome=outcome,
+                    loop_back_target=loop_back_target,
+                    retry_reason=str(
+                        outcome.get("retry_reason")
+                        or "recovery:plan_contract_revision"
+                    ),
+                )
+                self._apply_recovery_route_overlay(
+                    target=plan.get_node(loop_back_target),
+                    route_decision=route_decision,
+                )
+                save_plan(plan, self._drive_root)
+                yield envelope
+                return result
+
         pending_signal = self._watcher.read_pending_signal()
         if (
             pending_signal is not None
@@ -3186,6 +3350,27 @@ class PhaseRunner:
                         "task_id": task.get("id"),
                         "watcher_signal": pending.kind,
                         "watcher_signal_id": pending.signal_id,
+                    }
+                route_decision = self._latest_recovery_route_decision(
+                    task_id=str(task.get("id") or ""),
+                    phase_started_at=phase_started_at,
+                )
+                if route_decision:
+                    self._write_task_scoped_stop_request(
+                        task_id=str(task.get("id") or ""),
+                        run_id=run_id,
+                        reason="recovery:plan_contract_revision",
+                    )
+                    return {
+                        "status": "recovery_route",
+                        "task_id": task.get("id"),
+                        "loop_back_target": route_decision.get("loop_back_target")
+                        or "plan",
+                        "retry_reason": (
+                            "recovery:plan_contract_revision: "
+                            "bad generated test/proof contract"
+                        ),
+                        "route_decision": route_decision,
                     }
         except Exception as exc:
             log.error("Phase %s launcher invocation failed", phase_node.id, exc_info=True)

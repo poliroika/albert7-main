@@ -1,3 +1,1 @@
-"""
-Calculator test suite.
-"""
+"""Test suite for calculator."""
