@@ -674,6 +674,19 @@ def validate_review_contract(review: ReviewContract, *, phase: str = "") -> list
     issues: list[ContractIssue] = []
     if review.verdict not in {"ok", "revise", "abort"}:
         issues.append(_issue("invalid_review_verdict", "Review verdict must be ok/revise/abort.", phase=phase))
+    loop_target = str(review.loop_back_target or "").strip().split(":", 1)[0]
+    if phase == "subtask_review" and loop_target == "plan":
+        issues.append(
+            _issue(
+                "invalid_review_loop_back_target",
+                (
+                    "subtask_review may request implementation revision in execute; "
+                    "plan revisions require a typed control-plane "
+                    "RecoveryDecision/PlanRevisionPatch."
+                ),
+                phase=phase,
+            )
+        )
     if phase in _REVIEW_PHASES_REQUIRE_COVERAGE:
         if review.coverage is None or not review.coverage.is_complete():
             issues.append(

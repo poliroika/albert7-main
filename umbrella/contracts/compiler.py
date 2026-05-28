@@ -146,14 +146,18 @@ class ContractCompiler:
             bool(required & _LLM_RISK_CAPABILITIES)
             for required in required_capability_sets
         )
+        uses_network = any("network" in required for required in required_capability_sets)
+        uses_browser_ui = any(
+            "browser_ui" in required for required in required_capability_sets
+        )
         return TaskRiskProfile(
             code_changed=code_changed,
             tests_changed=tests_changed,
-            external_api=bool(caps.get("network") or caps.get("external_api")),
+            external_api=bool(caps.get("external_api") or uses_network),
             llm_or_prompt_logic=bool(llm_caps),
             web_or_http_runtime=bool(
-                caps.get("network")
-                or {"http_boot", "behavioral_http"} & kinds
+                {"http_boot", "behavioral_http"} & kinds
+                or uses_browser_ui
             ),
             high_stub_risk=bool(
                 {"mutation_smoke", "input_sensitivity", "metamorphic"} & kinds

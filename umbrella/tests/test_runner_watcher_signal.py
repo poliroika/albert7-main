@@ -10,6 +10,73 @@ from umbrella.phases.base import WatcherSignal
 from umbrella.utils.result_envelope import ErrorCode
 
 
+def test_plan_revision_patch_rejects_non_contract_delta_paths() -> None:
+    from umbrella.deep_agent_tools.phase_control_retry import (
+        _plan_revision_patch_from_typed_contract_issues,
+    )
+
+    patch = _plan_revision_patch_from_typed_contract_issues(
+        proof_command="python -m pytest tests/test_core.py -v",
+        subtask_id="calculator-core",
+        latest_failure={
+            "contract_issues": [
+                {
+                    "code": "bad_generated_oracle",
+                    "target_subtask_id": "calculator-core",
+                    "contract_path": "proof.anti_gaming.allows_test_only_change",
+                    "invalid_values": ["false"],
+                    "required_deltas": [
+                        {
+                            "op": "add",
+                            "path": "exceptions_for_missing_conftest_fix",
+                            "values": [
+                                "calculator-core subtask must fix conftest.py import path"
+                            ],
+                        }
+                    ],
+                    "evidence_refs": [
+                        "tests/conftest.py line 6: from calculator import Calculator"
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert patch is None
+
+
+def test_plan_revision_patch_accepts_real_contract_delta_paths() -> None:
+    from umbrella.deep_agent_tools.phase_control_retry import (
+        _plan_revision_patch_from_typed_contract_issues,
+    )
+
+    patch = _plan_revision_patch_from_typed_contract_issues(
+        proof_command="python -m pytest tests/conftest.py --co -q",
+        subtask_id="project-setup",
+        latest_failure={
+            "contract_issues": [
+                {
+                    "code": "plan_contract_issue",
+                    "target_subtask_id": "project-setup",
+                    "contract_path": "proof.scope.pytest_targets",
+                    "required_deltas": [
+                        {
+                            "op": "replace",
+                            "path": "proof.scope.pytest_targets",
+                            "values": ["tests/"],
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert patch is not None
+    assert patch["required_deltas"] == [
+        {"op": "replace", "path": "proof.scope.pytest_targets", "values": ["tests/"]}
+    ]
+
+
 def test_restart_phase_signal_loops_back_instead_of_worker_panic(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     drive = repo / "workspaces" / "demo" / ".memory" / "drive"

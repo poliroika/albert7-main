@@ -620,7 +620,7 @@ def test_loop_stop_request_run_id_matches_phase_task(tmp_path: Path):
     assert result[0] == "Stop requested by dashboard: operator"
 
 
-def test_loop_internal_recovery_stop_matches_exact_task_and_is_consumed(tmp_path: Path):
+def test_loop_task_scoped_dashboard_stop_matches_exact_task(tmp_path: Path):
     from ouroboros.loop import _check_stop_requested
 
     state_dir = tmp_path / "state"
@@ -631,8 +631,7 @@ def test_loop_internal_recovery_stop_matches_exact_task_and_is_consumed(tmp_path
             {
                 "task_id": "run-1:execute:123",
                 "scope": "task",
-                "internal_recovery_route": True,
-                "reason": "recovery:plan_contract_revision",
+                "reason": "operator",
             }
         ),
         encoding="utf-8",
@@ -653,13 +652,11 @@ def test_loop_internal_recovery_stop_matches_exact_task_and_is_consumed(tmp_path
 
     assert ignored is None
     assert result is not None
-    assert result[0] == (
-        "Stop requested by dashboard: recovery:plan_contract_revision"
-    )
-    assert not stop_path.exists()
+    assert result[0] == "Stop requested by dashboard: operator"
+    assert stop_path.exists()
 
 
-def test_loop_internal_recovery_stop_ignores_run_id_prefix(tmp_path: Path):
+def test_loop_task_scoped_dashboard_stop_ignores_run_id_prefix(tmp_path: Path):
     from ouroboros.loop import _check_stop_requested
 
     state_dir = tmp_path / "state"
@@ -669,8 +666,8 @@ def test_loop_internal_recovery_stop_ignores_run_id_prefix(tmp_path: Path):
             {
                 "run_id": "run-1",
                 "task_id": "run-1:execute:123",
-                "internal_recovery_route": True,
-                "reason": "recovery:plan_contract_revision",
+                "scope": "task",
+                "reason": "operator",
             }
         ),
         encoding="utf-8",
@@ -684,6 +681,53 @@ def test_loop_internal_recovery_stop_ignores_run_id_prefix(tmp_path: Path):
     )
 
     assert result is None
+
+
+def test_internal_phase_route_uses_phase_signal_not_dashboard_stop(tmp_path: Path):
+    from ouroboros.loop import (
+        _check_internal_phase_route_requested,
+        _check_stop_requested,
+    )
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    signal_path = state_dir / "phase_control_signal.json"
+    signal_path.write_text(
+        json.dumps(
+            {
+                "kind": "request_watcher_review",
+                "task_id": "run-1:execute:123",
+                "payload": {
+                    "recovery_decision": {
+                        "kind": "plan_contract_revision",
+                        "loop_back_target": "plan",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _check_stop_requested(tmp_path, "run-1:execute:123", {}, {"assistant_notes": []}) is None
+    assert (
+        _check_internal_phase_route_requested(
+            tmp_path,
+            "run-1:plan:456",
+            {},
+            {"assistant_notes": []},
+        )
+        is None
+    )
+    result = _check_internal_phase_route_requested(
+        tmp_path,
+        "run-1:execute:123",
+        {},
+        {"assistant_notes": []},
+    )
+
+    assert result is not None
+    assert result[0] == "Internal recovery route requested: plan_contract_revision -> plan"
+    assert signal_path.exists()
 
 
 def test_handle_tool_calls_skips_remaining_batch_after_stop(monkeypatch, tmp_path: Path):

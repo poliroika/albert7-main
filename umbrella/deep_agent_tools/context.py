@@ -133,7 +133,7 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
     current = str(task_id or "").strip()
     if not current:
         return False
-    if payload.get("internal_recovery_route") or str(payload.get("scope") or "") == "task":
+    if str(payload.get("scope") or "") == "task":
         requested = str(
             payload.get("task_id") or payload.get("target_task_id") or ""
         ).strip()
@@ -172,11 +172,6 @@ def _matching_stop_request(ctx: Any) -> dict[str, Any] | None:
         payload = {}
     if not _stop_request_matches_task(payload, str(getattr(ctx, "task_id", "") or "")):
         return None
-    if isinstance(payload, dict) and payload.get("internal_recovery_route"):
-        try:
-            stop_path.unlink(missing_ok=True)
-        except OSError:
-            pass
     return payload if isinstance(payload, dict) else {}
 
 

@@ -39,6 +39,46 @@ def test_review_batch_revise_with_coverage_passes_shape() -> None:
     assert not issues
 
 
+def test_subtask_review_cannot_directly_loop_back_to_plan() -> None:
+    review = ReviewContract.from_mapping(
+        {
+            "verdict": "revise",
+            "coverage": FULL_REVIEW_COVERAGE,
+            "issues": [
+                {"code": "weak_proof", "severity": "blocking", "message": "a"}
+            ],
+            "loop_back_target": "plan",
+        }
+    )
+
+    issues = validate_review_contract(review, phase="subtask_review")
+
+    assert any(item.code == "invalid_review_loop_back_target" for item in issues)
+
+
+def test_review_contract_preserves_typed_required_plan_changes() -> None:
+    change = {
+        "id": "gui-runtime-readiness",
+        "target_subtask_id": "runtime-smoke-test",
+        "path": "proof.execution.kind",
+        "op": "equals",
+        "value": "command",
+        "severity": "blocking",
+    }
+    review = ReviewContract.from_mapping(
+        {
+            "verdict": "revise",
+            "coverage": FULL_REVIEW_COVERAGE,
+            "issues": [
+                {"code": "weak_proof", "severity": "blocking", "message": "a"}
+            ],
+            "required_plan_changes": [change],
+        }
+    )
+
+    assert review.required_plan_changes == (change,)
+
+
 def test_review_ok_with_full_coverage_and_no_blockers() -> None:
     review = ReviewContract.from_mapping(
         {

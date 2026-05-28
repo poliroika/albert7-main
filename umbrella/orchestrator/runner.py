@@ -139,21 +139,7 @@ class PhaseRunner:
     def _stop_requested(self) -> bool:
         """Check the canonical stop-file location."""
         stop_path = self._drive_root / "state" / "stop_requested.json"
-        if not stop_path.exists():
-            return False
-        try:
-            payload = json.loads(
-                stop_path.read_text(encoding="utf-8", errors="replace")
-            )
-        except Exception:
-            return True
-        if (
-            isinstance(payload, dict)
-            and payload.get("internal_recovery_route") is True
-            and str(payload.get("task_id") or "").strip()
-        ):
-            return False
-        return True
+        return stop_path.exists()
 
     def _clear_pending_phase_signal(self) -> None:
         try:
@@ -388,27 +374,9 @@ class PhaseRunner:
 
     @staticmethod
     def _gmas_subtask_requires_context(raw_card: dict[str, Any]) -> bool:
-        parts: list[str] = []
-        for key in (
-            "id",
-            "subtask_id",
-            "title",
-            "name",
-            "goal",
-            "description",
-            "proof",
-            "files_to_create",
-            "files_to_change",
-            "files_affected",
-        ):
-            parts.append(str(raw_card.get(key) or ""))
-        return bool(
-            re.search(
-                r"(?i)\b(?:gmas|llm|multi[-_\s]?agent|agent|agents|bot|bots|"
-                r"ai[-_\s]?opponent|model[-_\s]?driven|judge)\b",
-                "\n".join(parts),
-            )
-        )
+        from umbrella.deep_agent_tools.workspace_gmas import _subtask_requires_gmas_context
+
+        return _subtask_requires_gmas_context(raw_card)
 
     def _read_phase_control_records(
         self,
@@ -2069,6 +2037,8 @@ class PhaseRunner:
                 continue
             card = next((c for c in execute.subtasks if c.id == subtask_id), None)
             if card is None or card.status != "done":
+                continue
+            if card.review_verdict != "revise":
                 continue
             completion = card.completion if isinstance(card.completion, dict) else {}
             report = completion.get("verification_report")

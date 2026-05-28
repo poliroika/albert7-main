@@ -154,6 +154,55 @@ def test_submit_capability_declaration_writes_canonical_state_path(
     assert declaration_ready_for_handoff(loaded)
 
 
+def test_submit_capability_declaration_accepts_headless_tkinter_import_probe(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from umbrella.deep_agent_tools import phase_control_research
+    from umbrella.deep_agent_tools.phase_control_common import ToolContext
+
+    drive = tmp_path / "workspaces" / "calc" / ".memory" / "drive"
+    (drive / "state").mkdir(parents=True)
+    (tmp_path / "workspaces" / "calc").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("UMBRELLA_REPO_ROOT", str(tmp_path))
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        host_repo_root=tmp_path,
+        drive_root=drive,
+    )
+    ctx.task_id = "phase_web_test:research"
+    ctx.loop_state_view = {"phase_label": "research", "active_workspace_id": "calc"}
+
+    result = phase_control_research._submit_capability_declaration(
+        ctx,
+        status="submitted",
+        capabilities={
+            "desktop_gui_headless": {
+                "available": True,
+                "reason": "Tkinter imports for headless controller proof.",
+            },
+        },
+        probes={
+            "desktop_gui_headless": {
+                "kind": "command",
+                "command": ["python", "-c", "import tkinter"],
+                "expect_exit": 0,
+            }
+        },
+        notes=(
+            "Tkinter is importable for headless controller tests; no real "
+            "desktop window runtime is claimed."
+        ),
+    )
+
+    assert result.startswith("OK:")
+    loaded = load_capability_declaration(drive)
+    assert loaded is not None
+    headless = loaded.capabilities["desktop_gui_headless"]
+    assert headless.available is True
+    assert headless.source == "probe"
+    assert loaded.probe_audit["desktop_gui_headless"] is True
+
+
 def test_submit_capability_declaration_tool_schema_requires_caps_and_notes() -> None:
     from umbrella.deep_agent_tools.phase_control_tools import get_tools
 

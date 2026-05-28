@@ -32,9 +32,9 @@ def get_tools() -> list[ToolEntry]:
                     "continue to satisfy contract v1 typed proof validation. "
                     "Do not use this just to gain permission for an ordinary "
                     "source edit; PhasePlan file ownership is advisory during "
-                    "execute. Plan-contract revisions must use a typed "
-                    "target_subtask_id plus a semantic proof patch; metadata "
-                    "or notes without a real contract diff are rejected."
+                    "execute. Use apply_plan_revision_patch for proof/oracle/"
+                    "contract revisions; metadata or notes without a real "
+                    "contract diff are rejected."
                 ),
                 "parameters": {
                     "type": "object",
@@ -68,6 +68,87 @@ def get_tools() -> list[ToolEntry]:
                 },
             },
             handler=_mutate_phase_plan,
+        ),
+        ToolEntry(
+            name="apply_plan_revision_patch",
+            schema={
+                "name": "apply_plan_revision_patch",
+                "description": (
+                    "Apply a typed PlanRevisionPatch to one execute subtask's "
+                    "proof/oracle/files-under-test contract. The patch must "
+                    "make a real semantic contract change and satisfy any "
+                    "required deltas returned by ReviewIssue/RecoveryDecision; "
+                    "reason-only or metadata-only patches are rejected."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["target_subtask_id", "patch"],
+                    "properties": {
+                        "target_subtask_id": {
+                            "type": "string",
+                            "description": "Execute subtask id whose contract is revised.",
+                        },
+                        "reason_code": {
+                            "type": "string",
+                            "description": (
+                                "Typed reason code from RecoveryDecision or "
+                                "ReviewIssue, e.g. bad_generated_oracle."
+                            ),
+                        },
+                        "deltas": {
+                            "type": "array",
+                            "description": (
+                                "Required ContractDelta entries. Alias of "
+                                "required_deltas."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "required": ["op", "path"],
+                                "properties": {
+                                    "op": {
+                                        "type": "string",
+                                        "enum": ["add", "remove", "replace"],
+                                    },
+                                    "path": {"type": "string"},
+                                    "value": {},
+                                    "values": {"type": "array", "items": {}},
+                                },
+                            },
+                        },
+                        "required_deltas": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["op", "path"],
+                                "properties": {
+                                    "op": {
+                                        "type": "string",
+                                        "enum": ["add", "remove", "replace"],
+                                    },
+                                    "path": {"type": "string"},
+                                    "value": {},
+                                    "values": {"type": "array", "items": {}},
+                                },
+                            },
+                        },
+                        "patch": {
+                            "type": "object",
+                            "description": (
+                                "Subtask contract fields to patch, such as "
+                                "proof, files_under_test, acceptance_criteria, "
+                                "or generated_test_contract. Do not include id, "
+                                "subtask_id, target_subtask_id, or legacy "
+                                "contract_migration fields."
+                            ),
+                        },
+                        "evidence_refs": {
+                            "type": "array",
+                            "items": EVIDENCE_REF_SCHEMA,
+                        },
+                    },
+                },
+            },
+            handler=_apply_plan_revision_patch,
         ),
         ToolEntry(
             name="add_phase",
@@ -261,7 +342,58 @@ def get_tools() -> list[ToolEntry]:
                         "coverage": REVIEW_COVERAGE_SCHEMA,
                         "required_plan_changes": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {
+                                "anyOf": [
+                                    {
+                                        "type": "string",
+                                        "description": (
+                                            "Legacy human note. This is never "
+                                            "used as control state."
+                                        ),
+                                    },
+                                    {
+                                        "type": "object",
+                                        "required": ["id", "path", "op"],
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "target_subtask_id": {"type": "string"},
+                                            "target_kind": {"type": "string"},
+                                            "target_id": {"type": "string"},
+                                            "path": {"type": "string"},
+                                            "op": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "exists",
+                                                    "equals",
+                                                    "contains",
+                                                    "not_contains",
+                                                    "remove_applied",
+                                                    "replace_applied",
+                                                    "semantic_diff",
+                                                ],
+                                            },
+                                            "value": {},
+                                            "values": {"type": "array"},
+                                            "old_value": {},
+                                            "new_value": {},
+                                            "severity": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "info",
+                                                    "warning",
+                                                    "error",
+                                                    "blocking",
+                                                ],
+                                            },
+                                            "reason": {"type": "string"},
+                                            "evidence_refs": {
+                                                "type": "array",
+                                                "items": EVIDENCE_REF_SCHEMA,
+                                            },
+                                        },
+                                    },
+                                ]
+                            },
                         },
                         "loop_back_target": {"type": "string"},
                         "notes": {"type": "string"},

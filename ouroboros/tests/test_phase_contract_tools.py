@@ -3447,7 +3447,7 @@ def test_submit_phase_plan_rejects_stale_blocker_from_existing_proposal(tmp_path
     assert "get_game_state_tool" in result
 
 
-def test_submit_phase_plan_rejects_unknown_palace_id_after_review_revision(tmp_path):
+def test_submit_phase_plan_rejects_unknown_palace_id_but_not_string_revision(tmp_path):
     from ouroboros.tools.phase_control import _submit_phase_plan
 
     workspace = tmp_path / "workspaces" / "test_ws"
@@ -3455,6 +3455,7 @@ def test_submit_phase_plan_rejects_unknown_palace_id_after_review_revision(tmp_p
     state = drive / "state"
     (drive / "logs").mkdir(parents=True)
     state.mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
     (state / "phase_plan_proposal_latest.json").write_text(
         json.dumps(
             {
@@ -3465,14 +3466,7 @@ def test_submit_phase_plan_rejects_unknown_palace_id_after_review_revision(tmp_p
                 "plan_id": "old-plan",
                 "plan": {
                     "plan_id": "old-plan",
-                    "subtasks": [
-                        {
-                            "id": "build",
-                            "title": "Build",
-                            "files_to_create": ["src/test_ws/app.py"],
-                            "success_test": "python -m pytest tests/test_app.py -q",
-                        }
-                    ],
+                    "subtasks": [_typed_python_subtask("build")],
                 },
                 "notes": "old accepted plan",
             },
@@ -3491,7 +3485,7 @@ def test_submit_phase_plan_rejects_unknown_palace_id_after_review_revision(tmp_p
                 "overlay": {
                     "retry_reason": "micro review requested revisions",
                     "revision_contract": {
-                        "revisions": [
+                        "required_plan_changes": [
                             "Add Phase 0 Project Initialization with pyproject.toml"
                         ]
                     },
@@ -3503,15 +3497,14 @@ def test_submit_phase_plan_rejects_unknown_palace_id_after_review_revision(tmp_p
     ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
 
     unknown = _submit_phase_plan(ctx, plan_id="memory-palace-id")
-    stale = _submit_phase_plan(ctx)
+    string_revision_result = _submit_phase_plan(ctx)
 
     assert unknown.startswith("ERROR:")
     assert "Unknown plan_id" in unknown
-    assert stale.startswith("ERROR:")
-    assert "review revision" in stale
+    assert string_revision_result.startswith("OK:"), string_revision_result
 
 
-def test_propose_phase_plan_rejects_unaddressed_review_revision(tmp_path):
+def test_propose_phase_plan_treats_string_revision_as_note_not_blocker(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"
     (drive / "logs").mkdir(parents=True)
@@ -3528,7 +3521,7 @@ def test_propose_phase_plan_rejects_unaddressed_review_revision(tmp_path):
                 "overlay": {
                     "retry_reason": "micro review requested revisions",
                     "revision_contract": {
-                        "revisions": [
+                        "required_plan_changes": [
                             (
                                 "subtask_06: Replace 'ActionPanel has buttons for "
                                 "build, move, diplomacy actions' with chat-based "
@@ -3548,23 +3541,107 @@ def test_propose_phase_plan_rejects_unaddressed_review_revision(tmp_path):
         plan={
             "plan_id": "bad-review-retry",
             "workspace_id": "test_ws",
-            "subtasks": [
-                {
-                    "id": "subtask_06",
-                    "title": "Build UI",
-                    "goal": "Create ActionPanel controls.",
-                    "success_test": "npm run build",
-                    "acceptance_criteria": [
-                        "ActionPanel has buttons for build, move, diplomacy actions",
-                    ],
-                }
-            ],
+            "subtasks": [_typed_python_subtask("subtask_06")],
+        },
+    )
+
+    assert result.startswith("OK:"), result
+    assert "missing keyword" not in result
+
+
+def test_propose_phase_plan_blocks_typed_required_plan_change(tmp_path):
+    workspace = tmp_path / "workspaces" / "test_ws"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        host_repo_root=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_node": {
+                "id": "plan",
+                "manifest_id": "plan",
+                "overlay": {
+                    "retry_reason": "micro review requested revisions",
+                    "revision_contract": {
+                        "required_plan_changes": [
+                            {
+                                "id": "runtime-kind",
+                                "target_subtask_id": "subtask_06",
+                                "path": "proof.execution.kind",
+                                "op": "equals",
+                                "value": "command",
+                                "severity": "blocking",
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+    )
+    ctx.task_id = "run-123:plan"
+    ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "typed-review-retry",
+            "workspace_id": "test_ws",
+            "subtasks": [_typed_python_subtask("subtask_06")],
         },
     )
 
     assert result.startswith("ERROR:")
-    assert "review revision appears unaddressed" in result
-    assert "chat" in result
+    assert "typed required_plan_change `runtime-kind`" in result
+
+
+def test_propose_phase_plan_accepts_satisfied_typed_required_plan_change(tmp_path):
+    workspace = tmp_path / "workspaces" / "test_ws"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        host_repo_root=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_node": {
+                "id": "plan",
+                "manifest_id": "plan",
+                "overlay": {
+                    "retry_reason": "micro review requested revisions",
+                    "revision_contract": {
+                        "required_plan_changes": [
+                            {
+                                "id": "runtime-kind",
+                                "target_subtask_id": "subtask_06",
+                                "path": "proof.execution.kind",
+                                "op": "equals",
+                                "value": "command",
+                                "severity": "blocking",
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+    )
+    ctx.task_id = "run-123:plan"
+    ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
+    subtask = _typed_python_subtask("subtask_06")
+    subtask["proof"]["execution"]["kind"] = "command"
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "typed-review-retry",
+            "workspace_id": "test_ws",
+            "subtasks": [subtask],
+        },
+    )
+
+    assert result.startswith("OK:"), result
 
 
 def test_propose_phase_plan_accepts_addressed_review_revision(tmp_path):

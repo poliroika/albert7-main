@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from umbrella.deep_agent_tools.phase_control_actions import (
+    _apply_plan_revision_patch,
     _apply_phase_plan_subtask_patch,
     _legacy_phase_subtask_materialization_issue,
     _merge_phase_plan_string_list,
@@ -778,6 +779,139 @@ def test_mutate_phase_plan_typed_patch_can_remove_oracle_property(
     assert "invalid_input_rejected" in required
     assert "no_test_tampering" in required
     assert "operation_semantics_match_task_examples" in required
+
+
+def test_apply_plan_revision_patch_removes_invalid_required_property(
+    tmp_path,
+) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "logic",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_logic.py",
+                                            "-q",
+                                        ],
+                                    },
+                                    "oracle": {
+                                        "required_properties": [
+                                            "distinct_inputs_distinct_outputs",
+                                            "no_test_tampering",
+                                        ],
+                                    },
+                                    "scope": {
+                                        "files_under_test": ["src/demo/logic.py"],
+                                        "changed_files_expected": [
+                                            "src/demo/logic.py",
+                                            "tests/test_logic.py",
+                                        ],
+                                        "pytest_targets": ["tests/test_logic.py"],
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _apply_plan_revision_patch(
+        ctx,
+        target_subtask_id="logic",
+        reason_code="bad_generated_oracle",
+        deltas=[
+            {
+                "op": "remove",
+                "path": "proof.required_properties",
+                "values": ["distinct_inputs_distinct_outputs"],
+            }
+        ],
+        patch={
+            "proof": {
+                "remove_required_properties": [
+                    "distinct_inputs_distinct_outputs"
+                ]
+            },
+        },
+        evidence_refs=[{"kind": "proof_result", "id": "proof-1"}],
+    )
+
+    assert result.startswith("PhasePlan mutated")
+    plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    logic = plan["nodes"][0]["subtasks"][0]
+    assert plan["version"] == 2
+    assert logic["proof"]["oracle"]["required_properties"] == ["no_test_tampering"]
+    assert "required_deltas" not in logic
+    signal = json.loads((state / "phase_control_signal.json").read_text())
+    assert signal["kind"] == "apply_plan_revision_patch"
+
+
+def test_apply_plan_revision_patch_rejects_reason_only_change(tmp_path) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [{"id": "logic", "status": "pending"}],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _apply_plan_revision_patch(
+        ctx,
+        target_subtask_id="logic",
+        reason_code="bad_generated_oracle",
+        patch={},
+        evidence_refs=[{"kind": "proof_result", "id": "proof-1"}],
+    )
+
+    assert "reason/evidence-only revisions are not accepted" in result
+    plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
+    assert plan["version"] == 1
 
 
 def test_mutate_phase_plan_required_deltas_replaces_oracle_property(

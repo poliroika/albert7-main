@@ -396,7 +396,7 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
     current = str(task_id or "").strip()
     if not current:
         return False
-    if payload.get("internal_recovery_route") or str(payload.get("scope") or "") == "task":
+    if str(payload.get("scope") or "") == "task":
         requested = str(
             payload.get("task_id") or payload.get("target_task_id") or ""
         ).strip()
@@ -432,11 +432,6 @@ def _matching_stop_request(ctx: ToolContext) -> dict[str, Any] | None:
         payload = {}
     if not _stop_request_matches_task(payload, str(getattr(ctx, "task_id", "") or "")):
         return None
-    if isinstance(payload, dict) and payload.get("internal_recovery_route"):
-        try:
-            stop_path.unlink(missing_ok=True)
-        except OSError:
-            pass
     return payload if isinstance(payload, dict) else {}
 
 
@@ -810,7 +805,7 @@ def _review_text_blocks(
     revisions: list[str] | None,
     notes: str,
     include_notes: bool = True,
-    required_plan_changes: list[str] | None = None,
+    required_plan_changes: list[Any] | None = None,
 ) -> str:
     parts: list[str] = []
     for item in issues or []:
@@ -830,7 +825,7 @@ def _plan_review_validation_issue(
     issues: list[dict[str, Any]] | None,
     revisions: list[str] | None,
     notes: str,
-    required_plan_changes: list[str] | None = None,
+    required_plan_changes: list[Any] | None = None,
 ) -> str:
     phase = _phase_control_phase_id(ctx)
     if phase not in {"plan_review", "subtask_review"}:

@@ -373,12 +373,13 @@ def test_execute_tool_surface_adds_declared_and_gmas_tools_dynamically(
                 subtasks=[
                     SubtaskCard(
                         id="gmas-memory",
-                        title="GMAS memory router",
-                        goal="Implement LLM/GMAS agent memory routing.",
+                        title="Model runtime memory router",
+                        goal="Implement model runtime memory routing.",
                         allowed_tools=frozenset(
                             {"palace_add", "loop_back_to", "request_extra_subtask"}
                         ),
                         allowed_skills=frozenset({"gmas-overview"}),
+                        memory_scope={"assets": [{"kind": "gmas_context"}]},
                     )
                 ],
             ),
@@ -397,3 +398,53 @@ def test_execute_tool_surface_adds_declared_and_gmas_tools_dynamically(
     assert {"palace_add", "loop_back_to", "request_extra_subtask"} <= allowed
     overlays = task.get("context_overlays") or {}
     assert "gmas-overview" in set(overlays.get("effective_allowed_skills") or [])
+
+
+def test_execute_agent_words_do_not_enable_gmas_tools_without_typed_contract(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    ws = repo / "workspaces" / "demo"
+    drive = ws / ".memory" / "drive"
+    (drive / "state").mkdir(parents=True)
+    (ws / "TASK_MAIN.md").write_text("Build an agent-like workflow", encoding="utf-8")
+
+    from umbrella.memory.palace.facade import MemPalace
+
+    palace = MemPalace(repo, "demo")
+    try:
+        task = build_phase_task(
+            phase_node=PhaseNode(
+                id="execute",
+                manifest_id="execute",
+                subtasks=[
+                    SubtaskCard(
+                        id="agent-router",
+                        title="Agent router",
+                        goal="Implement local agent and judge naming without LLM APIs.",
+                        allowed_tools=frozenset(
+                            {
+                                "get_gmas_context",
+                                "search_gmas_knowledge",
+                                "register_temp_tool",
+                            }
+                        ),
+                        allowed_skills=frozenset({"gmas-overview"}),
+                    )
+                ],
+            ),
+            manifest=_manifest("execute"),
+            workspace_id="demo",
+            run_id="run-1",
+            palace=palace,
+            repo_root=repo,
+            drive_root=drive,
+        )
+    finally:
+        palace.close()
+
+    allowed = set(task.get("tool_filter", {}).get("allow") or [])
+    assert not (allowed & {"get_gmas_context", "search_gmas_knowledge"})
+    assert "register_temp_tool" not in allowed
+    overlays = task.get("context_overlays") or {}
+    assert "gmas-overview" not in set(overlays.get("effective_allowed_skills") or [])

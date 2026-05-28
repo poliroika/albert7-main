@@ -1,12 +1,13 @@
 """Workspace write, patch, verification, and delegation helpers."""
 
-from typing import Iterable
+from typing import Any, Iterable
 
 from umbrella.deep_agent_tools.workspace_common import *
 from umbrella.deep_agent_tools.workspace_gmas import (
     _gmas_context_before_write_block,
     _llm_behavior_fallback_contract_block,
     _llm_runtime_contract_block,
+    _subtask_requires_gmas_context,
 )
 from umbrella.deep_agent_tools.workspace_read import (
     _workspace_file_read_at,
@@ -102,6 +103,32 @@ def _patch_protocol_gate(
     if block := _patch_hunk_mismatch_replacement_required_block(ctx, rel_path):
         return block
     return None
+
+
+def _model_runtime_contract_guards_apply(ctx: Any) -> bool:
+    overlays = getattr(ctx, "context_overlays", None)
+    if not isinstance(overlays, dict):
+        return False
+    if bool(overlays.get("gmas_prewrite_required")):
+        return True
+    domains = overlays.get("detected_domains") or []
+    if isinstance(domains, list) and any(
+        str(item).strip().lower() == "multi_agent_gmas" for item in domains
+    ):
+        return True
+    harness = overlays.get("harness_contract")
+    if isinstance(harness, dict):
+        selected = {
+            str(item).strip().lower()
+            for item in (harness.get("selected_ids") or [])
+            if str(item).strip()
+        }
+        if selected & {"llm_runtime", "multi_agent_gmas", "gmas"}:
+            return True
+    active_subtask = overlays.get("active_subtask")
+    if isinstance(active_subtask, dict) and _subtask_requires_gmas_context(active_subtask):
+        return True
+    return False
 
 def _workspace_layout_policy_block(rel_path: str) -> dict[str, Any] | None:
     norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
@@ -1336,12 +1363,13 @@ def update_workspace_seed(
             seed_path, file_path, new_content
         ):
             return _json(verification_block)
-        if llm_contract_block := _llm_runtime_contract_block(file_path, new_content):
-            return _json(llm_contract_block)
-        if behavior_fallback_block := _llm_behavior_fallback_contract_block(
-            file_path, new_content
-        ):
-            return _json(behavior_fallback_block)
+        if _model_runtime_contract_guards_apply(ctx):
+            if llm_contract_block := _llm_runtime_contract_block(file_path, new_content):
+                return _json(llm_contract_block)
+            if behavior_fallback_block := _llm_behavior_fallback_contract_block(
+                file_path, new_content
+            ):
+                return _json(behavior_fallback_block)
         target = _workspace_path(seed_path, file_path)
         if syntax_block := _python_syntax_block(file_path, new_content):
             return _json(syntax_block)
@@ -1867,12 +1895,13 @@ def _plan_workspace_patch_replacement_operation(
         seed_path, rel_path, new_content
     ):
         return None, _json(verification_block)
-    if llm_contract_block := _llm_runtime_contract_block(rel_path, new_content):
-        return None, _json(llm_contract_block)
-    if behavior_fallback_block := _llm_behavior_fallback_contract_block(
-        rel_path, new_content
-    ):
-        return None, _json(behavior_fallback_block)
+    if _model_runtime_contract_guards_apply(ctx):
+        if llm_contract_block := _llm_runtime_contract_block(rel_path, new_content):
+            return None, _json(llm_contract_block)
+        if behavior_fallback_block := _llm_behavior_fallback_contract_block(
+            rel_path, new_content
+        ):
+            return None, _json(behavior_fallback_block)
     if syntax_block := _python_syntax_block(rel_path, new_content):
         return None, _json(syntax_block)
     if tamper_block := _no_test_tampering_static_block(
@@ -2049,20 +2078,23 @@ def _plan_workspace_patch_operation(
     if op.action != "delete":
         if empty_block := _empty_workspace_file_block(rel_path, new_content):
             return None, _json(empty_block)
-        if placeholder_bridge_block := _placeholder_integration_bridge_block(
-            rel_path, new_content
-        ):
-            return None, _json(placeholder_bridge_block)
+        model_runtime_guards = _model_runtime_contract_guards_apply(ctx)
+        if model_runtime_guards:
+            if placeholder_bridge_block := _placeholder_integration_bridge_block(
+                rel_path, new_content
+            ):
+                return None, _json(placeholder_bridge_block)
         if verification_block := workspace_toml_verification_weakening_block(
             seed_path, rel_path, new_content
         ):
             return None, _json(verification_block)
-        if llm_contract_block := _llm_runtime_contract_block(rel_path, new_content):
-            return None, _json(llm_contract_block)
-        if behavior_fallback_block := _llm_behavior_fallback_contract_block(
-            rel_path, new_content
-        ):
-            return None, _json(behavior_fallback_block)
+        if model_runtime_guards:
+            if llm_contract_block := _llm_runtime_contract_block(rel_path, new_content):
+                return None, _json(llm_contract_block)
+            if behavior_fallback_block := _llm_behavior_fallback_contract_block(
+                rel_path, new_content
+            ):
+                return None, _json(behavior_fallback_block)
         if syntax_block := _python_syntax_block(rel_path, new_content):
             return None, _json(syntax_block)
         if tamper_block := _no_test_tampering_static_block(

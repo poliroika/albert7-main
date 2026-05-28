@@ -44,6 +44,9 @@ from umbrella.deep_agent_tools.phase_control_retry import (
     _completion_llm_memory_claim_issue,
     _phase_subtask_completion_issue,
 )
+from umbrella.deep_agent_tools.phase_contract_policy import (
+    _phase_plan_revision_contract_issues,
+)
 
 
 def _phase_plan_execute_node(plan: dict[str, Any]) -> dict[str, Any] | None:
@@ -693,14 +696,17 @@ def _apply_phase_plan_subtask_patch(
     list_patch_ops = _phase_plan_list_patch_key_ops()
     applied: list[str] = []
     for item, target, subtask_id, before_snapshot, required_deltas, semantic_patch in validated:
+        item_touched = False
         for key, (base, op) in list_patch_ops.items():
             if key not in item:
                 continue
             value = item[key]
             if op == "merge":
                 target[base] = _merge_phase_plan_string_list(target.get(base), value)
+                item_touched = True
             elif op in {"replace", "set"}:
                 target[base] = _phase_plan_string_items(value)
+                item_touched = True
             elif op == "remove":
                 remove_set = set(_phase_plan_string_items(value))
                 target[base] = [
@@ -708,6 +714,7 @@ def _apply_phase_plan_subtask_patch(
                     for path in _phase_plan_string_items(target.get(base))
                     if path not in remove_set
                 ]
+                item_touched = True
         for key, value in item.items():
             if (
                 key == "id"
@@ -721,6 +728,13 @@ def _apply_phase_plan_subtask_patch(
                 target[key] = _merge_phase_plan_proof_patch(target.get(key), value)
             else:
                 target[key] = value
+            item_touched = True
+        if not item_touched and not semantic_patch:
+            return [], (
+                "plan revision patch for subtask "
+                f"'{subtask_id}' did not apply any mutable contract fields; "
+                "reason/evidence-only revisions are not accepted."
+            )
         if semantic_patch:
             after = _semantic_contract_snapshot(target)
             if before_snapshot == after:
@@ -739,17 +753,19 @@ def _apply_phase_plan_subtask_patch(
     return applied, None
 
 
-def _mutate_phase_plan(
+def _apply_phase_plan_mutation(
     ctx: ToolContext,
     *,
     patch: dict[str, Any],
     target_subtask_id: str = "",
     subtask_id: str = "",
+    tool_name: str = "mutate_phase_plan",
+    signal_kind: str = "mutate_phase_plan",
 ) -> str:
-    if stop := _stop_requested_message(ctx, "mutate_phase_plan"):
+    if stop := _stop_requested_message(ctx, tool_name):
         return stop
     if not isinstance(patch, dict):
-        return "ERROR: mutate_phase_plan patch must be an object"
+        return f"ERROR: {tool_name} patch must be an object"
     if "subtask_id" in patch or "target_subtask_id" in patch:
         return (
             "ERROR: subtask_id is a selector, not a mutable patch field; pass "
@@ -796,11 +812,11 @@ def _mutate_phase_plan(
             unsupported.append(k)
     if unsupported:
         return (
-            "ERROR: unsupported mutate_phase_plan patch keys: "
+            f"ERROR: unsupported {tool_name} patch keys: "
             + ", ".join(unsupported)
         )
     if not applied:
-        return "ERROR: mutate_phase_plan patch did not apply any changes"
+        return f"ERROR: {tool_name} patch did not apply any changes"
     touched_subtask_ids = {
         item.removeprefix("subtasks.")
         for item in applied
@@ -847,7 +863,7 @@ def _mutate_phase_plan(
         "applied": applied,
         "version": plan["version"],
     }
-    signal_id = _write_control_signal(ctx, "mutate_phase_plan", signal_payload)
+    signal_id = _write_control_signal(ctx, signal_kind, signal_payload)
     _mirror_phase_plan_mutation_to_palace(
         ctx,
         plan=plan,
@@ -855,6 +871,59 @@ def _mutate_phase_plan(
         signal_id=signal_id,
     )
     return f"PhasePlan mutated (version {plan['version']}): {applied} (signal: {signal_id})"
+
+
+def _mutate_phase_plan(
+    ctx: ToolContext,
+    *,
+    patch: dict[str, Any],
+    target_subtask_id: str = "",
+    subtask_id: str = "",
+) -> str:
+    return _apply_phase_plan_mutation(
+        ctx,
+        patch=patch,
+        target_subtask_id=target_subtask_id,
+        subtask_id=subtask_id,
+        tool_name="mutate_phase_plan",
+        signal_kind="mutate_phase_plan",
+    )
+
+
+def _apply_plan_revision_patch(
+    ctx: ToolContext,
+    *,
+    target_subtask_id: str,
+    patch: dict[str, Any],
+    reason_code: str = "",
+    deltas: list[dict[str, Any]] | None = None,
+    required_deltas: list[dict[str, Any]] | None = None,
+    evidence_refs: list[Any] | None = None,
+) -> str:
+    selector = str(target_subtask_id or "").strip()
+    if not selector:
+        return "ERROR: apply_plan_revision_patch requires target_subtask_id"
+    if not isinstance(patch, dict):
+        return "ERROR: apply_plan_revision_patch patch must be an object"
+    normalized_patch = copy.deepcopy(patch)
+    effective_deltas = (
+        required_deltas
+        if isinstance(required_deltas, list)
+        else deltas if isinstance(deltas, list) else None
+    )
+    if effective_deltas is not None and "required_deltas" not in normalized_patch:
+        normalized_patch["required_deltas"] = copy.deepcopy(effective_deltas)
+    if reason_code and "reason_code" not in normalized_patch:
+        normalized_patch["reason_code"] = str(reason_code)
+    if evidence_refs is not None and "evidence_refs" not in normalized_patch:
+        normalized_patch["evidence_refs"] = copy.deepcopy(evidence_refs)
+    return _apply_phase_plan_mutation(
+        ctx,
+        patch=normalized_patch,
+        target_subtask_id=selector,
+        tool_name="apply_plan_revision_patch",
+        signal_kind="apply_plan_revision_patch",
+    )
 
 
 def _request_scope_change(
@@ -1048,6 +1117,14 @@ def _loop_back_to(ctx: ToolContext, *, phase: str, reason: str = "") -> str:
         return stop
     if policy_issue := _review_revision_policy_issue(ctx, reason=reason):
         return policy_issue
+    current_phase = _phase_control_phase_id(ctx)
+    if current_phase == "subtask_review" and str(phase or "").split(":", 1)[0] == "plan":
+        return (
+            "ERROR: subtask_review cannot loop_back_to plan directly. "
+            "Use loop_back_target='execute' for implementation repair; plan "
+            "revisions require a typed RecoveryDecision/PlanRevisionPatch from "
+            "the control plane."
+        )
     plan = _read_phase_plan(ctx)
     if plan is None:
         return "ERROR: no phase_plan.json found"
@@ -1278,7 +1355,7 @@ def _submit_micro_review(
     loop_back_target: str = "",
     notes: str = "",
     coverage: dict[str, Any] | None = None,
-    required_plan_changes: list[str] | None = None,
+    required_plan_changes: list[Any] | None = None,
 ) -> str:
     if stop := _stop_requested_message(ctx, "submit_micro_review"):
         return stop
@@ -1379,102 +1456,6 @@ def _submit_micro_review(
     return f"OK: Micro-review submitted: {verdict} (signal: {signal_id})"
 
 
-def _submit_plan_revision_contract_issues(ctx: ToolContext, plan: dict[str, Any]) -> list[str]:
-    overlays = getattr(ctx, "context_overlays", {}) or {}
-    phase_node = overlays.get("phase_node") if isinstance(overlays, dict) else None
-    overlay = phase_node.get("overlay") if isinstance(phase_node, dict) else None
-    if not isinstance(overlay, dict):
-        return []
-    reason = str(overlay.get("retry_reason") or "").strip().lower()
-    if not reason.startswith("micro review requested revisions"):
-        return []
-    contract = overlay.get("revision_contract")
-    if not isinstance(contract, dict):
-        return []
-    raw_revisions = contract.get("required_plan_changes") or contract.get("revisions") or []
-    revisions = [str(item).strip() for item in raw_revisions if str(item).strip()]
-    if not revisions:
-        return []
-    plan_text = json.dumps(plan, ensure_ascii=False).lower()
-    stopwords = {
-        "with",
-        "from",
-        "into",
-        "that",
-        "this",
-        "phase",
-        "project",
-        "subtask",
-        "subtasks",
-        "add",
-        "these",
-        "fields",
-        "provide",
-        "specify",
-        "exactly",
-        "validates",
-        "pytest-cov",
-        "platform-appropriate",
-    }
-    issues: list[str] = []
-    for revision in revisions:
-        revision_l = revision.lower()
-        if re.match(r"\s*(?:consider|optional|maybe|could|nice to have)\b", revision_l):
-            continue
-        if "replace" in revision_l and " with " in revision_l:
-            positive = revision_l.split(" with ", 1)[1]
-        elif "revision requires" in revision_l:
-            positive = revision_l.split("revision requires", 1)[1]
-        else:
-            positive = revision_l
-        semantic_numbers = re.findall(
-            r"\b(\d+(?:\.\d+)?)\s*(?:times?|retries?|attempts?|%)\b",
-            positive,
-        )
-        missing_numbers = [
-            number for number in semantic_numbers if number not in plan_text
-        ]
-        if missing_numbers:
-            issues.append(
-                "review revision numeric requirement appears unaddressed: "
-                f"`{revision}`; missing number(s): "
-                + ", ".join(missing_numbers[:8])
-            )
-            continue
-        alternatives = [
-            item.strip()
-            for item in re.split(r"\bor\b", positive)
-            if item.strip()
-        ] or [positive]
-        missing_by_alternative: list[list[str]] = []
-        revision_satisfied = False
-        for alternative in alternatives:
-            keywords = [
-                item
-                for raw in re.findall(r"[a-z0-9_.-]{4,}", alternative)
-                for item in (raw.strip("._-"),)
-                if item and item not in stopwords
-            ]
-            if not keywords:
-                revision_satisfied = True
-                break
-            covered = [item for item in keywords if item in plan_text]
-            floor = 1 if len(alternatives) > 1 else 2
-            required = min(len(keywords), max(floor, (len(keywords) + 1) // 2))
-            if len(covered) >= required:
-                revision_satisfied = True
-                break
-            missing_by_alternative.append([item for item in keywords if item not in covered])
-        if revision_satisfied:
-            continue
-        missing = min(missing_by_alternative, key=len) if missing_by_alternative else []
-        issues.append(
-            "review revision appears unaddressed: "
-            f"`{revision}`; missing keyword(s): " + ", ".join(missing[:8])
-        )
-    return issues
-
-
 def _submit_phase_plan(ctx: ToolContext, *, plan_id: str = "", notes: str = "") -> str:
     if stop := _stop_requested_message(ctx, "submit_phase_plan"):
         return stop
@@ -1508,7 +1489,7 @@ def _submit_phase_plan(ctx: ToolContext, *, plan_id: str = "", notes: str = "") 
         )
         if contradiction:
             return contradiction + " Submit a corrected phase plan before selecting it."
-        revision_issues = _submit_plan_revision_contract_issues(ctx, plan_payload)
+        revision_issues = _phase_plan_revision_contract_issues(ctx, plan_payload)
         if revision_issues:
             return "ERROR: " + "; ".join(revision_issues)
         plan_ir, compile_issues = compile_phase_plan(
@@ -3295,6 +3276,7 @@ def _phase_plan_policy_payload(
 
 
 __all__ = [
+    '_apply_plan_revision_patch',
     '_mutate_phase_plan',
     '_add_phase',
     '_loop_back_to',

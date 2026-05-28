@@ -295,7 +295,12 @@ def infer_harness_ids_for_subtask(
     proof = _proof_payload(subtask)
     execution = proof.get("execution") if isinstance(proof.get("execution"), dict) else {}
     command = " ".join(str(part) for part in execution.get("command") or [])
-    required_caps = " ".join(str(item) for item in proof.get("required_capabilities") or [])
+    required_cap_ids = {
+        str(item).strip().lower()
+        for item in (proof.get("required_capabilities") or [])
+        if str(item).strip()
+    }
+    required_caps = " ".join(sorted(required_cap_ids))
     harness_options = proof.get("harness_options")
     harness_options_text = ""
     if isinstance(harness_options, dict):
@@ -360,17 +365,7 @@ def infer_harness_ids_for_subtask(
         or "behavioral_http" in text
     ):
         add("web_ui_browser")
-    if any(
-        marker in text
-        for marker in (
-            "llm",
-            "gmas",
-            "agent",
-            "judge",
-            "prompt",
-            "model runtime",
-        )
-    ):
+    if required_cap_ids & {"llm_api", "multi_agent_gmas", "gmas"}:
         add("llm_runtime")
     if any(
         marker in text
@@ -387,10 +382,20 @@ def infer_harness_ids_for_subtask(
 
     caps = capability_envelope or {}
     if isinstance(caps, dict):
-        cap_text = " ".join(str(item) for item in caps.keys()).lower()
-        if "llm" in cap_text or "gmas" in cap_text:
+        if _capability_envelope_includes_model_runtime(caps):
             add("llm_runtime")
     return tuple(ids[:3])
+
+
+def _capability_entry_available(value: Any) -> bool:
+    if isinstance(value, dict):
+        available = value.get("available")
+        if available is True:
+            return True
+        if str(available).strip().lower() in {"true", "yes", "1"}:
+            return True
+        return False
+    return value is True or str(value).strip().lower() in {"true", "yes", "1"}
 
 
 def _capability_envelope_includes_model_runtime(value: Any) -> bool:
@@ -398,7 +403,9 @@ def _capability_envelope_includes_model_runtime(value: Any) -> bool:
         for key, item in value.items():
             key_text = str(key).strip().lower()
             if key_text in {"llm_api", "multi_agent_gmas", "gmas"}:
-                return True
+                if _capability_entry_available(item):
+                    return True
+                continue
             if _capability_envelope_includes_model_runtime(item):
                 return True
         return False

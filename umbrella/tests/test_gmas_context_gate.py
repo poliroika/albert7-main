@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from umbrella.deep_agent_tools.workspace_ops import _model_runtime_contract_guards_apply
 from umbrella.deep_agent_tools.workspace_gmas import (
     _gmas_context_query_specificity_issue,
 )
@@ -9,6 +10,7 @@ def test_gmas_context_query_rejects_placeholder_for_active_agent_subtask() -> No
     active = {
         "id": "gmas-bot-agents",
         "goal": "Implement GMAS-backed economy and diplomacy bots.",
+        "proof": {"required_capabilities": ["multi_agent_gmas"]},
         "files_to_create": ["src/demo/bots/economy_agent.py"],
     }
 
@@ -16,10 +18,21 @@ def test_gmas_context_query_rejects_placeholder_for_active_agent_subtask() -> No
     assert issue
 
 
+def test_gmas_context_query_does_not_key_off_agent_words_without_contract() -> None:
+    active = {
+        "id": "gmas-bot-agents",
+        "goal": "Implement GMAS-backed economy and diplomacy bots.",
+        "files_to_create": ["src/demo/bots/economy_agent.py"],
+    }
+
+    assert not _gmas_context_query_specificity_issue("GMAS context please", active)
+
+
 def test_gmas_context_query_accepts_symbol_or_specific_terms() -> None:
     active = {
         "id": "gmas-bot-agents",
         "goal": "Implement GMAS-backed economy and diplomacy bots.",
+        "proof": {"required_capabilities": ["multi_agent_gmas"]},
         "files_to_create": ["src/demo/bots/economy_agent.py"],
     }
 
@@ -53,6 +66,7 @@ def test_gmas_context_query_rejects_generic_query_during_execute_agent_subtask()
     active = {
         "id": "gmas-ai-agents",
         "goal": "Implement GMAS-backed civilization bots.",
+        "proof": {"required_capabilities": ["multi_agent_gmas"]},
         "files_to_create": ["src/civilization/civilization/ai/agents.py"],
     }
 
@@ -73,3 +87,29 @@ def test_gmas_context_query_accepts_concrete_workspace_research_query() -> None:
         None,
         ctx=ctx,
     )
+
+
+def test_model_runtime_write_guards_ignore_agent_words_without_contract() -> None:
+    ctx = SimpleNamespace(
+        context_overlays={
+            "active_subtask": {
+                "id": "agent-router",
+                "goal": "Implement local agent naming without LLM calls.",
+            }
+        }
+    )
+
+    assert not _model_runtime_contract_guards_apply(ctx)
+
+
+def test_model_runtime_write_guards_follow_typed_harness_contract() -> None:
+    ctx = SimpleNamespace(
+        context_overlays={
+            "harness_contract": {
+                "mode": "active",
+                "selected_ids": ["llm_runtime"],
+            }
+        }
+    )
+
+    assert _model_runtime_contract_guards_apply(ctx)

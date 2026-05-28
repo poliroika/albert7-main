@@ -357,6 +357,99 @@ def test_subtask_review_pass_resumes_execute_when_more_subtasks_remain(
     assert execute.overlay["last_reviewed_subtask_id"] == "s1"
 
 
+def test_fresh_pending_subtask_review_is_not_auto_closed_by_green_proof(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "civilization" / ".memory" / "drive"
+    (drive / "state").mkdir(parents=True)
+    runner = PhaseRunner(repo_root=repo, workspace_id="civilization", drive_root=drive)
+    execute = PhaseNode(
+        id="execute",
+        manifest_id="execute",
+        status="done",
+        subtasks=[
+            SubtaskCard(
+                id="s1",
+                title="First",
+                goal="first",
+                allowed_tools=frozenset(),
+                allowed_skills=frozenset(),
+                status="done",
+                completion={"verification_report": {"passed": True}},
+            ),
+            SubtaskCard(
+                id="s2",
+                title="Second",
+                goal="second",
+                allowed_tools=frozenset(),
+                allowed_skills=frozenset(),
+                status="pending",
+            ),
+        ],
+    )
+    review = PhaseNode(
+        id="subtask_review:s1",
+        manifest_id="subtask_review",
+        status="pending",
+        parent_phase_id="execute",
+        overlay={"subtask_id": "s1", "execute_phase_id": "execute"},
+    )
+    plan = PhasePlan(
+        plan_id="p1",
+        workspace_id="civilization",
+        run_id="run-fresh-review",
+        nodes=[execute, review],
+    )
+
+    runner._close_recovered_subtask_reviews(plan)
+
+    assert review.status == "pending"
+
+
+def test_recovered_revised_subtask_review_can_be_auto_closed(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "civilization" / ".memory" / "drive"
+    (drive / "state").mkdir(parents=True)
+    runner = PhaseRunner(repo_root=repo, workspace_id="civilization", drive_root=drive)
+    execute = PhaseNode(
+        id="execute",
+        manifest_id="execute",
+        status="done",
+        subtasks=[
+            SubtaskCard(
+                id="s1",
+                title="First",
+                goal="first",
+                allowed_tools=frozenset(),
+                allowed_skills=frozenset(),
+                status="done",
+                review_verdict="revise",
+                completion={"verification_report": {"passed": True}},
+            ),
+        ],
+    )
+    review = PhaseNode(
+        id="subtask_review:s1",
+        manifest_id="subtask_review",
+        status="pending",
+        parent_phase_id="execute",
+        overlay={"subtask_id": "s1", "execute_phase_id": "execute"},
+    )
+    plan = PhasePlan(
+        plan_id="p1",
+        workspace_id="civilization",
+        run_id="run-recovered-review",
+        nodes=[execute, review],
+    )
+
+    runner._close_recovered_subtask_reviews(plan)
+
+    assert review.status == "done"
+
+
 def test_latest_completed_subtask_reads_mark_subtask_signal(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     drive = repo / "workspaces" / "civilization" / ".memory" / "drive"

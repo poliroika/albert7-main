@@ -367,26 +367,27 @@ def _workspace_has_gmas_skill(
             (workspace_root / "workspace.toml").read_text(encoding="utf-8")
         )
         skills = data.get("skills") if isinstance(data, dict) else None
+        policies = data.get("policies") if isinstance(data, dict) else None
         if isinstance(skills, dict) and skills.get("multi_agent_gmas") is True:
+            return True
+        if isinstance(policies, dict) and policies.get("multi_agent_gmas") is True:
             return True
     except Exception:
         pass
 
     drive_root = getattr(ctx, "drive_root", None)
-    candidates: list[Path] = []
     if drive_root:
-        candidates.append(Path(drive_root) / "state" / "active_skills.json")
-    candidates.append(
-        workspace_root / ".memory" / "drive" / "state" / "active_skills.json"
-    )
-    for path in candidates:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            from umbrella.contracts.capability_declaration import load_capability_declaration
+
+            declaration = load_capability_declaration(Path(drive_root))
         except Exception:
-            continue
-        text = json.dumps(payload, ensure_ascii=False).lower()
-        if str(workspace_id).lower() in text and "multi_agent_gmas" in text:
-            return True
+            declaration = None
+        if declaration is not None:
+            for cap_id in ("llm_api", "multi_agent_gmas", "gmas"):
+                entry = declaration.capabilities.get(cap_id)
+                if entry is not None and entry.available:
+                    return True
     return False
 
 
@@ -786,36 +787,68 @@ def _subtask_is_setup_only_for_gmas(subtask: dict[str, Any], paths: list[str]) -
     )
 
 
-def _subtask_requires_gmas_context(subtask: dict[str, Any]) -> bool:
-    paths = _subtask_declared_paths(subtask)
-    if _subtask_declares_gmas_implementation(paths):
+_GMAS_REQUIRED_CAPABILITIES = frozenset({"llm_api", "multi_agent_gmas", "gmas"})
+_GMAS_HARNESS_PROFILES = frozenset({"llm_runtime", "multi_agent_gmas", "gmas"})
+
+
+def _normalised_string_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    raw_values = value if isinstance(value, (list, tuple, set, frozenset)) else [value]
+    return {str(item).strip().lower() for item in raw_values if str(item).strip()}
+
+
+def _subtask_proof_payload(subtask: dict[str, Any]) -> dict[str, Any]:
+    proof = subtask.get("proof")
+    return proof if isinstance(proof, dict) else {}
+
+
+def _subtask_declares_gmas_contract(subtask: dict[str, Any]) -> bool:
+    proof = _subtask_proof_payload(subtask)
+    required_caps = (
+        _normalised_string_set(subtask.get("required_capabilities"))
+        | _normalised_string_set(proof.get("required_capabilities"))
+    )
+    if required_caps & _GMAS_REQUIRED_CAPABILITIES:
         return True
-    if _subtask_is_setup_only_for_gmas(subtask, paths):
-        return False
-    parts: list[str] = []
-    for key in (
-        "id",
-        "subtask_id",
-        "title",
-        "name",
-        "goal",
-        "description",
-        "proof",
-        "files_to_create",
-        "files_to_change",
-        "files_affected",
-    ):
-        parts.append(str(subtask.get(key) or ""))
-    text = "\n".join(parts)
-    if not _GMAS_SUBTASK_SURFACE_RE.search(text):
-        return False
-    if paths and all(
-        _GMAS_CONFIG_ONLY_PATH_RE.search(path)
-        or _GMAS_PROJECT_SHELL_PATH_RE.search(path)
-        for path in paths
-    ):
-        return False
-    return True
+
+    harness_values = (
+        _normalised_string_set(subtask.get("harness_profile"))
+        | _normalised_string_set(subtask.get("harness_id"))
+        | _normalised_string_set(proof.get("harness_profile"))
+        | _normalised_string_set(proof.get("harness_id"))
+    )
+    harness = subtask.get("harness")
+    if isinstance(harness, dict):
+        harness_values |= _normalised_string_set(harness.get("id"))
+    proof_harness = proof.get("harness")
+    if isinstance(proof_harness, dict):
+        harness_values |= _normalised_string_set(proof_harness.get("id"))
+    if harness_values & _GMAS_HARNESS_PROFILES:
+        return True
+
+    domains = (
+        _normalised_string_set(subtask.get("domain"))
+        | _normalised_string_set(subtask.get("domains"))
+        | _normalised_string_set(proof.get("domain"))
+        | _normalised_string_set(proof.get("domains"))
+    )
+    if "multi_agent_gmas" in domains:
+        return True
+
+    memory_scope = subtask.get("memory_scope")
+    if isinstance(memory_scope, dict):
+        for asset in memory_scope.get("assets") or []:
+            if not isinstance(asset, dict):
+                continue
+            kind = str(asset.get("kind") or asset.get("type") or "").strip().lower()
+            if kind == "gmas_context":
+                return True
+    return False
+
+
+def _subtask_requires_gmas_context(subtask: dict[str, Any]) -> bool:
+    return _subtask_declares_gmas_contract(subtask)
 
 
 def _active_execute_subtask_info(ctx: Any) -> dict[str, Any] | None:

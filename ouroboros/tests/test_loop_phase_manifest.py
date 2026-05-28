@@ -659,6 +659,8 @@ def test_required_phase_completion_nudge_waits_for_palace_prerequisite():
     assert "submit_research_summary" in messages[-1]["content"]
     assert "palace_add" in messages[-1]["content"]
     assert "2/3" in messages[-1]["content"]
+    assert "Do not call `palace_add` with `{}`" in messages[-1]["content"]
+    assert "non-empty `title` or `content`" in messages[-1]["content"]
 
 
 def test_required_phase_completion_nudge_forces_submit_after_palace_prerequisite():
@@ -1549,6 +1551,49 @@ def test_loop_back_to_rejects_forward_phase_target(tmp_path):
     updated = json.loads((state_dir / "phase_plan.json").read_text())
     assert updated["nodes"][1]["status"] == "running"
     assert updated["nodes"][2]["status"] == "pending"
+    assert not (state_dir / "phase_control_signal.json").exists()
+
+
+def test_subtask_review_loop_back_to_plan_requires_typed_recovery(tmp_path):
+    import sys, json
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_control import _loop_back_to
+    from unittest.mock import MagicMock
+
+    plan = {
+        "plan_id": "p1", "workspace_id": "ws1", "run_id": "r1", "version": 1,
+        "nodes": [
+            {"id": "plan", "manifest_id": "plan", "status": "done"},
+            {"id": "execute", "manifest_id": "execute", "status": "done"},
+            {
+                "id": "subtask_review:s1",
+                "manifest_id": "subtask_review",
+                "status": "running",
+                "parent_phase_id": "execute",
+            },
+        ],
+        "edits_log": [],
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "phase_plan.json").write_text(json.dumps(plan))
+
+    ctx = MagicMock()
+    ctx.drive_root = tmp_path
+    ctx.task_id = "r1:subtask_review:s1"
+    ctx.context_overlays = {
+        "phase_node": {
+            "id": "subtask_review:s1",
+            "manifest_id": "subtask_review",
+        }
+    }
+
+    result = _loop_back_to(ctx, phase="plan", reason="review prose")
+
+    assert result.startswith("ERROR:")
+    assert "RecoveryDecision" in result
+    updated = json.loads((state_dir / "phase_plan.json").read_text())
+    assert updated["nodes"][0]["status"] == "done"
     assert not (state_dir / "phase_control_signal.json").exists()
 
 

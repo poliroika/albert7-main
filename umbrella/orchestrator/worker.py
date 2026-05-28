@@ -598,8 +598,11 @@ def _load_detected_domains_from_drive(drive_root: pathlib.Path | None) -> set[st
 def _phase_node_needs_gmas_prewrite(
     phase_node: PhaseNode, detected_domains: set[str]
 ) -> bool:
+    explicit_gmas_domain = "multi_agent_gmas" in {
+        domain.lower() for domain in detected_domains
+    }
     if phase_node.manifest_id != "execute":
-        return "multi_agent_gmas" in {domain.lower() for domain in detected_domains}
+        return explicit_gmas_domain
     for card in phase_node.subtasks or []:
         if card.status == "done":
             continue
@@ -607,7 +610,10 @@ def _phase_node_needs_gmas_prewrite(
             "id": card.id,
             "title": card.title,
             "goal": card.goal,
+            "allowed_tools": list(card.allowed_tools or []),
+            "allowed_skills": list(card.allowed_skills or []),
             "proof": _json_ready(dataclasses.asdict(card.proof)) if card.proof else {},
+            "memory_scope": dict(card.memory_scope or {}),
             "files_to_create": list(card.files_to_create or []),
             "files_to_change": list(card.files_to_change or []),
             "files_affected": list(card.files_affected or []),
@@ -692,7 +698,13 @@ def _effective_phase_allowed_tools(
     if manifest.id == "execute":
         allowed -= _CONDITIONAL_EXECUTE_TOOLS
         subtask_tools = _active_subtask_values(active_subtask, "allowed_tools")
-        allowed |= subtask_tools
+        allowed |= subtask_tools & set(manifest.allowed_tools or ())
+        allowed |= subtask_tools & {
+            "loop_back_to",
+            "request_extra_subtask",
+            "palace_add",
+            "palace_link",
+        }
         if gmas_prewrite_required:
             allowed |= _GMAS_EXECUTE_TOOLS
         if _subtask_memory_requests_palace_search(
@@ -721,7 +733,9 @@ def _effective_phase_allowed_skills(
         allowed -= {"gmas-overview", "gmas-pattern-author"}
     if manifest.id == "execute":
         allowed -= _CONDITIONAL_EXECUTE_SKILLS
-        allowed |= _active_subtask_values(active_subtask, "allowed_skills")
+        allowed |= _active_subtask_values(active_subtask, "allowed_skills") & set(
+            manifest.allowed_skills or ()
+        )
         if gmas_prewrite_required:
             allowed.add("gmas-overview")
     return sorted(allowed)

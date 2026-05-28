@@ -131,6 +131,47 @@ def test_execute_context_selects_runtime_gui_without_headless_guard(tmp_path):
     assert "native_gui_runtime_proof" in validator_flags_from_harness_payload(payload)
 
 
+def test_agent_words_do_not_select_llm_runtime_harness_without_typed_capability():
+    payload = build_harness_contract_payload(
+        phase_id="execute",
+        active_subtask={
+            "id": "agent-router",
+            "title": "Agent judge router",
+            "goal": "Implement local agent and judge naming without LLM APIs.",
+            "files_to_change": ["src/agent_router.py"],
+            "proof": {
+                "execution": {
+                    "kind": "pytest",
+                    "command": ["python", "-m", "pytest", "tests/test_agent_router.py", "-q"],
+                },
+                "scope": {"files_under_test": ["src/agent_router.py"]},
+            },
+        },
+    )
+
+    assert "llm_runtime" not in payload["selected_ids"]
+
+
+def test_required_llm_capability_selects_llm_runtime_harness():
+    payload = build_harness_contract_payload(
+        phase_id="execute",
+        active_subtask={
+            "id": "llm-runtime",
+            "title": "Model runtime integration",
+            "files_to_change": ["src/model_runtime.py"],
+            "proof": {
+                "required_capabilities": ["llm_api"],
+                "execution": {
+                    "kind": "pytest",
+                    "command": ["python", "-m", "pytest", "tests/test_model_runtime.py", "-q"],
+                },
+            },
+        },
+    )
+
+    assert "llm_runtime" in payload["selected_ids"]
+
+
 def test_harness_markdown_is_compact_for_prompt_injection():
     payload = build_harness_contract_payload(phase_id="plan")
     markdown = render_harness_contract_markdown(payload)

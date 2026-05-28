@@ -531,11 +531,6 @@ def _check_stop_requested(
         payload = {}
     if not _stop_request_matches_task(payload, task_id):
         return None
-    if isinstance(payload, dict) and payload.get("internal_recovery_route"):
-        try:
-            stop_path.unlink(missing_ok=True)
-        except OSError:
-            log.debug("Failed to consume internal recovery stop request", exc_info=True)
     if content and content.strip():
         llm_trace["assistant_notes"].append(content.strip()[:320])
     reason = (
@@ -597,7 +592,7 @@ def _stop_request_matches_task(payload: Any, task_id: str) -> bool:
     current = str(task_id or "").strip()
     if not current:
         return False
-    if payload.get("internal_recovery_route") or str(payload.get("scope") or "") == "task":
+    if str(payload.get("scope") or "") == "task":
         requested = str(
             payload.get("task_id") or payload.get("target_task_id") or ""
         ).strip()
@@ -1277,11 +1272,6 @@ def _blocked_tool_result_if_stop_requested(
         stop_payload = {}
     if not _stop_request_matches_task(stop_payload, task_id):
         return None
-    if isinstance(stop_payload, dict) and stop_payload.get("internal_recovery_route"):
-        try:
-            stop_path.unlink(missing_ok=True)
-        except OSError:
-            log.debug("Failed to consume internal recovery stop request", exc_info=True)
     reason = (
         str(stop_payload.get("reason") or "manual stop requested")
         if isinstance(stop_payload, dict)
@@ -3943,8 +3933,8 @@ def _normalise_tool_command_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(raw or "").lower())
 
 
-def _success_test_command_fragments(success_text: str) -> list[str]:
-    text = str(success_text or "").strip()
+def _proof_command_fragments(proof_command: str) -> list[str]:
+    text = str(proof_command or "").strip()
     if not text:
         return []
     fragments = [text]
@@ -3994,7 +3984,7 @@ def _pytest_output_is_skip_only(output: str) -> bool:
     return bool(match and int(match.group("skipped") or 0) > 0)
 
 
-def _current_execute_success_test_text(drive_root: pathlib.Path | None) -> str:
+def _current_execute_proof_command_text(drive_root: pathlib.Path | None) -> str:
     subtask = _current_execute_subtask(drive_root)
     if not isinstance(subtask, dict):
         return ""
@@ -4002,7 +3992,18 @@ def _current_execute_success_test_text(drive_root: pathlib.Path | None) -> str:
         _subtask_typed_proof_command_text,
     )
 
-    return _subtask_typed_proof_command_text(subtask)
+    proof_command = _subtask_typed_proof_command_text(subtask)
+    if proof_command:
+        return proof_command
+    # Compatibility only: freshly submitted plans are rejected if they use
+    # success_test as authority, but older persisted plan fixtures may still
+    # need a one-shot proof-command view.
+    raw = subtask.get("success_test")
+    if isinstance(raw, dict):
+        raw = raw.get("command") or raw.get("argv") or raw.get("cmd") or ""
+    if isinstance(raw, (list, tuple)):
+        return " ".join(str(part) for part in raw)
+    return str(raw or "").strip()
 
 
 def _current_execute_subtask_id(drive_root: pathlib.Path | None) -> str:
@@ -4040,15 +4041,15 @@ def _current_execute_subtask(drive_root: pathlib.Path | None) -> dict[str, Any] 
     return first if isinstance(first, dict) else None
 
 
-def _execute_success_test_observed(
+def _execute_proof_command_observed(
     *,
-    success_text: str,
+    proof_command: str,
     trace_tool_calls: list[dict[str, Any]],
 ) -> bool:
-    text = str(success_text or "").strip()
+    text = str(proof_command or "").strip()
     if not text:
         return False
-    fragments = _success_test_command_fragments(text)
+    fragments = _proof_command_fragments(text)
     lowered = text.lower()
     explicit_tools = {
         tool
@@ -4098,9 +4099,28 @@ def _may_force_mark_subtask_complete(
         subtask_id=active_subtask_id,
     ):
         return True
-    success_text = _current_execute_success_test_text(drive_root)
-    return _execute_success_test_observed(
-        success_text=success_text,
+    proof_command = _current_execute_proof_command_text(drive_root)
+    return _execute_proof_command_observed(
+        proof_command=proof_command,
+        trace_tool_calls=trace_tool_calls,
+    )
+
+
+def _success_test_command_fragments(success_text: str) -> list[str]:
+    return _proof_command_fragments(success_text)
+
+
+def _current_execute_success_test_text(drive_root: pathlib.Path | None) -> str:
+    return _current_execute_proof_command_text(drive_root)
+
+
+def _execute_success_test_observed(
+    *,
+    success_text: str,
+    trace_tool_calls: list[dict[str, Any]],
+) -> bool:
+    return _execute_proof_command_observed(
+        proof_command=success_text,
         trace_tool_calls=trace_tool_calls,
     )
 
@@ -4370,6 +4390,13 @@ def _append_phase_prerequisite_pending_message(
     store = str(missing_rule.get("store") or "palace").strip()
     tag = str(missing_rule.get("tag") or "").strip()
     tool_hint = preferred_tool or "the required memory-write tool"
+    palace_args_hint = ""
+    if tool_hint == "palace_add":
+        palace_args_hint = (
+            " Do not call `palace_add` with `{}`. Pass a non-empty `title` "
+            "or `content`; for research findings also include current "
+            "`source_id`/`evidence_kind` provenance so the write can be accepted."
+        )
     messages.append(
         {
             "role": "system",
@@ -4381,6 +4408,7 @@ def _append_phase_prerequisite_pending_message(
                 + (f" with tag `{tag}`" if tag else "")
                 + ". Add concrete phase memory first, then call the "
                 "phase-completion tool after the prerequisite is satisfied."
+                + palace_args_hint
             ),
         }
     )

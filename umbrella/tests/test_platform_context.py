@@ -23,7 +23,7 @@ def test_architecture_author_skill_does_not_enable_gmas_policy(tmp_path: Path) -
     assert hints["detected_domains"] == []
 
 
-def test_gmas_skill_still_enables_gmas_policy(tmp_path: Path) -> None:
+def test_gmas_skill_recommendation_does_not_enable_gmas_policy(tmp_path: Path) -> None:
     drive = tmp_path / ".memory" / "drive"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -33,6 +33,25 @@ def test_gmas_skill_still_enables_gmas_policy(tmp_path: Path) -> None:
             "status": "submitted",
             "recommended_skills": ["gmas-overview"],
             "capabilities": {"python": {"available": True}},
+        },
+    )
+
+    hints = overlay_hints_from_declaration(drive, workspace)
+
+    assert hints["recommended_skills"] == ["gmas-overview"]
+    assert hints["detected_domains"] == []
+
+
+def test_llm_api_capability_enables_gmas_policy(tmp_path: Path) -> None:
+    drive = tmp_path / ".memory" / "drive"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    persist_capability_declaration(
+        drive,
+        {
+            "status": "submitted",
+            "recommended_skills": ["architecture-author"],
+            "capabilities": {"llm_api": {"available": True}},
         },
     )
 

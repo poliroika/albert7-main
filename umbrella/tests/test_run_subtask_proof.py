@@ -1049,6 +1049,259 @@ def test_request_watcher_review_contract_issue_routes_without_text_regex(
     assert payload["issues"][0]["evidence_refs"] == ["ledger_event:proof-1"]
 
 
+def test_request_watcher_review_does_not_route_plan_for_non_contract_delta_path(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    task_id = "task:execute"
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "calc-engine",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_engine.py",
+                                            "-q",
+                                        ],
+                                    },
+                                    "scope": {
+                                        "files_under_test": [
+                                            "src/calculator/engine.py",
+                                            "tests/test_engine.py",
+                                        ],
+                                        "changed_files_expected": [
+                                            "src/calculator/engine.py",
+                                            "tests/test_engine.py",
+                                        ],
+                                    },
+                                    "anti_gaming": {
+                                        "allows_test_only_change": False,
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = {
+        "task_id": task_id,
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "calc-engine"},
+        "result_preview": json.dumps(
+            {
+                "passed": False,
+                "exit_code": 1,
+                "subtask_id": "calc-engine",
+                "command": ["python", "-m", "pytest", "tests/test_engine.py", "-q"],
+                "shell_result": {
+                    "output": (
+                        "ImportError: cannot import name 'Calculator' from "
+                        "'calculator'"
+                    )
+                },
+                "proof_ref": {
+                    "ref_type": "ledger_event",
+                    "ref_id": "proof-1",
+                },
+            }
+        ),
+    }
+    (logs / "tools.jsonl").write_text(
+        "\n".join(json.dumps(failed) for _ in range(3)) + "\n",
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        task_id=task_id,
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    payload = json.loads(
+        _request_watcher_review(
+            ctx,
+            reason="conftest import still points at a missing implementation",
+            contract_issues=[
+                {
+                    "code": "bad_generated_oracle",
+                    "target_subtask_id": "calc-engine",
+                    "contract_path": "proof.anti_gaming.allows_test_only_change",
+                    "invalid_values": ["false"],
+                    "required_deltas": [
+                        {
+                            "op": "add",
+                            "path": "exceptions_for_missing_conftest_fix",
+                            "values": [
+                                "calculator-core subtask must fix conftest import"
+                            ],
+                        }
+                    ],
+                    "evidence_refs": ["ledger_event:proof-1"],
+                }
+            ],
+        )
+    )
+
+    assert payload["status"] == "review_recorded"
+    assert payload["verdict"] == "implementation_bug"
+    assert payload["requires_plan_mutation"] is False
+    assert payload.get("loop_back_target") != "plan"
+    assert payload["recovery_decision"]["kind"] == "implementation_repair"
+    assert payload["recovery_decision"]["loop_back_target"] == "execute"
+    assert "plan_revision_patch" not in payload
+
+
+def test_same_blocker_guard_stops_unbounded_identical_recovery_reviews(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    task_id = "task:execute"
+    plan = {
+        "version": 1,
+        "nodes": [
+            {
+                "id": "execute",
+                "manifest_id": "execute",
+                "status": "running",
+                "subtasks": [
+                    {
+                        "id": "calc-engine",
+                        "status": "pending",
+                        "proof": {
+                            "execution": {
+                                "kind": "pytest",
+                                "command": [
+                                    "python",
+                                    "-m",
+                                    "pytest",
+                                    "tests/test_engine.py",
+                                    "-q",
+                                ],
+                            },
+                            "scope": {
+                                "files_under_test": [
+                                    "src/calculator/engine.py",
+                                    "tests/test_engine.py",
+                                ],
+                                "changed_files_expected": [
+                                    "src/calculator/engine.py",
+                                    "tests/test_engine.py",
+                                ],
+                            },
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    (state / "phase_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    failed = {
+        "task_id": task_id,
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "calc-engine"},
+        "result_preview": json.dumps(
+            {
+                "passed": False,
+                "exit_code": 1,
+                "subtask_id": "calc-engine",
+                "command": ["python", "-m", "pytest", "tests/test_engine.py", "-q"],
+                "shell_result": {"output": "assert 9 != 9"},
+                "proof_ref": {"ref_type": "ledger_event", "ref_id": "proof-1"},
+            }
+        ),
+    }
+    (logs / "tools.jsonl").write_text(json.dumps(failed) + "\n", encoding="utf-8")
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        task_id=task_id,
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+    contract_issues = [
+        {
+            "code": "bad_generated_oracle",
+            "target_subtask_id": "calc-engine",
+            "contract_path": "proof.required_properties",
+            "invalid_values": ["distinct_inputs_distinct_outputs"],
+            "required_deltas": [
+                {
+                    "op": "remove",
+                    "path": "proof.required_properties",
+                    "values": ["distinct_inputs_distinct_outputs"],
+                }
+            ],
+            "evidence_refs": ["ledger_event:proof-1"],
+        }
+    ]
+
+    first = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason="typed issue",
+        contract_issues=contract_issues,
+    )
+    second = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason="typed issue",
+        contract_issues=contract_issues,
+    )
+    third = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason="typed issue",
+        contract_issues=contract_issues,
+    )
+
+    assert first["recovery_decision"]["kind"] == "plan_contract_revision"
+    assert second["recovery_decision"]["kind"] == "plan_contract_revision"
+    assert third["recovery_decision"]["kind"] == "blocked_no_valid_next_action"
+    assert third["same_blocker_guard"]["count"] == 3
+    assert third["loop_back_target"] == "none"
+
+    plan["version"] = 2
+    (state / "phase_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    after_plan_change = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason="typed issue",
+        contract_issues=contract_issues,
+    )
+
+    assert after_plan_change["recovery_decision"]["kind"] == "plan_contract_revision"
+    assert after_plan_change["same_blocker_guard"]["count"] == 1
+
+
 def test_retry_watcher_not_required_has_no_plan_revision_conflict(
     tmp_path: Path,
 ) -> None:

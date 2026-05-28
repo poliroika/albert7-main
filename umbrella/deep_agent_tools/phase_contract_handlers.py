@@ -15,6 +15,7 @@ from umbrella.deep_agent_tools.phase_contract_policy import (
     _phase_plan_llm_test_double_issues,
     _phase_plan_missing_leaf_file_field_issues,
     _phase_plan_generic_success_test_issues,
+    _phase_plan_revision_contract_issues,
     _phase_plan_success_test_issues,
     _phase_plan_workspace_prefix_issues,
     _workspace_existing_impl_roots,
@@ -1722,167 +1723,6 @@ def _plan_frontend_build_entrypoint_issues(plan: dict[str, Any]) -> list[str]:
     return issues
 
 
-def _plan_revision_contract_issues(ctx: ToolContext, plan: dict[str, Any]) -> list[str]:
-    overlays = getattr(ctx, "context_overlays", {}) or {}
-    phase_node = overlays.get("phase_node") if isinstance(overlays, dict) else None
-    overlay = phase_node.get("overlay") if isinstance(phase_node, dict) else None
-    if not isinstance(overlay, dict):
-        return []
-    reason = str(overlay.get("retry_reason") or "").strip().lower()
-    if not reason.startswith("micro review requested revisions"):
-        return []
-    contract = overlay.get("revision_contract")
-    if not isinstance(contract, dict):
-        return []
-    raw_revisions = contract.get("required_plan_changes") or contract.get("revisions") or []
-    revisions = [str(item).strip() for item in raw_revisions if str(item).strip()]
-    if not revisions:
-        return []
-    plan_text = json.dumps(plan, ensure_ascii=False).lower()
-    stopwords = {
-        "with",
-        "from",
-        "into",
-        "that",
-        "this",
-        "phase",
-        "project",
-        "subtask",
-        "subtasks",
-        "replace",
-        "these",
-        "fields",
-        "provide",
-        "specify",
-        "exactly",
-        "validates",
-        "pytest-cov",
-        "platform-appropriate",
-    }
-    issues: list[str] = []
-    for revision in revisions:
-        revision_l = revision.lower()
-        if re.match(r"\s*(?:consider|optional|maybe|could|nice to have)\b", revision_l):
-            continue
-        if re.search(r"\bconcrete\s+executable\s+commands?\b", revision_l):
-            success_texts = [
-                str(
-                    subtask.get("verification_command")
-                    or subtask.get("success_test")
-                    or subtask.get("success_check")
-                    or subtask.get("success_checks")
-                    or ""
-                ).strip()
-                for subtask in _iter_plan_subtasks_for_policy(plan)
-                if isinstance(subtask, dict)
-            ]
-            if success_texts and all(
-                re.search(
-                    r"\b(?:python|py|pytest|node|npm|npx|pnpm|yarn|uv|"
-                    r"playwright|run_workspace_verify|run_unit_tests|"
-                    r"harness_run|http_boot|behavioral_http)\b",
-                    text.lower(),
-                )
-                for text in success_texts
-            ):
-                continue
-        if re.search(
-            r"\bsplit\b.{0,80}\btest\s+creation\b.{0,80}\bvalidation\b"
-            r".{0,80}\bseparate\s+subtasks\b",
-            revision_l,
-        ):
-            subtasks = [
-                subtask
-                for subtask in _iter_plan_subtasks_for_policy(plan)
-                if isinstance(subtask, dict)
-            ]
-            success_texts = [
-                str(
-                    subtask.get("verification_command")
-                    or subtask.get("success_test")
-                    or subtask.get("success_check")
-                    or subtask.get("success_checks")
-                    or ""
-                ).strip()
-                for subtask in subtasks
-            ]
-            has_test_files = any(
-                any("test" in path.lower() for path in _plan_subtask_declared_paths(subtask))
-                for subtask in subtasks
-            )
-            if (
-                len(subtasks) >= 2
-                and has_test_files
-                and success_texts
-                and all(text for text in success_texts)
-            ):
-                continue
-        if re.search(r"(?:\$|\bbudget\b|\busd\b|\bresources?\b)", revision_l) and not re.search(
-            r"\b(?:add|replace|remove|rename|specify|set|change|include|"
-            r"create|split|use)\b",
-            revision_l,
-        ):
-            continue
-        if "replace" in revision_l and " with " in revision_l:
-            positive = revision_l.split(" with ", 1)[1]
-        elif "revision requires" in revision_l:
-            positive = revision_l.split("revision requires", 1)[1]
-        else:
-            positive = revision_l
-        semantic_numbers = re.findall(
-            r"\b(\d+(?:\.\d+)?)\s*(?:times?|retries?|attempts?|turns?|"
-            r"interactions?|rounds?|%)\b",
-            positive,
-        )
-        missing_numbers = [
-            number for number in semantic_numbers if number not in plan_text
-        ]
-        if missing_numbers:
-            issues.append(
-                "review revision numeric requirement appears unaddressed: "
-                f"`{revision}`; missing number(s): "
-                + ", ".join(missing_numbers[:8])
-            )
-            continue
-        alternatives = [
-            item.strip()
-            for item in re.split(r"\bor\b", positive)
-            if item.strip()
-        ] or [positive]
-        missing_by_alternative: list[list[str]] = []
-        revision_satisfied = False
-        for alternative in alternatives:
-            keywords = [
-                item
-                for raw in re.findall(r"[a-z0-9_.-]{4,}", alternative)
-                for item in (raw.strip("._-"),)
-                if item
-                and item not in stopwords
-                and not re.fullmatch(
-                    r"\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?",
-                    item,
-                )
-            ]
-            if not keywords:
-                revision_satisfied = True
-                break
-            covered = [item for item in keywords if item in plan_text]
-            floor = 1 if len(alternatives) > 1 else 2
-            required = min(len(keywords), max(floor, (len(keywords) + 1) // 2))
-            if len(covered) >= required:
-                revision_satisfied = True
-                break
-            missing_by_alternative.append([item for item in keywords if item not in covered])
-        if revision_satisfied:
-            continue
-        missing = min(missing_by_alternative, key=len) if missing_by_alternative else []
-        issues.append(
-            "review revision appears unaddressed: "
-            f"`{revision}`; missing keyword(s): " + ", ".join(missing[:8])
-        )
-    return issues
-
-
 def _validate_phase_plan_contract(
     ctx: ToolContext,
     plan: dict[str, Any],
@@ -1952,7 +1792,7 @@ def _validate_phase_plan_contract(
         *_phase_plan_empty_test_skeleton_issues(plan),
         *_phase_plan_workspace_prefix_issues(ctx, plan),
         *_phase_plan_greenfield_layout_issues(ctx, plan),
-        *_plan_revision_contract_issues(ctx, plan),
+        *_phase_plan_revision_contract_issues(ctx, plan),
     ):
         issues.append(
             ContractIssue(

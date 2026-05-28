@@ -23,11 +23,6 @@ def overlay_hints_from_declaration(
     detected_domains: list[str] = []
     if declaration is not None:
         recommended_skills = list(declaration.recommended_skills)
-        if any(
-            skill in recommended_skills
-            for skill in ("multi_agent_gmas", "gmas-overview")
-        ):
-            detected_domains.append("multi_agent_gmas")
         llm_entry = declaration.capabilities.get("llm_api")
         if llm_entry is not None and llm_entry.available:
             detected_domains.append("multi_agent_gmas")

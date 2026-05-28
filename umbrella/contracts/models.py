@@ -449,11 +449,19 @@ class ReviewContract:
     loop_back_target: str = ""
     notes: str = ""
     coverage: ReviewCoverageChecklist | None = None
-    required_plan_changes: tuple[str, ...] = ()
+    required_plan_changes: tuple[Any, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ReviewContract":
         changes = value.get("required_plan_changes") or ()
+        if not isinstance(changes, (list, tuple)):
+            changes = ()
+        preserved_changes: list[Any] = []
+        for item in changes:
+            if isinstance(item, dict):
+                preserved_changes.append(dict(item))
+            elif str(item).strip():
+                preserved_changes.append(str(item))
         return cls(
             verdict=cast(ReviewVerdict, str(value.get("verdict") or "")),
             issues=tuple(
@@ -464,7 +472,7 @@ class ReviewContract:
             loop_back_target=str(value.get("loop_back_target") or ""),
             notes=str(value.get("notes") or ""),
             coverage=ReviewCoverageChecklist.from_mapping(value.get("coverage")),
-            required_plan_changes=tuple(str(item) for item in changes if str(item).strip()),
+            required_plan_changes=tuple(preserved_changes),
         )
 
 

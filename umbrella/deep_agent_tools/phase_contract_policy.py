@@ -2076,36 +2076,166 @@ def _subtask_payload_by_id(plan: dict[str, Any], subtask_id: str) -> dict[str, A
     return None
 
 
+def _path_values(root: Any, path: str) -> list[Any]:
+    tokens = [part for part in str(path or "").strip().split(".") if part]
+    values = [root]
+    for token in tokens:
+        next_values: list[Any] = []
+        for value in values:
+            if isinstance(value, dict) and token in value:
+                next_values.append(value[token])
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and token in item:
+                        next_values.append(item[token])
+        values = next_values
+        if not values:
+            break
+    return values
+
+
+def _typed_change_value(change: dict[str, Any]) -> Any:
+    if "value" in change:
+        return change.get("value")
+    if "new_value" in change:
+        return change.get("new_value")
+    values = change.get("values")
+    if isinstance(values, list) and len(values) == 1:
+        return values[0]
+    return values
+
+
+def _value_contains(actual: Any, expected: Any) -> bool:
+    if isinstance(actual, dict):
+        return any(_value_contains(value, expected) for value in actual.values())
+    if isinstance(actual, (list, tuple, set)):
+        return any(_value_contains(value, expected) for value in actual)
+    if expected is None:
+        return actual is None
+    if actual == expected:
+        return True
+    if isinstance(actual, str):
+        return str(expected) in actual
+    return False
+
+
+def _any_path_value_contains(values: list[Any], expected: Any) -> bool:
+    return any(_value_contains(value, expected) for value in values)
+
+
+def _required_change_target(
+    plan: dict[str, Any], change: dict[str, Any]
+) -> tuple[Any | None, str]:
+    target_subtask_id = str(
+        change.get("target_subtask_id")
+        or change.get("subtask_id")
+        or change.get("target_id")
+        or ""
+    ).strip()
+    if target_subtask_id:
+        return _subtask_payload_by_id(plan, target_subtask_id), target_subtask_id
+    target_kind = str(change.get("target_kind") or "plan").strip().lower()
+    if target_kind in {"plan", "phase_plan", "workspace"}:
+        return plan, "plan"
+    return None, str(change.get("target_id") or target_kind or "<unknown>").strip()
+
+
+def _typed_required_change_issue(plan: dict[str, Any], change: dict[str, Any]) -> str:
+    change_id = str(change.get("id") or change.get("change_id") or "<unnamed>").strip()
+    severity = str(change.get("severity") or "blocking").strip().lower()
+    if severity not in {"blocking", "error"}:
+        return ""
+    path = str(change.get("path") or change.get("field") or "").strip()
+    op = str(change.get("op") or change.get("action") or "").strip().lower()
+    if op in {"remove", "delete"}:
+        op = "remove_applied"
+    if op == "replace":
+        op = "replace_applied"
+    if not path or not op:
+        return (
+            f"typed required_plan_change `{change_id}` is not enforceable: "
+            "blocking changes must include `path` and `op`"
+        )
+    target, target_label = _required_change_target(plan, change)
+    if target is None:
+        return (
+            f"typed required_plan_change `{change_id}` targets missing "
+            f"`{target_label}`"
+        )
+    values = _path_values(target, path)
+    expected = _typed_change_value(change)
+    if op == "exists":
+        if values and any(value not in (None, "", [], {}) for value in values):
+            return ""
+        return (
+            f"typed required_plan_change `{change_id}` expected `{path}` "
+            f"to exist on `{target_label}`"
+        )
+    if op == "equals":
+        if any(value == expected for value in values):
+            return ""
+        return (
+            f"typed required_plan_change `{change_id}` expected `{path}` "
+            f"on `{target_label}` to equal `{expected}`"
+        )
+    if op == "contains":
+        if _any_path_value_contains(values, expected):
+            return ""
+        return (
+            f"typed required_plan_change `{change_id}` expected `{path}` "
+            f"on `{target_label}` to contain `{expected}`"
+        )
+    if op == "not_contains":
+        if not values or not _any_path_value_contains(values, expected):
+            return ""
+        return (
+            f"typed required_plan_change `{change_id}` expected `{path}` "
+            f"on `{target_label}` not to contain `{expected}`"
+        )
+    if op == "remove_applied":
+        if expected is None:
+            if not values:
+                return ""
+        elif not values or not _any_path_value_contains(values, expected):
+            return ""
+        return (
+            f"typed required_plan_change `{change_id}` expected removal at "
+            f"`{path}` on `{target_label}`"
+        )
+    if op == "replace_applied":
+        old_value = change.get("old_value")
+        new_value = change.get("new_value", change.get("value"))
+        old_absent = old_value is None or not _any_path_value_contains(values, old_value)
+        new_present = new_value is None or _any_path_value_contains(values, new_value)
+        if old_absent and new_present:
+            return ""
+        return (
+            f"typed required_plan_change `{change_id}` expected replacement at "
+            f"`{path}` on `{target_label}`"
+        )
+    if op == "semantic_diff":
+        if values and values != [change.get("previous_value")]:
+            return ""
+        return (
+            f"typed required_plan_change `{change_id}` expected semantic diff "
+            f"at `{path}` on `{target_label}`"
+        )
+    return (
+        f"typed required_plan_change `{change_id}` has unsupported op `{op}`"
+    )
+
+
 def _typed_revision_compliance_issues(
     ctx: ToolContext | None, plan: dict[str, Any]
 ) -> list[str]:
     if _umbrella_phase_id(ctx) != "plan":
         return []
-    issues: list[str] = []
-    for change in _phase_plan_required_changes(ctx):
-        subtask_id = str(change.get("subtask_id") or "").strip()
-        field = str(change.get("field") or "").strip()
-        action = str(change.get("action") or "set").strip().lower()
-        if not subtask_id or not field:
-            continue
-        subtask = _subtask_payload_by_id(plan, subtask_id)
-        if subtask is None:
-            issues.append(
-                f"required_plan_change targets missing subtask `{subtask_id}`"
-            )
-            continue
-        blob = json.dumps(subtask, ensure_ascii=False).lower()
-        if action in {"remove", "delete"}:
-            if field.lower() in blob:
-                issues.append(
-                    f"required_plan_change expected `{field}` removed from `{subtask_id}`"
-                )
-            continue
-        if field.lower() not in blob:
-            issues.append(
-                f"required_plan_change field `{field}` not reflected in subtask `{subtask_id}`"
-            )
-    return issues
+    return [
+        issue
+        for change in _phase_plan_required_changes(ctx)
+        for issue in [_typed_required_change_issue(plan, change)]
+        if issue
+    ]
 
 
 def _phase_plan_revision_items(ctx: ToolContext | None) -> list[str]:
@@ -2624,67 +2754,7 @@ def _phase_plan_revision_contract_issues(
 ) -> list[str]:
     if _umbrella_phase_id(ctx) != "plan":
         return []
-    typed_issues = _typed_revision_compliance_issues(ctx, plan)
-    if typed_issues:
-        return typed_issues
-    issues: list[str] = []
-    for revision in _phase_plan_revision_items(ctx):
-        rename_issue = _revision_rename_issue(plan, revision)
-        if rename_issue is not None:
-            if rename_issue:
-                issues.append(rename_issue)
-            continue
-        if _revision_is_optional_instruction(revision):
-            continue
-        if _revision_is_non_actionable_budget_comment(revision):
-            continue
-        if _revision_is_meta_test_strategy_instruction(
-            revision
-        ) or _revision_is_success_test_quality_instruction(revision):
-            continue
-        positive_clause = _revision_positive_clause(revision)
-        keywords = _revision_keywords(positive_clause)
-        if not keywords:
-            continue
-        target_text, target_id = _plan_text_for_revision_target(plan, revision)
-        if target_id and not target_text:
-            issues.append(
-                f"review revision targets `{target_id}` but the new phase plan has no matching subtask"
-            )
-            continue
-        required_numbers = _revision_semantic_number_tokens(positive_clause)
-        if required_numbers:
-            present_numbers = set(_revision_number_tokens(target_text))
-            missing_numbers = [
-                number
-                for number in required_numbers
-                if not _revision_number_present(
-                    number,
-                    present_numbers,
-                    positive_clause,
-                )
-            ]
-            if missing_numbers:
-                target_hint = f" in `{target_id}`" if target_id else ""
-                issues.append(
-                    "review revision numeric requirement appears unaddressed"
-                    f"{target_hint}: `{revision}`; missing number(s): "
-                    + ", ".join(missing_numbers[:8])
-                )
-                continue
-        haystack = set(_revision_keywords(target_text))
-        covered = [keyword for keyword in keywords if keyword in haystack]
-        required = min(len(keywords), min(4, max(2, (len(keywords) + 1) // 2)))
-        if len(covered) >= required:
-            continue
-        missing = [keyword for keyword in keywords if keyword not in haystack]
-        target_hint = f" in `{target_id}`" if target_id else ""
-        issues.append(
-            "review revision appears unaddressed"
-            f"{target_hint}: `{revision}`; missing keyword(s): "
-            + ", ".join(missing[:8])
-        )
-    return issues
+    return _typed_revision_compliance_issues(ctx, plan)
 
 
 __all__ = [

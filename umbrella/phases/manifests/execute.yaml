@@ -25,6 +25,7 @@ allowed_tools:
   - bg_list
   - bg_kill
   - run_unit_tests
+  - apply_plan_revision_patch
   - mutate_phase_plan
   - request_scope_change
   - mark_subtask_complete
@@ -55,7 +56,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, bg_start, bg_status, bg_tail, bg_list, bg_kill, run_unit_tests, mutate_phase_plan, request_scope_change, mark_subtask_complete, request_watcher_review]
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, bg_start, bg_status, bg_tail, bg_list, bg_kill, run_unit_tests, apply_plan_revision_patch, mutate_phase_plan, request_scope_change, mark_subtask_complete, request_watcher_review]
     - deny_tools: [wipe_workspace, reset_palace]
     - deny_path: ["**/.env*", "**/secrets/**"]
 
