@@ -392,11 +392,37 @@ def _pytest_targets_not_covered(
 def _no_test_tampering_proof_narrowing_issue(
     previous: Any, updated: Any, *, subtask_id: str
 ) -> str:
-    if (
-        getattr(previous.execution, "kind", "") != "pytest"
-        or getattr(updated.execution, "kind", "") != "pytest"
-        or "no_test_tampering" not in updated.oracle.required_properties
-    ):
+    previous_properties = set(getattr(previous.oracle, "required_properties", ()) or ())
+    updated_properties = set(getattr(updated.oracle, "required_properties", ()) or ())
+    if "no_test_tampering" in previous_properties and "no_test_tampering" not in updated_properties:
+        return (
+            "no_test_tampering_removal_forbidden: accepted no_test_tampering "
+            f"proof for subtask `{subtask_id}` cannot remove the anti-gaming "
+            "property during execute."
+        )
+    if "no_test_tampering" not in (previous_properties | updated_properties):
+        return ""
+    previous_kind = str(getattr(previous.execution, "kind", "") or "")
+    updated_kind = str(getattr(updated.execution, "kind", "") or "")
+    if previous_kind == "pytest" and updated_kind != "pytest":
+        updated_caps = {
+            str(item).strip().lower()
+            for item in (getattr(updated, "required_capabilities", ()) or ())
+            if str(item).strip()
+        }
+        runtime_upgrade = (
+            str(getattr(updated, "harness_profile", "") or "") == "desktop_gui_runtime"
+            and updated_kind == "command"
+            and "desktop_gui_runtime" in updated_caps
+        )
+        if not runtime_upgrade:
+            return (
+                "proof_kind_downgrade_forbidden: no_test_tampering pytest proof "
+                f"for subtask `{subtask_id}` cannot be replaced with "
+                f"`{updated_kind}` during execute; use an equally strong typed "
+                "proof or a validated desktop_gui_runtime command contract."
+            )
+    if previous_kind != "pytest" or updated_kind != "pytest":
         return ""
 
     previous_scope = _dedupe_pytest_targets(list(previous.scope.pytest_targets))
@@ -990,8 +1016,8 @@ def _request_scope_change(
             f"path(s) also appear on later subtask(s): {hits}. PhasePlan file "
             "ownership is advisory during execute. Read the file fresh and edit "
             "it directly if the active proof genuinely depends on it. Use "
-            "mutate_phase_plan only when changing proof/oracle/contract shape, "
-            "especially for test files."
+            "apply_plan_revision_patch only when changing proof/oracle/"
+            "contract shape, especially for test files."
         )
     existing = set(_phase_plan_string_items(active.get("files_to_create")))
     merged = sorted(existing | set(path_list))

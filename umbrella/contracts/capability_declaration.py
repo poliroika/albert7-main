@@ -524,7 +524,7 @@ def probe_required_capability_resolution_errors(
                 "limitation in constraints/limitations. The probe is part of "
                 "the same submit_capability_declaration call; for Tkinter "
                 "desktop runtime use e.g. "
-                'probes.desktop_gui_runtime={"kind":"command","command":["python","-c","import tkinter as tk; root=tk.Tk(); root.update(); root.destroy()"],"expect_exit":0}.'
+                'probes.desktop_gui_runtime={"kind":"command","intent":"real_gui_root_lifecycle","command":["python","-c","import tkinter as tk; root=tk.Tk(); root.update(); root.destroy()"],"expect_exit":0}.'
             )
             continue
         if not _text_contains_any(combined, _CONCRETE_CAPABILITY_LIMITATION_PHRASES):

@@ -338,7 +338,7 @@ def _enrich_greenfield_layout_block(
     enriched = dict(block)
     enriched["structural_deadlock"] = True
     enriched["recommended_action"] = (
-        "mutate_phase_plan.replace_files_to_create_or_loop_back_to_plan"
+        "apply_plan_revision_patch.replace_files_to_create_or_loop_back_to_plan"
     )
     enriched["bad_declared_path"] = bad
     enriched["suggested_path_pattern"] = "src/<package>/..."
@@ -349,7 +349,7 @@ def _enrich_greenfield_layout_block(
             + " This is a structural plan/layout conflict. The active subtask "
             "declares a non-canonical Python layout, while workspace write policy "
             "requires `src/<package>/...`. Replace the bad declared path via "
-            "`mutate_phase_plan` or loop back to plan; do not keep retrying the "
+            "`apply_plan_revision_patch` or loop back to plan; do not keep retrying the "
             "same write in execute."
         ).strip()
     if declared_paths and bad and bad in {p.replace("\\", "/").strip().lstrip("/") for p in declared_paths}:
@@ -2439,7 +2439,7 @@ def _no_test_tampering_oracle_freeze_block(
     active_id = str((active or {}).get("id") or state.get("subtask_id") or "").strip()
     gate = {
         "reason": "no_test_tampering_oracle_freeze",
-        "allowed_next_tools": ["read_file", "repo_read", "request_watcher_review", "mutate_phase_plan"],
+        "allowed_next_tools": ["read_file", "repo_read", "request_watcher_review", "apply_plan_revision_patch"],
         "blocked_tools": [
             "apply_workspace_patch",
             "replace_workspace_file",
@@ -2462,7 +2462,7 @@ def _no_test_tampering_oracle_freeze_block(
         "next_step": (
             "Repair the implementation, or if the generated test contract is "
             "internally contradictory, call `request_watcher_review` and then "
-            "`mutate_phase_plan` with a typed proof patch and required_deltas "
+            "`apply_plan_revision_patch` with a typed proof patch and required_deltas "
             "before editing test/proof oracle files."
         ),
         "allowed_next_tools": gate["allowed_next_tools"],
@@ -3794,7 +3794,7 @@ def delegate_to_ouroboros(
     The new task runs in the background with its own PhasePlan. Use this only
     when the work is genuinely separate from the current run (such as editing
     Umbrella/Ouroboros code itself). For in-run plan changes, use the
-    ``mutate_phase_plan`` / ``add_phase`` / ``edit_subtask_card`` tools.
+    ``apply_plan_revision_patch`` / ``add_phase`` / ``edit_subtask_card`` tools.
     """
     try:
         import threading

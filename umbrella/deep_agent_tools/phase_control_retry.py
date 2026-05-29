@@ -1551,6 +1551,34 @@ class ContractDelta:
         return payload
 
 
+_ALLOWED_RETRY_PROOF_KINDS = frozenset(
+    {
+        "pytest",
+        "verification_step",
+        "http_boot",
+        "behavioral_http",
+        "input_sensitivity",
+        "mutation_smoke",
+        "metamorphic",
+        "property_test",
+        "import_check",
+        "build",
+        "command",
+    }
+)
+
+
+def _replacement_proof_kind(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    if "kind" in value:
+        return str(value.get("kind") or "").strip()
+    execution = value.get("execution")
+    if isinstance(execution, dict):
+        return str(execution.get("kind") or "").strip()
+    return ""
+
+
 @dataclass(frozen=True)
 class RetryContractIssue:
     """Typed recovery issue; prose can annotate it but cannot create it."""
@@ -1649,7 +1677,14 @@ def _contract_delta_from_payload(raw: Any) -> ContractDelta | None:
         for item in (raw.get("values") or [])
         if str(item).strip()
     ) if isinstance(raw.get("values"), list) else ()
+    if path in {"proof.execution.kind", "proof.kind"} and any(
+        value not in _ALLOWED_RETRY_PROOF_KINDS for value in values
+    ):
+        return None
     replacement = raw.get("replacement") if "replacement" in raw else None
+    replacement_kind = _replacement_proof_kind(replacement)
+    if replacement_kind and replacement_kind not in _ALLOWED_RETRY_PROOF_KINDS:
+        return None
     return ContractDelta(
         op=op, path=path, values=values, replacement=replacement
     )
@@ -2207,14 +2242,13 @@ def _plan_contract_revision_decision(
                 "evidence_refs": json_ready(patch.get("evidence_refs") or []),
             }
         ]
-    required_change = {
-        "target_subtask_id": target,
-        "reason_code": patch["reason_code"],
-        "contract_path": str(patch.get("contract_path") or ""),
-        "invalid_values": json_ready(patch.get("invalid_values") or []),
-        "required_deltas": json_ready(patch.get("required_deltas") or []),
-        "evidence_refs": json_ready(patch.get("evidence_refs") or []),
-    }
+    required_changes = _typed_required_plan_changes_from_patch(
+        target_subtask_id=target,
+        reason_code=patch["reason_code"],
+        required_deltas=patch.get("required_deltas") or [],
+        evidence_refs=patch.get("evidence_refs") or [],
+        revision_id=str(patch.get("revision_id") or ""),
+    )
     return RecoveryDecision(
         decision_id=hash_value(
             {
@@ -2231,7 +2265,7 @@ def _plan_contract_revision_decision(
         failure_hash=failure_hash,
         loop_back_target="plan",
         issues=issues,
-        required_plan_changes=[required_change],
+        required_plan_changes=required_changes,
         plan_revision_patch=json_ready(patch),
         allowed_next_actions=[
             "route to plan contract revision",
@@ -2247,6 +2281,80 @@ def _plan_contract_revision_decision(
         ],
         evidence=evidence,
     )
+
+
+def _typed_required_plan_changes_from_patch(
+    *,
+    target_subtask_id: str,
+    reason_code: str,
+    required_deltas: Any,
+    evidence_refs: Any,
+    revision_id: str = "",
+) -> list[dict[str, Any]]:
+    if not isinstance(required_deltas, list):
+        return []
+    refs = json_ready(evidence_refs if isinstance(evidence_refs, list) else [])
+    changes: list[dict[str, Any]] = []
+    for index, delta in enumerate(required_deltas, start=1):
+        if not isinstance(delta, dict):
+            continue
+        path = str(delta.get("path") or "").strip()
+        op = str(delta.get("op") or "").strip().lower()
+        if not path or op not in {"remove", "replace", "add"}:
+            continue
+        values = delta.get("values")
+        if isinstance(values, list):
+            value_items = values
+        elif "value" in delta:
+            value_items = [delta.get("value")]
+        elif "replacement" in delta:
+            value_items = [delta.get("replacement")]
+        else:
+            value_items = [None]
+        base = {
+            "id": f"{revision_id or reason_code}-{index}",
+            "target_subtask_id": target_subtask_id,
+            "severity": "blocking",
+            "reason_code": reason_code,
+            "source": "RecoveryDecision.required_deltas",
+            "evidence_refs": refs,
+        }
+        if op == "remove":
+            for value_index, value in enumerate(value_items, start=1):
+                item = {
+                    **base,
+                    "id": f"{base['id']}-remove-{value_index}",
+                    "path": path,
+                    "op": "remove_applied",
+                }
+                if value is not None:
+                    item["value"] = json_ready(value)
+                changes.append(item)
+            continue
+        if op == "add":
+            for value_index, value in enumerate(value_items, start=1):
+                item = {
+                    **base,
+                    "id": f"{base['id']}-add-{value_index}",
+                    "path": path,
+                    "op": "contains",
+                }
+                if value is not None:
+                    item["value"] = json_ready(value)
+                changes.append(item)
+            continue
+        if op == "replace":
+            item = {
+                **base,
+                "path": path,
+                "op": "equals",
+            }
+            if len(value_items) == 1:
+                item["value"] = json_ready(value_items[0])
+            else:
+                item["values"] = json_ready(value_items)
+            changes.append(item)
+    return changes
 
 
 def _implementation_repair_decision(

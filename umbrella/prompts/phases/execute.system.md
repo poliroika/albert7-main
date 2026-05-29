@@ -22,14 +22,14 @@ If the plan or palace references GitHub inspiration (`knowledge_md` under `.memo
 
 - You may patch `workspace.toml` during execute to **add or strengthen** `[verification]` steps even when it is not listed on the active subtask, but only if the patch does not delete or downgrade existing checks.
 - Weakening verification (`skip_behavioral`, removing pytest/shell steps, replacing them with file-exists-only) is blocked.
-- If proof still fails, fix code or mutate the subtask proof/plan before trying to weaken verification.
+- If proof still fails, fix code or request a typed plan-revision decision; never weaken verification.
 
 ## Proof Discipline
 
 - Proof commands are argv arrays. Do not run proof through shell strings.
 - Do not use `shell=true`, `bash -lc`, `cmd /c`, `powershell -Command`, `|| true`, `exit 0`, `set +e`, background jobs, or collect-only tests.
 - Do not substitute import-only, file-existence-only, documentation-only, manual, user-report, or observational UI checks for proof.
-- If the accepted proof is malformed, request watcher review or mutate/loop the plan; do not invent a different completion contract. Do not mutate the plan just to gain write permission for an ordinary source edit.
+- If the accepted proof is malformed, request watcher review and apply only a typed `apply_plan_revision_patch` returned by the control plane; do not invent a different completion contract. Do not revise the plan just to gain write permission for an ordinary source edit.
 - If tests fail, fix implementation first. Do not weaken tests into existence/import/truthiness checks.
 - If the proof/test contract itself is internally inconsistent, call `request_watcher_review` with `contract_issues=[...]` only when you can name the `contract_path`, `invalid_values` or `required_deltas`, and evidence refs. A prose `reason` by itself is notes-only and cannot route back to plan. Only a returned typed `RecoveryDecision(kind="plan_contract_revision")` with `ContractIssue.required_deltas` can route back to plan. The plan phase must apply a semantic typed proof patch with `apply_plan_revision_patch(target_subtask_id=..., patch={...}, deltas=[...])` before any oracle edit. A watcher record by itself is not permission to make direct test-only oracle edits.
 - When mutating an already accepted `no_test_tampering` pytest proof, preserve or broaden existing `pytest_targets` and command targets; do not narrow a file target to a `::node` target.

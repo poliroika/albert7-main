@@ -25,7 +25,6 @@ allowed_tools:
   - palace_add
   - palace_link
   - apply_plan_revision_patch
-  - mutate_phase_plan
   - mark_subtask_complete
   - request_watcher_review
   - get_gmas_context
@@ -56,7 +55,7 @@ memory:
 
 permissions:
   rules:
-    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, run_unit_tests, palace_search, palace_add, palace_link, apply_plan_revision_patch, mutate_phase_plan, mark_subtask_complete, request_watcher_review, get_gmas_context, search_gmas_knowledge]
+    - allow_tools: [apply_workspace_patch, delete_workspace_file, shell, terminal_session, read_file, load_skill, list_files, repo_read, repo_list, run_workspace_verify, run_subtask_proof, run_unit_tests, palace_search, palace_add, palace_link, apply_plan_revision_patch, mark_subtask_complete, request_watcher_review, get_gmas_context, search_gmas_knowledge]
     - deny_tools: [add_phase, wipe_workspace, reset_palace]
     - deny_path: ["**/.env*", "**/secrets/**"]
 

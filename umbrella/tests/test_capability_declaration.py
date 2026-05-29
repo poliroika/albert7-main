@@ -83,6 +83,7 @@ def test_validate_declaration_rejects_available_runtime_with_stale_negative_text
                     "reason": "",
                     "probe": {
                         "kind": "command",
+                        "intent": "real_gui_root_lifecycle",
                         "command": [
                             "python",
                             "-c",
@@ -115,6 +116,7 @@ def test_validate_declaration_rejects_available_runtime_with_stale_probe_needed_
                     "reason": "",
                     "probe": {
                         "kind": "command",
+                        "intent": "real_gui_root_lifecycle",
                         "command": [
                             "python",
                             "-c",
@@ -149,6 +151,7 @@ def test_validate_declaration_rejects_available_runtime_with_probe_confirmation_
                     "reason": "",
                     "probe": {
                         "kind": "command",
+                        "intent": "real_gui_root_lifecycle",
                         "command": [
                             "python",
                             "-c",
@@ -179,6 +182,7 @@ def test_capability_text_contradiction_catches_research_summary_probe_todo() -> 
                 "source": "probe",
                 "probe": {
                     "kind": "command",
+                    "intent": "real_gui_root_lifecycle",
                     "command": [
                         "python",
                         "-c",
@@ -497,6 +501,7 @@ def test_validate_phase_plan_rejects_stale_available_capability_note(
                         "source": "probe",
                         "probe": {
                             "kind": "command",
+                            "intent": "real_gui_root_lifecycle",
                             "command": [
                                 "python",
                                 "-c",
@@ -586,6 +591,7 @@ def test_validate_phase_plan_rejects_stale_available_capability_tool_notes(
                         "source": "probe",
                         "probe": {
                             "kind": "command",
+                            "intent": "real_gui_root_lifecycle",
                             "command": [
                                 "python",
                                 "-c",

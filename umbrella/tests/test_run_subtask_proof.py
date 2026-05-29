@@ -1047,6 +1047,16 @@ def test_request_watcher_review_contract_issue_routes_without_text_regex(
     assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
     assert payload["issues"][0]["contract_path"] == "proof.required_properties"
     assert payload["issues"][0]["evidence_refs"] == ["ledger_event:proof-1"]
+    [change] = payload["required_plan_changes"]
+    assert change["id"]
+    assert change["target_subtask_id"] == "calc-engine"
+    assert change["severity"] == "blocking"
+    assert change["reason_code"] == "bad_generated_oracle"
+    assert change["source"] == "RecoveryDecision.required_deltas"
+    assert change["evidence_refs"] == ["ledger_event:proof-1"]
+    assert change["path"] == "proof.required_properties"
+    assert change["op"] == "remove_applied"
+    assert change["value"] == "distinct_inputs_distinct_outputs"
 
 
 def test_request_watcher_review_does_not_route_plan_for_non_contract_delta_path(

@@ -152,7 +152,7 @@ def test_agent_words_do_not_select_llm_runtime_harness_without_typed_capability(
     assert "llm_runtime" not in payload["selected_ids"]
 
 
-def test_required_llm_capability_selects_llm_runtime_harness():
+def test_required_llm_capability_does_not_select_runtime_harness_without_profile():
     payload = build_harness_contract_payload(
         phase_id="execute",
         active_subtask={
@@ -169,7 +169,62 @@ def test_required_llm_capability_selects_llm_runtime_harness():
         },
     )
 
+    assert "llm_runtime" not in payload["selected_ids"]
+
+
+def test_explicit_llm_profile_selects_llm_runtime_harness():
+    payload = build_harness_contract_payload(
+        phase_id="execute",
+        active_subtask={
+            "id": "llm-runtime",
+            "title": "Model runtime integration",
+            "files_to_change": ["src/model_runtime.py"],
+            "proof": {
+                "harness_profile": "llm_runtime",
+                "required_capabilities": ["llm_api"],
+                "execution": {
+                    "kind": "pytest",
+                    "command": ["python", "-m", "pytest", "tests/test_model_runtime.py", "-q"],
+                },
+            },
+        },
+    )
+
     assert "llm_runtime" in payload["selected_ids"]
+
+
+def test_gui_click_words_do_not_select_runtime_harness_without_profile():
+    payload = build_harness_contract_payload(
+        phase_id="execute",
+        active_subtask={
+            "id": "calculator-gui",
+            "title": "Implement Tkinter GUI window",
+            "goal": "Create calculator GUI with buttons, display, and click handlers.",
+            "files_to_create": ["src/calculator/gui.py", "tests/test_gui.py"],
+            "files_to_change": ["src/calculator/__init__.py"],
+            "proof": {
+                "required_capabilities": ["python"],
+                "execution": {
+                    "kind": "pytest",
+                    "command": ["python", "-m", "pytest", "tests/test_gui.py", "-q"],
+                },
+                "oracle": {"required_properties": ["no_test_tampering"]},
+                "scope": {
+                    "files_under_test": ["src/calculator/gui.py", "tests/test_gui.py"],
+                    "changed_files_expected": [
+                        "src/calculator/gui.py",
+                        "src/calculator/__init__.py",
+                        "tests/test_gui.py",
+                    ],
+                    "pytest_targets": ["tests/test_gui.py::test_button_updates_display"],
+                },
+            },
+        },
+    )
+
+    assert "desktop_gui_runtime" not in payload["selected_ids"]
+    assert "desktop_gui_headless" not in payload["selected_ids"]
+    assert "python_src_layout" in payload["selected_ids"]
 
 
 def test_harness_markdown_is_compact_for_prompt_injection():

@@ -60,6 +60,21 @@ ALLOWED_SCHEMA_NAMES = {
     "completion",
     "verification_report",
 }
+_ALLOWED_PROOF_KINDS = frozenset(
+    {
+        "pytest",
+        "verification_step",
+        "http_boot",
+        "behavioral_http",
+        "input_sensitivity",
+        "mutation_smoke",
+        "metamorphic",
+        "property_test",
+        "import_check",
+        "build",
+        "command",
+    }
+)
 _CANDIDATE_CONTROL_DIRS = {
     ".git",
     ".memory",
@@ -342,6 +357,20 @@ def validate_proof_spec(
     caps = runtime_capabilities or {}
     planned_runtime_text = _proof_planned_runtime_text(proof)
     execution_command_text = "\n".join(str(item) for item in execution.command).lower()
+    if execution.kind not in _ALLOWED_PROOF_KINDS:
+        issues.append(
+            _issue(
+                "unknown_proof_kind",
+                (
+                    f"Unknown proof.execution.kind `{execution.kind}`; "
+                    "subtask proofs must use a typed ProofSpec proof kind. "
+                    "Workspace verification-only checks such as file_exists "
+                    "cannot replace behavioral proof."
+                ),
+                phase=phase,
+                subtask_id=subtask_id,
+            )
+        )
     if proof.harness_profile and proof.harness_profile not in known_harness_profile_ids():
         issues.append(
             _issue(

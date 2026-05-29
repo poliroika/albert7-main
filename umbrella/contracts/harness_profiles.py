@@ -282,7 +282,32 @@ def explicit_harness_ids_from_subtask(subtask: dict[str, Any] | None) -> tuple[s
     return tuple(ids)
 
 
-def infer_harness_ids_for_subtask(
+def _safe_default_harness_ids_for_subtask(
+    subtask: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    if not isinstance(subtask, dict):
+        return ()
+    ids: list[str] = []
+    paths = _subtask_paths(subtask)
+    if any(path.endswith(".py") for path in paths) or "pyproject.toml" in paths:
+        ids.append("python_src_layout")
+    return tuple(ids)
+
+
+def active_harness_ids_for_subtask(
+    subtask: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    ids: list[str] = []
+    for profile_id in explicit_harness_ids_from_subtask(subtask):
+        if profile_id not in ids:
+            ids.append(profile_id)
+    for profile_id in _safe_default_harness_ids_for_subtask(subtask):
+        if profile_id not in ids:
+            ids.append(profile_id)
+    return tuple(ids)
+
+
+def suggest_harness_ids_for_planning(
     subtask: dict[str, Any] | None,
     *,
     phase_id: str = "",
@@ -387,6 +412,26 @@ def infer_harness_ids_for_subtask(
     return tuple(ids[:3])
 
 
+def infer_harness_ids_for_subtask(
+    subtask: dict[str, Any] | None,
+    *,
+    phase_id: str = "",
+    capability_envelope: dict[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Backward-compatible planner suggestion helper.
+
+    This is intentionally not an execute/control-plane authority. Execute
+    contexts and validator flags use explicit proof.harness_profile plus safe
+    structural defaults only.
+    """
+
+    return suggest_harness_ids_for_planning(
+        subtask,
+        phase_id=phase_id,
+        capability_envelope=capability_envelope,
+    )
+
+
 def _capability_entry_available(value: Any) -> bool:
     if isinstance(value, dict):
         available = value.get("available")
@@ -438,16 +483,15 @@ def build_harness_contract_payload(
             "profiles": profiles,
         }
     if phase == "execute" and active_subtask:
-        selected = infer_harness_ids_for_subtask(
-            active_subtask,
-            phase_id=phase,
-            capability_envelope=capability_envelope,
-        )
+        selected = active_harness_ids_for_subtask(active_subtask)
         return {
             "schema_version": HARNESS_PROFILE_SCHEMA_VERSION,
             "mode": "active",
             "selected_ids": list(selected),
-            "reason": "active execute subtask profile selection",
+            "reason": (
+                "active execute subtask explicit profile selection plus safe "
+                "structural defaults"
+            ),
             "profiles": [
                 _PROFILES[profile_id].contract_payload(reason="selected for active subtask")
                 for profile_id in selected
@@ -540,6 +584,6 @@ def validator_flags_from_overlays(overlays: dict[str, Any] | None) -> frozenset[
 
 def validator_flags_for_subtask(subtask: dict[str, Any] | None) -> frozenset[str]:
     flags: set[str] = set()
-    for profile_id in infer_harness_ids_for_subtask(subtask, phase_id="execute"):
+    for profile_id in active_harness_ids_for_subtask(subtask):
         flags.update(validator_flags_for_profile(profile_id))
     return frozenset(flags)

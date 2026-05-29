@@ -113,7 +113,7 @@ def build_phase_contract(
                 ),
                 "proof_revision_requires": [
                     "request_watcher_review verdict=bad_test_contract",
-                    "mutate_phase_plan typed proof patch with required_deltas",
+                    "apply_plan_revision_patch typed proof patch with required_deltas",
                     "fresh run_subtask_proof after proof contract revision",
                 ],
             },

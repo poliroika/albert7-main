@@ -155,6 +155,65 @@ def test_mutate_phase_plan_blocks_pytest_node_target_narrowing(tmp_path) -> None
     assert "proof_selection_narrowing_forbidden" in result
 
 
+def test_mutate_phase_plan_rejects_unknown_file_exists_proof_kind(tmp_path) -> None:
+    drive = _write_plan(
+        tmp_path, ["python", "-m", "pytest", "tests/test_calculator_gui.py", "-q"]
+    )
+    result = _mutate_phase_plan(
+        _ctx(drive),
+        patch={
+            "subtasks": [
+                {
+                    "id": "calculator-gui",
+                    "proof": {
+                        "execution": {
+                            "kind": "file_exists",
+                            "command": [
+                                "python",
+                                "-c",
+                                "from pathlib import Path; assert Path('src/calculator/gui.py').exists()",
+                            ],
+                        },
+                    },
+                }
+            ]
+        },
+    )
+
+    assert result.startswith("ERROR: cannot mutate phase plan")
+    assert "unknown_proof_kind" in result
+
+
+def test_mutate_phase_plan_blocks_pytest_to_build_downgrade(tmp_path) -> None:
+    drive = _write_plan(
+        tmp_path, ["python", "-m", "pytest", "tests/test_calculator_gui.py", "-q"]
+    )
+    result = _mutate_phase_plan(
+        _ctx(drive),
+        patch={
+            "subtasks": [
+                {
+                    "id": "calculator-gui",
+                    "proof": {
+                        "execution": {
+                            "kind": "build",
+                            "command": [
+                                "python",
+                                "-m",
+                                "compileall",
+                                "src",
+                            ],
+                        },
+                    },
+                }
+            ]
+        },
+    )
+
+    assert result.startswith("ERROR: cannot mutate phase plan")
+    assert "proof_kind_downgrade_forbidden" in result
+
+
 def test_mutate_phase_plan_blocks_mocked_proof_when_contract_disallows_mocks(
     tmp_path,
 ) -> None:

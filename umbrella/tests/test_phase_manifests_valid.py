@@ -106,6 +106,25 @@ def test_execute_schedules_subtask_review_manifest():
     assert manifest.mini_review_after == "subtask_review"
 
 
+def test_execute_manifests_expose_single_typed_plan_revision_tool():
+    from umbrella.phases.loader import load_manifest
+
+    for name in ("execute", "subtask_template"):
+        manifest = load_manifest(MANIFESTS_DIR / f"{name}.yaml")
+        assert "apply_plan_revision_patch" in manifest.allowed_tools
+        assert "mutate_phase_plan" not in manifest.allowed_tools
+
+
+def test_mutate_phase_plan_schema_does_not_teach_legacy_migration_fields():
+    from umbrella.deep_agent_tools.phase_control_tools import get_tools
+
+    tools = {tool.name: tool.schema for tool in get_tools()}
+    schema_text = json.dumps(tools["mutate_phase_plan"], ensure_ascii=False)
+
+    assert "contract_migration_reason" not in schema_text
+    assert "contract_migration_files" not in schema_text
+
+
 def test_phase_memory_routes_subtasks_to_subtask_store():
     from umbrella.phases.loader import load_manifest
 

@@ -476,6 +476,7 @@ def test_submit_capability_declaration_accepts_probe_backed_desktop_runtime(
         probes={
             "desktop_gui_runtime": {
                 "kind": "command",
+                "intent": "real_gui_root_lifecycle",
                 "command": [
                     sys.executable,
                     "-c",
@@ -542,6 +543,7 @@ def test_submit_capability_declaration_rejects_declared_probe_mismatch(
         probes={
             "desktop_gui_runtime": {
                 "kind": "command",
+                "intent": "real_gui_root_lifecycle",
                 "command": [
                     sys.executable,
                     "-c",

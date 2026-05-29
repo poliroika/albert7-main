@@ -22,21 +22,7 @@ _PROBE_KINDS = frozenset({"command"})
 _IMPORT_ONLY_CAPABILITY_PROBE_TAGS = frozenset({
     "desktop_gui_headless",
 })
-_DESKTOP_GUI_RUNTIME_MARKERS = (
-    "tk.tk(",
-    "tkinter.tk(",
-    "tk(",
-    "customtkinter.ctk(",
-    "ctk.ctk(",
-    "ctk(",
-    "qapplication(",
-    "qwidget(",
-    "qmainwindow(",
-    "wx.app(",
-    ".show(",
-    ".mainloop(",
-    ".update(",
-)
+_DESKTOP_GUI_RUNTIME_INTENT = "real_gui_root_lifecycle"
 
 
 def baseline_runtime_capabilities() -> dict[str, bool]:
@@ -63,14 +49,13 @@ def _probe_command_text(spec: dict[str, Any]) -> str:
 
 
 def _validate_desktop_gui_runtime_probe(spec: dict[str, Any]) -> str | None:
-    command_text = _probe_command_text(spec)
-    compact = "".join(str(command_text or "").lower().split())
-    if any(marker in compact for marker in _DESKTOP_GUI_RUNTIME_MARKERS):
+    intent = str(spec.get("intent") or "").strip().lower()
+    if intent == _DESKTOP_GUI_RUNTIME_INTENT:
         return None
     return (
-        "desktop_gui_runtime probe must exercise real native GUI runtime "
-        "(create/update/destroy or show a window/root). Import-only library "
-        "checks belong to desktop_gui_headless or a library-specific capability."
+        "desktop_gui_runtime probe must declare "
+        "intent=real_gui_root_lifecycle. Import-only toolkit checks belong to "
+        "desktop_gui_headless or a library-specific capability."
     )
 
 
@@ -94,8 +79,6 @@ def validate_probe_spec(spec: Any, *, capability_tag: str = "") -> str | None:
             issue.code == "import_only_proof"
             and tag in _IMPORT_ONLY_CAPABILITY_PROBE_TAGS
         ):
-            continue
-        if tag == "desktop_gui_runtime" and issue.code == "import_only_proof":
             continue
         return issue.message
     return None
@@ -173,6 +156,9 @@ def run_capability_probes(
                 "reason": reason,
                 "probe": probe,
             }
+            env_id = str(probe.get("execution_environment_id") or "").strip()
+            if env_id:
+                merged[name]["execution_environment_id"] = env_id
             continue
         merged[name] = {
             "available": bool(raw.get("available")),
