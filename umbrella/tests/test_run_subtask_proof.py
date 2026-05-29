@@ -800,6 +800,100 @@ def test_run_subtask_proof_managed_runtime_launches_and_cleans_up(
     assert shell_result["managed_runtime"]["cleanup"]["alive_after"] is False
 
 
+def test_run_subtask_proof_managed_runtime_requires_driver_for_behavior_claims(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    workspace.mkdir(parents=True)
+    (workspace / "runtime_app.py").write_text(
+        "import time\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    plan = {
+        "nodes": [
+            {
+                "id": "execute",
+                "manifest_id": "execute",
+                "status": "running",
+                "subtasks": [
+                    {
+                        "id": "runtime-behavior",
+                        "status": "pending",
+                        "proof": {
+                            "harness_profile": "desktop_gui_runtime",
+                            "required_capabilities": [
+                                "python",
+                                "subprocess",
+                                "desktop_gui_runtime",
+                            ],
+                            "harness_options": {
+                                "managed_runtime": True,
+                                "readiness": {"type": "log_contains", "text": "READY"},
+                                "startup_timeout_sec": 5,
+                                "cleanup": "kill process group after readiness proof",
+                            },
+                            "execution": {
+                                "kind": "command",
+                                "command": [sys.executable, "runtime_app.py"],
+                                "timeout_sec": 10,
+                                "shell": False,
+                            },
+                            "oracle": {
+                                "oracle_type": "unit_assertions",
+                                "required_properties": [
+                                    "runtime_started",
+                                    "no_test_tampering",
+                                ],
+                            },
+                            "scope": {
+                                "files_under_test": ["runtime_app.py"],
+                                "changed_files_expected": ["runtime_app.py"],
+                            },
+                            "generated_test_contract": {
+                                "oracle_claims": [
+                                    {
+                                        "claim_id": "real_click_adds",
+                                        "source": "task_requirement",
+                                        "subject": "gui.real_interaction",
+                                        "input_sequence": ["2", "+", "3", "="],
+                                        "expected_display": "5",
+                                    }
+                                ]
+                            },
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    (state / "phase_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        umbrella_managed=True,
+        umbrella_phase_id="execute",
+        context_overlays={
+            "phase_manifest": {"id": "execute"},
+            "phase_node": {"id": "execute", "manifest_id": "execute"},
+        },
+        current_task_type="phase_run",
+    )
+
+    raw = _run_subtask_proof(ctx, subtask_id="runtime-behavior")
+
+    payload = json.loads(raw)
+    assert payload["passed"] is False
+    assert payload["shell_result"]["managed_runtime"]["missing_driver"] is True
+
+
 def test_managed_runtime_prepares_workspace_python_and_env(
     tmp_path: Path,
 ) -> None:

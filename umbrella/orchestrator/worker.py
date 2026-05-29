@@ -541,6 +541,35 @@ def render_phase_user_prompt(
             "Do not call the phase-completion tool until each required check "
             "has returned a successful result in this phase."
         )
+    if manifest.exit_criteria.completion_contract:
+        lines.append("\n## Outcome-specific phase completion evidence")
+        for tool, contract in sorted(manifest.exit_criteria.completion_contract.items()):
+            if not isinstance(contract, dict):
+                continue
+            outcomes = contract.get("outcomes") or {}
+            if not isinstance(outcomes, dict):
+                continue
+            lines.append(f"- `{tool}`:")
+            for outcome, spec in sorted(outcomes.items()):
+                if not isinstance(spec, dict):
+                    continue
+                requires = spec.get("requires") or []
+                if not requires:
+                    continue
+                readable = []
+                for req in requires:
+                    if not isinstance(req, dict):
+                        continue
+                    req_tool = str(req.get("tool") or req.get("accept") or "").strip()
+                    accept = str(req.get("accept") or "success").strip()
+                    if req_tool:
+                        readable.append(f"{req_tool} ({accept})")
+                if readable:
+                    lines.append(f"  - outcome `{outcome}` requires: " + ", ".join(readable))
+        lines.append(
+            "Failed verification is valid evidence for a loop-back outcome, "
+            "but not for an ok outcome."
+        )
     palace_rules = _effective_palace_write_rules(
         manifest,
         research_depth=research_depth,
@@ -1021,6 +1050,7 @@ def build_phase_task(
         "deny": effective_forbidden_tools,
         "required": list(manifest.exit_criteria.required_calls),
         "completion_prerequisites": {
+            "completion_contract": manifest.exit_criteria.completion_contract,
             "required_tools": list(manifest.exit_criteria.required_prior_calls),
             "palace_writes": [
                 {

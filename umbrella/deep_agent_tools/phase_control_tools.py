@@ -464,6 +464,16 @@ def get_tools() -> list[ToolEntry]:
                     "properties": {
                         "outcome": {"type": "string", "enum": ["ok", "loop_back"]},
                         "notes": {"type": "string"},
+                        "issues": {
+                            "type": "array",
+                            "description": "Typed final-review issues; notes remain human-only.",
+                            "items": {"type": "object"},
+                        },
+                        "required_changes": {
+                            "type": "array",
+                            "description": "Typed required changes to hand off to the target phase.",
+                            "items": {"type": "object"},
+                        },
                     },
                 },
             },

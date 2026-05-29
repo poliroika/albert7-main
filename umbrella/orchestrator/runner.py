@@ -1352,6 +1352,27 @@ class PhaseRunner:
         phase_node.status = "done"
         phase_node.ended_at = time.time()
         overlay: dict[str, Any] = {"retry_reason": retry_reason}
+        phase_exit_decision_path = self._drive_root / "state" / "phase_exit_decision_latest.json"
+        try:
+            phase_exit_decision = json.loads(
+                phase_exit_decision_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            phase_exit_decision = {}
+        if isinstance(phase_exit_decision, dict):
+            decision_phase = str(phase_exit_decision.get("phase_id") or "").strip()
+            decision_task = str(phase_exit_decision.get("task_id") or "").strip()
+            outcome_task = str(outcome.get("task_id") or "").strip()
+            if decision_phase == phase_node.id and (
+                not decision_task or not outcome_task or decision_task == outcome_task
+            ):
+                overlay["phase_exit_decision"] = phase_exit_decision
+                issues = phase_exit_decision.get("issues")
+                if isinstance(issues, list):
+                    overlay["required_issues"] = issues
+                changes = phase_exit_decision.get("required_changes")
+                if isinstance(changes, list):
+                    overlay["required_changes"] = changes
         retry_context = self._phase_retry_context(
             phase_node=phase_node,
             outcome=outcome,

@@ -284,8 +284,9 @@ def test_review_and_verify_manifests_have_read_only_diagnostics():
 
     final_review = load_manifest(MANIFESTS_DIR / "final_review.yaml")
     assert "run_workspace_verify" in final_review.allowed_tools
-    assert "run_workspace_verify" in final_review.exit_criteria.required_prior_calls
-    assert "run_real_e2e" in final_review.exit_criteria.required_prior_calls
+    contract = final_review.exit_criteria.completion_contract["submit_final_review"]
+    assert contract["outcomes"]["ok"]["requires"][0]["accept"] == "passed_evidence"
+    assert contract["outcomes"]["loop_back"]["requires"][0]["accept"] == "executed_evidence"
     assert "submit_verification" not in final_review.allowed_tools
     assert "promote_to_durable" not in final_review.allowed_tools
     assert "verification-protocol" not in final_review.allowed_skills

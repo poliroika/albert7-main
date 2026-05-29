@@ -88,6 +88,7 @@ class RequiredPalaceWrite:
 class ExitCriteria:
     required_calls: tuple[str, ...] = ()
     required_prior_calls: tuple[str, ...] = ()
+    completion_contract: dict[str, Any] = field(default_factory=dict)
     required_palace_writes: tuple[RequiredPalaceWrite, ...] = ()
     min_palace_writes: tuple[RequiredPalaceWrite, ...] = ()
 

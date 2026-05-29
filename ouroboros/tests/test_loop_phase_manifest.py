@@ -849,6 +849,209 @@ def test_accepted_completion_tool_waits_for_prior_tool_calls(tmp_path):
     assert "read_workspace_charter" in messages[-1]["content"]
 
 
+def test_failed_verify_counts_as_executed_evidence_not_passed_evidence():
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import _trace_entry_satisfies_tool_prerequisite
+
+    item = {
+        "tool": "run_workspace_verify",
+        "result": json.dumps(
+            {
+                "passed": False,
+                "failed_step_count": 2,
+                "verify_run_id": "verify-failed",
+                "verification_report_ref": {"report_id": "report-failed"},
+            }
+        ),
+    }
+
+    assert _trace_entry_satisfies_tool_prerequisite(
+        item,
+        tool_name="run_workspace_verify",
+        accept="executed_evidence",
+    )
+    assert not _trace_entry_satisfies_tool_prerequisite(
+        item,
+        tool_name="run_workspace_verify",
+        accept="passed_evidence",
+    )
+
+    malformed = {
+        "tool": "run_workspace_verify",
+        "result": "ERROR: tool exploded before producing a report",
+    }
+    assert not _trace_entry_satisfies_tool_prerequisite(
+        malformed,
+        tool_name="run_workspace_verify",
+        accept="executed_evidence",
+    )
+
+    blocked = {
+        "tool": "run_workspace_verify",
+        "result": json.dumps({"status": "blocked", "blocker": "env unavailable"}),
+    }
+    assert not _trace_entry_satisfies_tool_prerequisite(
+        blocked,
+        tool_name="run_workspace_verify",
+        accept="executed_evidence",
+    )
+    assert _trace_entry_satisfies_tool_prerequisite(
+        blocked,
+        tool_name="run_workspace_verify",
+        accept="blocker_evidence",
+    )
+
+
+def test_final_review_loop_back_accepts_failed_verify_evidence(tmp_path):
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import _LoopState, _handle_phase_tail_after_tool_round
+
+    state = _LoopState(round_idx=5)
+    state.llm_trace["tool_calls"] = [
+        {
+            "tool": "run_workspace_verify",
+            "result": json.dumps(
+                {
+                    "passed": False,
+                    "failed_step_count": 2,
+                    "verify_run_id": "verify-failed",
+                    "verification_report_ref": {"report_id": "report-failed"},
+                    "results": [{"name": "pytest:tests", "status": "failed"}],
+                }
+            ),
+        },
+        {
+            "tool": "submit_final_review",
+            "result": "OK: Final review submitted: loop_back (signal: sig-1)",
+        },
+    ]
+    messages = []
+
+    result = _handle_phase_tail_after_tool_round(
+        state=state,
+        tool_calls=[
+            {
+                "function": {
+                    "name": "submit_final_review",
+                    "arguments": json.dumps({"outcome": "loop_back"}),
+                }
+            }
+        ],
+        terminating_tools=frozenset({"submit_final_review"}),
+        messages=messages,
+        phase_label="final_review",
+        budget_remaining_usd=None,
+        llm=None,
+        max_retries=0,
+        drive_logs=tmp_path,
+        task_id="phase_web_1:final_review",
+        event_queue=None,
+        task_type="phase_run",
+        drive_root=tmp_path,
+        rounds_in_phase=5,
+        completion_prerequisites=(
+            {
+                "kind": "completion_contract",
+                "tool": "submit_final_review",
+                "outcomes": {
+                    "loop_back": {
+                        "requires": [
+                            {
+                                "tool": "run_workspace_verify",
+                                "accept": "executed_evidence",
+                            }
+                        ]
+                    }
+                },
+            },
+        ),
+    )
+
+    assert result is not None
+    assert result[1] == "terminated"
+    assert "REQUIRED_TOOL_CALLS_PENDING" not in "\n".join(
+        str(msg.get("content") or "") for msg in messages
+    )
+
+
+def test_final_review_ok_rejects_failed_verify_evidence(tmp_path):
+    import sys
+    import pathlib
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.loop import _LoopState, _handle_phase_tail_after_tool_round
+
+    state = _LoopState(round_idx=5)
+    state.llm_trace["tool_calls"] = [
+        {
+            "tool": "run_workspace_verify",
+            "result": json.dumps(
+                {
+                    "passed": False,
+                    "failed_step_count": 1,
+                    "verify_run_id": "verify-failed",
+                    "verification_report_ref": {"report_id": "report-failed"},
+                }
+            ),
+        },
+        {
+            "tool": "submit_final_review",
+            "result": "OK: Final review submitted: ok (signal: sig-1)",
+        },
+    ]
+    messages = []
+
+    result = _handle_phase_tail_after_tool_round(
+        state=state,
+        tool_calls=[
+            {
+                "function": {
+                    "name": "submit_final_review",
+                    "arguments": json.dumps({"outcome": "ok"}),
+                }
+            }
+        ],
+        terminating_tools=frozenset({"submit_final_review"}),
+        messages=messages,
+        phase_label="final_review",
+        budget_remaining_usd=None,
+        llm=None,
+        max_retries=0,
+        drive_logs=tmp_path,
+        task_id="phase_web_1:final_review",
+        event_queue=None,
+        task_type="phase_run",
+        drive_root=tmp_path,
+        rounds_in_phase=5,
+        completion_prerequisites=(
+            {
+                "kind": "completion_contract",
+                "tool": "submit_final_review",
+                "outcomes": {
+                    "ok": {
+                        "requires": [
+                            {
+                                "tool": "run_workspace_verify",
+                                "accept": "passed_evidence",
+                            }
+                        ]
+                    }
+                },
+            },
+        ),
+    )
+
+    assert result == ("continue", "continue")
+    assert "REQUIRED_TOOL_CALLS_PENDING" in messages[-1]["content"]
+    assert "`run_workspace_verify` accepted 0/1" in messages[-1]["content"]
+
+
 def test_required_phase_completion_nudge_forces_submit_after_prior_tool_calls():
     import sys
     import pathlib
@@ -1312,6 +1515,54 @@ def test_submit_final_review_ok_accepts_same_round_logged_e2e(tmp_path):
     result = _submit_final_review(ctx, outcome="ok", notes="green")
 
     assert result.startswith("OK:")
+
+
+def test_submit_final_review_loop_back_writes_phase_exit_decision(tmp_path):
+    import sys, json
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from ouroboros.tools.phase_control import _submit_final_review
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "run-1:final_review"
+    ctx.current_task_type = "phase_run"
+    ctx.context_overlays = {
+        "phase_node": {"id": "final_review", "manifest_id": "final_review"}
+    }
+    ctx.loop_state_view = {
+        "phase_label": "final_review",
+        "verification_summary": "Verification failed: pytest:tests",
+    }
+
+    result = _submit_final_review(
+        ctx,
+        outcome="loop_back",
+        issues=[
+            {
+                "code": "verification_step_failed",
+                "severity": "blocking",
+                "phase": "final_review",
+                "message": "pytest:tests failed",
+            }
+        ],
+        required_changes=[
+            {
+                "id": "fix-pytest-tests",
+                "target_phase": "execute",
+                "path": "verification.pytest:tests",
+                "op": "repair",
+            }
+        ],
+    )
+
+    assert result.startswith("OK:")
+    decision = json.loads(
+        (tmp_path / "state" / "phase_exit_decision_latest.json").read_text()
+    )
+    assert decision["outcome"] == "loop_back"
+    assert decision["target_phase"] == "execute"
+    assert decision["issues"][0]["code"] == "verification_step_failed"
+    assert decision["required_changes"][0]["id"] == "fix-pytest-tests"
 
 
 def test_submit_verification_pass_rejects_unresolved_limitations(tmp_path):

@@ -971,6 +971,7 @@ _FULL_RESULT_TRACE_TOOLS = frozenset(
         "mark_subtask_complete",
         "mark_remediation_complete",
         "run_workspace_verify",
+        "run_real_e2e",
     }
 )
 
@@ -2725,6 +2726,26 @@ def _phase_completion_prerequisites(
     if not isinstance(raw, dict):
         return ()
     normalized: list[dict[str, Any]] = []
+    completion_contract = raw.get("completion_contract")
+    if completion_contract is None:
+        completion_contract = tool_filter.get("completion_contract")
+    if isinstance(completion_contract, dict):
+        for tool, contract in completion_contract.items():
+            if not isinstance(contract, dict):
+                continue
+            tool_name = str(tool).strip()
+            if not tool_name:
+                continue
+            outcomes = contract.get("outcomes")
+            if not isinstance(outcomes, dict):
+                continue
+            normalized.append(
+                {
+                    "kind": "completion_contract",
+                    "tool": tool_name,
+                    "outcomes": outcomes,
+                }
+            )
     required_tools = raw.get("required_tools") or []
     if isinstance(required_tools, list):
         for tool in required_tools:
@@ -4128,6 +4149,8 @@ def _execute_success_test_observed(
 
 def _trace_json_payload(item: dict[str, Any]) -> dict[str, Any]:
     text = _trace_result_text(item).strip()
+    if not text:
+        text = str(item.get("result_preview") or item.get("content") or "").strip()
     if not text.startswith("{"):
         return {}
     try:
@@ -4280,20 +4303,44 @@ def _trace_entry_satisfies_palace_prerequisite(
     return False, ""
 
 
-def _trace_entry_satisfies_tool_prerequisite(
-    item: dict[str, Any],
-    *,
-    tool_name: str,
-) -> bool:
-    expected = str(tool_name or "").strip()
-    if not expected or str(item.get("tool") or "").strip() != expected:
+def _trace_tool_payload_has_structured_evidence(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict) or not payload:
         return False
-    text = str(
-        item.get("result")
-        or item.get("result_preview")
-        or item.get("content")
-        or ""
-    ).strip()
+    if payload.get("verification_report_ref") or payload.get("verification_report"):
+        return True
+    if payload.get("verify_run_id") or payload.get("report_id"):
+        return True
+    if isinstance(payload.get("results"), list):
+        return True
+    return False
+
+
+def _trace_tool_payload_has_blocker_evidence(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    for key in (
+        "blocker",
+        "blockers",
+        "issues",
+        "failure_hash",
+        "recovery_decision",
+        "verification_report_ref",
+        "verification_report",
+    ):
+        value = payload.get(key)
+        if value:
+            return True
+    return False
+
+
+def _trace_entry_operationally_executed(item: dict[str, Any]) -> bool:
+    text = _trace_result_text(item).strip()
+    if not text:
+        text = str(
+            item.get("result_preview")
+            or item.get("content")
+            or ""
+        ).strip()
     if not text:
         return False
     lowered = text.lower()
@@ -4306,11 +4353,89 @@ def _trace_entry_satisfies_tool_prerequisite(
     payload = _trace_json_payload(item)
     if payload:
         status = str(payload.get("status") or "").strip().lower()
-        if status in {"blocked", "error", "failed", "missing", "not_found"}:
+        if status in {"blocked", "denied", "error", "malformed", "missing", "not_found"}:
             return False
-        if payload.get("ok") is False or payload.get("passed") is False:
+        if payload.get("ok") is False:
             return False
     return True
+
+
+def _trace_entry_satisfies_tool_prerequisite(
+    item: dict[str, Any],
+    *,
+    tool_name: str,
+    accept: str = "success",
+) -> bool:
+    expected = str(tool_name or "").strip()
+    if not expected or str(item.get("tool") or "").strip() != expected:
+        return False
+    mode = str(accept or "success").strip() or "success"
+    payload = _trace_json_payload(item)
+    if mode == "blocker_evidence":
+        return bool(payload and _trace_tool_payload_has_blocker_evidence(payload))
+    if not _trace_entry_operationally_executed(item):
+        return False
+
+    if mode == "executed_evidence":
+        if payload:
+            return _trace_tool_payload_has_structured_evidence(payload)
+        return True
+
+    if mode == "passed_evidence":
+        if not payload:
+            return False
+        if payload.get("passed") is not True:
+            return False
+        try:
+            failed_count = int(payload.get("failed_step_count") or 0)
+        except (TypeError, ValueError):
+            failed_count = 0
+        return failed_count <= 0 and _trace_tool_payload_has_structured_evidence(payload)
+
+    if payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"failed"}:
+            return False
+        if payload.get("passed") is False:
+            return False
+    return True
+
+
+def _tool_call_args(tool_call: dict[str, Any]) -> dict[str, Any]:
+    function = tool_call.get("function") if isinstance(tool_call, dict) else {}
+    if not isinstance(function, dict):
+        return {}
+    raw = function.get("arguments")
+    if raw is None:
+        raw = function.get("args")
+    if raw is None:
+        raw = tool_call.get("args")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _latest_tool_call_args(
+    tool_calls: list[dict[str, Any]],
+    *,
+    tool_name: str,
+) -> dict[str, Any]:
+    expected = str(tool_name or "").strip()
+    if not expected:
+        return {}
+    for tool_call in reversed(tool_calls or []):
+        function = tool_call.get("function") if isinstance(tool_call, dict) else {}
+        if not isinstance(function, dict):
+            continue
+        if str(function.get("name") or "").strip() == expected:
+            return _tool_call_args(tool_call)
+    return {}
 
 
 def _phase_completion_prerequisite_status(
@@ -4318,18 +4443,84 @@ def _phase_completion_prerequisite_status(
     completion_prerequisites: tuple[dict[str, Any], ...],
     trace_tool_calls: list[dict[str, Any]],
     candidate_tool: str,
+    candidate_tool_args: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, int, int, str]:
+    def _check_rules(
+        rules: tuple[dict[str, Any], ...],
+    ) -> tuple[dict[str, Any] | None, int, int, str]:
+        return _phase_completion_prerequisite_status(
+            completion_prerequisites=rules,
+            trace_tool_calls=trace_tool_calls,
+            candidate_tool=candidate_tool,
+            candidate_tool_args={},
+        )
+
     for rule in completion_prerequisites or ():
+        rule_kind = str(rule.get("kind") or ("tool_call" if rule.get("tool") else "")).strip()
+        if rule_kind == "completion_contract":
+            completion_tool = str(rule.get("tool") or "").strip()
+            if completion_tool and candidate_tool and completion_tool != candidate_tool:
+                continue
+            outcomes = rule.get("outcomes") if isinstance(rule.get("outcomes"), dict) else {}
+            if not outcomes:
+                continue
+            args = candidate_tool_args or {}
+            outcome = str(args.get("outcome") or "").strip()
+            if outcome:
+                contract = outcomes.get(outcome)
+                if not isinstance(contract, dict):
+                    return (
+                        {
+                            "kind": "completion_contract",
+                            "tool": completion_tool,
+                            "outcome": outcome,
+                            "missing": "unknown_outcome",
+                        },
+                        0,
+                        1,
+                        completion_tool,
+                    )
+                required = tuple(
+                    req
+                    for req in (contract.get("requires") or ())
+                    if isinstance(req, dict)
+                )
+                return _check_rules(required)
+
+            first_missing: tuple[dict[str, Any] | None, int, int, str] | None = None
+            for contract in outcomes.values():
+                if not isinstance(contract, dict):
+                    continue
+                required = tuple(
+                    req
+                    for req in (contract.get("requires") or ())
+                    if isinstance(req, dict)
+                )
+                missing = _check_rules(required)
+                if missing[0] is None:
+                    first_missing = None
+                    break
+                if first_missing is None:
+                    first_missing = missing
+            if first_missing is not None:
+                return first_missing
+            continue
+
         try:
             needed = max(1, int(rule.get("n") or 1))
         except (TypeError, ValueError):
             needed = 1
-        if str(rule.get("kind") or "") == "tool_call":
+        if rule_kind == "tool_call":
             tool = str(rule.get("tool") or "").strip()
+            accept = str(rule.get("accept") or "success").strip() or "success"
             count = sum(
                 1
                 for item in trace_tool_calls or []
-                if _trace_entry_satisfies_tool_prerequisite(item, tool_name=tool)
+                if _trace_entry_satisfies_tool_prerequisite(
+                    item,
+                    tool_name=tool,
+                    accept=accept,
+                )
             )
             if count >= needed:
                 continue
@@ -4372,7 +4563,11 @@ def _append_phase_prerequisite_pending_message(
     completion_tool: str,
     preferred_tool: str,
 ) -> str:
-    if str(missing_rule.get("kind") or "") == "tool_call":
+    missing_kind = str(
+        missing_rule.get("kind")
+        or ("tool_call" if missing_rule.get("tool") else "")
+    ).strip()
+    if missing_kind == "tool_call":
         tool_hint = preferred_tool or str(missing_rule.get("tool") or "").strip()
         messages.append(
             {
@@ -4446,15 +4641,19 @@ def _maybe_force_required_phase_completion(
         if str(tc.get("function", {}).get("name") or "").strip()
     }
     if invoked & set(terminating_tools):
+        completion_tool = next(iter(sorted(invoked & set(terminating_tools))), "")
         missing_rule, prereq_count, prereq_needed, preferred_tool = (
             _phase_completion_prerequisite_status(
                 completion_prerequisites=completion_prerequisites,
                 trace_tool_calls=list(trace_tool_calls or []),
-                candidate_tool="",
+                candidate_tool=completion_tool,
+                candidate_tool_args=_latest_tool_call_args(
+                    tool_calls,
+                    tool_name=completion_tool,
+                ),
             )
         )
         if missing_rule is not None:
-            completion_tool = next(iter(sorted(invoked & set(terminating_tools))), "")
             tool_hint = _append_phase_prerequisite_pending_message(
                 messages=messages,
                 missing_rule=missing_rule,
@@ -4489,6 +4688,7 @@ def _maybe_force_required_phase_completion(
             completion_prerequisites=completion_prerequisites,
             trace_tool_calls=list(trace_tool_calls or []),
             candidate_tool=chosen,
+            candidate_tool_args={},
         )
     )
     if missing_rule is not None:
@@ -5351,6 +5551,10 @@ def _handle_phase_tail_after_tool_round(
     if terminating_tools:
         invoked = {tc.get("function", {}).get("name", "") for tc in tool_calls}
         if invoked & set(terminating_tools):
+            completion_tool = next(
+                iter(sorted(invoked & set(terminating_tools))),
+                next(iter(sorted(terminating_tools)), ""),
+            )
             accepted, rejected = _successful_terminating_tools(
                 tool_calls=tool_calls,
                 trace_tool_calls=list(state.llm_trace.get("tool_calls") or []),
@@ -5361,14 +5565,14 @@ def _handle_phase_tail_after_tool_round(
                     _phase_completion_prerequisite_status(
                         completion_prerequisites=completion_prerequisites,
                         trace_tool_calls=list(state.llm_trace.get("tool_calls") or []),
-                        candidate_tool="",
+                        candidate_tool=completion_tool,
+                        candidate_tool_args=_latest_tool_call_args(
+                            tool_calls,
+                            tool_name=completion_tool,
+                        ),
                     )
                 )
                 if missing_rule is not None:
-                    completion_tool = next(
-                        iter(sorted(invoked & set(terminating_tools))),
-                        next(iter(sorted(terminating_tools)), ""),
-                    )
                     _append_phase_prerequisite_pending_message(
                         messages=messages,
                         missing_rule=missing_rule,

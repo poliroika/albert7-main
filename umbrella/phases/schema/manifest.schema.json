@@ -145,6 +145,40 @@
       "properties": {
         "required_calls": {"type": "array", "items": {"type": "string"}},
         "required_prior_calls": {"type": "array", "items": {"type": "string"}},
+        "completion_contract": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "outcomes": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "requires": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "tool": {"type": "string"},
+                          "accept": {
+                            "type": "string",
+                            "enum": ["success", "executed_evidence", "passed_evidence", "blocker_evidence"]
+                          },
+                          "allow_domain_failed": {"type": "boolean"},
+                          "n": {"type": "integer", "minimum": 1}
+                        },
+                        "additionalProperties": true
+                      }
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            },
+            "additionalProperties": true
+          }
+        },
         "required_palace_writes": {
           "type": "array",
           "items": {

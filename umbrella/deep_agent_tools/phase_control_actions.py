@@ -23,7 +23,9 @@ from umbrella.contracts import (
     ContractIssue,
     ContractValidator,
     EvidenceRef,
+    PhaseExitDecision,
     ReviewContract,
+    ReviewIssue,
     ResearchSummaryContract,
     VerificationReportRef,
     build_workspace_context,
@@ -1594,7 +1596,14 @@ def _submit_phase_plan(ctx: ToolContext, *, plan_id: str = "", notes: str = "") 
     return f"OK: Phase plan submitted: {selected_plan_id} (signal: {signal_id})"
 
 
-def _submit_final_review(ctx: ToolContext, *, outcome: str, notes: str = "") -> str:
+def _submit_final_review(
+    ctx: ToolContext,
+    *,
+    outcome: str,
+    notes: str = "",
+    issues: list[dict[str, Any]] | None = None,
+    required_changes: list[dict[str, Any]] | None = None,
+) -> str:
     if stop := _stop_requested_message(ctx, "submit_final_review"):
         return stop
     if outcome not in ("ok", "loop_back"):
@@ -1603,10 +1612,40 @@ def _submit_final_review(ctx: ToolContext, *, outcome: str, notes: str = "") -> 
         gate = _final_review_e2e_gate(ctx)
         if gate:
             return gate
-    signal_id = _write_control_signal(ctx, "submit_final_review", {
+    target_phase = "execute" if outcome == "loop_back" else None
+    typed_issues = tuple(
+        ReviewIssue.from_mapping(item)
+        for item in (issues or [])
+        if isinstance(item, dict)
+    )
+    typed_required_changes = tuple(
+        dict(item) for item in (required_changes or []) if isinstance(item, dict)
+    )
+    signal_payload = {
         "outcome": outcome,
         "notes": notes,
-    })
+        "issues": [json_ready(item) for item in typed_issues],
+        "required_changes": list(typed_required_changes),
+    }
+    signal_id = _write_control_signal(ctx, "submit_final_review", signal_payload)
+    try:
+        view = getattr(ctx, "loop_state_view", {}) or {}
+        decision = PhaseExitDecision(
+            phase_id=_phase_control_phase_id(ctx),
+            task_id=str(getattr(ctx, "task_id", "") or ""),
+            outcome=outcome,
+            target_phase=target_phase,
+            issues=typed_issues,
+            required_changes=typed_required_changes,
+            verification_summary=str(view.get("verification_summary") or ""),
+            source_tool_call_id=signal_id,
+        )
+        (_state_dir(ctx) / "phase_exit_decision_latest.json").write_text(
+            _json(json_ready(decision)),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
     return f"OK: Final review submitted: {outcome} (signal: {signal_id})"
 
 
@@ -1938,6 +1977,31 @@ def _managed_runtime_readiness_specs(options: dict[str, Any]) -> list[dict[str, 
     return specs or [{"type": "process_alive"}]
 
 
+def _managed_runtime_contract_claims_behavior(proof: Any) -> bool:
+    contract = getattr(proof, "generated_test_contract", {}) or {}
+    if not isinstance(contract, dict):
+        return False
+    claims = contract.get("oracle_claims")
+    if not isinstance(claims, list):
+        return False
+    behavioral_fields = {
+        "input_sequence",
+        "input_values",
+        "expected_output",
+        "expected_display",
+        "expected_status",
+        "expected_behavior",
+    }
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        if claim.get("input_sequence"):
+            return True
+        if any(key in claim for key in behavioral_fields - {"expected_behavior"}):
+            return True
+    return False
+
+
 def _managed_runtime_env_overrides(proof: Any, options: dict[str, Any]) -> dict[str, str]:
     env: dict[str, str] = {}
     execution_env = getattr(getattr(proof, "execution", None), "env", None)
@@ -2117,7 +2181,9 @@ def _run_managed_runtime_proof(
             str(item)
             for item in getattr(getattr(proof, "oracle", None), "required_properties", ())
         }
-        needs_driver = bool(required_props - _RUNTIME_STARTED_ONLY_PROPERTIES)
+        needs_driver = bool(
+            required_props - _RUNTIME_STARTED_ONLY_PROPERTIES
+        ) or _managed_runtime_contract_claims_behavior(proof)
         assert_ok = assert_payload is None or (
             int(assert_payload.get("exit_code", 1)) == 0
             and str(assert_payload.get("status") or "") != "blocked"

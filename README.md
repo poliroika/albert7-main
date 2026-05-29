@@ -56,12 +56,13 @@ flowchart LR
     Execute --> FinalReview["final_review"]
     FinalReview --> Verify[verify]
     Verify -->|pass| Report[FinalReport]
-    Verify -->|fail| Reflexion[reflexion]
-    Reflexion --> Execute
+    Verify -->|fail| Execute
+    Verify -. repeated/systemic fail .-> Reflexion[reflexion]
+    Reflexion -. lessons .-> Execute
     FinalReview -->|loop_back| Research
 ```
 
-Each phase manifest is validated against `umbrella/phases/schema/manifest.schema.json`. The `PhaseRunner` spawns a Worker-Ouroboros per phase with the manifest's tool filter and prompt overlays. The Watcher-Ouroboros runs in parallel, waking only on trigger conditions (stall, repeated error, verify fail, budget overrun).
+Each phase manifest is validated against `umbrella/phases/schema/manifest.schema.json`. The `PhaseRunner` spawns a Worker-Ouroboros per phase with the manifest's tool filter and prompt overlays. The Watcher is a read-only polling supervisor inside the runner wait cycle: it wakes on trigger conditions (stall, repeated error, verify fail, budget overrun), emits repair signals, and lets the next Worker phase perform any workspace edits. Reflexion is an optional repeated-failure/self-improvement path, not the default first verify-failure route.
 
 ## Repository Structure
 
@@ -152,6 +153,21 @@ uv run bridge
 Then open `http://127.0.0.1:8765`.
 
 Arguments (`umbrella/web_bridge/server.py`): `--host` (default `127.0.0.1`), `--port` (default `8765`), `--repo-root`, `--log-level`.
+
+### Docker deployment
+
+```powershell
+docker compose up --build
+```
+
+Or build/run directly:
+
+```powershell
+docker build -t umbrella:latest .
+docker run --rm --env-file .env -p 8765:8765 umbrella:latest
+```
+
+For public hosting, deploy the included `Dockerfile`, set runtime secrets such as `LLM_API_KEY` / `OPENAI_API_KEY`, and use `/api/health` as the health check. See [Docker deployment](docs/docker-deploy.md) for volume and platform notes.
 
 ### Development mode (hot reload)
 

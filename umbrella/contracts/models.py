@@ -637,3 +637,46 @@ class PhaseDecision:
     target_phase: str | None = None
     blocking_issue_codes: tuple[str, ...] = ()
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class PhaseExitDecision:
+    phase_id: str
+    task_id: str
+    outcome: str
+    target_phase: str | None = None
+    evidence_refs: tuple[EvidenceRef, ...] = ()
+    issues: tuple[ReviewIssue, ...] = ()
+    required_changes: tuple[dict[str, Any], ...] = ()
+    verification_summary: str = ""
+    source_tool_call_id: str = ""
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "PhaseExitDecision":
+        return cls(
+            phase_id=str(value.get("phase_id") or ""),
+            task_id=str(value.get("task_id") or ""),
+            outcome=str(value.get("outcome") or ""),
+            target_phase=(
+                str(value.get("target_phase"))
+                if value.get("target_phase") is not None
+                else None
+            ),
+            evidence_refs=tuple(
+                EvidenceRef.from_mapping(item)
+                for item in value.get("evidence_refs") or ()
+                if isinstance(item, dict)
+            ),
+            issues=tuple(
+                ReviewIssue.from_mapping(item)
+                for item in value.get("issues") or ()
+                if isinstance(item, dict)
+            ),
+            required_changes=tuple(
+                dict(item)
+                for item in value.get("required_changes") or ()
+                if isinstance(item, dict)
+            ),
+            verification_summary=str(value.get("verification_summary") or ""),
+            source_tool_call_id=str(value.get("source_tool_call_id") or ""),
+        )

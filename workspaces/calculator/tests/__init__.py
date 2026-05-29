@@ -1,1 +1,3 @@
-"""Test package for calculator."""
+"""
+Tests for the calculator package.
+"""

@@ -109,6 +109,7 @@ def _parse_exit_criteria(raw: dict[str, Any]) -> ExitCriteria:
     return ExitCriteria(
         required_calls=tuple(raw.get("required_calls", [])),
         required_prior_calls=tuple(raw.get("required_prior_calls", [])),
+        completion_contract=dict(raw.get("completion_contract") or {}),
         required_palace_writes=tuple(
             RequiredPalaceWrite(store=r["store"], tag=r.get("tag"), n=r.get("n", 1))
             for r in raw.get("required_palace_writes", [])
