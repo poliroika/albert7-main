@@ -53,6 +53,86 @@ def derive_recovery_options(
         for item in (issue.get("evidence_refs") or [])
         if str(item).strip()
     ) if isinstance(issue.get("evidence_refs"), list) else ()
+    if code in {
+        "package_import_env_mismatch",
+        "proof_execution_env_mismatch",
+        "setup_harness_mismatch",
+    }:
+        source = f"RecoveryPolicy.{code}"
+        return (
+            RecoveryOption(
+                code="proof_contract_repair",
+                target_subtask_id=target_subtask_id,
+                reason_code=code,
+                required_plan_changes=(
+                    {
+                        "id": "pytest-src-layout-pythonpath",
+                        "target_subtask_id": target_subtask_id,
+                        "severity": "blocking",
+                        "reason_code": code,
+                        "source": source,
+                        "path": "proof.execution.env",
+                        "op": "add",
+                        "value": {"PYTHONPATH": "src"},
+                        "evidence_refs": list(evidence_refs),
+                    },
+                ),
+                required_deltas=(
+                    ContractDelta(
+                        op="add",
+                        path="proof.execution.env",
+                        value={"PYTHONPATH": "src"},
+                        target_subtask_id=target_subtask_id,
+                        source_issue_code=code,
+                    ),
+                ),
+                evidence_refs=evidence_refs,
+            ),
+            RecoveryOption(
+                code="packaging_import_repair",
+                target_subtask_id=target_subtask_id,
+                reason_code=code,
+                required_plan_changes=(
+                    {
+                        "id": "pytest-src-layout-packaging",
+                        "target_subtask_id": target_subtask_id,
+                        "severity": "blocking",
+                        "reason_code": code,
+                        "source": source,
+                        "path": "files_to_change",
+                        "op": "semantic_diff",
+                        "allowed_files": [
+                            "pyproject.toml",
+                            "pytest.ini",
+                            "setup.cfg",
+                            "workspace.toml",
+                        ],
+                        "forbidden_files": ["src/", "tests/"],
+                        "evidence_refs": list(evidence_refs),
+                    },
+                ),
+                evidence_refs=evidence_refs,
+            ),
+            RecoveryOption(
+                code="plan_contract_revision",
+                target_subtask_id=target_subtask_id,
+                reason_code=code,
+                required_plan_changes=(
+                    {
+                        "id": "project-setup-harness-alignment",
+                        "target_subtask_id": target_subtask_id,
+                        "severity": "blocking",
+                        "reason_code": code,
+                        "source": source,
+                        "path": "proof.execution",
+                        "op": "semantic_diff",
+                        "evidence_refs": list(evidence_refs),
+                    },
+                ),
+                evidence_refs=evidence_refs,
+            ),
+        )
+
     if code != "headless_proof_uses_real_gui_root":
         return ()
 

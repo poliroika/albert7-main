@@ -4,7 +4,7 @@
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -34,6 +34,24 @@ WRITE_TOOLS = frozenset(
 )
 COMPLETION_TOOLS = frozenset({"mark_subtask_complete", "run_subtask_proof"})
 PLAN_REPAIR_TOOLS = frozenset({"apply_plan_revision_patch"})
+BLOCKED_CONTROL_TOOLS = frozenset(
+    {
+        "apply_workspace_patch",
+        "replace_workspace_file",
+        "delete_workspace_file",
+        "provision_workspace_environment",
+        "run_subtask_proof",
+        "mark_subtask_complete",
+        "request_watcher_review",
+        "apply_plan_revision_patch",
+    }
+)
+PACKAGING_IMPORT_FILES = (
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "workspace.toml",
+)
 
 
 @dataclass(frozen=True)
@@ -303,6 +321,95 @@ def classify_work_item_kind(*payloads: Any) -> WorkItemKind:
     return "implementation_repair"
 
 
+def _kind_from_control_payload(payload: Mapping[str, Any]) -> WorkItemKind:
+    text = _payload_text(payload).lower()
+    code = str(
+        payload.get("reason_code")
+        or payload.get("trigger_code")
+        or payload.get("code")
+        or ""
+    ).strip()
+    if code in {"package_import_env_mismatch", "setup_harness_mismatch"}:
+        return "packaging_import_repair"
+    if code == "proof_execution_env_mismatch":
+        return "proof_contract_repair"
+    return classify_work_item_kind(payload, text)
+
+
+def _repair_allowed_files(kind: WorkItemKind, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    if kind == "packaging_import_repair":
+        return PACKAGING_IMPORT_FILES
+    if kind == "proof_contract_repair":
+        return ()
+    return fallback
+
+
+def _repair_forbidden_files(kind: WorkItemKind, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    if kind == "packaging_import_repair":
+        forbidden = set(fallback)
+        forbidden.update(path for path in fallback if path.startswith(("src/", "tests/")))
+        forbidden.update(("src/", "tests/"))
+        return tuple(sorted(forbidden))
+    return fallback
+
+
+def reclassify_active_work_item(
+    drive_root: Path,
+    payload: Mapping[str, Any],
+    *,
+    decision_id: str = "",
+) -> WorkItem | None:
+    """Supersede the active WorkItem when proof evidence belongs to another lane."""
+
+    current = load_active_work_item(drive_root)
+    if current is None:
+        return None
+    kind = _kind_from_control_payload(payload)
+    if kind == current.kind:
+        return current
+    text = _payload_text(payload)
+    allowed_files = _repair_allowed_files(kind, current.allowed_files)
+    forbidden_files = _repair_forbidden_files(kind, current.forbidden_files)
+    required_change = {
+        "id": str(payload.get("reason_code") or payload.get("code") or kind),
+        "source": "WorkItemReclassifier",
+        "reason_code": str(payload.get("reason_code") or payload.get("code") or ""),
+        "message": text[:1200],
+        "target_subtask_id": current.active_subtask_id,
+        "evidence_refs": list(payload.get("evidence_refs") or []),
+        "supersedes_work_item_id": current.id,
+    }
+    item_id = "work:" + hash_value(
+        {
+            "supersedes": current.id,
+            "kind": kind,
+            "payload": json_ready(payload),
+            "decision_id": decision_id,
+            "attempt_id": current.attempt_id,
+        }
+    )[:16]
+    tool_envelope = _tool_envelope_for_kind(
+        kind,
+        allowed_files=list(allowed_files),
+        forbidden_files=list(forbidden_files),
+    )
+    next_item = replace(
+        current,
+        id=item_id,
+        kind=kind,
+        required_changes=(required_change,),
+        allowed_files=tuple(allowed_files),
+        forbidden_files=tuple(forbidden_files),
+        tool_envelope=tool_envelope,
+        created_from_decision_id=decision_id or current.created_from_decision_id,
+    )
+    queue = [item for item in load_work_item_queue(drive_root) if item.id != current.id]
+    queue.append(next_item)
+    save_work_item_queue(drive_root, queue)
+    save_active_work_item(drive_root, next_item)
+    return next_item
+
+
 def _module_name_from_text(text: str) -> str:
     for pattern in (
         r"No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
@@ -545,9 +652,9 @@ def materialize_work_items_from_phase_exit(
         if kind == "packaging_import_repair" and not allowed_files:
             allowed_files = [
                 path
-                for path in ("workspace.toml", "pyproject.toml", "setup.cfg", "setup.py")
+                for path in PACKAGING_IMPORT_FILES
                 if path in text
-            ] or ["workspace.toml", "pyproject.toml", "setup.cfg", "setup.py"]
+            ] or list(PACKAGING_IMPORT_FILES)
         forbidden_files = _unique_paths(change.get("forbidden_files"))
         fallback_proof = (
             change.get("proof_contract")
@@ -643,6 +750,7 @@ def work_item_tool_filter(
     tool_filter: Mapping[str, Any],
     *,
     work_item: WorkItem | None,
+    control_decision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "allow": list(tool_filter.get("allow") or []),
@@ -654,6 +762,21 @@ def work_item_tool_filter(
     if work_item is None:
         payload["allow"] = [tool for tool in payload["allow"] if tool not in gated]
         payload["deny"] = sorted(set(payload["deny"]) | gated)
+        return payload
+    if (
+        isinstance(control_decision, Mapping)
+        and str(control_decision.get("kind") or "") == "blocked_no_valid_next_action"
+    ):
+        allowed_next = set(_string_items(control_decision.get("allowed_next_tools")))
+        if not allowed_next:
+            allowed_next = {
+                tool
+                for tool in _string_items(control_decision.get("required_next_tools"))
+                if tool
+            }
+        payload["allow"] = sorted(set(payload["allow"]) & allowed_next)
+        payload["deny"] = sorted(set(payload["deny"]) | (BLOCKED_CONTROL_TOOLS - allowed_next))
+        payload["required"] = [tool for tool in payload["required"] if tool in allowed_next]
         return payload
     envelope = work_item.tool_envelope or {}
     allowed = set(payload["allow"])

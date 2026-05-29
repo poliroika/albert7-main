@@ -437,6 +437,150 @@ def test_recovery_decision_interrupts_running_execute_before_next_round(
     assert runner._stop_requested() is False
 
 
+def test_same_blocker_decision_interrupts_execute_before_next_round(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+    task_id = "run-1:execute:1"
+    started_at = time.time()
+
+    class FakeHandle:
+        worker_pid = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def wait(self, timeout=None):
+            self.calls += 1
+            (state / "phase_control_signals.jsonl").write_text(
+                json.dumps(
+                    {
+                        "signal_id": "review-1",
+                        "created_at": time.time(),
+                        "kind": "request_watcher_review",
+                        "task_id": task_id,
+                        "run_id": "run-1",
+                        "phase": "execute",
+                        "payload": {
+                            "status": "review_recorded",
+                            "verdict": "blocked_no_valid_next_action",
+                            "loop_back_target": "none",
+                            "recovery_decision": {
+                                "kind": "blocked_no_valid_next_action",
+                                "trigger_code": "same_blocker_repeated",
+                                "active_subtask_id": "calculator-core",
+                                "blocker_fingerprint": "fp1",
+                                "loop_back_target": "none",
+                                "allowed_next_actions": [
+                                    "change proof contract before another retry"
+                                ],
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return None
+
+    class FakeLauncher:
+        def __init__(self) -> None:
+            self.handle = FakeHandle()
+
+        def submit_task(self, task, timeout=None):
+            return self.handle
+
+    fake = FakeLauncher()
+    runner._launcher = fake
+    phase_node = PhaseNode(id="execute", manifest_id="execute", status="running")
+    phase_node.started_at = started_at
+
+    outcome = runner._run_phase_single(
+        {"id": task_id},
+        phase_node,
+        run_id="run-1",
+    )
+
+    assert outcome["status"] == "control_impasse"
+    assert outcome["control_decision"]["kind"] == "blocked_no_valid_next_action"
+    assert fake.handle.calls == 1
+
+
+def test_blocked_no_valid_next_action_without_route_fails_typed_impasse(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "control_decision.json").write_text(
+        json.dumps(
+            {
+                "kind": "blocked_no_valid_next_action",
+                "reason_code": "same_blocker_repeated",
+                "blocker_fingerprint": "fp1",
+                "active_subtask_id": "calculator-core",
+                "target_phase": "none",
+                "allowed_next_actions": ["revise proof contract"],
+                "state_signature": {"plan_version": 0},
+                "created_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+
+    class NoSubmitLauncher:
+        def submit_task(self, task, timeout=None):
+            raise AssertionError("blocked control decision must stop before submit_task")
+
+    runner._launcher = NoSubmitLauncher()
+    phase_node = PhaseNode(id="execute", manifest_id="execute", status="running")
+    phase_node.started_at = time.time()
+
+    outcome = runner._run_phase_single(
+        {"id": "run-1:execute:1"},
+        phase_node,
+        run_id="run-1",
+    )
+
+    assert outcome["status"] == "control_impasse"
+    assert outcome["control_decision"]["blocker_fingerprint"] == "fp1"
+
+
+def test_same_blocker_reset_after_plan_state_change(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps({"version": 2, "nodes": []}),
+        encoding="utf-8",
+    )
+    (state / "control_decision.json").write_text(
+        json.dumps(
+            {
+                "kind": "blocked_no_valid_next_action",
+                "reason_code": "same_blocker_repeated",
+                "blocker_fingerprint": "fp1",
+                "state_signature": {"plan_version": 1},
+                "created_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+
+    decision = runner._latest_blocked_control_decision(include_global=True)
+
+    assert decision == {}
+
+
 def test_recovery_decision_routes_independent_of_review_status(
     tmp_path: Path,
 ) -> None:

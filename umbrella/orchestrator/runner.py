@@ -49,6 +49,7 @@ from umbrella.contracts import (
     compile_phase_plan,
     json_ready,
     hash_value,
+    load_active_work_item,
     validate_done_subtasks_materialized,
 )
 
@@ -641,6 +642,251 @@ class PhaseRunner:
                 "loop_back_target": loop_target,
             }
         return {}
+
+    @staticmethod
+    def _control_decision_payload_from_record(row: dict[str, Any]) -> dict[str, Any]:
+        if str(row.get("kind") or "") == "blocked_no_valid_next_action":
+            return dict(row)
+        nested = row.get("control_decision")
+        if isinstance(nested, dict):
+            return dict(nested)
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        decision = payload.get("recovery_decision")
+        if isinstance(decision, dict) and str(decision.get("kind") or "") == (
+            "blocked_no_valid_next_action"
+        ):
+            return {
+                "kind": "blocked_no_valid_next_action",
+                "reason_code": str(decision.get("trigger_code") or ""),
+                "blocker_fingerprint": str(decision.get("blocker_fingerprint") or ""),
+                "active_subtask_id": str(decision.get("active_subtask_id") or ""),
+                "allowed_next_actions": json_ready(
+                    decision.get("allowed_next_actions") or []
+                ),
+                "forbidden_next_actions": json_ready(
+                    decision.get("forbidden_next_actions") or []
+                ),
+                "issues": json_ready(decision.get("issues") or []),
+                "required_changes": json_ready(
+                    decision.get("required_plan_changes") or []
+                ),
+                "evidence_refs": json_ready(decision.get("evidence_refs") or []),
+                "recovery_decision": json_ready(decision),
+                "source_task_id": str(row.get("task_id") or ""),
+                "run_id": str(row.get("run_id") or ""),
+                "phase_id": str(row.get("phase") or ""),
+                "created_at": row.get("created_at"),
+            }
+        return {}
+
+    def _read_control_decision_records(
+        self,
+        *,
+        task_id: str = "",
+        phase_started_at: float | None = None,
+        include_global: bool = False,
+    ) -> list[dict[str, Any]]:
+        state_dir = self._drive_root / "state"
+        records: list[dict[str, Any]] = []
+        for path in (
+            state_dir / "control_decisions.jsonl",
+            state_dir / "control_decision.json",
+        ):
+            if not path.exists():
+                continue
+            try:
+                if path.suffix == ".jsonl":
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        if isinstance(row, dict):
+                            records.append(row)
+                else:
+                    row = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(row, dict):
+                        records.append(row)
+            except (OSError, json.JSONDecodeError):
+                log.debug("Failed to read control decision record %s", path, exc_info=True)
+        if task_id:
+            records.extend(
+                self._read_phase_control_records(
+                    task_id=task_id,
+                    phase_started_at=phase_started_at,
+                )
+            )
+        filtered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in records:
+            decision = self._control_decision_payload_from_record(row)
+            if not decision:
+                continue
+            source_task = str(
+                decision.get("source_task_id") or row.get("task_id") or ""
+            ).strip()
+            if task_id and source_task and source_task != task_id and not include_global:
+                continue
+            created = decision.get("created_at") or row.get("created_at")
+            if (
+                phase_started_at is not None
+                and isinstance(created, (int, float))
+                and float(created) < float(phase_started_at) - 5.0
+                and not include_global
+            ):
+                continue
+            key = str(decision.get("control_decision_id") or "") or hash_value(
+                json_ready(decision)
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(decision)
+        return filtered
+
+    @staticmethod
+    def _row_created_at(row: dict[str, Any]) -> float | None:
+        for key in ("created_at", "time", "timestamp", "started_at", "finished_at"):
+            value = row.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    continue
+        return None
+
+    def _phase_plan_version_from_state(self) -> int:
+        path = self._drive_root / "state" / "phase_plan.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        if not isinstance(payload, dict):
+            return 0
+        try:
+            return int(payload.get("version") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _effective_state_change_after(self, created_at: float) -> bool:
+        write_tools = {
+            "apply_workspace_patch",
+            "replace_workspace_file",
+            "delete_workspace_file",
+            "provision_workspace_environment",
+            "apply_plan_revision_patch",
+            "mutate_phase_plan",
+        }
+        path = self._drive_root / "logs" / "tools.jsonl"
+        if not path.exists():
+            return False
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("tool") or "") not in write_tools:
+                    continue
+                row_time = self._row_created_at(row)
+                if row_time is None or row_time <= created_at:
+                    continue
+                if is_effective_write_tool_log_row(row):
+                    return True
+        except OSError:
+            log.debug("Failed to inspect tools log for control state changes", exc_info=True)
+        return False
+
+    def _control_decision_is_stale(self, decision: dict[str, Any]) -> bool:
+        signature = (
+            decision.get("state_signature")
+            if isinstance(decision.get("state_signature"), dict)
+            else {}
+        )
+        plan_version = signature.get("plan_version")
+        if plan_version not in (None, ""):
+            try:
+                if int(plan_version) != self._phase_plan_version_from_state():
+                    return True
+            except (TypeError, ValueError):
+                pass
+        try:
+            active = load_active_work_item(self._drive_root)
+        except Exception:
+            active = None
+        expected_work_item = str(signature.get("active_work_item_id") or "").strip()
+        if expected_work_item:
+            if active is None or active.id != expected_work_item:
+                return True
+        expected_proof_hash = str(signature.get("proof_contract_hash") or "").strip()
+        if expected_proof_hash and active is not None:
+            proof_hash = hash_value(json_ready(active.proof_contract))[:16]
+            if proof_hash != expected_proof_hash:
+                return True
+        created = decision.get("created_at")
+        if isinstance(created, (int, float)) and self._effective_state_change_after(
+            float(created)
+        ):
+            return True
+        return False
+
+    def _latest_blocked_control_decision(
+        self,
+        *,
+        task_id: str = "",
+        phase_started_at: float | None = None,
+        include_global: bool = False,
+    ) -> dict[str, Any]:
+        records = self._read_control_decision_records(
+            task_id=task_id,
+            phase_started_at=phase_started_at,
+            include_global=include_global,
+        )
+        for decision in reversed(records):
+            if str(decision.get("kind") or "") != "blocked_no_valid_next_action":
+                continue
+            if self._control_decision_is_stale(decision):
+                continue
+            return json_ready(decision)
+        return {}
+
+    def _write_phase_impasse(
+        self,
+        *,
+        phase_node: PhaseNode,
+        run_id: str,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = {
+            "code": "blocked_no_valid_next_action",
+            "phase_id": phase_node.id,
+            "run_id": run_id,
+            "control_decision": json_ready(decision),
+            "blocker_fingerprint": str(decision.get("blocker_fingerprint") or ""),
+            "allowed_next_actions": json_ready(decision.get("allowed_next_actions") or []),
+            "forbidden_next_actions": json_ready(
+                decision.get("forbidden_next_actions") or []
+            ),
+            "created_at": time.time(),
+        }
+        path = self._drive_root / "state" / "phase_impasse.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return payload
+
+    @staticmethod
+    def _control_impasse_message(decision: dict[str, Any]) -> str:
+        allowed = decision.get("allowed_next_actions") or []
+        allowed_text = "; ".join(str(item) for item in allowed if str(item).strip())
+        fingerprint = str(decision.get("blocker_fingerprint") or "")
+        return (
+            "phase_impasse: code=blocked_no_valid_next_action"
+            + (f" fingerprint={fingerprint}" if fingerprint else "")
+            + (f" allowed_next_actions={allowed_text}" if allowed_text else "")
+        )
 
     def _apply_recovery_route_overlay(
         self,
@@ -2948,6 +3194,31 @@ class PhaseRunner:
             took_ms=0,
         ))
 
+        if manifest.id == "execute":
+            blocked_decision = self._latest_blocked_control_decision(
+                include_global=True,
+            )
+            if blocked_decision:
+                phase_node.status = "failed"
+                phase_node.ended_at = time.time()
+                self._write_phase_impasse(
+                    phase_node=phase_node,
+                    run_id=run_id,
+                    decision=blocked_decision,
+                )
+                save_plan(plan, self._drive_root)
+                yield self._emit(ResultEnvelope.failure(
+                    ErrorCode.EVIDENCE_VALIDATION_FAILED,
+                    self._control_impasse_message(blocked_decision),
+                    run_id=run_id,
+                    phase=phase_node.id,
+                ))
+                return PhaseResult(
+                    phase_id=phase_node.id,
+                    outcome="failed",
+                    error=self._control_impasse_message(blocked_decision),
+                )
+
         base_task = build_phase_task(
             phase_node=phase_node,
             manifest=manifest,
@@ -3092,6 +3363,32 @@ class PhaseRunner:
                 save_plan(plan, self._drive_root)
                 yield envelope
                 return result
+
+        if outcome.get("status") == "control_impasse":
+            blocked_decision = (
+                outcome.get("control_decision")
+                if isinstance(outcome.get("control_decision"), dict)
+                else {}
+            )
+            phase_node.status = "failed"
+            phase_node.ended_at = time.time()
+            self._write_phase_impasse(
+                phase_node=phase_node,
+                run_id=run_id,
+                decision=blocked_decision,
+            )
+            save_plan(plan, self._drive_root)
+            yield self._emit(ResultEnvelope.failure(
+                ErrorCode.EVIDENCE_VALIDATION_FAILED,
+                self._control_impasse_message(blocked_decision),
+                run_id=run_id,
+                phase=phase_node.id,
+            ))
+            return PhaseResult(
+                phase_id=phase_node.id,
+                outcome="failed",
+                error=self._control_impasse_message(blocked_decision),
+            )
 
         pending_signal = self._watcher.read_pending_signal()
         if (
@@ -3469,8 +3766,19 @@ class PhaseRunner:
     def _run_phase_single(
         self, task: dict[str, Any], phase_node: PhaseNode, *, run_id: str
     ) -> dict[str, Any]:
-        launcher = self._ensure_launcher()
         try:
+            preexisting_block = self._latest_blocked_control_decision(
+                task_id=str(task.get("id") or ""),
+                phase_started_at=phase_node.started_at,
+                include_global=True,
+            )
+            if preexisting_block:
+                return {
+                    "status": "control_impasse",
+                    "task_id": task.get("id"),
+                    "control_decision": preexisting_block,
+                }
+            launcher = self._ensure_launcher()
             handle = launcher.submit_task(task, timeout=self._phase_timeout_seconds) \
                 if hasattr(launcher, "submit_task") else None
             if handle is None:
@@ -3485,6 +3793,16 @@ class PhaseRunner:
             while True:
                 outcome = handle.wait(timeout=float(poll_sec))
                 if outcome is not None:
+                    blocked_decision = self._latest_blocked_control_decision(
+                        task_id=str(task.get("id") or ""),
+                        phase_started_at=phase_started_at,
+                    )
+                    if blocked_decision:
+                        return {
+                            "status": "control_impasse",
+                            "task_id": task.get("id"),
+                            "control_decision": blocked_decision,
+                        }
                     route_decision = self._latest_recovery_route_decision(
                         task_id=str(task.get("id") or ""),
                         phase_started_at=phase_started_at,
@@ -3516,6 +3834,16 @@ class PhaseRunner:
                         "task_id": task.get("id"),
                         "watcher_signal": pending.kind,
                         "watcher_signal_id": pending.signal_id,
+                    }
+                blocked_decision = self._latest_blocked_control_decision(
+                    task_id=str(task.get("id") or ""),
+                    phase_started_at=phase_started_at,
+                )
+                if blocked_decision:
+                    return {
+                        "status": "control_impasse",
+                        "task_id": task.get("id"),
+                        "control_decision": blocked_decision,
                     }
                 route_decision = self._latest_recovery_route_decision(
                     task_id=str(task.get("id") or ""),

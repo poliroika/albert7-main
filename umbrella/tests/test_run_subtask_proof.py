@@ -1487,6 +1487,130 @@ def test_retry_watcher_routes_tk_setup_failure_to_proof_execution_infra(
     assert "implementation" not in " ".join(payload["allowed_next_actions"]).lower()
 
 
+def test_module_not_found_src_layout_classifies_package_import_env_mismatch(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    (workspace / "src" / "calculator").mkdir(parents=True)
+    (workspace / "src" / "calculator" / "__init__.py").write_text("", encoding="utf-8")
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    logs = drive / "logs"
+    state.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    task_id = "run-1:execute"
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "calculator-core",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_calculator_core.py",
+                                            "-q",
+                                        ],
+                                    },
+                                    "scope": {
+                                        "files_under_test": [
+                                            "src/calculator/core.py",
+                                            "tests/test_calculator_core.py",
+                                        ],
+                                        "changed_files_expected": [
+                                            "src/calculator/core.py"
+                                        ],
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    setup_smoke = {
+        "task_id": "run-1:execute:setup",
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "project-setup"},
+        "result_preview": json.dumps(
+            {
+                "passed": True,
+                "command": [
+                    "python",
+                    "-c",
+                    "import sys; sys.path.insert(0, 'src'); import calculator",
+                ],
+                "exit_code": 0,
+            }
+        ),
+    }
+    failed = {
+        "task_id": task_id,
+        "tool": "run_subtask_proof",
+        "args": {"subtask_id": "calculator-core"},
+        "result_preview": json.dumps(
+            {
+                "passed": False,
+                "exit_code": 1,
+                "subtask_id": "calculator-core",
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/test_calculator_core.py",
+                    "-q",
+                ],
+                "shell_result": {
+                    "output": "ModuleNotFoundError: No module named 'calculator'"
+                },
+                "proof_ref": {"ref_type": "ledger_event", "ref_id": "proof-1"},
+            }
+        ),
+    }
+    (logs / "tools.jsonl").write_text(
+        json.dumps(setup_smoke) + "\n" + json.dumps(failed) + "\n",
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        task_id=task_id,
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    payload = _phase_subtask_retry_watcher_review_payload(
+        ctx,
+        reason="pytest cannot import the src-layout package",
+    )
+
+    assert payload["verdict"] == "proof_execution_infra"
+    assert payload["recovery_decision"]["kind"] == "proof_execution_infra"
+    issue = payload["issues"][0]
+    assert issue["code"] == "package_import_env_mismatch"
+    assert issue["contract_path"] == "proof.execution.env"
+    assert "implementation" not in " ".join(payload["forbidden_next_actions"]).lower()
+    assert payload["required_plan_changes"][0]["reason_code"] == (
+        "package_import_env_mismatch"
+    )
+
+
 def test_request_watcher_review_contract_issue_routes_without_text_regex(
     tmp_path: Path,
 ) -> None:
@@ -1853,6 +1977,14 @@ def test_same_blocker_guard_stops_unbounded_identical_recovery_reviews(
     assert third["recovery_decision"]["kind"] == "blocked_no_valid_next_action"
     assert third["same_blocker_guard"]["count"] == 3
     assert third["loop_back_target"] == "none"
+    control_decision = json.loads(
+        (state / "control_decision.json").read_text(encoding="utf-8")
+    )
+    assert control_decision["kind"] == "blocked_no_valid_next_action"
+    assert control_decision["reason_code"] == "same_blocker_repeated"
+    assert control_decision["blocker_fingerprint"] == third["recovery_decision"][
+        "blocker_fingerprint"
+    ]
 
     plan["version"] = 2
     (state / "phase_plan.json").write_text(json.dumps(plan), encoding="utf-8")

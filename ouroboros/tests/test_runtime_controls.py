@@ -730,6 +730,42 @@ def test_internal_phase_route_uses_phase_signal_not_dashboard_stop(tmp_path: Pat
     assert signal_path.exists()
 
 
+def test_internal_phase_route_interrupts_blocked_same_blocker(tmp_path: Path):
+    from ouroboros.loop import _check_internal_phase_route_requested
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "phase_control_signal.json").write_text(
+        json.dumps(
+            {
+                "kind": "request_watcher_review",
+                "task_id": "run-1:execute:123",
+                "payload": {
+                    "recovery_decision": {
+                        "kind": "blocked_no_valid_next_action",
+                        "blocker_fingerprint": "fp1",
+                        "loop_back_target": "none",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _check_internal_phase_route_requested(
+        tmp_path,
+        "run-1:execute:123",
+        {},
+        {"assistant_notes": []},
+    )
+
+    assert result is not None
+    assert result[0] == (
+        "Internal control impasse requested: "
+        "blocked_no_valid_next_action fingerprint=fp1"
+    )
+
+
 def test_handle_tool_calls_skips_remaining_batch_after_stop(monkeypatch, tmp_path: Path):
     import ouroboros.loop as loop
 

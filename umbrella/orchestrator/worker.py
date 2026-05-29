@@ -1079,11 +1079,13 @@ def build_phase_task(
     }
     if manifest.id == "execute":
         try:
+            from umbrella.contracts.control_decisions import load_latest_control_decision
             from umbrella.contracts.work_items import work_item_tool_filter
 
             tool_filter = work_item_tool_filter(
                 tool_filter,
                 work_item=active_work_item_obj,
+                control_decision=load_latest_control_decision(drive_root),
             )
         except Exception:
             log.debug("Failed to apply WorkItem tool filter", exc_info=True)

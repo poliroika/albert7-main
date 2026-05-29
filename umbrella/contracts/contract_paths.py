@@ -18,6 +18,7 @@ CANONICAL_CONTRACT_PATHS = frozenset(
         "proof.execution.kind",
         "proof.execution.command",
         "proof.execution.timeout_sec",
+        "proof.execution.env",
         "proof.execution.execution_environment_id",
         "proof.scope",
         "proof.scope.pytest_targets",

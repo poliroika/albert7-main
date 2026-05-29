@@ -71,6 +71,12 @@ from umbrella.contracts.oracle_validator import (
 )
 from umbrella.contracts.policy_input import to_policy_input
 from umbrella.contracts.recovery_policy import RecoveryOption, derive_recovery_options
+from umbrella.contracts.control_decisions import (
+    clear_control_decision,
+    control_decision_from_recovery_decision,
+    load_latest_control_decision,
+    write_control_decision,
+)
 from umbrella.contracts.layout_policy import validate_plan_layout_policy
 from umbrella.contracts.validators import (
     ContractValidator,
@@ -91,6 +97,7 @@ from umbrella.contracts.work_items import (
     load_active_work_item,
     load_work_item_queue,
     materialize_work_items_from_phase_exit,
+    reclassify_active_work_item,
     save_active_work_item,
     save_work_item_queue,
     work_item_tool_filter,
@@ -157,10 +164,13 @@ __all__ = [
     "classify_tcl_tk_status",
     "clear_active_work_item",
     "complete_active_work_item",
+    "clear_control_decision",
+    "control_decision_from_recovery_decision",
     "find_capability_binding",
     "ensure_active_work_item_for_subtask",
     "load_capability_bindings",
     "load_active_work_item",
+    "load_latest_control_decision",
     "load_environment_records",
     "load_work_item_queue",
     "known_harness_profile_ids",
@@ -170,8 +180,10 @@ __all__ = [
     "probe_required_capability_ids",
     "materialize_work_items_from_phase_exit",
     "resolve_execution_environment",
+    "reclassify_active_work_item",
     "save_active_work_item",
     "save_work_item_queue",
+    "write_control_decision",
     "suggest_contract_path",
     "to_policy_input",
     "validate_completion_contract",

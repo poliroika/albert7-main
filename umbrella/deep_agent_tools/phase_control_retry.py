@@ -1567,6 +1567,9 @@ _ALLOWED_RETRY_PROOF_KINDS = frozenset(
 _PROOF_EXECUTION_INFRA_CODES = frozenset(
     {
         "proof_execution_infra",
+        "package_import_env_mismatch",
+        "proof_execution_env_mismatch",
+        "setup_harness_mismatch",
         "capability_probe_environment_mismatch",
         "dependency_provision_required",
         "headless_proof_uses_real_gui_root",
@@ -1598,6 +1601,9 @@ class RetryContractIssue:
         "invalid_generated_test_contract",
         "proof_scope_mismatch",
         "proof_execution_infra",
+        "package_import_env_mismatch",
+        "proof_execution_env_mismatch",
+        "setup_harness_mismatch",
         "capability_probe_environment_mismatch",
         "dependency_provision_required",
         "headless_proof_uses_real_gui_root",
@@ -1688,6 +1694,12 @@ def _recovery_contract_path_for_issue_code(
         return deltas[0].path
     if code_text == "capability_probe_environment_mismatch":
         return "proof.required_capabilities"
+    if code_text in {
+        "package_import_env_mismatch",
+        "proof_execution_env_mismatch",
+        "setup_harness_mismatch",
+    }:
+        return "proof.execution.env"
     if code_text in _PROOF_EXECUTION_INFRA_CODES:
         return "proof.execution"
     return _canonical_contract_path_or_default(raw_path)
@@ -1850,10 +1862,186 @@ def _typed_contract_issues_from_latest_failure(
     return issues
 
 
+_MODULE_NOT_FOUND_RE = re.compile(
+    r"ModuleNotFoundError:\s+No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]"
+)
+
+
+def _command_text(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(item) for item in value)
+    return str(value or "")
+
+
+def _proof_invocation_is_python_pytest(*values: Any) -> bool:
+    text = " ".join(_command_text(value) for value in values).lower()
+    return bool(text.strip()) and ("pytest" in text or re.search(r"\bpython(?:3)?\b", text))
+
+
+def _proof_declares_src_pythonpath(
+    *,
+    active_subtask: dict[str, Any] | None,
+    latest_failure: dict[str, Any],
+) -> bool:
+    command_text = _command_text(latest_failure.get("command"))
+    if "pythonpath" in command_text.lower() and "src" in command_text.lower():
+        return True
+    proof = active_subtask.get("proof") if isinstance(active_subtask, dict) else {}
+    execution = proof.get("execution") if isinstance(proof, dict) else {}
+    env = execution.get("env") if isinstance(execution, dict) else {}
+    if isinstance(env, dict):
+        for key, value in env.items():
+            if str(key).upper() == "PYTHONPATH" and "src" in str(value).replace("\\", "/"):
+                return True
+    return False
+
+
+def _workspace_root_from_retry_ctx(ctx: ToolContext | None) -> pathlib.Path | None:
+    if ctx is None:
+        return None
+    raw_drive_root = str(getattr(ctx, "drive_root", "") or "").strip()
+    if raw_drive_root:
+        drive_root = pathlib.Path(raw_drive_root)
+        candidate = drive_root.parent.parent
+        if candidate.exists():
+            return candidate
+    raw_repo_root = str(
+        getattr(ctx, "host_repo_root", "")
+        or getattr(ctx, "repo_dir", "")
+        or ""
+    ).strip()
+    workspace_id = str(getattr(ctx, "workspace_id", "") or "").strip()
+    if raw_repo_root and workspace_id:
+        repo_root = pathlib.Path(raw_repo_root)
+        candidate = repo_root / "workspaces" / workspace_id
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _pyproject_declares_pytest_src_pythonpath(workspace_root: pathlib.Path | None) -> bool:
+    if workspace_root is None:
+        return False
+    pyproject = workspace_root / "pyproject.toml"
+    try:
+        text = pyproject.read_text(encoding="utf-8", errors="replace").lower()
+    except Exception:
+        return False
+    return "pythonpath" in text and "src" in text
+
+
+def _src_layout_module_exists(
+    workspace_root: pathlib.Path | None,
+    module_name: str,
+) -> bool:
+    if workspace_root is None or not module_name:
+        return False
+    module_path = module_name.replace(".", "/")
+    return (
+        (workspace_root / "src" / module_path).is_dir()
+        or (workspace_root / "src" / f"{module_path}.py").is_file()
+    )
+
+
+def _setup_smoke_used_sys_path_insert(
+    ctx: ToolContext | None,
+    *,
+    module_name: str,
+) -> bool:
+    if ctx is None:
+        return False
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    run_prefix = task_id.split(":", 1)[0] if ":" in task_id else ""
+    logs_path = pathlib.Path(getattr(ctx, "drive_root", "") or "") / "logs" / "tools.jsonl"
+    try:
+        lines = logs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return False
+    needle = f"import {module_name}".lower()
+    for line in lines[-500:]:
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(row, dict):
+            continue
+        row_task = str(row.get("task_id") or "")
+        if run_prefix and not row_task.startswith(run_prefix):
+            continue
+        text = json.dumps(row, ensure_ascii=False).lower()
+        if "sys.path.insert" in text and "src" in text and needle in text:
+            return True
+    return False
+
+
+def _src_layout_module_not_found_issue(
+    *,
+    ctx: ToolContext | None,
+    subtask_id: str,
+    latest_failure: dict[str, Any],
+    active_subtask: dict[str, Any] | None,
+    proof_command: str,
+) -> RetryContractIssue | None:
+    output = str(latest_failure.get("output_excerpt") or "")
+    match = _MODULE_NOT_FOUND_RE.search(output)
+    if not match:
+        return None
+    module_name = match.group(1).split(".")[0]
+    command = latest_failure.get("command") or proof_command
+    if not _proof_invocation_is_python_pytest(command, proof_command):
+        return None
+    workspace_root = _workspace_root_from_retry_ctx(ctx)
+    if not _src_layout_module_exists(workspace_root, module_name):
+        return None
+    if _proof_declares_src_pythonpath(
+        active_subtask=active_subtask,
+        latest_failure=latest_failure,
+    ) or _pyproject_declares_pytest_src_pythonpath(workspace_root):
+        return None
+    evidence_refs = tuple(
+        str(item).strip()
+        for item in (latest_failure.get("evidence_refs") or [])
+        if str(item).strip()
+    ) if isinstance(latest_failure.get("evidence_refs"), list) else ()
+    setup_note = (
+        " Project setup used sys.path.insert(0, 'src'), which is diagnostic only "
+        "and does not satisfy the downstream pytest harness."
+        if _setup_smoke_used_sys_path_insert(ctx, module_name=module_name)
+        else ""
+    )
+    return RetryContractIssue(
+        code="package_import_env_mismatch",
+        severity="blocking",
+        target_subtask_id=subtask_id,
+        target_path=f"src/{module_name}",
+        contract_path="proof.execution.env",
+        required_replacements=(
+            ContractDelta(
+                op="add",
+                path="proof.execution.env",
+                value={"PYTHONPATH": "src"},
+                target_subtask_id=subtask_id,
+                source_issue_code="package_import_env_mismatch",
+            ),
+        ),
+        evidence_refs=evidence_refs,
+        failure_hash=_retry_failure_hash(latest_failure),
+        failure_phase="fixture/setup/import_resolution",
+        evidence=(
+            f"Pytest failed before production behavior entered because module "
+            f"`{module_name}` exists under src/ but the declared proof environment "
+            "does not expose src on PYTHONPATH." + setup_note
+        ),
+    )
+
+
 def _proof_execution_infra_issues_from_latest_failure(
     *,
     subtask_id: str,
     latest_failure: dict[str, Any],
+    ctx: ToolContext | None = None,
+    active_subtask: dict[str, Any] | None = None,
+    proof_command: str = "",
 ) -> list[RetryContractIssue]:
     issues: list[RetryContractIssue] = []
     failure_hash = _retry_failure_hash(latest_failure)
@@ -1924,8 +2112,22 @@ def _proof_execution_infra_issues_from_latest_failure(
             _proof_execution_infra_issues_from_latest_failure(
                 subtask_id=subtask_id,
                 latest_failure=nested,
+                ctx=ctx,
+                active_subtask=active_subtask,
+                proof_command=proof_command,
             )
         )
+    deterministic = _src_layout_module_not_found_issue(
+        ctx=ctx,
+        subtask_id=subtask_id,
+        latest_failure=latest_failure,
+        active_subtask=active_subtask,
+        proof_command=proof_command,
+    )
+    if deterministic is not None and not any(
+        issue.code == deterministic.code for issue in issues
+    ):
+        issues.append(deterministic)
     return issues
 
 
@@ -2343,6 +2545,73 @@ def _same_blocker_blocked_decision(
     )
 
 
+def _same_blocker_state_signature(
+    ctx: ToolContext,
+    *,
+    state: dict[str, Any],
+    decision: RecoveryDecision,
+) -> dict[str, Any]:
+    active_subtask = state.get("active_subtask")
+    proof_contract = (
+        active_subtask.get("proof")
+        if isinstance(active_subtask, dict)
+        else {}
+    )
+    active_work_item_id = ""
+    try:
+        from umbrella.contracts.work_items import load_active_work_item
+
+        work_item = load_active_work_item(pathlib.Path(getattr(ctx, "drive_root", "")))
+        if work_item is not None:
+            active_work_item_id = work_item.id
+            proof_contract = work_item.proof_contract or proof_contract
+    except Exception:
+        active_work_item_id = ""
+    return {
+        "plan_version": _current_plan_version(ctx),
+        "phase_id": _phase_id_from_retry_context(ctx),
+        "active_subtask_id": decision.active_subtask_id,
+        "active_work_item_id": active_work_item_id,
+        "proof_contract_hash": hash_value(json_ready(proof_contract))[:16],
+        "failure_hash": decision.failure_hash,
+        "blocker_fingerprint": decision.blocker_fingerprint,
+    }
+
+
+def _write_blocked_control_decision(
+    ctx: ToolContext,
+    *,
+    state: dict[str, Any],
+    decision: RecoveryDecision,
+) -> dict[str, Any]:
+    try:
+        from umbrella.contracts.control_decisions import (
+            control_decision_from_recovery_decision,
+            write_control_decision,
+        )
+
+        payload = control_decision_from_recovery_decision(
+            _recovery_decision_payload(decision),
+            run_id=_run_id(ctx),
+            task_id=str(state.get("task_id") or getattr(ctx, "task_id", "") or ""),
+            phase_id=_phase_id_from_retry_context(ctx),
+            target_phase="none",
+            target_work_item_kind="",
+            state_signature=_same_blocker_state_signature(
+                ctx,
+                state=state,
+                decision=decision,
+            ),
+        )
+        write_control_decision(pathlib.Path(getattr(ctx, "drive_root", "")), payload)
+        return {
+            "ref": "artifact:state/control_decision.json",
+            "control_decision_id": str(payload.get("control_decision_id") or ""),
+        }
+    except Exception:
+        return {}
+
+
 def _plan_contract_revision_decision(
     *,
     subtask_id: str,
@@ -2583,11 +2852,13 @@ def _proof_execution_infra_decision(
             }
         )
     allowed = [
+        "repair the proof execution environment or src-layout packaging contract",
         "provision the execution environment with provision_workspace_environment",
         "route to plan and switch the proof to a headless/controller strategy",
         "route to research/preflight to refresh capability bindings",
     ]
     forbidden = [
+        "patch production source for a package import environment mismatch",
         "patch production source for a setup-only Tk/Tcl/display failure",
         "edit tests directly after a failing proof",
         "treat import tkinter as desktop_gui_runtime proof",
@@ -2961,6 +3232,11 @@ def _phase_subtask_retry_watcher_review_payload(
     infra_issues = _proof_execution_infra_issues_from_latest_failure(
         subtask_id=subtask_id,
         latest_failure=latest_failure,
+        ctx=ctx,
+        active_subtask=state.get("active_subtask")
+        if isinstance(state.get("active_subtask"), dict)
+        else None,
+        proof_command=proof_command,
     )
     contract_path_errors = [*latest_contract_path_errors, *requested_contract_path_errors]
     if contract_path_errors:
@@ -3023,6 +3299,29 @@ def _phase_subtask_retry_watcher_review_payload(
                 previous=decision,
                 guard=same_blocker_guard,
             )
+    control_decision_ref: dict[str, Any] = {}
+    if decision.kind == "blocked_no_valid_next_action":
+        control_decision_ref = _write_blocked_control_decision(
+            ctx,
+            state=state,
+            decision=decision,
+        )
+    elif decision.kind == "proof_execution_infra":
+        try:
+            from umbrella.contracts.work_items import reclassify_active_work_item
+
+            reclassify_active_work_item(
+                pathlib.Path(getattr(ctx, "drive_root", "")),
+                {
+                    "reason_code": decision.trigger_code,
+                    "issues": decision.issues,
+                    "evidence_refs": decision.evidence_refs,
+                    "required_changes": decision.required_plan_changes,
+                },
+                decision_id=decision.decision_id,
+            )
+        except Exception:
+            pass
     required_context_reads = list(state.get("required_context_reads") or [])[:20]
     review = {
         **base,
@@ -3035,6 +3334,7 @@ def _phase_subtask_retry_watcher_review_payload(
         "latest_failure": latest_failure,
         "patch_guidance": patch_guidance,
         "same_blocker_guard": same_blocker_guard,
+        "control_decision_ref": control_decision_ref,
         "recommendation": _phase_subtask_retry_recommendation(
             failed_attempts=failed_attempts,
             watcher_reviews=watcher_reviews,

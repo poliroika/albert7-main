@@ -5,6 +5,7 @@ from umbrella.contracts.work_items import (
     WorkItem,
     load_active_work_item,
     materialize_work_items_from_phase_exit,
+    reclassify_active_work_item,
     save_active_work_item,
     work_item_tool_filter,
 )
@@ -201,6 +202,119 @@ def test_work_item_tool_filter_removes_execute_write_and_complete_without_active
     assert "apply_workspace_patch" not in filtered["allow"]
     assert "run_subtask_proof" not in filtered["allow"]
     assert "mark_subtask_complete" not in filtered["allow"]
+
+
+def test_work_item_reclassified_from_implementation_to_packaging_import(tmp_path) -> None:
+    ctx, drive = _execute_ctx(tmp_path)
+    save_active_work_item(
+        drive,
+        WorkItem(
+            id="execute:calculator-core",
+            kind="implementation_repair",
+            source_phase="execute",
+            target_phase="execute",
+            active_subtask_id="calculator-core",
+            allowed_files=("src/calculator/core.py", "tests/test_calculator_core.py"),
+            proof_contract={"execution": {"kind": "pytest"}},
+            tool_envelope={"allowed_tools": ["apply_workspace_patch"]},
+        ),
+    )
+
+    item = reclassify_active_work_item(
+        drive,
+        {
+            "reason_code": "package_import_env_mismatch",
+            "evidence_refs": ["ledger_event:proof-1"],
+            "message": "ModuleNotFoundError: No module named 'calculator'",
+        },
+        decision_id="decision-1",
+    )
+
+    assert item is not None
+    assert item.id != "execute:calculator-core"
+    assert item.kind == "packaging_import_repair"
+    assert item.allowed_files == (
+        "pyproject.toml",
+        "pytest.ini",
+        "setup.cfg",
+        "workspace.toml",
+    )
+    assert "src/" in item.forbidden_files
+    assert load_active_work_item(drive).id == item.id
+
+
+def test_reclassified_work_item_updates_tool_envelope(tmp_path) -> None:
+    _ctx, drive = _execute_ctx(tmp_path)
+    save_active_work_item(
+        drive,
+        WorkItem(
+            id="execute:calculator-core",
+            kind="implementation_repair",
+            source_phase="execute",
+            target_phase="execute",
+            active_subtask_id="calculator-core",
+            allowed_files=("src/calculator/core.py",),
+            proof_contract={},
+            tool_envelope={"allowed_tools": ["apply_workspace_patch"]},
+        ),
+    )
+
+    item = reclassify_active_work_item(
+        drive,
+        {"reason_code": "package_import_env_mismatch"},
+        decision_id="decision-1",
+    )
+
+    assert item is not None
+    assert item.tool_envelope["policy"]["allowed_files"] == list(item.allowed_files)
+    assert "apply_plan_revision_patch" not in item.tool_envelope["allowed_tools"]
+
+
+def test_blocked_work_item_tool_surface_only_required_actions() -> None:
+    work_item = WorkItem(
+        id="work:1",
+        kind="proof_contract_repair",
+        source_phase="execute",
+        target_phase="execute",
+        active_subtask_id="calculator-core",
+        allowed_files=(),
+        proof_contract={},
+        tool_envelope={
+            "allowed_tools": [
+                "read_file",
+                "apply_workspace_patch",
+                "apply_plan_revision_patch",
+                "run_subtask_proof",
+                "mark_subtask_complete",
+                "request_watcher_review",
+            ]
+        },
+    )
+
+    filtered = work_item_tool_filter(
+        {
+            "allow": [
+                "read_file",
+                "apply_workspace_patch",
+                "apply_plan_revision_patch",
+                "run_subtask_proof",
+                "mark_subtask_complete",
+                "request_watcher_review",
+            ],
+            "deny": [],
+            "required": ["mark_subtask_complete"],
+        },
+        work_item=work_item,
+        control_decision={
+            "kind": "blocked_no_valid_next_action",
+            "allowed_next_tools": ["apply_plan_revision_patch"],
+        },
+    )
+
+    assert filtered["allow"] == ["apply_plan_revision_patch"]
+    assert "mark_subtask_complete" in filtered["deny"]
+    assert "request_watcher_review" in filtered["deny"]
+    assert "run_subtask_proof" in filtered["deny"]
 
 
 def test_compile_phase_context_carries_active_work_item(tmp_path) -> None:

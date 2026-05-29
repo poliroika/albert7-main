@@ -571,6 +571,17 @@ def _check_internal_phase_route_requested(
     if not isinstance(decision, dict):
         return None
     decision_kind = str(decision.get("kind") or "").strip()
+    if decision_kind == "blocked_no_valid_next_action":
+        if content and content.strip():
+            llm_trace["assistant_notes"].append(content.strip()[:320])
+        fingerprint = str(decision.get("blocker_fingerprint") or "").strip()
+        suffix = f" fingerprint={fingerprint}" if fingerprint else ""
+        return (
+            "Internal control impasse requested: "
+            f"blocked_no_valid_next_action{suffix}",
+            accumulated_usage,
+            llm_trace,
+        )
     if decision_kind not in {"plan_contract_revision", "proof_execution_infra"}:
         return None
     loop_target = str(
