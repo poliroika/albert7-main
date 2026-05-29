@@ -56,6 +56,11 @@ from umbrella.contracts.environments import (
     persist_environment_record,
     resolve_execution_environment,
 )
+from umbrella.contracts.contract_paths import (
+    InvalidContractPath,
+    normalize_contract_path,
+    validate_delta_path,
+)
 from umbrella.deep_agent_tools.phase_control_retry import (
     _completion_llm_memory_claim_issue,
     _phase_subtask_completion_issue,
@@ -526,25 +531,25 @@ _PHASE_PLAN_SEMANTIC_CONTRACT_KEYS = frozenset(
 )
 
 
-_LEGACY_CONTRACT_KEY_ROOT = "contract" + "_" + "migration"
-_LEGACY_CONTRACT_MIGRATION_KEYS = frozenset(
+_BLOCKED_CONTRACT_MIGRATION_KEY_ROOT = "contract" + "_" + "migration"
+_BLOCKED_PLAN_REVISION_METADATA_KEYS = frozenset(
     {
         *(
             f"{stem}_{field}"
             for stem in (
-                _LEGACY_CONTRACT_KEY_ROOT,
-                "test_" + _LEGACY_CONTRACT_KEY_ROOT,
-                "success_test_" + _LEGACY_CONTRACT_KEY_ROOT,
+                _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT,
+                "test_" + _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT,
+                "success_test_" + _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT,
             )
             for field in ("reason", "files")
         ),
-        _LEGACY_CONTRACT_KEY_ROOT,
-        "test_" + _LEGACY_CONTRACT_KEY_ROOT,
-        "success_test_" + _LEGACY_CONTRACT_KEY_ROOT,
-        _LEGACY_CONTRACT_KEY_ROOT + "_id",
-        _LEGACY_CONTRACT_KEY_ROOT + "_token",
+        _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT,
+        "test_" + _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT,
+        "success_test_" + _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT,
+        _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT + "_id",
+        _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT + "_token",
         "plan" + "_" + "mutation" + "_" + "ticket",
-        _LEGACY_CONTRACT_KEY_ROOT + "_ticket",
+        _BLOCKED_CONTRACT_MIGRATION_KEY_ROOT + "_ticket",
     }
 )
 
@@ -574,7 +579,11 @@ def _semantic_path_values(snapshot: Any, path: str) -> list[Any]:
     path = str(path or "").strip()
     if not path:
         return []
-    if path in {"proof.required_properties", "proof.oracle.required_properties"}:
+    try:
+        path = normalize_contract_path(path).path
+    except InvalidContractPath:
+        return []
+    if path == "proof.oracle.required_properties":
         proof = snapshot.get("proof") if isinstance(snapshot, dict) else None
         values: list[Any] = []
         if isinstance(proof, dict):
@@ -612,13 +621,33 @@ def _plan_revision_required_deltas(item: dict[str, Any]) -> list[dict[str, Any]]
     return [delta for delta in raw if isinstance(delta, dict)] if isinstance(raw, list) else []
 
 
+def _normalize_plan_revision_required_deltas(
+    item: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    deltas = _plan_revision_required_deltas(item)
+    normalized: list[dict[str, Any]] = []
+    for delta in deltas:
+        try:
+            normalized.append(validate_delta_path(delta))
+        except InvalidContractPath as exc:
+            return [], _invalid_contract_path_message(
+                exc,
+                source="PlanRevisionPatch.required_deltas",
+            )
+    return normalized, ""
+
+
 def _required_deltas_satisfied(
     deltas: list[dict[str, Any]],
     after_snapshot: Any,
 ) -> str:
     for delta in deltas:
         op = str(delta.get("op") or "").strip()
-        path = str(delta.get("path") or "").strip()
+        raw_path = str(delta.get("path") or "").strip()
+        try:
+            path = normalize_contract_path(raw_path).path
+        except InvalidContractPath as exc:
+            return f"required_delta has invalid contract path: {exc}"
         values = set(_phase_plan_string_items(delta.get("values")))
         if not path or not values:
             return "required_deltas entries require path and values"
@@ -642,7 +671,7 @@ def _required_deltas_satisfied(
     return ""
 
 
-def _legacy_phase_subtask_materialization_issue(
+def _phase_subtask_materialization_issue(
     ctx: ToolContext,
     *,
     current_phase: dict[str, Any] | None,
@@ -699,15 +728,19 @@ def _apply_phase_plan_subtask_patch(
         target = by_id.get(subtask_id)
         if target is None:
             return [], f"subtask '{subtask_id}' not found in execute phase"
-        legacy_keys = sorted(key for key in item if key in _LEGACY_CONTRACT_MIGRATION_KEYS)
-        if legacy_keys:
+        blocked_metadata_keys = sorted(
+            key for key in item if key in _BLOCKED_PLAN_REVISION_METADATA_KEYS
+        )
+        if blocked_metadata_keys:
             return [], (
-                "legacy plan-revision metadata is not accepted in active "
+                "deprecated plan-revision metadata is not accepted in active "
                 "plan mutation; use target_subtask_id plus a typed proof patch "
-                "and optional required_deltas. Legacy key(s): "
-                + ", ".join(legacy_keys)
+                "and optional required_deltas. Deprecated key(s): "
+                + ", ".join(blocked_metadata_keys)
             )
-        required_deltas = _plan_revision_required_deltas(item)
+        required_deltas, delta_error = _normalize_plan_revision_required_deltas(item)
+        if delta_error:
+            return [], delta_error
         semantic_patch = _has_semantic_contract_patch(item) or bool(required_deltas)
         before_snapshot = _semantic_contract_snapshot(target) if semantic_patch else {}
         requested_status = str(item.get("status") or "").strip().lower()
@@ -832,14 +865,16 @@ def _apply_phase_plan_mutation(
             patch = {**patch, "proof": patch["proof_contract"]}
             patch.pop("proof_contract", None)
         patch = {"subtasks": [{"id": selector, **patch}]}
-    legacy_keys = sorted(key for key in patch if key in _LEGACY_CONTRACT_MIGRATION_KEYS)
-    if legacy_keys:
+    blocked_metadata_keys = sorted(
+        key for key in patch if key in _BLOCKED_PLAN_REVISION_METADATA_KEYS
+    )
+    if blocked_metadata_keys:
         return (
-            "ERROR: legacy plan-revision metadata is not accepted in "
+            "ERROR: deprecated plan-revision metadata is not accepted in "
             "active plan mutation; pass target_subtask_id and a typed patch "
-            "that changes proof/files_under_test/acceptance_criteria. Legacy "
+            "that changes proof/files_under_test/acceptance_criteria. Deprecated "
             "key(s): "
-            + ", ".join(legacy_keys)
+            + ", ".join(blocked_metadata_keys)
         )
     applied: list[str] = []
     unsupported: list[str] = []
@@ -1390,6 +1425,320 @@ def _submit_research_summary(
     return f"OK: Research summary submitted (architecture: {architecture_id}, findings: {len(canonical_findings)}, signal: {signal_id})"
 
 
+def _invalid_contract_path_message(exc: InvalidContractPath, *, source: str) -> str:
+    return (
+        "ERROR: invalid_recovery_contract: "
+        f"{source} contains invalid contract path `{exc.raw_path}`. "
+        f"{exc.message}"
+        + (f"; canonical suggestion: `{exc.suggestion}`" if exc.suggestion else "")
+    )
+
+
+_SCOPE_REVIEW_CODES = frozenset({"proof_scope_mismatch", "scope_mismatch"})
+_PROOF_STRENGTH_REVIEW_CODES = frozenset({"weak_proof", "manual_proof"})
+_PROOF_INFRA_REVIEW_CODES = frozenset(
+    {
+        "headless_proof_uses_real_gui_root",
+        "proof_execution_infra",
+        "capability_probe_environment_mismatch",
+        "dependency_provision_required",
+    }
+)
+_FILE_TARGET_REVIEW_CODES = frozenset(
+    {"missing_proof", "unavailable_proof_target"}
+)
+
+
+def _submitted_plan_subtasks_by_id(ctx: ToolContext) -> dict[str, dict[str, Any]]:
+    payload = _submitted_or_latest_phase_plan_payload(ctx)
+    raw_plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
+    subtasks = raw_plan.get("subtasks") if isinstance(raw_plan, dict) else None
+    by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(subtasks, list):
+        for subtask in subtasks:
+            if not isinstance(subtask, dict):
+                continue
+            subtask_id = str(
+                subtask.get("id") or subtask.get("subtask_id") or ""
+            ).strip()
+            if subtask_id:
+                by_id[subtask_id] = subtask
+    return by_id
+
+
+def _review_issue_target_id(issue: dict[str, Any]) -> str:
+    return str(
+        issue.get("target_subtask_id") or issue.get("subtask_id") or ""
+    ).strip()
+
+
+def _review_change_issue_candidates(
+    *,
+    path: str,
+    issues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if path.startswith("proof.scope."):
+        codes = _SCOPE_REVIEW_CODES
+    elif path in {"files_to_create", "files_to_change", "files_affected"}:
+        codes = _FILE_TARGET_REVIEW_CODES
+    elif path.startswith("proof."):
+        codes = _PROOF_STRENGTH_REVIEW_CODES | _PROOF_INFRA_REVIEW_CODES
+    else:
+        codes = frozenset()
+    return [
+        issue
+        for issue in issues
+        if str(issue.get("code") or "").strip() in codes
+        and _review_issue_target_id(issue)
+    ]
+
+
+def _infer_review_change_target(
+    *,
+    change: dict[str, Any],
+    path: str,
+    issues: list[dict[str, Any]],
+) -> str:
+    explicit = str(
+        change.get("target_subtask_id")
+        or change.get("subtask_id")
+        or change.get("target_id")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+
+    candidates = _review_change_issue_candidates(path=path, issues=issues)
+    candidate_targets = list(
+        dict.fromkeys(_review_issue_target_id(issue) for issue in candidates)
+    )
+    if len(candidate_targets) == 1:
+        return candidate_targets[0]
+
+    all_targets = list(
+        dict.fromkeys(
+            _review_issue_target_id(issue)
+            for issue in issues
+            if _review_issue_target_id(issue)
+        )
+    )
+    if len(all_targets) == 1:
+        return all_targets[0]
+
+    return ""
+
+
+def _review_path_values(root: dict[str, Any], path: str) -> list[Any]:
+    try:
+        canonical_path = normalize_contract_path(path).path
+    except InvalidContractPath:
+        return []
+    values: list[Any] = [root]
+    for token in [part for part in canonical_path.split(".") if part]:
+        next_values: list[Any] = []
+        for value in values:
+            if isinstance(value, dict) and token in value:
+                next_values.append(value[token])
+        values = next_values
+        if not values:
+            break
+    return values
+
+
+def _previous_review_path_value(
+    *,
+    subtasks_by_id: dict[str, dict[str, Any]],
+    target_subtask_id: str,
+    path: str,
+) -> Any:
+    subtask = subtasks_by_id.get(target_subtask_id)
+    if not isinstance(subtask, dict):
+        return None
+    values = _review_path_values(subtask, path)
+    if len(values) == 1:
+        return copy.deepcopy(values[0])
+    if values:
+        return copy.deepcopy(values)
+    return None
+
+
+def _with_semantic_previous_value(
+    *,
+    change: dict[str, Any],
+    subtasks_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if str(change.get("op") or "").strip() != "semantic_diff":
+        return change
+    if "previous_value" in change:
+        return change
+    target_subtask_id = str(change.get("target_subtask_id") or "").strip()
+    path = str(change.get("path") or "").strip()
+    previous = _previous_review_path_value(
+        subtasks_by_id=subtasks_by_id,
+        target_subtask_id=target_subtask_id,
+        path=path,
+    )
+    if previous is not None:
+        change["previous_value"] = json_ready(previous)
+    return change
+
+
+def _derived_review_required_changes(
+    *,
+    issues: list[dict[str, Any]],
+    subtasks_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        severity = str(issue.get("severity") or "").strip().lower()
+        if severity not in {"blocking", "error"}:
+            continue
+        code = str(issue.get("code") or "").strip()
+        target_subtask_id = _review_issue_target_id(issue)
+        if not target_subtask_id:
+            continue
+        if code in _SCOPE_REVIEW_CODES:
+            path = "proof.scope"
+        elif code in _PROOF_STRENGTH_REVIEW_CODES:
+            path = "proof"
+        elif code == "headless_proof_uses_real_gui_root":
+            path = "proof.scope.pytest_targets"
+        elif code in _PROOF_INFRA_REVIEW_CODES:
+            path = "proof.execution"
+        else:
+            continue
+        change = {
+            "id": f"{code}-{target_subtask_id}",
+            "target_subtask_id": target_subtask_id,
+            "severity": "blocking",
+            "reason_code": code,
+            "source": "ReviewIssue",
+            "path": path,
+            "op": "semantic_diff",
+        }
+        if isinstance(issue.get("evidence_refs"), list):
+            change["evidence_refs"] = issue.get("evidence_refs")
+        changes.append(
+            _with_semantic_previous_value(
+                change=change,
+                subtasks_by_id=subtasks_by_id,
+            )
+        )
+    return changes
+
+
+def _normalize_required_plan_change(
+    *,
+    change: dict[str, Any],
+    issues: list[dict[str, Any]],
+    subtasks_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    item = dict(change)
+    raw_path = str(item.get("path") or item.get("field") or "").strip()
+    if raw_path:
+        item["path"] = normalize_contract_path(raw_path).path
+    path = str(item.get("path") or "").strip()
+    target_subtask_id = _infer_review_change_target(
+        change=item,
+        path=path,
+        issues=issues,
+    )
+    if target_subtask_id:
+        item["target_subtask_id"] = target_subtask_id
+    op = str(item.get("op") or item.get("action") or "").strip()
+    if op == "replace_applied" and "old_value" not in item and "new_value" not in item:
+        item["op"] = "semantic_diff"
+        item.pop("value", None)
+        item.pop("values", None)
+    item = _with_semantic_previous_value(
+        change=item,
+        subtasks_by_id=subtasks_by_id,
+    )
+    return item
+
+
+def _append_unique_review_change(
+    changes: list[Any],
+    change: dict[str, Any],
+) -> None:
+    key = json.dumps(json_ready(change), sort_keys=True, ensure_ascii=False)
+    for existing in changes:
+        if not isinstance(existing, dict):
+            continue
+        if json.dumps(json_ready(existing), sort_keys=True, ensure_ascii=False) == key:
+            return
+    changes.append(change)
+
+
+def _normalize_review_control_paths(
+    *,
+    ctx: ToolContext,
+    issues: list[dict[str, Any]],
+    required_plan_changes: list[Any] | None,
+) -> tuple[dict[str, Any], str]:
+    subtasks_by_id = _submitted_plan_subtasks_by_id(ctx)
+    normalized_issues: list[dict[str, Any]] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        item = dict(issue)
+        for key in ("contract_path", "target_path"):
+            raw_path = str(item.get(key) or "").strip()
+            if not raw_path:
+                continue
+            try:
+                item[key] = normalize_contract_path(raw_path).path
+            except InvalidContractPath as exc:
+                return {}, _invalid_contract_path_message(
+                    exc,
+                    source=f"ReviewIssue.{key}",
+                )
+        raw_deltas = item.get("required_deltas")
+        if isinstance(raw_deltas, list):
+            normalized_deltas: list[dict[str, Any]] = []
+            for delta in raw_deltas:
+                if not isinstance(delta, dict):
+                    continue
+                try:
+                    normalized_deltas.append(validate_delta_path(delta))
+                except InvalidContractPath as exc:
+                    return {}, _invalid_contract_path_message(
+                        exc,
+                        source="ReviewIssue.required_deltas",
+                    )
+            item["required_deltas"] = normalized_deltas
+        normalized_issues.append(item)
+
+    normalized_changes: list[Any] = []
+    for change in _derived_review_required_changes(
+        issues=normalized_issues,
+        subtasks_by_id=subtasks_by_id,
+    ):
+        _append_unique_review_change(normalized_changes, change)
+    for change in required_plan_changes or []:
+        if not isinstance(change, dict):
+            normalized_changes.append(change)
+            continue
+        try:
+            item = _normalize_required_plan_change(
+                change=change,
+                issues=normalized_issues,
+                subtasks_by_id=subtasks_by_id,
+            )
+        except InvalidContractPath as exc:
+            return {}, _invalid_contract_path_message(
+                exc,
+                source="required_plan_changes",
+            )
+        _append_unique_review_change(normalized_changes, item)
+    return {
+        "issues": normalized_issues,
+        "required_plan_changes": normalized_changes,
+    }, ""
+
+
 def _submit_micro_review(
     ctx: ToolContext,
     *,
@@ -1420,11 +1769,20 @@ def _submit_micro_review(
             effective_issues = [*effective_issues, *migrated]
     if effective_issues is None:
         effective_issues = []
-    if feedback_issue := _micro_review_feedback_issue(
+    normalized_review, path_issue = _normalize_review_control_paths(
+        ctx=ctx,
+        issues=effective_issues,
+        required_plan_changes=required_plan_changes,
+    )
+    if path_issue:
+        return path_issue
+    effective_issues = normalized_review["issues"]
+    required_plan_changes = normalized_review["required_plan_changes"]
+    if not effective_issues and (feedback_issue := _micro_review_feedback_issue(
         verdict=verdict,
         revisions=revisions,
         notes=notes,
-    ):
+    )):
         return feedback_issue
     if policy_issue := _review_revision_policy_issue(
         ctx,
@@ -3294,7 +3652,7 @@ def _mark_subtask_complete(
                     "`completion_contract`; summary/evidence-only completion "
                     "drops verifier proof_refs and verification_report."
                 )
-            materialization_issue = _legacy_phase_subtask_materialization_issue(
+            materialization_issue = _phase_subtask_materialization_issue(
                 ctx,
                 current_phase=current_phase,
                 subtask_id=subtask_id,

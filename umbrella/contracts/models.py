@@ -8,6 +8,8 @@ machine-checkable proof fields: valid shape is not evidence.
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Generic, Literal, TypeVar, cast
 
+from umbrella.contracts.contract_paths import validate_delta_path
+
 
 CURRENT_CONTRACT_VERSION = "1"
 
@@ -165,6 +167,57 @@ class UmbrellaAttestation:
     byproducts: tuple[ArtifactDigest, ...] = ()
     started_at: str = ""
     finished_at: str = ""
+
+
+@dataclass(frozen=True)
+class ContractDelta:
+    """Canonical contract delta used by review/recovery/plan revision paths."""
+
+    op: Literal["add", "remove", "replace"]
+    path: str
+    values: tuple[str, ...] = ()
+    value: Any = None
+    replacement: Any = None
+    target_subtask_id: str = ""
+    source_issue_code: str = ""
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "ContractDelta":
+        normalized = validate_delta_path(value)
+        raw_values = normalized.get("values")
+        return cls(
+            op=cast(Literal["add", "remove", "replace"], str(normalized.get("op"))),
+            path=str(normalized.get("path") or ""),
+            values=tuple(
+                str(item).strip()
+                for item in (raw_values or ())
+                if str(item).strip()
+            )
+            if isinstance(raw_values, (list, tuple))
+            else (),
+            value=normalized.get("value") if "value" in normalized else None,
+            replacement=(
+                normalized.get("replacement")
+                if "replacement" in normalized
+                else None
+            ),
+            target_subtask_id=str(normalized.get("target_subtask_id") or "").strip(),
+            source_issue_code=str(normalized.get("source_issue_code") or "").strip(),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"op": self.op, "path": self.path}
+        if self.values:
+            payload["values"] = list(self.values)
+        if self.value is not None:
+            payload["value"] = json_ready(self.value)
+        if self.replacement is not None:
+            payload["replacement"] = json_ready(self.replacement)
+        if self.target_subtask_id:
+            payload["target_subtask_id"] = self.target_subtask_id
+        if self.source_issue_code:
+            payload["source_issue_code"] = self.source_issue_code
+        return payload
 
 
 @dataclass(frozen=True)
@@ -442,7 +495,7 @@ class ReviewIssue:
             if isinstance(value.get("invalid_values"), (list, tuple))
             else (),
             required_deltas=tuple(
-                dict(item)
+                ContractDelta.from_mapping(item).to_payload()
                 for item in (value.get("required_deltas") or ())
                 if isinstance(item, dict)
             )

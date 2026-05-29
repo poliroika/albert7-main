@@ -49,6 +49,7 @@ from umbrella.contracts.environments import (
     DEFAULT_EXECUTION_ENVIRONMENT_ID,
     find_capability_binding,
 )
+from umbrella.contracts.contract_paths import InvalidContractPath, normalize_contract_path
 from umbrella.contracts.schemas import VALID_REVIEW_CODES
 from umbrella.contracts.oracle_validator import (
     BAD_ORACLE_REVIEW_CODES,
@@ -832,6 +833,23 @@ def validate_review_contract(review: ReviewContract, *, phase: str = "") -> list
             for delta in item.required_deltas:
                 op = str(delta.get("op") or "").strip()
                 path = str(delta.get("path") or "").strip()
+                try:
+                    path = normalize_contract_path(path).path
+                except InvalidContractPath as exc:
+                    issues.append(
+                        ContractIssue(
+                            code="invalid_recovery_contract",
+                            severity="blocking",
+                            phase=phase or item.phase,
+                            subtask_id=item.subtask_id or item.target_subtask_id,
+                            message=(
+                                "bad-oracle required_delta path is not a "
+                                f"canonical PlanIR/ProofContract path: {exc}"
+                            ),
+                            evidence_refs=item.evidence_refs,
+                        )
+                    )
+                    continue
                 if op not in {"remove", "replace", "add"} or not path:
                     issues.append(
                         ContractIssue(

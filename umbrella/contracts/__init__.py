@@ -1,6 +1,16 @@
 """Contract/evidence-driven phase gate primitives."""
 
 from umbrella.contracts.compiler import ContractCompiler
+from umbrella.contracts.contract_paths import (
+    CANONICAL_CONTRACT_PATHS,
+    CONTRACT_PATH_ALIASES,
+    CanonicalPath,
+    InvalidContractPath,
+    is_canonical_contract_path,
+    normalize_contract_path,
+    suggest_contract_path,
+    validate_delta_path,
+)
 from umbrella.contracts.decision import PhaseDecisionEngine, decide_phase_transition
 from umbrella.contracts.evidence import EvidenceResolver, build_workspace_context
 from umbrella.contracts.hashing import diff_hash, hash_value, workspace_hash
@@ -30,6 +40,7 @@ from umbrella.contracts.models import (
     CompletedClaim,
     CompletionContract,
     ContractBundle,
+    ContractDelta,
     ContractEnvelope,
     ContractIssue,
     EvidenceRef,
@@ -59,6 +70,7 @@ from umbrella.contracts.oracle_validator import (
     generated_oracle_contract_issues,
 )
 from umbrella.contracts.policy_input import to_policy_input
+from umbrella.contracts.recovery_policy import RecoveryOption, derive_recovery_options
 from umbrella.contracts.layout_policy import validate_plan_layout_policy
 from umbrella.contracts.validators import (
     ContractValidator,
@@ -78,15 +90,20 @@ __all__ = [
     "CompletedClaim",
     "CompletionContract",
     "ContractBundle",
+    "ContractDelta",
     "ContractCompiler",
     "ContractEnvelope",
     "ContractIssue",
     "ContractValidator",
+    "CANONICAL_CONTRACT_PATHS",
+    "CONTRACT_PATH_ALIASES",
+    "CanonicalPath",
     "EvidenceRef",
     "EvidenceResolver",
     "CapabilityBinding",
     "ExecutionEnvironmentRecord",
     "HarnessProfile",
+    "InvalidContractPath",
     "PhaseExitDecision",
     "PhaseDecision",
     "PhaseDecisionEngine",
@@ -99,6 +116,7 @@ __all__ = [
     "ResearchSummaryContract",
     "ReviewContract",
     "ReviewIssue",
+    "RecoveryOption",
     "SubtaskIR",
     "TaskRiskProfile",
     "UmbrellaAttestation",
@@ -114,23 +132,28 @@ __all__ = [
     "contract_issues_payload",
     "decide_phase_transition",
     "diff_hash",
+    "derive_recovery_options",
     "extract_failed_pytest_node_ids",
     "generated_oracle_contract_issues",
     "hash_value",
+    "is_canonical_contract_path",
     "json_ready",
     "classify_tcl_tk_status",
     "find_capability_binding",
     "load_capability_bindings",
     "load_environment_records",
     "known_harness_profile_ids",
+    "normalize_contract_path",
     "persist_capability_binding",
     "persist_environment_record",
     "probe_required_capability_ids",
     "resolve_execution_environment",
+    "suggest_contract_path",
     "to_policy_input",
     "validate_completion_contract",
     "validate_completion_materialization",
     "validate_done_subtasks_materialized",
+    "validate_delta_path",
     "validate_envelope",
     "validate_proof_spec",
     "validate_review_contract",

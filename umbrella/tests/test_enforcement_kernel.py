@@ -32,6 +32,43 @@ def test_shell_post_diff_reports_workspace_mutation(tmp_path: Path) -> None:
     assert any(issue.code == "shell_tool_workspace_mutation" for issue in issues)
 
 
+def test_internal_memory_logs_not_workspace_mutation(tmp_path: Path) -> None:
+    before = snapshot_workspace(tmp_path)
+    log_dir = tmp_path / ".memory" / "drive" / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "tools.jsonl").write_text("{}\n", encoding="utf-8")
+    state_dir = tmp_path / ".memory" / "drive" / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "phase_control_signals.jsonl").write_text("{}\n", encoding="utf-8")
+    changes = diff_snapshots(before, snapshot_workspace(tmp_path))
+
+    issues = check_post_tool_diff("run_subtask_proof", "execute", changes)
+
+    assert not issues
+
+
+def test_src_change_after_proof_is_workspace_mutation(tmp_path: Path) -> None:
+    before = snapshot_workspace(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('changed')\n", encoding="utf-8")
+    changes = diff_snapshots(before, snapshot_workspace(tmp_path))
+
+    issues = check_post_tool_diff("run_subtask_proof", "execute", changes)
+
+    assert any(issue.code == "shell_tool_workspace_mutation" for issue in issues)
+
+
+def test_tests_change_after_failed_proof_still_blocked(tmp_path: Path) -> None:
+    before = snapshot_workspace(tmp_path)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_app.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    changes = diff_snapshots(before, snapshot_workspace(tmp_path))
+
+    issues = check_post_tool_diff("run_subtask_proof", "execute", changes)
+
+    assert any(issue.path == "tests/test_app.py" for issue in issues)
+
+
 def test_diff_snapshots_ignores_capture_content_payload(tmp_path: Path) -> None:
     (tmp_path / ".memory" / "drive" / "logs").mkdir(parents=True)
     (tmp_path / ".memory" / "drive" / "logs" / "events.jsonl").write_text(

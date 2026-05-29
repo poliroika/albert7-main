@@ -4,9 +4,9 @@ from types import SimpleNamespace
 from umbrella.deep_agent_tools.phase_control_actions import (
     _apply_plan_revision_patch,
     _apply_phase_plan_subtask_patch,
-    _legacy_phase_subtask_materialization_issue,
     _merge_phase_plan_string_list,
     _mutate_phase_plan,
+    _phase_subtask_materialization_issue,
     _phase_plan_string_items,
     _request_scope_change,
 )
@@ -374,7 +374,7 @@ def test_mutate_phase_plan_rejects_top_level_legacy_plan_revision_metadata(
         },
     )
 
-    assert "legacy plan-revision metadata is not accepted" in result
+    assert "deprecated plan-revision metadata is not accepted" in result
     plan = json.loads((state / "phase_plan.json").read_text(encoding="utf-8"))
     subtask = plan["nodes"][0]["subtasks"][0]
     assert "contract_migration_reason" not in subtask
@@ -998,6 +998,209 @@ def test_mutate_phase_plan_required_deltas_replaces_oracle_property(
     assert "required_deltas" not in plan["nodes"][0]["subtasks"][0]
 
 
+def test_required_deltas_satisfied_scope_pytest_targets_replace(tmp_path) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "gui",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": [
+                                            "python",
+                                            "-m",
+                                            "pytest",
+                                            "tests/test_old_gui.py",
+                                        ],
+                                    },
+                                    "oracle": {"required_properties": []},
+                                    "scope": {
+                                        "pytest_targets": ["tests/test_old_gui.py"],
+                                    },
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _apply_plan_revision_patch(
+        ctx,
+        target_subtask_id="gui",
+        reason_code="headless_proof_uses_real_gui_root",
+        required_deltas=[
+            {
+                "op": "replace",
+                "path": "proof.scope.pytest_targets",
+                "values": ["tests/test_gui.py::test_headless_controller_state_transitions"],
+            }
+        ],
+        patch={
+            "proof": {
+                "scope": {
+                    "pytest_targets": [
+                        "tests/test_gui.py::test_headless_controller_state_transitions"
+                    ]
+                }
+            }
+        },
+    )
+
+    assert result.startswith("PhasePlan mutated"), result
+
+
+def test_required_deltas_satisfied_pytest_targets_alias(tmp_path) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "gui",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": ["python", "-m", "pytest", "tests/test_old_gui.py"],
+                                    },
+                                    "oracle": {"required_properties": []},
+                                    "scope": {"pytest_targets": ["tests/test_old_gui.py"]},
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _apply_plan_revision_patch(
+        ctx,
+        target_subtask_id="gui",
+        reason_code="headless_proof_uses_real_gui_root",
+        required_deltas=[
+            {
+                "op": "replace",
+                "path": "proof.pytest_targets",
+                "values": ["tests/test_gui.py::test_headless_controller_state_transitions"],
+            }
+        ],
+        patch={
+            "proof": {
+                "scope": {
+                    "pytest_targets": [
+                        "tests/test_gui.py::test_headless_controller_state_transitions"
+                    ]
+                }
+            }
+        },
+    )
+
+    assert result.startswith("PhasePlan mutated"), result
+
+
+def test_required_deltas_reject_indexed_path(tmp_path) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    (state / "phase_plan.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "manifest_id": "execute",
+                        "status": "running",
+                        "subtasks": [
+                            {
+                                "id": "gui",
+                                "status": "pending",
+                                "proof": {
+                                    "execution": {
+                                        "kind": "pytest",
+                                        "command": ["python", "-m", "pytest", "tests/test_old_gui.py"],
+                                    },
+                                    "oracle": {"required_properties": []},
+                                    "scope": {"pytest_targets": ["tests/test_old_gui.py"]},
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:execute:1",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "execute", "manifest_id": "execute"}},
+    )
+
+    result = _apply_plan_revision_patch(
+        ctx,
+        target_subtask_id="gui",
+        reason_code="headless_proof_uses_real_gui_root",
+        required_deltas=[
+            {
+                "op": "replace",
+                "path": "proof.pytest_targets[0]",
+                "values": ["tests/test_gui.py::test_headless_controller_state_transitions"],
+            }
+        ],
+        patch={
+            "proof": {
+                "scope": {
+                    "pytest_targets": [
+                        "tests/test_gui.py::test_headless_controller_state_transitions"
+                    ]
+                }
+            }
+        },
+    )
+
+    assert "invalid_recovery_contract" in result
+    assert "proof.scope.pytest_targets" in result
+
+
 def test_mutate_phase_plan_rejects_subtask_id_inside_patch(tmp_path) -> None:
     drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
     state = drive / "state"
@@ -1035,7 +1238,7 @@ def test_mutate_phase_plan_rejects_subtask_id_inside_patch(tmp_path) -> None:
     assert "subtask_id is a selector" in result
 
 
-def test_legacy_completion_checks_declared_files_before_accepting(tmp_path) -> None:
+def test_completion_checks_declared_files_before_accepting(tmp_path) -> None:
     repo = tmp_path / "repo"
     drive = repo / "workspaces" / "demo" / ".memory" / "drive"
     drive.mkdir(parents=True)
@@ -1055,7 +1258,7 @@ def test_legacy_completion_checks_declared_files_before_accepting(tmp_path) -> N
         ],
     }
 
-    issue = _legacy_phase_subtask_materialization_issue(
+    issue = _phase_subtask_materialization_issue(
         ctx,
         current_phase=current_phase,
         subtask_id="launcher",

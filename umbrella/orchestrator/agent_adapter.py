@@ -6,7 +6,6 @@ keeps that boundary explicit so Ouroboros, Hermes-style agents, or test doubles
 can be swapped without changing phase semantics.
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable

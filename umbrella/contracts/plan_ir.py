@@ -1,6 +1,5 @@
 """Compile typed phase-plan contracts into PlanIR."""
 
-from __future__ import annotations
 
 from typing import Any
 

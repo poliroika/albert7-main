@@ -17,6 +17,7 @@ from umbrella.deep_agent_tools.phase_control_common import (
     _WEB_SEARCH_ONLY_CONTEXT_RE,
 )
 from umbrella.deep_agent_tools.phase_control_base import _tool_log_rows_for_task
+from umbrella.contracts.contract_paths import InvalidContractPath, normalize_contract_path
 import ast
 import json
 import pathlib
@@ -2076,8 +2077,37 @@ def _subtask_payload_by_id(plan: dict[str, Any], subtask_id: str) -> dict[str, A
     return None
 
 
+def _path_scalar_items(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    if value in (None, ""):
+        return []
+    return [value]
+
+
 def _path_values(root: Any, path: str) -> list[Any]:
-    tokens = [part for part in str(path or "").strip().split(".") if part]
+    try:
+        canonical_path = normalize_contract_path(str(path or "")).path
+    except InvalidContractPath:
+        return []
+    if canonical_path == "proof.oracle.required_properties":
+        proof = root.get("proof") if isinstance(root, dict) else None
+        values: list[Any] = []
+        if isinstance(proof, dict):
+            values.extend(_path_scalar_items(proof.get("required_properties")))
+            oracle = proof.get("oracle")
+            if isinstance(oracle, dict):
+                values.extend(_path_scalar_items(oracle.get("required_properties")))
+        proof_contract = root.get("proof_contract") if isinstance(root, dict) else None
+        if isinstance(proof_contract, dict):
+            values.extend(_path_scalar_items(proof_contract.get("required_properties")))
+            oracle = proof_contract.get("oracle")
+            if isinstance(oracle, dict):
+                values.extend(_path_scalar_items(oracle.get("required_properties")))
+        return values
+    tokens = [part for part in canonical_path.split(".") if part]
     values = [root]
     for token in tokens:
         next_values: list[Any] = []
@@ -2155,6 +2185,13 @@ def _typed_required_change_issue(plan: dict[str, Any], change: dict[str, Any]) -
         return (
             f"typed required_plan_change `{change_id}` is not enforceable: "
             "blocking changes must include `path` and `op`"
+        )
+    try:
+        path = normalize_contract_path(path).path
+    except InvalidContractPath as exc:
+        return (
+            f"invalid_recovery_contract: typed required_plan_change "
+            f"`{change_id}` has invalid contract path: {exc}"
         )
     target, target_label = _required_change_target(plan, change)
     if target is None:

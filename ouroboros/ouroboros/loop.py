@@ -4017,15 +4017,7 @@ def _current_execute_proof_command_text(drive_root: pathlib.Path | None) -> str:
     proof_command = _subtask_typed_proof_command_text(subtask)
     if proof_command:
         return proof_command
-    # Compatibility only: freshly submitted plans are rejected if they use
-    # success_test as authority, but older persisted plan fixtures may still
-    # need a one-shot proof-command view.
-    raw = subtask.get("success_test")
-    if isinstance(raw, dict):
-        raw = raw.get("command") or raw.get("argv") or raw.get("cmd") or ""
-    if isinstance(raw, (list, tuple)):
-        return " ".join(str(part) for part in raw)
-    return str(raw or "").strip()
+    return ""
 
 
 def _current_execute_subtask_id(drive_root: pathlib.Path | None) -> str:
@@ -4124,25 +4116,6 @@ def _may_force_mark_subtask_complete(
     proof_command = _current_execute_proof_command_text(drive_root)
     return _execute_proof_command_observed(
         proof_command=proof_command,
-        trace_tool_calls=trace_tool_calls,
-    )
-
-
-def _success_test_command_fragments(success_text: str) -> list[str]:
-    return _proof_command_fragments(success_text)
-
-
-def _current_execute_success_test_text(drive_root: pathlib.Path | None) -> str:
-    return _current_execute_proof_command_text(drive_root)
-
-
-def _execute_success_test_observed(
-    *,
-    success_text: str,
-    trace_tool_calls: list[dict[str, Any]],
-) -> bool:
-    return _execute_proof_command_observed(
-        proof_command=success_text,
         trace_tool_calls=trace_tool_calls,
     )
 
@@ -5015,6 +4988,26 @@ def _normalize_completion_error(text: str) -> str:
     return value[:240]
 
 
+def _completion_error_status(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("status", "reason", "code", "verdict"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        decision = payload.get("recovery_decision")
+        if isinstance(decision, dict):
+            return str(decision.get("trigger_code") or decision.get("kind") or "").strip()
+    normalized = _normalize_completion_error(raw)
+    return "invalid_recovery_contract" if "invalid_recovery_contract" in normalized else ""
+
+
 def _active_plan_id_from_tools(tools: ToolRegistry, task_id: str) -> str:
     ctx = getattr(tools, "_ctx", None)
     if ctx is None:
@@ -5057,6 +5050,33 @@ def _maybe_trip_completion_impasse(
             continue
         normalized = _normalize_completion_error(result)
         active_plan_id = _active_plan_id_from_tools(tools, task_id)
+        error_status = _completion_error_status(result)
+        if error_status == "invalid_recovery_contract":
+            payload = {
+                "schema_version": 1,
+                "ts": utc_now_iso(),
+                "status": "invalid_recovery_contract",
+                "task_id": task_id,
+                "plan_id": active_plan_id,
+                "drive_root": str(drive_root or ""),
+                "phase": phase_label,
+                "tool": tool,
+                "normalized_error": normalized,
+                "last_error": result[:PHASE_ERROR_ARTIFACT_CHARS],
+            }
+            if drive_root:
+                try:
+                    state_dir = pathlib.Path(drive_root) / "state"
+                    state_dir.mkdir(parents=True, exist_ok=True)
+                    (state_dir / "invalid_recovery_contract.json").write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    log.debug(
+                        "invalid_recovery_contract artifact write failed",
+                        exc_info=True,
+                    )
         key = (phase_label, tool, normalized, active_plan_id)
         count = state.counts.get(key, 0) + 1
         state.counts[key] = count

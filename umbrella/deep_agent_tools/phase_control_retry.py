@@ -4,7 +4,18 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from umbrella.deep_agent_tools.phase_control_common import *
-from umbrella.contracts import BAD_ORACLE_REVIEW_CODES, hash_value, json_ready
+from umbrella.contracts import (
+    BAD_ORACLE_REVIEW_CODES,
+    ContractDelta,
+    hash_value,
+    json_ready,
+)
+from umbrella.contracts.contract_paths import (
+    InvalidContractPath,
+    normalize_contract_path,
+    validate_delta_path,
+)
+from umbrella.contracts.recovery_policy import derive_recovery_options
 
 _SUCCESS_TEST_TOOL_NAMES = (
     "harness_run",
@@ -1537,49 +1548,6 @@ def _implementation_retry_recommendation(paths: list[str]) -> str:
     )
 
 
-_BAD_GENERATED_SUCCESS_TEST_TEXT_LINT_RE = re.compile(
-    r"\b("
-    r"bad\s+generated\s+(?:success[-_\s]?test|test|test\s+contract)|"
-    r"generated\s+(?:success[-_\s]?test|test)\s+(?:contract\s+)?"
-    r"(?:is\s+)?(?:wrong|invalid|contradictory|inconsistent|impossible)|"
-    r"(?:generated\s+)?(?:test|proof|oracle)\s+contract\s+"
-    r"(?:itself\s+)?(?:has|contains|is)\s+"
-    r"(?:bugs?|errors?|wrong|invalid|contradictory|inconsistent|impossible|unfixable)|"
-    r"(?:test|proof|oracle)\s+contract\b.{0,160}\b"
-    r"(?:bugs?|errors?|wrong|invalid|contradictory|inconsistent|impossible|unfixable)|"
-    r"generated\s+test\s+file\b.{0,160}\b"
-    r"(?:bugs?|errors?|wrong|invalid|contradictory|inconsistent|impossible|unfixable)|"
-    r"mathematically\s+(?:wrong|impossible)|"
-    r"expected\s+value\s+is\s+mathematically\s+wrong|"
-    r"internally\s+(?:inconsistent|contradictory)|"
-    r"contradicts?\s+(?:itself|the\s+accepted\s+plan)|"
-    r"test\s+(?:needs|should|must)\s+(?:be\s+)?(?:changed|updated|repaired|"
-    r"migrated|fixed|adjusted)|"
-    r"proposed\s+fix\s*:\s*change\s+line|"
-    r"only\s+(?:sets|provides|supplies)\b"
-    r")",
-    re.IGNORECASE,
-)
-
-
-@dataclass(frozen=True)
-class ContractDelta:
-    """Typed contract change required before a recovery mutation can be accepted."""
-
-    op: Literal["remove", "replace", "add"]
-    path: str
-    values: tuple[str, ...] = ()
-    replacement: Any | None = None
-
-    def to_payload(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"op": self.op, "path": self.path}
-        if self.values:
-            payload["values"] = list(self.values)
-        if self.replacement is not None:
-            payload["replacement"] = json_ready(self.replacement)
-        return payload
-
-
 _ALLOWED_RETRY_PROOF_KINDS = frozenset(
     {
         "pytest",
@@ -1633,7 +1601,6 @@ class RetryContractIssue:
         "capability_probe_environment_mismatch",
         "dependency_provision_required",
         "headless_proof_uses_real_gui_root",
-        "need_more_context",
     ]
     severity: Literal["info", "warning", "blocking"]
     target_subtask_id: str
@@ -1682,34 +1649,6 @@ class RetryContractIssue:
         return payload
 
 
-_PLAN_REVISION_DELTA_PATH_PREFIXES = (
-    "proof.",
-    "proof:",
-    "subtask:",
-)
-_PLAN_REVISION_DELTA_PATHS = {
-    "files_to_create",
-    "files_to_change",
-    "files_affected",
-    "proof",
-    "generated_test_contract",
-    "harness_profile",
-    "harness_options",
-    "required_capabilities",
-}
-
-
-def _is_plan_revision_delta_path(path: str) -> bool:
-    text = str(path or "").strip()
-    if not text:
-        return False
-    if text in _PLAN_REVISION_DELTA_PATHS:
-        return True
-    if any(text.startswith(prefix) for prefix in _PLAN_REVISION_DELTA_PATH_PREFIXES):
-        return True
-    return False
-
-
 def _invalid_values_target_required_properties(
     raw: dict[str, Any],
     *,
@@ -1721,12 +1660,47 @@ def _invalid_values_target_required_properties(
     )
 
 
+def _canonical_contract_path_or_default(raw: Any, *, default: str = "") -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return default
+    try:
+        return normalize_contract_path(text).path
+    except InvalidContractPath:
+        return ""
+
+
+def _recovery_contract_path_for_issue_code(
+    code: str,
+    *,
+    raw_path: Any = None,
+    deltas: tuple[ContractDelta, ...] = (),
+) -> str:
+    """Derive authoritative recovery paths from issue code and schema.
+
+    Watchers diagnose the issue; they do not define canonical PlanIR paths.
+    """
+
+    code_text = str(code or "").strip()
+    if code_text == "headless_proof_uses_real_gui_root":
+        return "proof.scope.pytest_targets"
+    if deltas:
+        return deltas[0].path
+    if code_text == "capability_probe_environment_mismatch":
+        return "proof.required_capabilities"
+    if code_text in _PROOF_EXECUTION_INFRA_CODES:
+        return "proof.execution"
+    return _canonical_contract_path_or_default(raw_path)
+
+
 def _contract_delta_from_payload(raw: Any) -> ContractDelta | None:
     if not isinstance(raw, dict):
         return None
-    path = str(raw.get("path") or "").strip()
-    if not _is_plan_revision_delta_path(path):
+    try:
+        normalized = validate_delta_path(raw)
+    except InvalidContractPath:
         return None
+    path = str(normalized.get("path") or "").strip()
     op = str(raw.get("op") or "remove").strip()
     if op not in {"remove", "replace", "add"}:
         return None
@@ -1794,7 +1768,10 @@ def _typed_contract_issues_from_latest_failure(
                 raw.get("invalid_values") or raw.get("invalid_required_properties"),
                 list,
             ) else ()
-            contract_path = str(raw.get("contract_path") or "proof.required_properties")
+            contract_path = _canonical_contract_path_or_default(
+                raw.get("contract_path"),
+                default="proof.oracle.required_properties",
+            )
             if (
                 invalid_values
                 and not removals
@@ -1819,7 +1796,7 @@ def _typed_contract_issues_from_latest_failure(
                     target_subtask_id=target,
                     target_path=str(raw.get("target_path") or "").strip(),
                     contract_path=str(
-                        raw.get("contract_path")
+                        _canonical_contract_path_or_default(raw.get("contract_path"))
                         or (removals[0].path if removals else "")
                     ),
                     invalid_values=invalid_values,
@@ -1855,7 +1832,7 @@ def _typed_contract_issues_from_latest_failure(
             required_removals = (
                 ContractDelta(
                     op="remove",
-                    path="proof.required_properties",
+                    path="proof.oracle.required_properties",
                     values=invalid_required_properties,
                 ),
             )
@@ -1905,13 +1882,20 @@ def _proof_execution_infra_issues_from_latest_failure(
                 )
                 if delta is not None
             ) if isinstance(raw_deltas, list) else ()
+            contract_path = _recovery_contract_path_for_issue_code(
+                code,
+                raw_path=raw.get("contract_path"),
+                deltas=deltas,
+            )
+            if not contract_path:
+                continue
             issues.append(
                 RetryContractIssue(
                     code=code,  # type: ignore[arg-type]
                     severity="blocking",
                     target_subtask_id=target,
                     target_path=str(raw.get("target_path") or "").strip(),
-                    contract_path=str(raw.get("contract_path") or "proof.execution"),
+                    contract_path=contract_path,
                     required_replacements=deltas,
                     evidence_refs=tuple(
                         str(item).strip()
@@ -1966,7 +1950,7 @@ def _normalise_requested_contract_issues(
         if code not in BAD_ORACLE_REVIEW_CODES and code not in _PROOF_EXECUTION_INFRA_CODES:
             continue
         target = str(raw.get("target_subtask_id") or subtask_id).strip()
-        contract_path = str(raw.get("contract_path") or "").strip()
+        contract_path = _canonical_contract_path_or_default(raw.get("contract_path"))
         invalid_values = [
             str(item).strip()
             for item in (raw.get("invalid_values") or [])
@@ -1983,7 +1967,28 @@ def _normalise_requested_contract_issues(
         if not contract_path and deltas:
             contract_path = str(deltas[0].get("path") or "").strip()
         if not contract_path and code in _PROOF_EXECUTION_INFRA_CODES:
-            contract_path = "proof.execution"
+            contract_path = _recovery_contract_path_for_issue_code(
+                code,
+                raw_path=raw.get("contract_path"),
+                deltas=tuple(
+                    ContractDelta(
+                        op=str(delta.get("op") or "remove"),  # type: ignore[arg-type]
+                        path=str(delta.get("path") or ""),
+                        values=tuple(
+                            str(item).strip()
+                            for item in (delta.get("values") or [])
+                            if str(item).strip()
+                        )
+                        if isinstance(delta.get("values"), list)
+                        else (),
+                        replacement=delta.get("replacement")
+                        if "replacement" in delta
+                        else None,
+                    )
+                    for delta in deltas
+                    if isinstance(delta, dict)
+                ),
+            )
         if not contract_path:
             continue
         if (
@@ -2001,9 +2006,9 @@ def _normalise_requested_contract_issues(
                     "values": invalid_values,
                 }
             ]
-        if not deltas and invalid_values:
+        if not deltas and invalid_values and code not in _PROOF_EXECUTION_INFRA_CODES:
             continue
-        if not deltas and not invalid_values:
+        if not deltas and not invalid_values and code not in _PROOF_EXECUTION_INFRA_CODES:
             continue
         evidence_refs = [
             str(item).strip()
@@ -2032,32 +2037,30 @@ def _normalise_requested_contract_issues(
     return normalised
 
 
-def _bad_generated_success_test_text_lints(
-    *,
-    reason: str,
-    latest_failure: dict[str, Any],
-) -> list[dict[str, Any]]:
-    failure_text = ""
-    for key in ("reason", "output_excerpt", "stderr", "stdout"):
-        value = latest_failure.get(key)
-        if isinstance(value, str) and value.strip():
-            failure_text += "\n" + value
-    evidence_text = f"{reason}\n{failure_text}".strip()
-    if not evidence_text:
+def _contract_issue_delta_path_errors(raw_issues: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_issues, list):
         return []
-    if not _BAD_GENERATED_SUCCESS_TEST_TEXT_LINT_RE.search(evidence_text):
-        return []
-    return [
-        {
-                "code": "possible_bad_generated_oracle_text",
-                "confidence": "low",
-                "source": "text_lint",
-                "message": (
-                    "Free-text evidence resembles a bad generated oracle, but route "
-                    "requires a typed contract issue with required_deltas."
-                ),
-            }
-    ]
+    errors: list[dict[str, Any]] = []
+    for issue_index, raw in enumerate(raw_issues, start=1):
+        if not isinstance(raw, dict):
+            continue
+        for delta_index, delta in enumerate(raw.get("required_deltas") or [], start=1):
+            if not isinstance(delta, dict):
+                continue
+            try:
+                validate_delta_path(delta)
+            except InvalidContractPath as exc:
+                errors.append(
+                    {
+                        "issue_index": issue_index,
+                        "delta_index": delta_index,
+                        "code": str(raw.get("code") or ""),
+                        "path": exc.raw_path,
+                        "message": str(exc),
+                        **({"suggestion": exc.suggestion} if exc.suggestion else {}),
+                    }
+                )
+    return errors
 
 
 def _plan_revision_patch_from_typed_contract_issues(
@@ -2140,7 +2143,7 @@ class RecoveryDecision:
         "implementation_repair",
         "plan_contract_revision",
         "proof_execution_infra",
-        "need_more_context",
+        "recovery_contract_invalid",
         "blocked_no_valid_next_action",
     ]
     trigger_code: str
@@ -2446,7 +2449,7 @@ def _typed_required_plan_changes_from_patch(
     for index, delta in enumerate(required_deltas, start=1):
         if not isinstance(delta, dict):
             continue
-        path = str(delta.get("path") or "").strip()
+        path = _canonical_contract_path_or_default(delta.get("path"))
         op = str(delta.get("op") or "").strip().lower()
         if not path or op not in {"remove", "replace", "add"}:
             continue
@@ -2551,6 +2554,34 @@ def _proof_execution_infra_decision(
         for ref in issue.evidence_refs:
             if ref and ref not in evidence_refs:
                 evidence_refs.append(ref)
+    required_plan_changes: list[dict[str, Any]] = []
+    for idx, issue in enumerate(infra_issues, start=1):
+        options = derive_recovery_options(issue.to_payload())
+        if options:
+            for option in options:
+                required_plan_changes.extend(
+                    dict(item) for item in option.required_plan_changes
+                )
+            continue
+        path = _recovery_contract_path_for_issue_code(
+            issue.code,
+            raw_path=issue.contract_path,
+            deltas=issue.required_replacements,
+        )
+        if not path:
+            continue
+        required_plan_changes.append(
+            {
+                "id": f"proof-execution-infra-{idx}",
+                "target_subtask_id": issue.target_subtask_id or subtask_id,
+                "severity": "blocking",
+                "reason_code": issue.code,
+                "source": "RecoveryDecision.proof_execution_infra",
+                "path": path,
+                "op": "semantic_diff",
+                "evidence_refs": list(issue.evidence_refs),
+            }
+        )
     allowed = [
         "provision the execution environment with provision_workspace_environment",
         "route to plan and switch the proof to a headless/controller strategy",
@@ -2577,19 +2608,7 @@ def _proof_execution_infra_decision(
         failure_hash=failure_hash,
         loop_back_target="plan",
         issues=issues,
-        required_plan_changes=[
-            {
-                "id": f"proof-execution-infra-{idx}",
-                "target_subtask_id": issue.target_subtask_id or subtask_id,
-                "severity": "blocking",
-                "reason_code": issue.code,
-                "source": "RecoveryDecision.proof_execution_infra",
-                "path": issue.contract_path or "proof.execution",
-                "op": "semantic_diff",
-                "evidence_refs": list(issue.evidence_refs),
-            }
-            for idx, issue in enumerate(infra_issues, start=1)
-        ],
+        required_plan_changes=required_plan_changes,
         allowed_next_actions=allowed,
         forbidden_next_actions=forbidden,
         evidence_refs=evidence_refs,
@@ -2597,54 +2616,48 @@ def _proof_execution_infra_decision(
     )
 
 
-def _need_typed_issue_decision(
+def _invalid_recovery_contract_decision(
     *,
     subtask_id: str,
     latest_failure: dict[str, Any],
-    text_lints: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
 ) -> RecoveryDecision:
     failure_hash = _retry_failure_hash(latest_failure)
     return RecoveryDecision(
         decision_id=hash_value(
             {
-                "kind": "need_more_context",
+                "kind": "recovery_contract_invalid",
                 "subtask_id": subtask_id,
-                "trigger_code": "typed_issue_required",
                 "failure_hash": failure_hash,
-                "text_lints": text_lints,
+                "errors": errors,
             }
         )[:16],
-        kind="need_more_context",
-        trigger_code="typed_issue_required",
+        kind="recovery_contract_invalid",
+        trigger_code="invalid_recovery_contract",
         active_subtask_id=subtask_id,
         failure_hash=failure_hash,
         loop_back_target="none",
         issues=[
             {
-                "code": "typed_contract_issue_required",
+                "code": "invalid_recovery_contract",
                 "severity": "blocking",
                 "target_subtask_id": subtask_id,
                 "message": (
-                    "Free-text evidence suggests a bad generated oracle, but "
-                    "the control plane has no typed ContractIssue with "
-                    "required_deltas. Produce contract_issues before routing "
-                    "or repairing."
+                    "A watcher/reviewer supplied typed-looking recovery data "
+                    "with invalid ContractDelta path(s). The control plane "
+                    "will not route to plan until the recovery contract is "
+                    "canonicalized."
                 ),
-                "text_lints": json_ready(text_lints),
+                "invalid_paths": errors,
             }
         ],
         allowed_next_actions=[
-            "read the generated test contract and failing proof output",
-            (
-                "call request_watcher_review with contract_issues including "
-                "contract_path and required_deltas"
-            ),
-            "run a proof/parser that emits typed contract_issues",
+            "regenerate the RecoveryDecision with canonical ContractDelta paths",
+            "use ContractPathRegistry suggestions before routing to plan",
         ],
         forbidden_next_actions=[
-            "continue implementation_repair from prose-only bad-oracle claims",
-            "edit protected tests directly after a failing proof",
-            "mark_subtask_complete without a passing proof",
+            "route to plan with invalid required_deltas",
+            "ask the planner to satisfy an impossible indexed path",
         ],
     )
 
@@ -2698,10 +2711,11 @@ def _retry_watcher_verdict_payload(
             "allowed_next_actions": decision.allowed_next_actions,
             "forbidden_next_actions": decision.forbidden_next_actions,
         }
-    if decision.kind == "need_more_context":
+    if decision.kind == "recovery_contract_invalid":
         return {
             **base,
-            "verdict": "typed_issue_required",
+            "status": "invalid_recovery_contract",
+            "verdict": "invalid_recovery_contract",
             "can_edit_tests": False,
             "requires_plan_mutation": False,
             "loop_back_target": "none",
@@ -2924,6 +2938,10 @@ def _phase_subtask_retry_watcher_review_payload(
         for key in ("proof_failure_classification", "verification_report"):
             if isinstance(payload.get(key), dict):
                 latest_failure[key] = payload.get(key)
+    latest_contract_path_errors = _contract_issue_delta_path_errors(
+        latest_failure.get("contract_issues")
+    )
+    requested_contract_path_errors = _contract_issue_delta_path_errors(contract_issues)
     requested_contract_issues = _normalise_requested_contract_issues(
         contract_issues,
         subtask_id=str(state.get("subtask_id") or ""),
@@ -2944,11 +2962,15 @@ def _phase_subtask_retry_watcher_review_payload(
         subtask_id=subtask_id,
         latest_failure=latest_failure,
     )
-    text_lints = _bad_generated_success_test_text_lints(
-        reason=str(reason or ""),
-        latest_failure=latest_failure,
-    )
-    if plan_revision_patch:
+    contract_path_errors = [*latest_contract_path_errors, *requested_contract_path_errors]
+    if contract_path_errors:
+        status = "invalid_recovery_contract"
+        decision = _invalid_recovery_contract_decision(
+            subtask_id=subtask_id,
+            latest_failure=latest_failure,
+            errors=contract_path_errors,
+        )
+    elif plan_revision_patch:
         status = "review_recorded"
         decision = _plan_contract_revision_decision(
             subtask_id=subtask_id,
@@ -2972,22 +2994,15 @@ def _phase_subtask_retry_watcher_review_payload(
             )
             else "review_not_required"
         )
-        if text_lints and status == "review_recorded":
-            decision = _need_typed_issue_decision(
-                subtask_id=subtask_id,
-                latest_failure=latest_failure,
-                text_lints=text_lints,
-            )
-        else:
-            decision = _implementation_repair_decision(
-                subtask_id=subtask_id,
-                trigger_code=(
-                    "retry_threshold_reached"
-                    if status == "review_recorded"
-                    else "below_retry_threshold"
-                ),
-                latest_failure=latest_failure,
-            )
+        decision = _implementation_repair_decision(
+            subtask_id=subtask_id,
+            trigger_code=(
+                "retry_threshold_reached"
+                if status == "review_recorded"
+                else "below_retry_threshold"
+            ),
+            latest_failure=latest_failure,
+        )
     same_blocker_guard: dict[str, Any] = {}
     if status == "review_recorded":
         fingerprint = _same_blocker_fingerprint(
@@ -3018,7 +3033,6 @@ def _phase_subtask_retry_watcher_review_payload(
         "failed_attempts": failed_attempts,
         "prior_watcher_reviews": watcher_reviews,
         "latest_failure": latest_failure,
-        "text_lints": text_lints,
         "patch_guidance": patch_guidance,
         "same_blocker_guard": same_blocker_guard,
         "recommendation": _phase_subtask_retry_recommendation(
@@ -3040,12 +3054,11 @@ def _phase_subtask_retry_watcher_review_payload(
             "refresh capability bindings, or revise the proof strategy in plan "
             "to a headless/controller proof."
         )
-    elif decision.kind == "need_more_context":
+    elif decision.kind == "recovery_contract_invalid":
         review["recommendation"] = (
-            "Do not continue implementation repair from prose-only bad-oracle "
-            "evidence. Produce a typed ContractIssue with contract_path and "
-            "required_deltas, then call request_watcher_review again or route "
-            "through the proof parser."
+            "Do not route to plan with invalid ContractDelta paths. Regenerate "
+            "the recovery contract using canonical PlanIR/ProofContract paths "
+            "from ContractPathRegistry, then retry watcher review."
         )
     elif decision.kind == "blocked_no_valid_next_action":
         review["recommendation"] = (

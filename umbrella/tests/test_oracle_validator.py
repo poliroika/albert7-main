@@ -177,3 +177,97 @@ def test_oracle_detector_allows_typed_budget_override() -> None:
     issues = generated_oracle_contract_issues(contract, subtask_id="complex")
 
     assert not issues
+
+
+def test_ungrounded_distinct_outputs_property_routes_to_bad_generated_oracle() -> None:
+    contract = {
+        "required_properties": ["distinct_inputs_distinct_outputs"],
+        "oracle_claims": [
+            {
+                "claim_id": "golden_case",
+                "source": "task_requirement",
+                "subject": "calculate",
+                "input": ["5+4"],
+                "accepted": True,
+                "expected_output": "9",
+            }
+        ],
+    }
+
+    issues = generated_oracle_contract_issues(contract, subtask_id="logic")
+    payload = contract_issues_payload(issues)
+
+    issue = next(item for item in payload if item["code"] == "bad_generated_oracle")
+    assert issue["contract_path"] == "proof.oracle.required_properties"
+    assert issue["required_deltas"] == [
+        {
+            "op": "remove",
+            "path": "proof.oracle.required_properties",
+            "values": ["distinct_inputs_distinct_outputs"],
+        }
+    ]
+
+
+def test_grounded_distinct_outputs_property_is_allowed() -> None:
+    contract = {
+        "required_properties": ["distinct_inputs_distinct_outputs"],
+        "required_property_sources": {
+            "distinct_inputs_distinct_outputs": ["task_requirement"]
+        },
+        "oracle_claims": [
+            {
+                "claim_id": "unique_output_domain",
+                "source": "task_requirement",
+                "subject": "slugify",
+                "input": "a",
+                "accepted": True,
+                "expected_output": "a",
+            }
+        ],
+    }
+
+    issues = generated_oracle_contract_issues(contract, subtask_id="logic")
+
+    assert not [issue for issue in issues if issue.code == "bad_generated_oracle"]
+
+
+def test_counterexample_5plus4_6plus3_removes_distinct_outputs_without_calculator_hardcode() -> None:
+    contract = {
+        "required_properties": ["distinct_inputs_distinct_outputs"],
+        "oracle_claims": [
+            {
+                "claim_id": "case_a",
+                "source": "task_requirement",
+                "subject": "binary_operation",
+                "input_values": [[5, 4]],
+                "accepted": True,
+                "expected_output": 9,
+                "test_refs": ["tests/test_model.py::test_distinct_outputs"],
+            },
+            {
+                "claim_id": "case_b",
+                "source": "task_requirement",
+                "subject": "binary_operation",
+                "input_values": [[6, 3]],
+                "accepted": True,
+                "expected_output": 9,
+                "test_refs": ["tests/test_model.py::test_distinct_outputs"],
+            },
+        ],
+    }
+
+    issues = generated_oracle_contract_issues(
+        contract,
+        subtask_id="model",
+        failed_node_ids=("tests/test_model.py::test_distinct_outputs",),
+    )
+    payload = contract_issues_payload(issues)
+
+    bad_oracle = next(item for item in payload if item["code"] == "bad_generated_oracle")
+    assert bad_oracle["required_deltas"] == [
+        {
+            "op": "remove",
+            "path": "proof.oracle.required_properties",
+            "values": ["distinct_inputs_distinct_outputs"],
+        }
+    ]

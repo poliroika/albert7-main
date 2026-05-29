@@ -96,6 +96,8 @@ PLAN_REVISION_DELTA_SCHEMA = {
         "values": {"type": "array", "items": {"type": "string"}},
         "value": {},
         "replacement": {},
+        "target_subtask_id": {"type": "string"},
+        "source_issue_code": {"type": "string"},
     },
 }
 

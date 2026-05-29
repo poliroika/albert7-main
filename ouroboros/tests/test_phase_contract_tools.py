@@ -3644,6 +3644,112 @@ def test_propose_phase_plan_accepts_satisfied_typed_required_plan_change(tmp_pat
     assert result.startswith("OK:"), result
 
 
+def test_propose_phase_plan_canonicalizes_required_change_path_alias(tmp_path):
+    workspace = tmp_path / "workspaces" / "test_ws"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        host_repo_root=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_node": {
+                "id": "plan",
+                "manifest_id": "plan",
+                "overlay": {
+                    "revision_contract": {
+                        "required_plan_changes": [
+                            {
+                                "id": "pytest-target",
+                                "target_subtask_id": "subtask_06",
+                                "path": "proof.pytest_targets",
+                                "op": "contains",
+                                "value": "tests/test_app.py::test_add_behavior",
+                                "severity": "blocking",
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+    )
+    ctx.task_id = "run-123:plan"
+    ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
+
+    subtask = _typed_python_subtask("subtask_06")
+    subtask["proof"]["generated_test_contract"] = {
+        "oracle_claims": [
+            {
+                "claim_id": "add_golden_case",
+                "source": "task_requirement",
+                "subject": "add",
+                "input_values": [[1, 2]],
+                "accepted": True,
+                "expected_output": 3,
+                "test_refs": ["tests/test_app.py::test_add_behavior"],
+            }
+        ]
+    }
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "typed-review-retry",
+            "workspace_id": "test_ws",
+            "subtasks": [subtask],
+        },
+    )
+
+    assert result.startswith("OK:"), result
+
+
+def test_propose_phase_plan_reports_invalid_recovery_contract_path(tmp_path):
+    workspace = tmp_path / "workspaces" / "test_ws"
+    drive = workspace / ".memory" / "drive"
+    (drive / "logs").mkdir(parents=True)
+    _write_basic_capability_declaration(drive)
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        host_repo_root=tmp_path,
+        drive_root=drive,
+        context_overlays={
+            "phase_node": {
+                "id": "plan",
+                "manifest_id": "plan",
+                "overlay": {
+                    "revision_contract": {
+                        "required_plan_changes": [
+                            {
+                                "id": "bad-index-path",
+                                "target_subtask_id": "subtask_06",
+                                "path": "proof.pytest_targets[0]",
+                                "op": "semantic_diff",
+                                "severity": "blocking",
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+    )
+    ctx.task_id = "run-123:plan"
+    ctx.loop_state_view = {"phase_label": "plan", "active_workspace_id": "test_ws"}
+
+    result = _propose_phase_plan(
+        ctx,
+        plan={
+            "plan_id": "typed-review-retry",
+            "workspace_id": "test_ws",
+            "subtasks": [_typed_python_subtask("subtask_06")],
+        },
+    )
+
+    assert result.startswith("ERROR:")
+    assert "invalid_recovery_contract" in result
+    assert "proof.scope.pytest_targets" in result
+
+
 def test_propose_phase_plan_accepts_addressed_review_revision(tmp_path):
     workspace = tmp_path / "workspaces" / "test_ws"
     drive = workspace / ".memory" / "drive"

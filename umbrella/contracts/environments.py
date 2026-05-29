@@ -1,6 +1,5 @@
 """Execution-environment records for capability-carrying proof runs."""
 
-from __future__ import annotations
 
 import json
 import os

@@ -5,7 +5,6 @@ domain memory: planning sees a compact catalog, execution receives only the
 profiles selected for the active subtask, and guards consume validator flags.
 """
 
-from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass

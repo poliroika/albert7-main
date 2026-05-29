@@ -109,6 +109,70 @@ def test_completion_impasse_writes_artifact_after_repeated_control_error(tmp_pat
     assert payload["tool"] == "mark_subtask_complete"
 
 
+def test_invalid_recovery_contract_is_recorded_without_immediate_phase_impasse(tmp_path):
+    class Tools:
+        class Ctx:
+            active_plan_id = "plan123"
+
+        _ctx = Ctx()
+
+    guard = _CompletionToolImpasseState()
+    tool_calls = [
+        {
+            "function": {
+                "name": "submit_phase_plan",
+                "arguments": json.dumps({"plan_id": "p1"}),
+            }
+        }
+    ]
+    trace = [
+        {
+            "tool": "submit_phase_plan",
+            "result": json.dumps(
+                {
+                    "status": "invalid_recovery_contract",
+                    "reason": "invalid_contract_path",
+                }
+            ),
+            "is_error": True,
+        }
+    ]
+
+    message = _maybe_trip_completion_impasse(
+        state=guard,
+        tool_calls=tool_calls,
+        trace_tool_calls=trace,
+        terminating_tools=frozenset({"submit_phase_plan"}),
+        phase_label="plan",
+        task_id="task123",
+        drive_root=tmp_path,
+        tools=Tools(),
+    )
+
+    assert message == ""
+    payload = json.loads(
+        (tmp_path / "state" / "invalid_recovery_contract.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["status"] == "invalid_recovery_contract"
+    assert not (tmp_path / "state" / "phase_impasse.json").exists()
+
+    for _ in range(2):
+        message = _maybe_trip_completion_impasse(
+            state=guard,
+            tool_calls=tool_calls,
+            trace_tool_calls=trace,
+            terminating_tools=frozenset({"submit_phase_plan"}),
+            phase_label="plan",
+            task_id="task123",
+            drive_root=tmp_path,
+            tools=Tools(),
+        )
+
+    assert "phase_impasse" in message
+
+
 def test_write_tool_updates_last_write_round():
     state = _LoopState(round_idx=7)
     state.llm_trace = {"assistant_notes": [], "tool_calls": []}

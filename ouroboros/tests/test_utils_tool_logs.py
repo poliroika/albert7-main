@@ -3,26 +3,32 @@ import json
 from ouroboros.utils import sanitize_tool_args_for_log
 
 
-def test_sanitize_tool_args_preserves_phase_mutation_file_lists() -> None:
+def test_sanitize_tool_args_preserves_plan_revision_deltas() -> None:
     logged = sanitize_tool_args_for_log(
-        "mutate_phase_plan",
+        "apply_plan_revision_patch",
         {
+            "target_subtask_id": "implement_game_state",
+            "reason_code": "bad_generated_oracle",
+            "required_deltas": [
+                {
+                    "op": "remove",
+                    "path": "proof.oracle.required_properties",
+                    "values": ["ungrounded_unique_outputs"],
+                }
+            ],
             "patch": {
-                "subtasks": [
-                    {
-                        "id": "implement_game_state",
-                        "contract_migration_reason": (
-                            "Generated test expectation was internally wrong."
-                        ),
-                        "contract_migration_files": ["tests/test_game_state.py"],
+                "proof": {
+                    "oracle": {
+                        "required_properties": ["button_callbacks_update_display"]
                     }
-                ]
-            }
+                }
+            },
         },
     )
 
-    assert logged["patch"]["subtasks"][0]["contract_migration_files"] == [
-        "tests/test_game_state.py"
+    assert logged["required_deltas"][0]["path"] == "proof.oracle.required_properties"
+    assert logged["patch"]["proof"]["oracle"]["required_properties"] == [
+        "button_callbacks_update_display"
     ]
     assert "_depth_limit" not in json.dumps(logged)
 

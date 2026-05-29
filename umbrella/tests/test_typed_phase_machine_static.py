@@ -23,7 +23,8 @@ ACTIVE_RUNTIME_FILES = [
 ]
 
 
-def test_phase_control_legacy_not_imported_by_runtime() -> None:
+def test_removed_phase_control_legacy_module_not_used_by_runtime() -> None:
+    assert not (REPO / "umbrella/deep_agent_tools/phase_control_legacy.py").exists()
     for rel in ACTIVE_RUNTIME_FILES:
         assert "phase_control_legacy" not in _read(rel), rel
 
@@ -61,12 +62,10 @@ def test_no_contract_migration_metadata_in_active_plan_mutation() -> None:
 
 def test_no_regex_controls_recovery_route() -> None:
     text = _read("umbrella/deep_agent_tools/phase_control_retry.py")
-    lint_start = text.index("def _bad_generated_success_test_text_lints")
-    patch_start = text.index("def _plan_revision_patch_from_typed_contract_issues")
-    lint_block = text[lint_start:patch_start]
-    assert "loop_back_target" not in lint_block
-    assert "requires_plan_mutation" not in lint_block
-    assert "RecoveryDecision" not in lint_block
+    assert "_BAD_GENERATED_SUCCESS_TEST_TEXT_LINT_RE" not in text
+    assert "_bad_generated_success_test_text_lints" not in text
+    assert "possible_bad_generated_oracle_text" not in text
+    assert "typed_contract_issue_required" not in text
 
 
 def test_free_text_required_plan_changes_are_not_blocking_control() -> None:
@@ -85,7 +84,9 @@ def test_free_text_required_plan_changes_are_not_blocking_control() -> None:
 
 def test_plan_revision_route_requires_real_contract_delta_path() -> None:
     retry = _read("umbrella/deep_agent_tools/phase_control_retry.py")
-    assert "def _is_plan_revision_delta_path" in retry
+    assert "validate_delta_path" in retry
+    assert "normalize_contract_path" in retry
+    assert "_is_plan_revision_delta_path" not in retry
     assert "exceptions_for_missing_conftest_fix" not in retry
 
 

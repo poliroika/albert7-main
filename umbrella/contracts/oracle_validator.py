@@ -6,7 +6,6 @@ contract problem, not an implementation problem. This module turns typed
 control plane can route to plan revision without scraping review prose.
 """
 
-from __future__ import annotations
 
 import json
 import re
@@ -116,6 +115,13 @@ def generated_oracle_contract_issues(
                 evidence_refs=evidence_refs,
             )
         )
+    issues.extend(
+        _ungrounded_required_property_issues(
+            contract,
+            subtask_id=subtask_id,
+            evidence_refs=evidence_refs,
+        )
+    )
 
     seen_ids: set[str] = set()
     for index, claim in enumerate(claims, start=1):
@@ -130,7 +136,7 @@ def generated_oracle_contract_issues(
                     required_deltas=[
                         {
                             "op": "replace",
-                            "path": f"proof.generated_test_contract.oracle_claims.{index}.claim_id",
+                            "path": "proof.generated_test_contract.oracle_claims",
                             "replacement": claim_id,
                         }
                     ],
@@ -169,7 +175,7 @@ def generated_oracle_contract_issues(
                     required_deltas=[
                         {
                             "op": "replace",
-                            "path": f"proof.generated_test_contract.oracle_claims.{claim_id}.source",
+                            "path": "proof.generated_test_contract.oracle_claims",
                             "values": [claim_id],
                         }
                     ],
@@ -367,6 +373,81 @@ def _interface_domain_conflicts(
     return issues
 
 
+def _ungrounded_required_property_issues(
+    contract: dict[str, Any],
+    *,
+    subtask_id: str,
+    evidence_refs: tuple[str, ...],
+) -> list[ContractIssue]:
+    properties = set(_required_properties(contract))
+    if "distinct_inputs_distinct_outputs" not in properties:
+        return []
+    if _required_property_is_grounded(contract, "distinct_inputs_distinct_outputs"):
+        return []
+    return [
+        _issue(
+            "bad_generated_oracle",
+            subtask_id=subtask_id,
+            message=(
+                "Global distinct_inputs_distinct_outputs is not grounded in "
+                "the task, interface model, reference behavior, or harness "
+                "contract. Many domains legitimately map distinct inputs to "
+                "the same output."
+            ),
+            contract_path="proof.oracle.required_properties",
+            invalid_values=["distinct_inputs_distinct_outputs"],
+            required_deltas=[
+                {
+                    "op": "remove",
+                    "path": "proof.oracle.required_properties",
+                    "values": ["distinct_inputs_distinct_outputs"],
+                }
+            ],
+            evidence_refs=evidence_refs,
+        )
+    ]
+
+
+def _required_properties(contract: dict[str, Any]) -> list[str]:
+    raw = contract.get("required_properties")
+    if raw is None and isinstance(contract.get("oracle"), dict):
+        raw = contract["oracle"].get("required_properties")
+    return [
+        str(item).strip()
+        for item in (raw or [])
+        if str(item).strip()
+    ] if isinstance(raw, list) else []
+
+
+def _required_property_is_grounded(contract: dict[str, Any], property_id: str) -> bool:
+    sources = contract.get("required_property_sources")
+    if isinstance(sources, dict):
+        source = sources.get(property_id)
+        if isinstance(source, str) and source.strip():
+            return True
+        if isinstance(source, list) and any(str(item).strip() for item in source):
+            return True
+    grounded = contract.get("grounded_required_properties") or contract.get(
+        "grounded_properties"
+    )
+    if isinstance(grounded, list) and property_id in {
+        str(item).strip() for item in grounded
+    }:
+        return True
+    for claim in contract.get("oracle_claims") or []:
+        if not isinstance(claim, dict):
+            continue
+        if property_id not in {
+            str(item).strip()
+            for item in (claim.get("grounds_properties") or [])
+            if str(item).strip()
+        }:
+            continue
+        if str(claim.get("source") or "").strip() in _VALID_CLAIM_SOURCES:
+            return True
+    return False
+
+
 def _claim_id(claim: dict[str, Any], index: int) -> str:
     return str(claim.get("claim_id") or f"claim_{index}").strip()
 
@@ -476,6 +557,7 @@ def _issue(
     *,
     subtask_id: str,
     message: str,
+    contract_path: str = "proof.generated_test_contract.oracle_claims",
     invalid_values: list[str] | None = None,
     required_deltas: list[dict[str, Any]] | None = None,
     evidence_refs: tuple[str, ...] = (),
@@ -497,7 +579,7 @@ def _issue(
         severity="blocking",
         subtask_id=subtask_id,
         target_subtask_id=subtask_id,
-        contract_path="proof.generated_test_contract.oracle_claims",
+        contract_path=contract_path,
         invalid_values=tuple(invalid_values or ()),
         required_deltas=tuple(dict(item) for item in (required_deltas or ())),
         message=message,

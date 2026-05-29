@@ -27,6 +27,12 @@ _WRITE_TOOLS = {
     "claude_code_edit",
 }
 _SHELL_TOOLS = {"run_workspace_command", "terminal_session", "run_python_code", "shell"}
+_READ_ONLY_VERIFICATION_TOOLS = {
+    "run_subtask_proof",
+    "run_workspace_verify",
+    "run_unit_tests",
+    "run_real_e2e",
+}
 _KNOWN_PHASES = {
     "preflight",
     "research",
@@ -80,6 +86,11 @@ _CACHE_PARTS = {
 }
 _SOURCE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs"}
 _CONFIG_FILES = {"pyproject.toml", "package.json", "tsconfig.json", "vite.config.ts"}
+_INTERNAL_OBSERVATION_PREFIXES = (
+    ".memory/drive/logs/",
+    ".memory/drive/state/",
+    ".umbrella/",
+)
 
 
 @dataclass(frozen=True)
@@ -174,6 +185,11 @@ def classify_sensitive_path(path: str) -> str:
     if is_test_path(lower):
         return "tests"
     return ""
+
+
+def _is_internal_observation_path(path: str) -> bool:
+    lower = normalise_workspace_path(path).lower()
+    return any(lower.startswith(prefix) for prefix in _INTERNAL_OBSERVATION_PREFIXES)
 
 
 def check_tool_allowed(tool_name: str, phase: str) -> list[EnforcementIssue]:
@@ -433,6 +449,8 @@ def check_post_tool_diff(
         rel = normalise_workspace_path(change.path)
         if allow_cache_writes and _is_snapshot_ignored(rel):
             continue
+        if _is_internal_observation_path(rel):
+            continue
         category = classify_sensitive_path(rel)
         if category in {"supervisor_path", "hidden_evaluator"}:
             issues.append(
@@ -465,7 +483,7 @@ def check_post_tool_diff(
                     message=f"`{tool_name}` deleted test/probe file `{rel}`.",
                 )
             )
-        elif tool_name in _SHELL_TOOLS and change.kind in {"created", "modified", "deleted"}:
+        elif tool_name in (_SHELL_TOOLS | _READ_ONLY_VERIFICATION_TOOLS) and change.kind in {"created", "modified", "deleted"}:
             issues.append(
                 EnforcementIssue(
                     code="shell_tool_workspace_mutation",

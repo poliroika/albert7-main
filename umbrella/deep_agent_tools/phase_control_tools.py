@@ -8,6 +8,7 @@ from umbrella.deep_agent_tools import phase_control_retry as _retry
 from umbrella.contracts.schemas import (
     COMPLETION_CONTRACT_SCHEMA,
     EVIDENCE_REF_SCHEMA,
+    PLAN_REVISION_DELTA_SCHEMA,
     REVIEW_COVERAGE_SCHEMA,
     REVIEW_ISSUE_SCHEMA,
     VERIFICATION_REPORT_REF_SCHEMA,
@@ -101,35 +102,11 @@ def get_tools() -> list[ToolEntry]:
                                 "Required ContractDelta entries. Alias of "
                                 "required_deltas."
                             ),
-                            "items": {
-                                "type": "object",
-                                "required": ["op", "path"],
-                                "properties": {
-                                    "op": {
-                                        "type": "string",
-                                        "enum": ["add", "remove", "replace"],
-                                    },
-                                    "path": {"type": "string"},
-                                    "value": {},
-                                    "values": {"type": "array", "items": {}},
-                                },
-                            },
+                            "items": PLAN_REVISION_DELTA_SCHEMA,
                         },
                         "required_deltas": {
                             "type": "array",
-                            "items": {
-                                "type": "object",
-                                "required": ["op", "path"],
-                                "properties": {
-                                    "op": {
-                                        "type": "string",
-                                        "enum": ["add", "remove", "replace"],
-                                    },
-                                    "path": {"type": "string"},
-                                    "value": {},
-                                    "values": {"type": "array", "items": {}},
-                                },
-                            },
+                            "items": PLAN_REVISION_DELTA_SCHEMA,
                         },
                         "patch": {
                             "type": "object",
@@ -137,8 +114,8 @@ def get_tools() -> list[ToolEntry]:
                                 "Subtask contract fields to patch, such as "
                                 "proof, files_under_test, acceptance_criteria, "
                                 "or generated_test_contract. Do not include id, "
-                                "subtask_id, target_subtask_id, or legacy "
-                                "contract_migration fields."
+                                "subtask_id, target_subtask_id, or deprecated "
+                                "revision metadata fields."
                             ),
                         },
                         "evidence_refs": {
@@ -664,22 +641,7 @@ def get_tools() -> list[ToolEntry]:
                                     },
                                     "required_deltas": {
                                         "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "required": ["op", "path"],
-                                            "properties": {
-                                                "op": {
-                                                    "type": "string",
-                                                    "enum": ["remove", "replace", "add"],
-                                                },
-                                                "path": {"type": "string"},
-                                                "values": {
-                                                    "type": "array",
-                                                    "items": {"type": "string"},
-                                                },
-                                                "replacement": {},
-                                            },
-                                        },
+                                        "items": PLAN_REVISION_DELTA_SCHEMA,
                                     },
                                     "evidence_refs": {
                                         "type": "array",

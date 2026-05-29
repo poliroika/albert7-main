@@ -1134,7 +1134,7 @@ def test_retry_state_counts_typed_run_subtask_proof_failures(tmp_path: Path) -> 
     assert "tests/test_bots.py" in block["required_context_reads"]
 
 
-def test_retry_watcher_text_only_bad_oracle_does_not_route_to_plan(
+def test_retry_watcher_text_only_bad_oracle_is_notes_only(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path
@@ -1220,18 +1220,18 @@ def test_retry_watcher_text_only_bad_oracle_does_not_route_to_plan(
     )
 
     assert payload["status"] == "review_recorded"
-    assert payload["verdict"] == "typed_issue_required"
+    assert payload["verdict"] == "implementation_bug"
     assert payload["can_edit_tests"] is False
     assert payload["requires_plan_mutation"] is False
-    assert payload["loop_back_target"] == "none"
-    assert payload["issues"][0]["code"] == "typed_contract_issue_required"
     assert "contract_migration" not in payload
     assert "plan_revision_patch" not in payload
-    assert payload["recovery_decision"]["kind"] == "need_more_context"
+    assert payload["recovery_decision"]["kind"] == "implementation_repair"
+    assert payload["recovery_decision"]["loop_back_target"] == "execute"
     assert "plan_mutation_ticket" not in payload
     assert "plan_revision_patch" not in payload["recovery_decision"]
     assert "plan_mutation_ticket" not in payload["recovery_decision"]
-    assert payload["text_lints"][0]["code"] == "possible_bad_generated_oracle_text"
+    assert "text_lints" not in payload
+    assert "typed_contract_issue_required" not in json.dumps(payload)
 
 
 def test_retry_watcher_typed_contract_issue_overrides_threshold_and_patch_guidance(
@@ -1358,7 +1358,7 @@ def test_retry_watcher_typed_contract_issue_overrides_threshold_and_patch_guidan
     assert patch["required_deltas"] == [
         {
             "op": "remove",
-            "path": "proof.required_properties",
+            "path": "proof.oracle.required_properties",
             "values": ["distinct_inputs_distinct_outputs"],
         }
     ]
@@ -1593,7 +1593,7 @@ def test_request_watcher_review_contract_issue_routes_without_text_regex(
     assert payload["requires_plan_mutation"] is True
     assert payload["loop_back_target"] == "plan"
     assert payload["recovery_decision"]["kind"] == "plan_contract_revision"
-    assert payload["issues"][0]["contract_path"] == "proof.required_properties"
+    assert payload["issues"][0]["contract_path"] == "proof.oracle.required_properties"
     assert payload["issues"][0]["evidence_refs"] == ["ledger_event:proof-1"]
     [change] = payload["required_plan_changes"]
     assert change["id"]
@@ -1602,12 +1602,12 @@ def test_request_watcher_review_contract_issue_routes_without_text_regex(
     assert change["reason_code"] == "bad_generated_oracle"
     assert change["source"] == "RecoveryDecision.required_deltas"
     assert change["evidence_refs"] == ["ledger_event:proof-1"]
-    assert change["path"] == "proof.required_properties"
+    assert change["path"] == "proof.oracle.required_properties"
     assert change["op"] == "remove_applied"
     assert change["value"] == "distinct_inputs_distinct_outputs"
 
 
-def test_request_watcher_review_does_not_route_plan_for_non_contract_delta_path(
+def test_request_watcher_review_rejects_non_contract_delta_path(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path
@@ -1725,12 +1725,12 @@ def test_request_watcher_review_does_not_route_plan_for_non_contract_delta_path(
         )
     )
 
-    assert payload["status"] == "review_recorded"
-    assert payload["verdict"] == "implementation_bug"
+    assert payload["status"] == "invalid_recovery_contract"
+    assert payload["verdict"] == "invalid_recovery_contract"
     assert payload["requires_plan_mutation"] is False
-    assert payload.get("loop_back_target") != "plan"
-    assert payload["recovery_decision"]["kind"] == "implementation_repair"
-    assert payload["recovery_decision"]["loop_back_target"] == "execute"
+    assert payload.get("loop_back_target") == "none"
+    assert payload["recovery_decision"]["kind"] == "recovery_contract_invalid"
+    assert payload["recovery_decision"]["loop_back_target"] == "none"
     assert "plan_revision_patch" not in payload
 
 
@@ -2076,7 +2076,7 @@ def test_bad_generated_oracle_flow_allows_plan_mutation_after_freeze(
                 "reason": "no_test_tampering_oracle_freeze",
                 "test_paths": ["tests/test_engine.py"],
                 "failed_attempts": 1,
-                "success_test": "python -m pytest tests/test_engine.py -q",
+                "proof_command": "python -m pytest tests/test_engine.py -q",
             }
         ),
     }
@@ -2115,7 +2115,7 @@ def test_bad_generated_oracle_flow_allows_plan_mutation_after_freeze(
     assert review["plan_revision_patch"]["required_deltas"] == [
         {
             "op": "remove",
-            "path": "proof.required_properties",
+            "path": "proof.oracle.required_properties",
             "values": ["distinct_inputs_distinct_outputs"],
         }
     ]
@@ -2255,7 +2255,6 @@ def test_watcher_implementation_bug_clears_oracle_freeze_gate_and_prioritizes_so
     state.mkdir(parents=True)
     logs.mkdir(parents=True)
     task_id = "task:execute"
-    success_test = "python -m pytest tests/test_gui.py -q"
     (state / "phase_plan.json").write_text(
         json.dumps(
             {
@@ -2585,7 +2584,7 @@ def test_replace_workspace_file_counts_as_repair_after_retry_watcher(
     logs = drive / "logs"
     state.mkdir(parents=True)
     logs.mkdir(parents=True)
-    success_test = "python -m pytest tests/test_bots.py -q"
+    proof_command = ["python", "-m", "pytest", "tests/test_bots.py", "-q"]
     task_id = "task:execute"
     (state / "phase_plan.json").write_text(
         json.dumps(
@@ -2596,13 +2595,25 @@ def test_replace_workspace_file_counts_as_repair_after_retry_watcher(
                         "manifest_id": "execute",
                         "status": "running",
                         "subtasks": [
-                            {
-                                "id": "gmas-bot",
-                                "status": "pending",
-                                "success_test": success_test,
-                                "files_to_change": ["src/demo/bots/economy_agent.py"],
-                                "files_under_test": ["tests/test_bots.py"],
-                            }
+                                {
+                                    "id": "gmas-bot",
+                                    "status": "pending",
+                                    "files_to_change": ["src/demo/bots/economy_agent.py"],
+                                    "proof": {
+                                        "execution": {
+                                            "kind": "pytest",
+                                            "command": proof_command,
+                                            "shell": False,
+                                        },
+                                        "scope": {
+                                            "files_under_test": ["tests/test_bots.py"],
+                                            "changed_files_expected": [
+                                                "src/demo/bots/economy_agent.py"
+                                            ],
+                                            "pytest_targets": ["tests/test_bots.py"],
+                                        },
+                                    },
+                                }
                         ],
                     }
                 ]
@@ -2633,7 +2644,7 @@ def test_replace_workspace_file_counts_as_repair_after_retry_watcher(
                 "reviewer": "umbrella",
                 "review_kind": "retry_watcher",
                 "subtask_id": "gmas-bot",
-                "success_test": success_test,
+                "proof_command": " ".join(proof_command),
                 "failed_attempts": 3,
             }
         ),
@@ -2680,7 +2691,7 @@ def test_replace_workspace_file_blocked_before_retry_watcher(tmp_path: Path) -> 
     target = workspace / "src" / "demo" / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
     task_id = "task:execute"
-    success_test = "python -m pytest tests/test_app.py -q"
+    proof_command = ["python", "-m", "pytest", "tests/test_app.py", "-q"]
     (state / "phase_plan.json").write_text(
         json.dumps(
             {
@@ -2690,13 +2701,25 @@ def test_replace_workspace_file_blocked_before_retry_watcher(tmp_path: Path) -> 
                         "manifest_id": "execute",
                         "status": "running",
                         "subtasks": [
-                            {
-                                "id": "app",
-                                "status": "pending",
-                                "success_test": success_test,
-                                "files_to_change": ["src/demo/app.py"],
-                                "files_under_test": ["tests/test_app.py"],
-                            }
+                                {
+                                    "id": "app",
+                                    "status": "pending",
+                                    "files_to_change": ["src/demo/app.py"],
+                                    "proof": {
+                                        "execution": {
+                                            "kind": "pytest",
+                                            "command": proof_command,
+                                            "shell": False,
+                                        },
+                                        "scope": {
+                                            "files_under_test": ["tests/test_app.py"],
+                                            "changed_files_expected": [
+                                                "src/demo/app.py"
+                                            ],
+                                            "pytest_targets": ["tests/test_app.py"],
+                                        },
+                                    },
+                                }
                         ],
                     }
                 ]
