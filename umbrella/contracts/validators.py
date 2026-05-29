@@ -46,6 +46,10 @@ from umbrella.contracts.runtime_probes import (
     proof_requires_capability,
 )
 from umbrella.contracts.schemas import VALID_REVIEW_CODES
+from umbrella.contracts.oracle_validator import (
+    BAD_ORACLE_REVIEW_CODES,
+    generated_oracle_contract_issues,
+)
 from umbrella.contracts.layout_policy import (
     is_python_implementation_path,
     validate_plan_layout_policy,
@@ -179,6 +183,12 @@ _REVIEW_CODES_REQUIRE_REVISION = {
     "llm_judge_only_evidence",
     "greenfield_python_src_layout_policy",
     "unknown_harness_profile",
+    "bad_generated_oracle",
+    "plan_contract_issue",
+    "inconsistent_generated_oracle",
+    "oracle_domain_mismatch",
+    "contradictory_required_behavior",
+    "invalid_generated_test_contract",
 }
 
 
@@ -745,6 +755,68 @@ def validate_review_contract(review: ReviewContract, *, phase: str = "") -> list
                     evidence_refs=item.evidence_refs,
                 )
             )
+        if item.code in BAD_ORACLE_REVIEW_CODES:
+            contract_path = str(item.contract_path or item.target_path or "").strip()
+            if item.severity != "blocking":
+                issues.append(
+                    ContractIssue(
+                        code="invalid_bad_oracle_issue_severity",
+                        severity="blocking",
+                        phase=phase or item.phase,
+                        subtask_id=item.subtask_id or item.target_subtask_id,
+                        message=(
+                            f"{item.code} issues are control-plane blockers "
+                            "and must use severity='blocking'."
+                        ),
+                        evidence_refs=item.evidence_refs,
+                    )
+                )
+            if not contract_path:
+                issues.append(
+                    ContractIssue(
+                        code="bad_oracle_issue_missing_contract_path",
+                        severity="blocking",
+                        phase=phase or item.phase,
+                        subtask_id=item.subtask_id or item.target_subtask_id,
+                        message=(
+                            f"{item.code} must include contract_path or "
+                            "target_path; free-text notes cannot route a plan "
+                            "revision."
+                        ),
+                        evidence_refs=item.evidence_refs,
+                    )
+                )
+            if not item.required_deltas:
+                issues.append(
+                    ContractIssue(
+                        code="bad_oracle_issue_missing_required_deltas",
+                        severity="blocking",
+                        phase=phase or item.phase,
+                        subtask_id=item.subtask_id or item.target_subtask_id,
+                        message=(
+                            f"{item.code} must include typed required_deltas "
+                            "so plan revision can be validated structurally."
+                        ),
+                        evidence_refs=item.evidence_refs,
+                    )
+                )
+            for delta in item.required_deltas:
+                op = str(delta.get("op") or "").strip()
+                path = str(delta.get("path") or "").strip()
+                if op not in {"remove", "replace", "add"} or not path:
+                    issues.append(
+                        ContractIssue(
+                            code="invalid_bad_oracle_required_delta",
+                            severity="blocking",
+                            phase=phase or item.phase,
+                            subtask_id=item.subtask_id or item.target_subtask_id,
+                            message=(
+                                "bad-oracle required_deltas entries need "
+                                "op in remove/replace/add and a path."
+                            ),
+                            evidence_refs=item.evidence_refs,
+                        )
+                    )
         if item.severity == "human_required" and item.code != "requires_human_checkpoint":
             issues.append(
                 ContractIssue(
@@ -908,6 +980,53 @@ def validate_plan_test_tampering_policy(
         if not test_paths or proof is None:
             continue
         if "no_test_tampering" in proof.oracle.required_properties:
+            generated_contract = (
+                subtask.generated_test_contract
+                or proof.generated_test_contract
+            )
+            behavioural_test_paths = [
+                path
+                for path in test_paths
+                if not path.replace("\\", "/").endswith("/__init__.py")
+                and path.replace("\\", "/") != "tests/__init__.py"
+            ]
+            if (
+                behavioural_test_paths
+                and proof.execution.kind == "pytest"
+                and not generated_contract
+            ):
+                issues.append(
+                    ContractIssue(
+                        code="invalid_generated_test_contract",
+                        severity="blocking",
+                        phase=phase,
+                        subtask_id=subtask.id,
+                        target_subtask_id=subtask.id,
+                        contract_path="proof.generated_test_contract",
+                        invalid_values=tuple(behavioural_test_paths),
+                        required_deltas=(
+                            {
+                                "op": "add",
+                                "path": "proof.generated_test_contract.oracle_claims",
+                                "values": [
+                                    "claim_id",
+                                    "source",
+                                    "subject",
+                                    "typed_input",
+                                    "expected_behavior",
+                                    "test_refs",
+                                ],
+                            },
+                        ),
+                        message=(
+                            "Subtask creates or changes pytest tests under "
+                            f"{behavioural_test_paths}; generated tests need a "
+                            "typed proof.generated_test_contract with sourced "
+                            "oracle_claims and test_refs so contradictory "
+                            "oracles can route to plan revision."
+                        ),
+                    )
+                )
             continue
         issues.append(
             _issue(
@@ -1411,6 +1530,16 @@ class ContractValidator:
                             drive_root=drive_root,
                         )
                     )
+                    generated_contract = (
+                        subtask.generated_test_contract
+                        or subtask.proof.generated_test_contract
+                    )
+                    issues.extend(
+                        generated_oracle_contract_issues(
+                            generated_contract,
+                            subtask_id=subtask.id,
+                        )
+                    )
                     issues.extend(validate_subtask_proof_strength(subtask, phase="plan"))
         for review in bundle.reviews:
             issues.extend(validate_review_contract(review))
@@ -1423,6 +1552,12 @@ class ContractValidator:
                         subtask_id=item.subtask_id,
                         message=item.message,
                         evidence_refs=item.evidence_refs,
+                        target_subtask_id=item.target_subtask_id,
+                        target_path=item.target_path,
+                        contract_path=item.contract_path,
+                        invalid_values=item.invalid_values,
+                        required_deltas=item.required_deltas,
+                        failure_hash=item.failure_hash,
                     )
                 )
         if context is not None and not skip_cross_phase_evidence:

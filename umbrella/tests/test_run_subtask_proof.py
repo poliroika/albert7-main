@@ -137,6 +137,132 @@ def test_run_subtask_proof_records_verifier_ledger(tmp_path: Path) -> None:
     assert issues == [], [issue.message for issue in issues]
 
 
+def test_run_subtask_proof_attaches_bad_generated_oracle_issue(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    ws = "demo"
+    workspace = repo / "workspaces" / ws
+    (workspace / "src" / "demoapp").mkdir(parents=True)
+    (workspace / "src" / "demoapp" / "__init__.py").write_text("", encoding="utf-8")
+    (workspace / "tests").mkdir()
+    (workspace / "tests" / "test_gui.py").write_text("", encoding="utf-8")
+    drive = workspace / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    plan = {
+        "nodes": [
+            {
+                "id": "execute",
+                "manifest_id": "execute",
+                "status": "running",
+                "subtasks": [
+                    {
+                        "id": "gui",
+                        "status": "pending",
+                        "files_to_change": ["src/demoapp/__init__.py"],
+                        "proof": {
+                            "execution": {
+                                "kind": "pytest",
+                                "command": ["python", "-m", "pytest", "tests/test_gui.py", "-q"],
+                                "timeout_sec": 30,
+                                "shell": False,
+                            },
+                            "oracle": {
+                                "oracle_type": "unit_assertions",
+                                "required_properties": ["invalid_input_rejected"],
+                            },
+                            "scope": {
+                                "files_under_test": [
+                                    "src/demoapp/__init__.py",
+                                    "tests/test_gui.py",
+                                ],
+                                "changed_files_expected": ["src/demoapp/__init__.py"],
+                            },
+                            "generated_test_contract": {
+                                "interface_model": {
+                                    "events": [
+                                        {
+                                            "name": "on_digit",
+                                            "valid_values": list(range(10)),
+                                            "invalid_values": [">9"],
+                                        }
+                                    ]
+                                },
+                                "oracle_claims": [
+                                    {
+                                        "claim_id": "reject_10",
+                                        "source": "interface_model",
+                                        "subject": "on_digit",
+                                        "input_value": 10,
+                                        "accepted": False,
+                                        "test_refs": [
+                                            "tests/test_gui.py::test_rejects_10"
+                                        ],
+                                    },
+                                    {
+                                        "claim_id": "accept_10",
+                                        "source": "interface_model",
+                                        "subject": "on_digit",
+                                        "input_value": 10,
+                                        "accepted": True,
+                                        "test_refs": [
+                                            "tests/test_gui.py::test_accepts_10"
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    (state / "phase_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    ctx = SimpleNamespace(
+        host_repo_root=repo,
+        repo_dir=repo,
+        drive_root=drive,
+        umbrella_managed=True,
+        umbrella_phase_id="execute",
+        context_overlays={
+            "phase_manifest": {"id": "execute"},
+            "phase_node": {"id": "execute", "manifest_id": "execute"},
+        },
+        current_task_type="phase_run",
+    )
+
+    def _fake_command(*_args, **_kwargs) -> str:
+        return json.dumps(
+            {
+                "workspace_id": ws,
+                "exit_code": 1,
+                "command": ["python", "-m", "pytest", "tests/test_gui.py", "-q"],
+                "output": (
+                    "FAILED tests/test_gui.py::test_rejects_10 - AssertionError\n"
+                    "FAILED tests/test_gui.py::test_accepts_10 - AssertionError\n"
+                ),
+            }
+        )
+
+    with patch(
+        "umbrella.deep_agent_tools.workspace_commands.run_workspace_command",
+        side_effect=_fake_command,
+    ):
+        raw = _run_subtask_proof(ctx, subtask_id="gui")
+    payload = json.loads(raw)
+
+    assert payload["passed"] is False
+    assert payload["contract_issues"][0]["code"] == "bad_generated_oracle"
+    assert payload["contract_issues"][0]["required_deltas"] == [
+        {
+            "op": "remove",
+            "path": "proof.generated_test_contract.oracle_claims",
+            "values": ["reject_10", "accept_10"],
+        }
+    ]
+
+
 def test_run_subtask_proof_blocks_passed_hint_when_declared_file_missing(
     tmp_path: Path,
 ) -> None:
@@ -788,14 +914,14 @@ def test_retry_watcher_text_only_bad_oracle_does_not_route_to_plan(
     )
 
     assert payload["status"] == "review_recorded"
-    assert payload["verdict"] == "implementation_bug"
+    assert payload["verdict"] == "typed_issue_required"
     assert payload["can_edit_tests"] is False
     assert payload["requires_plan_mutation"] is False
-    assert "loop_back_target" not in payload
-    assert "issues" not in payload
+    assert payload["loop_back_target"] == "none"
+    assert payload["issues"][0]["code"] == "typed_contract_issue_required"
     assert "contract_migration" not in payload
     assert "plan_revision_patch" not in payload
-    assert payload["recovery_decision"]["kind"] == "implementation_repair"
+    assert payload["recovery_decision"]["kind"] == "need_more_context"
     assert "plan_mutation_ticket" not in payload
     assert "plan_revision_patch" not in payload["recovery_decision"]
     assert "plan_mutation_ticket" not in payload["recovery_decision"]

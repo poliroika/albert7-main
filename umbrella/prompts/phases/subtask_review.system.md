@@ -15,7 +15,9 @@ After a green `run_subtask_proof`, call `submit_micro_review` immediately - do n
 
 ## Review Contract
 
-For revise/abort, use issue codes such as `stale_proof_ref`, `fake_evidence_ref`, `proof_scope_mismatch`, `claim_without_proof`, `test_tampering_detected`, `policy_violation`, or `requires_human_checkpoint`.
+For revise/abort, use issue codes such as `stale_proof_ref`, `fake_evidence_ref`, `proof_scope_mismatch`, `claim_without_proof`, `test_tampering_detected`, `policy_violation`, `bad_generated_oracle`, `inconsistent_generated_oracle`, `contradictory_required_behavior`, `invalid_generated_test_contract`, or `requires_human_checkpoint`.
+
+If proof output shows that a generated test oracle is internally inconsistent, submit a typed blocking issue with `contract_path`, `invalid_values`, `required_deltas`, and evidence refs. Prose in `notes` is not enough to route the run back to plan.
 
 Example:
 

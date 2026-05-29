@@ -153,6 +153,16 @@ def test_plan_prompt_documents_executable_leaf_payload_contract():
     assert "mock/fake/dry-run" in prompt
 
 
+def test_plan_prompt_requires_generated_oracle_claims_for_generated_tests():
+    prompt = (PROMPTS_DIR / "plan.system.md").read_text(encoding="utf-8")
+
+    assert '"generated_test_contract"' in prompt
+    assert '"oracle_claims"' in prompt
+    assert '"claim_id"' in prompt
+    assert '"test_refs"' in prompt
+    assert "at most 6 generated oracle claims" in prompt
+
+
 def test_plan_prompt_does_not_target_workspace_toml_as_subtask_file():
     prompt = (PROMPTS_DIR / "plan.system.md").read_text(encoding="utf-8")
 
@@ -190,6 +200,16 @@ def test_plan_review_prompt_accepts_no_test_tampering_property():
     assert "do not reject it merely because it appears in `required_properties`" in prompt
     assert "Pure test-verification subtasks" in prompt
     assert "Do not ask to remove `no_test_tampering`" in prompt
+
+
+def test_review_prompts_expose_bad_generated_oracle_issue_codes():
+    plan_review_prompt = (PROMPTS_DIR / "plan_review.system.md").read_text(encoding="utf-8")
+    subtask_review_prompt = (PROMPTS_DIR / "subtask_review.system.md").read_text(encoding="utf-8")
+
+    for prompt in (plan_review_prompt, subtask_review_prompt):
+        assert "bad_generated_oracle" in prompt
+        assert "invalid_generated_test_contract" in prompt
+        assert "required_deltas" in prompt
 
 
 def test_plan_review_prompt_matches_desktop_runtime_validator():

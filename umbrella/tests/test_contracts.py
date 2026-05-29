@@ -362,6 +362,31 @@ def test_plan_contract_accepts_no_test_tampering_on_same_subtask():
                             "pytest_targets": ["tests/test_app.py"],
                         },
                         "anti_gaming": {"requires_real_runtime": True},
+                        "generated_test_contract": {
+                            "interface_model": {
+                                "events": [
+                                    {
+                                        "name": "app_behavior",
+                                        "valid_values": ["basic_case"],
+                                    }
+                                ]
+                            },
+                            "proof_budget": {
+                                "max_generated_tests_per_subtask": 6,
+                                "allow_expanded_generated_tests": False,
+                            },
+                            "oracle_claims": [
+                                {
+                                    "claim_id": "basic_case_returns_expected_output",
+                                    "source": "task_requirement",
+                                    "subject": "app_behavior",
+                                    "input_values": ["basic_case"],
+                                    "accepted": True,
+                                    "expected_behavior": "returns expected output",
+                                    "test_refs": ["tests/test_app.py"],
+                                }
+                            ],
+                        },
                     },
                 }
             ]
@@ -375,6 +400,52 @@ def test_plan_contract_accepts_no_test_tampering_on_same_subtask():
     )
 
     assert "test_tampering_risk" not in _codes(issues)
+    assert "invalid_generated_test_contract" not in _codes(issues)
+
+
+def test_plan_contract_requires_generated_test_contract_for_generated_pytest_oracle():
+    plan, compile_issues = compile_phase_plan(
+        {
+            "subtasks": [
+                {
+                    "id": "core",
+                    "title": "Core",
+                    "goal": "Implement core and generated tests.",
+                    "files_to_create": ["src/app.py", "tests/test_app.py"],
+                    "proof": {
+                        "execution": {
+                            "kind": "pytest",
+                            "command": ["python", "-m", "pytest", "tests/test_app.py", "-q"],
+                        },
+                        "oracle": {
+                            "oracle_type": "unit_assertions",
+                            "required_properties": [
+                                "distinct_inputs_distinct_outputs",
+                                "no_test_tampering",
+                            ],
+                        },
+                        "scope": {
+                            "files_under_test": ["src/app.py"],
+                            "changed_files_expected": ["src/app.py", "tests/test_app.py"],
+                            "pytest_targets": ["tests/test_app.py"],
+                        },
+                        "anti_gaming": {"requires_real_runtime": True},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert compile_issues == []
+    assert plan is not None
+    issues = ContractValidator.validate(
+        ContractBundle(run_id="r", workspace_id="ws", plan=plan)
+    )
+
+    assert "invalid_generated_test_contract" in _codes(issues)
+    issue = next(issue for issue in issues if issue.code == "invalid_generated_test_contract")
+    assert issue.contract_path == "proof.generated_test_contract"
+    assert issue.required_deltas
 
 
 def test_no_test_tampering_scope_cannot_overlap_only_changed_test_file():

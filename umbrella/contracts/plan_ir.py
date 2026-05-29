@@ -35,6 +35,7 @@ _PROOF_TOP_LEVEL_KEYS = {
     "harness_profile",
     "harness_id",
     "harness_options",
+    "generated_test_contract",
     "required_capabilities",
     "human_claims",
     "evidence_refs",
@@ -142,6 +143,14 @@ def compile_phase_plan(
         )
         proof_payload = item.get("proof")
         proof = None
+        generated_contract = _dict_value(
+            item.get("generated_test_contract")
+            or (
+                proof_payload.get("generated_test_contract")
+                if isinstance(proof_payload, dict)
+                else None
+            )
+        )
         if isinstance(proof_payload, dict):
             issues.extend(_proof_shape_issues(proof_payload, subtask_id=subtask_id))
             proof = ProofSpec.from_mapping(proof_payload)
@@ -176,6 +185,7 @@ def compile_phase_plan(
                 files_to_create=_tuple_str(item.get("files_to_create") or item.get("new_files")),
                 dependencies=_tuple_str(item.get("dependencies")),
                 proof=proof,
+                generated_test_contract=generated_contract,
                 acceptance_claims=_tuple_str(
                     item.get("acceptance_claims") or item.get("acceptance_criteria")
                 ),

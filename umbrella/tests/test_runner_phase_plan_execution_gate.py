@@ -226,6 +226,23 @@ def test_execution_floor_reads_submitted_capability_declaration(
                         "requires_real_runtime": True,
                         "allows_mock": False,
                     },
+                    "generated_test_contract": {
+                        "interface_model": {
+                            "api": "src.civ.core.add",
+                            "valid_values": ["(1, 2)", "(2, 3)"],
+                        },
+                        "oracle_claims": [
+                            {
+                                "claim_id": "add_two_positive_pairs",
+                                "source": "task_requirement",
+                                "subject": "add",
+                                "input_values": ["(1, 2)", "(2, 3)"],
+                                "accepted": True,
+                                "expected_behavior": "returns numeric sums",
+                                "test_refs": ["tests/test_core.py"],
+                            }
+                        ],
+                    },
                     "required_capabilities": ["python"],
                 },
             }

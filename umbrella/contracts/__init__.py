@@ -39,6 +39,12 @@ from umbrella.contracts.models import (
     json_ready,
 )
 from umbrella.contracts.plan_ir import canonicalize_phase_plan, compile_phase_plan
+from umbrella.contracts.oracle_validator import (
+    BAD_ORACLE_REVIEW_CODES,
+    contract_issues_payload,
+    extract_failed_pytest_node_ids,
+    generated_oracle_contract_issues,
+)
 from umbrella.contracts.policy_input import to_policy_input
 from umbrella.contracts.layout_policy import validate_plan_layout_policy
 from umbrella.contracts.validators import (
@@ -85,10 +91,14 @@ __all__ = [
     "build_workspace_context",
     "all_harness_profiles",
     "build_harness_contract_payload",
+    "BAD_ORACLE_REVIEW_CODES",
     "canonicalize_phase_plan",
     "compile_phase_plan",
+    "contract_issues_payload",
     "decide_phase_transition",
     "diff_hash",
+    "extract_failed_pytest_node_ids",
+    "generated_oracle_contract_issues",
     "hash_value",
     "json_ready",
     "known_harness_profile_ids",

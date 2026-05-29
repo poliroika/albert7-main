@@ -467,6 +467,23 @@ def test_validate_phase_plan_contract_reads_submitted_declaration(tmp_path: Path
                         "pytest_targets": ["tests/test_calc.py"],
                     },
                     "anti_gaming": {"requires_real_runtime": True},
+                    "generated_test_contract": {
+                        "interface_model": {
+                            "api": "calc scaffold",
+                            "valid_values": ["package import smoke"],
+                        },
+                        "oracle_claims": [
+                            {
+                                "claim_id": "scaffold_test_ok",
+                                "source": "task_requirement",
+                                "subject": "scaffold",
+                                "input_values": ["package import smoke"],
+                                "accepted": True,
+                                "expected_behavior": "pytest smoke passes",
+                                "test_refs": ["tests/test_calc.py"],
+                            }
+                        ],
+                    },
                     "required_capabilities": ["python"],
                 },
             }
@@ -722,6 +739,23 @@ def test_submit_phase_plan_reads_submitted_declaration_not_state_nested_draft(
                         "pytest_targets": ["tests/test_calc.py"],
                     },
                     "anti_gaming": {"requires_real_runtime": True},
+                    "generated_test_contract": {
+                        "interface_model": {
+                            "api": "calc scaffold",
+                            "valid_values": ["package import smoke"],
+                        },
+                        "oracle_claims": [
+                            {
+                                "claim_id": "scaffold_test_ok",
+                                "source": "task_requirement",
+                                "subject": "scaffold",
+                                "input_values": ["package import smoke"],
+                                "accepted": True,
+                                "expected_behavior": "pytest smoke passes",
+                                "test_refs": ["tests/test_calc.py"],
+                            }
+                        ],
+                    },
                     "required_capabilities": ["python"],
                 },
             }

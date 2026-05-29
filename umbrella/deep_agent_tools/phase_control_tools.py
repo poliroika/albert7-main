@@ -636,6 +636,10 @@ def get_tools() -> list[ToolEntry]:
                                         "enum": [
                                             "bad_generated_oracle",
                                             "plan_contract_issue",
+                                            "inconsistent_generated_oracle",
+                                            "oracle_domain_mismatch",
+                                            "contradictory_required_behavior",
+                                            "invalid_generated_test_contract",
                                         ],
                                     },
                                     "target_subtask_id": {"type": "string"},

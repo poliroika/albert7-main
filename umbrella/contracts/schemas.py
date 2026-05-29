@@ -75,7 +75,79 @@ VALID_REVIEW_CODES = (
     "unknown_harness_profile",
     "missing_capability_declaration",
     "capability_probe_failed",
+    "bad_generated_oracle",
+    "plan_contract_issue",
+    "inconsistent_generated_oracle",
+    "oracle_domain_mismatch",
+    "contradictory_required_behavior",
+    "invalid_generated_test_contract",
 )
+
+PLAN_REVISION_DELTA_SCHEMA = {
+    "type": "object",
+    "required": ["op", "path"],
+    "properties": {
+        "op": {"type": "string", "enum": ["remove", "replace", "add"]},
+        "path": {"type": "string"},
+        "values": {"type": "array", "items": {"type": "string"}},
+        "value": {},
+        "replacement": {},
+    },
+}
+
+GENERATED_TEST_CONTRACT_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Typed oracle model for generated tests. Tests are evidence for these "
+        "claims, not the source of truth for contradictory behavior."
+    ),
+    "properties": {
+        "interface_model": {"type": "object"},
+        "proof_budget": {
+            "type": "object",
+            "properties": {
+                "max_generated_tests_per_subtask": {"type": "integer"},
+                "allow_expanded_generated_tests": {"type": "boolean"},
+                "override_reason": {"type": "string"},
+            },
+        },
+        "oracle_claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["claim_id", "source"],
+                "properties": {
+                    "claim_id": {"type": "string"},
+                    "source": {
+                        "type": "string",
+                        "enum": [
+                            "task_requirement",
+                            "interface_model",
+                            "reference_behavior",
+                            "harness_contract",
+                        ],
+                    },
+                    "subject": {"type": "string"},
+                    "event": {"type": "string"},
+                    "api": {"type": "string"},
+                    "input": {},
+                    "input_value": {},
+                    "input_values": {"type": "array"},
+                    "input_sequence": {"type": "array"},
+                    "accepted": {"type": "boolean"},
+                    "valid": {"type": "boolean"},
+                    "expectation": {"type": "string"},
+                    "expected_behavior": {"type": "string"},
+                    "expected_output": {},
+                    "expected_display": {},
+                    "expected_status": {},
+                    "expected_result": {},
+                    "test_refs": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    },
+}
 
 REVIEW_COVERAGE_SCHEMA = {
     "type": "object",
@@ -205,6 +277,7 @@ PROOF_CONTRACT_SCHEMA = {
                 "and cleanup details. Required for real runtime GUI proof."
             ),
         },
+        "generated_test_contract": GENERATED_TEST_CONTRACT_SCHEMA,
         "required_capabilities": {"type": "array", "items": {"type": "string"}},
         "human_claims": {"type": "array", "items": {"type": "string"}},
         "evidence_refs": {"type": "array", "items": EVIDENCE_REF_SCHEMA},
@@ -268,6 +341,7 @@ PHASE_PLAN_SUBTASK_SCHEMA = {
         "dependencies": {"type": "array", "items": {"type": "string"}},
         "acceptance_claims": {"type": "array", "items": {"type": "string"}},
         "proof": PROOF_CONTRACT_SCHEMA,
+        "generated_test_contract": GENERATED_TEST_CONTRACT_SCHEMA,
         "memory_scope": SUBTASK_MEMORY_SCOPE_SCHEMA,
         "allowed_tools": {
             "type": "array",
@@ -319,6 +393,12 @@ REVIEW_ISSUE_SCHEMA = {
         },
         "phase": {"type": "string"},
         "subtask_id": {"type": "string"},
+        "target_subtask_id": {"type": "string"},
+        "target_path": {"type": "string"},
+        "contract_path": {"type": "string"},
+        "invalid_values": {"type": "array", "items": {"type": "string"}},
+        "required_deltas": {"type": "array", "items": PLAN_REVISION_DELTA_SCHEMA},
+        "failure_hash": {"type": "string"},
         "message": {"type": "string"},
         "evidence_refs": {"type": "array", "items": EVIDENCE_REF_SCHEMA},
     },

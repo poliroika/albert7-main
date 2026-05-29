@@ -62,6 +62,32 @@ Use this shape on every leaf:
   "harness_options": {
     "notes": "Profile-specific launch/driver/evidence details when needed"
   },
+  "generated_test_contract": {
+    "interface_model": {
+      "events": [
+        {
+          "name": "on_action",
+          "valid_values": ["typed domain values"],
+          "invalid_values": ["typed invalid classes"]
+        }
+      ]
+    },
+    "proof_budget": {
+      "max_generated_tests_per_subtask": 6,
+      "allow_expanded_generated_tests": false
+    },
+    "oracle_claims": [
+      {
+        "claim_id": "stable_claim_id",
+        "source": "task_requirement",
+        "subject": "on_action",
+        "input_values": ["representative value"],
+        "accepted": true,
+        "expected_behavior": "machine-checkable expected behavior",
+        "test_refs": ["tests/test_behavior.py::test_case"]
+      }
+    ]
+  },
   "required_capabilities": ["python", "subprocess"],
   "human_claims": ["Different inputs exercise different behavior"]
 }
@@ -102,6 +128,8 @@ Use `distinct_inputs_distinct_outputs` only when the domain contract truly requi
 - For every nontrivial leaf, make the plan specific enough for execute: name the behavior under test, expected user-visible outcome, negative case or input variation, needed memory/assets, and any extra tools/skills/prompts that should be loaded through `memory_scope`, `allowed_tools`, `allowed_skills`, `codeptr_refs`, `mcp_refs`, or `proof.harness_options`.
 - If a leaf needs a long-running runtime (server, worker, desktop app, watcher), encode that in `proof.harness_profile`/`proof.harness_options` instead of relying on foreground shell behavior. Include readiness, evidence, cleanup, and whether a separate assert/interaction command is required.
 - Treat tests/proof expectations as an oracle owned by the active subtask. For `no_test_tampering` leaves, set `anti_gaming.allows_test_only_change=false`; any later oracle correction must go through `request_watcher_review` and a typed `apply_plan_revision_patch(target_subtask_id=..., patch={...}, deltas=[...])` that applies the returned `ContractIssue.required_deltas` through a real semantic proof diff. Notes, reasons, and metadata-only changes are rejected.
+- When a leaf creates generated tests, declare `proof.generated_test_contract` with `interface_model`, `proof_budget`, and `oracle_claims`. Each claim needs a stable `claim_id`, a `source` (`task_requirement`, `interface_model`, `reference_behavior`, or `harness_contract`), typed subject/input/expected fields, and `test_refs` for the pytest node(s) or checked test target derived from that claim. Tests are evidence for these typed claims; free-form assertions are not the only oracle.
+- Keep generated-test proof bounded by default: for simple application leaves use at most 6 generated oracle claims per subtask. Split work into core/model behavior, controller/headless behavior, and final smoke layers before adding optional e2e/property/mutation expansions. Raise `proof.generated_test_contract.proof_budget` only through explicit typed workspace policy or a complex-domain reason.
 - High-stub-risk, prompt, parser, game, API, or model-runtime behavior needs input sensitivity, metamorphic, mutation, golden-case, or adversarial proof when the active domain contract requires it.
 - If any subtask creates or changes a path containing `test`, include `no_test_tampering` in that same subtask's `oracle.required_properties`.
 - `files_under_test` must share at least one exact workspace-relative path with `changed_files_expected`.

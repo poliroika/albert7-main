@@ -26,8 +26,11 @@ from umbrella.contracts import (
     VerificationReportRef,
     build_workspace_context,
     canonicalize_phase_plan,
+    contract_issues_payload,
     compile_phase_plan,
     diff_hash,
+    extract_failed_pytest_node_ids,
+    generated_oracle_contract_issues,
     hash_value,
     json_ready,
     validate_completion_materialization,
@@ -2549,6 +2552,41 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
     if after_patch_event:
         proof_ref["created_after_event"] = after_patch_event
 
+    failure_output = "\n".join(
+        str(payload.get(key) or "")
+        for key in ("output", "stdout", "stderr")
+        if str(payload.get(key) or "").strip()
+    )
+    shell_result = payload.get("shell_result")
+    if isinstance(shell_result, dict):
+        failure_output = "\n".join(
+            item
+            for item in (
+                failure_output,
+                str(shell_result.get("output") or ""),
+                str(shell_result.get("stdout") or ""),
+                str(shell_result.get("stderr") or ""),
+            )
+            if item.strip()
+        )
+    generated_contract = (
+        proof.generated_test_contract
+        or (
+            subtask.get("generated_test_contract")
+            if isinstance(subtask.get("generated_test_contract"), dict)
+            else {}
+        )
+    )
+    oracle_issue_payloads: list[dict[str, Any]] = []
+    if not passed and generated_contract:
+        oracle_issues = generated_oracle_contract_issues(
+            generated_contract,
+            subtask_id=resolved_id,
+            failed_node_ids=extract_failed_pytest_node_ids(failure_output),
+            evidence_refs=(f"ledger_event:{proof_ledger.event_id}",),
+        )
+        oracle_issue_payloads = contract_issues_payload(oracle_issues)
+
     if blocking_materialization_issues:
         issue_details = "; ".join(
             f"{issue.code}: {issue.message or issue.suggested_action or issue.code}"
@@ -2570,6 +2608,11 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
                 "materialization_issues": [
                     json_ready(issue) for issue in blocking_materialization_issues
                 ],
+                **(
+                    {"contract_issues": oracle_issue_payloads}
+                    if oracle_issue_payloads
+                    else {}
+                ),
                 "next_step": (
                     "Do not call mark_subtask_complete yet. The proof command passed, "
                     "but the active subtask's declared filesystem materialization is "
@@ -2621,6 +2664,11 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
             **supervisor_ledger_ref(proof_ledger),
             "verification_report": verification_report,
             "proof_ref": proof_ref,
+            **(
+                {"contract_issues": oracle_issue_payloads}
+                if oracle_issue_payloads
+                else {}
+            ),
             "completion_contract_hint": completion_hint,
             "next_step": (
                 "If passed, call mark_subtask_complete(completion_contract=completion_contract_hint). "

@@ -177,6 +177,12 @@ class ContractIssue:
     message: str = ""
     evidence_refs: tuple[EvidenceRef, ...] = ()
     suggested_action: str = ""
+    target_subtask_id: str = ""
+    target_path: str = ""
+    contract_path: str = ""
+    invalid_values: tuple[str, ...] = ()
+    required_deltas: tuple[dict[str, Any], ...] = ()
+    failure_hash: str = ""
 
     @property
     def is_blocking(self) -> bool:
@@ -315,6 +321,7 @@ class ProofSpec:
     anti_gaming: ProofAntiGamingSpec = field(default_factory=ProofAntiGamingSpec)
     harness_profile: str = ""
     harness_options: dict[str, Any] = field(default_factory=dict)
+    generated_test_contract: dict[str, Any] = field(default_factory=dict)
     required_capabilities: tuple[str, ...] = ()
     human_claims: tuple[str, ...] = ()
     evidence_refs: tuple[EvidenceRef, ...] = ()
@@ -342,6 +349,9 @@ class ProofSpec:
             anti_gaming=ProofAntiGamingSpec.from_mapping(value.get("anti_gaming") or {}),
             harness_profile=harness_profile,
             harness_options=harness_options,
+            generated_test_contract=dict(value.get("generated_test_contract") or {})
+            if isinstance(value.get("generated_test_contract"), dict)
+            else {},
             required_capabilities=tuple(
                 str(item).strip()
                 for item in (value.get("required_capabilities") or ())
@@ -365,6 +375,7 @@ class SubtaskIR:
     files_to_create: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     proof: ProofSpec | None = None
+    generated_test_contract: dict[str, Any] = field(default_factory=dict)
     acceptance_claims: tuple[str, ...] = ()
     memory_scope: dict[str, Any] = field(default_factory=dict)
     allowed_tools: tuple[str, ...] = ()
@@ -387,6 +398,12 @@ class ReviewIssue:
     severity: IssueSeverity
     phase: str = ""
     subtask_id: str = ""
+    target_subtask_id: str = ""
+    target_path: str = ""
+    contract_path: str = ""
+    invalid_values: tuple[str, ...] = ()
+    required_deltas: tuple[dict[str, Any], ...] = ()
+    failure_hash: str = ""
     message: str = ""
     evidence_refs: tuple[EvidenceRef, ...] = ()
 
@@ -398,6 +415,24 @@ class ReviewIssue:
             severity=cast(IssueSeverity, str(value.get("severity") or "warning")),
             phase=str(value.get("phase") or ""),
             subtask_id=str(value.get("subtask_id") or ""),
+            target_subtask_id=str(value.get("target_subtask_id") or ""),
+            target_path=str(value.get("target_path") or ""),
+            contract_path=str(value.get("contract_path") or ""),
+            invalid_values=tuple(
+                str(item).strip()
+                for item in (value.get("invalid_values") or ())
+                if str(item).strip()
+            )
+            if isinstance(value.get("invalid_values"), (list, tuple))
+            else (),
+            required_deltas=tuple(
+                dict(item)
+                for item in (value.get("required_deltas") or ())
+                if isinstance(item, dict)
+            )
+            if isinstance(value.get("required_deltas"), (list, tuple))
+            else (),
+            failure_hash=str(value.get("failure_hash") or ""),
             message=str(value.get("message") or ""),
             evidence_refs=tuple(
                 EvidenceRef.from_mapping(item)

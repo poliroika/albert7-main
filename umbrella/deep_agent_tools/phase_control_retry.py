@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from umbrella.deep_agent_tools.phase_control_common import *
-from umbrella.contracts import hash_value, json_ready
+from umbrella.contracts import BAD_ORACLE_REVIEW_CODES, hash_value, json_ready
 
 _SUCCESS_TEST_TOOL_NAMES = (
     "harness_run",
@@ -1269,6 +1269,26 @@ def _phase_subtask_retry_context(ctx: ToolContext) -> dict[str, Any] | None:
     }
 
 
+def _phase_control_signal_rows_for_task(
+    ctx: ToolContext, task_id: str
+) -> list[dict[str, Any]]:
+    path = _drive_state(ctx) / "phase_control_signals.jsonl"
+    if not task_id or not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and str(row.get("task_id") or "") == task_id:
+                rows.append(row)
+    except OSError:
+        return rows
+    return rows
+
+
 def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
     context = _phase_subtask_retry_context(ctx)
     if not context:
@@ -1289,6 +1309,15 @@ def _phase_subtask_retry_state(ctx: ToolContext) -> dict[str, Any] | None:
             continue
         ok, _reason = _tool_row_success_status(row)
         if not ok:
+            continue
+        ts = _tool_row_time(row)
+        if ts is not None and (mutate_cutoff is None or ts > mutate_cutoff):
+            mutate_cutoff = ts
+    for row in _phase_control_signal_rows_for_task(ctx, task_id):
+        if str(row.get("kind") or "") not in {
+            "mutate_phase_plan",
+            "apply_plan_revision_patch",
+        }:
             continue
         ts = _tool_row_time(row)
         if ts is not None and (mutate_cutoff is None or ts > mutate_cutoff):
@@ -1586,6 +1615,10 @@ class RetryContractIssue:
     code: Literal[
         "bad_generated_oracle",
         "plan_contract_issue",
+        "inconsistent_generated_oracle",
+        "oracle_domain_mismatch",
+        "contradictory_required_behavior",
+        "invalid_generated_test_contract",
         "proof_scope_mismatch",
         "proof_execution_infra",
         "need_more_context",
@@ -1635,6 +1668,7 @@ _PLAN_REVISION_DELTA_PATHS = {
     "files_to_change",
     "files_affected",
     "proof",
+    "generated_test_contract",
     "harness_profile",
     "harness_options",
     "required_capabilities",
@@ -1708,7 +1742,7 @@ def _typed_contract_issues_from_latest_failure(
             if not isinstance(raw, dict):
                 continue
             code = str(raw.get("code") or "").strip()
-            if code not in {"bad_generated_oracle", "plan_contract_issue"}:
+            if code not in BAD_ORACLE_REVIEW_CODES:
                 continue
             target = str(raw.get("target_subtask_id") or subtask_id).strip()
             if not target:
@@ -1756,7 +1790,7 @@ def _typed_contract_issues_from_latest_failure(
                 continue
             issues.append(
                 RetryContractIssue(
-                    code="bad_generated_oracle",
+                    code=code,  # type: ignore[arg-type]
                     severity="blocking",
                     target_subtask_id=target,
                     target_path=str(raw.get("target_path") or "").strip(),
@@ -1833,7 +1867,7 @@ def _normalise_requested_contract_issues(
         if not isinstance(raw, dict):
             continue
         code = str(raw.get("code") or "").strip()
-        if code not in {"bad_generated_oracle", "plan_contract_issue"}:
+        if code not in BAD_ORACLE_REVIEW_CODES:
             continue
         target = str(raw.get("target_subtask_id") or subtask_id).strip()
         contract_path = str(raw.get("contract_path") or "").strip()
@@ -2389,6 +2423,58 @@ def _implementation_repair_decision(
     )
 
 
+def _need_typed_issue_decision(
+    *,
+    subtask_id: str,
+    latest_failure: dict[str, Any],
+    text_lints: list[dict[str, Any]],
+) -> RecoveryDecision:
+    failure_hash = _retry_failure_hash(latest_failure)
+    return RecoveryDecision(
+        decision_id=hash_value(
+            {
+                "kind": "need_more_context",
+                "subtask_id": subtask_id,
+                "trigger_code": "typed_issue_required",
+                "failure_hash": failure_hash,
+                "text_lints": text_lints,
+            }
+        )[:16],
+        kind="need_more_context",
+        trigger_code="typed_issue_required",
+        active_subtask_id=subtask_id,
+        failure_hash=failure_hash,
+        loop_back_target="none",
+        issues=[
+            {
+                "code": "typed_contract_issue_required",
+                "severity": "blocking",
+                "target_subtask_id": subtask_id,
+                "message": (
+                    "Free-text evidence suggests a bad generated oracle, but "
+                    "the control plane has no typed ContractIssue with "
+                    "required_deltas. Produce contract_issues before routing "
+                    "or repairing."
+                ),
+                "text_lints": json_ready(text_lints),
+            }
+        ],
+        allowed_next_actions=[
+            "read the generated test contract and failing proof output",
+            (
+                "call request_watcher_review with contract_issues including "
+                "contract_path and required_deltas"
+            ),
+            "run a proof/parser that emits typed contract_issues",
+        ],
+        forbidden_next_actions=[
+            "continue implementation_repair from prose-only bad-oracle claims",
+            "edit protected tests directly after a failing proof",
+            "mark_subtask_complete without a passing proof",
+        ],
+    )
+
+
 def _retry_watcher_verdict_payload(
     *,
     status: str,
@@ -2423,6 +2509,18 @@ def _retry_watcher_verdict_payload(
             "loop_back_target": "none",
             "issues": decision.issues,
             "required_plan_changes": decision.required_plan_changes,
+            "allowed_next_actions": decision.allowed_next_actions,
+            "forbidden_next_actions": decision.forbidden_next_actions,
+        }
+    if decision.kind == "need_more_context":
+        return {
+            **base,
+            "verdict": "typed_issue_required",
+            "can_edit_tests": False,
+            "requires_plan_mutation": False,
+            "loop_back_target": "none",
+            "issues": decision.issues,
+            "required_plan_changes": [],
             "allowed_next_actions": decision.allowed_next_actions,
             "forbidden_next_actions": decision.forbidden_next_actions,
         }
@@ -2674,15 +2772,22 @@ def _phase_subtask_retry_watcher_review_payload(
             )
             else "review_not_required"
         )
-        decision = _implementation_repair_decision(
-            subtask_id=subtask_id,
-            trigger_code=(
-                "retry_threshold_reached"
-                if status == "review_recorded"
-                else "below_retry_threshold"
-            ),
-            latest_failure=latest_failure,
-        )
+        if text_lints and status == "review_recorded":
+            decision = _need_typed_issue_decision(
+                subtask_id=subtask_id,
+                latest_failure=latest_failure,
+                text_lints=text_lints,
+            )
+        else:
+            decision = _implementation_repair_decision(
+                subtask_id=subtask_id,
+                trigger_code=(
+                    "retry_threshold_reached"
+                    if status == "review_recorded"
+                    else "below_retry_threshold"
+                ),
+                latest_failure=latest_failure,
+            )
     same_blocker_guard: dict[str, Any] = {}
     if status == "review_recorded":
         fingerprint = _same_blocker_fingerprint(
@@ -2726,6 +2831,13 @@ def _phase_subtask_retry_watcher_review_payload(
         review["plan_revision_patch"] = plan_revision_patch
         review["recommendation"] = _plan_revision_retry_recommendation(
             plan_revision_patch
+        )
+    elif decision.kind == "need_more_context":
+        review["recommendation"] = (
+            "Do not continue implementation repair from prose-only bad-oracle "
+            "evidence. Produce a typed ContractIssue with contract_path and "
+            "required_deltas, then call request_watcher_review again or route "
+            "through the proof parser."
         )
     elif decision.kind == "blocked_no_valid_next_action":
         review["recommendation"] = (
