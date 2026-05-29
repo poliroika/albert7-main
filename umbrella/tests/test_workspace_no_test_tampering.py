@@ -347,7 +347,7 @@ def test_desktop_gui_runtime_harness_allows_real_root_smoke_shape(
     assert (workspace / "tests" / "test_e2e.py").exists()
 
 
-def test_no_test_tampering_without_headless_harness_does_not_globally_block_tk_root(
+def test_no_test_tampering_without_runtime_contract_blocks_tk_root(
     tmp_path: Path,
 ) -> None:
     ctx, workspace = _phase_ctx(tmp_path)
@@ -363,5 +363,6 @@ def test_no_test_tampering_without_headless_harness_does_not_globally_block_tk_r
 
     payload = json.loads(apply_workspace_patch(ctx, "demo", patch))
 
-    assert payload["status"] == "applied"
-    assert (workspace / "tests" / "test_e2e.py").exists()
+    assert payload["reason"] == "no_test_tampering_static_guard"
+    assert payload["issues"][0]["code"] == "native_gui_root_in_test"
+    assert not (workspace / "tests" / "test_e2e.py").exists()

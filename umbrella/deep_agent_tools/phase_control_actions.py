@@ -1,6 +1,8 @@
 """Phase-control action handlers exposed as tools."""
 
 import copy
+import logging
+import subprocess
 
 from umbrella.deep_agent_tools.phase_control_common import *
 from umbrella.deep_agent_tools.phase_control_base import *
@@ -43,6 +45,15 @@ from umbrella.contracts.runtime_probes import (
     effective_runtime_capabilities,
     load_runtime_capabilities,
 )
+from umbrella.contracts.environments import (
+    DEFAULT_EXECUTION_ENVIRONMENT_ID,
+    CapabilityBinding,
+    classify_tcl_tk_status,
+    find_capability_binding,
+    persist_capability_binding,
+    persist_environment_record,
+    resolve_execution_environment,
+)
 from umbrella.deep_agent_tools.phase_control_retry import (
     _completion_llm_memory_claim_issue,
     _phase_subtask_completion_issue,
@@ -50,6 +61,8 @@ from umbrella.deep_agent_tools.phase_control_retry import (
 from umbrella.deep_agent_tools.phase_contract_policy import (
     _phase_plan_revision_contract_issues,
 )
+
+log = logging.getLogger(__name__)
 
 
 def _phase_plan_execute_node(plan: dict[str, Any]) -> dict[str, Any] | None:
@@ -2358,6 +2371,385 @@ def _resolve_execute_subtask(
     return None
 
 
+def _proof_execution_environment_id(proof: Any) -> str:
+    execution = getattr(proof, "execution", None)
+    env_id = str(getattr(execution, "execution_environment_id", "") or "").strip()
+    if env_id:
+        return env_id
+    options = getattr(proof, "harness_options", {}) or {}
+    if isinstance(options, dict):
+        for key in ("execution_environment_id", "environment_id", "env_id"):
+            value = str(options.get(key) or "").strip()
+            if value:
+                return value
+    return DEFAULT_EXECUTION_ENVIRONMENT_ID
+
+
+def _proof_command_python_executable(command: list[str], fallback: str) -> str:
+    if not command:
+        return fallback
+    first = pathlib.Path(str(command[0])).name.lower()
+    if first in {"python", "python3", "py", "python.exe", "python3.exe", "py.exe"}:
+        return str(command[0])
+    if "python" in first:
+        return str(command[0])
+    return fallback
+
+
+def _proof_required_capability_issues(
+    *,
+    drive_root: pathlib.Path,
+    proof: Any,
+    subtask_id: str,
+    env_id: str,
+    env_hash: str,
+    proof_ref: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    refs = []
+    if isinstance(proof_ref, dict) and proof_ref.get("ref_id"):
+        refs.append(f"{proof_ref.get('ref_type') or 'ledger_event'}:{proof_ref['ref_id']}")
+    for cap in tuple(getattr(proof, "required_capabilities", ()) or ()):
+        capability_id = str(cap or "").strip()
+        if capability_id not in {"desktop_gui_runtime"}:
+            continue
+        binding = find_capability_binding(
+            drive_root,
+            capability_id=capability_id,
+            env_id=env_id,
+            env_hash=env_hash,
+        )
+        if binding is not None and binding.available:
+            continue
+        issues.append(
+            {
+                "code": "capability_probe_environment_mismatch",
+                "severity": "blocking",
+                "target_subtask_id": subtask_id,
+                "target_kind": "proof",
+                "contract_path": "proof.required_capabilities",
+                "capability_id": capability_id,
+                "env_id": env_id,
+                "env_hash": env_hash,
+                "failure_phase": "capability_binding",
+                "production_code_entered": False,
+                "message": (
+                    f"Proof requires `{capability_id}`, but there is no "
+                    "available probe binding for the same execution environment."
+                ),
+                "required_deltas": [
+                    {
+                        "op": "replace",
+                        "path": "proof.execution.execution_environment_id",
+                        "replacement": env_id,
+                    }
+                ],
+                "evidence_refs": refs,
+            }
+        )
+    return issues
+
+
+def _tk_root_setup_failure_issue(
+    *,
+    output: str,
+    proof: Any,
+    subtask_id: str,
+    drive_root: pathlib.Path,
+    env_id: str,
+    env_hash: str,
+    python_executable: str,
+    proof_ref: dict[str, Any],
+) -> dict[str, Any] | None:
+    status = classify_tcl_tk_status(output)
+    if not status:
+        return None
+    lowered = str(output or "").lower()
+    setup_failure = (
+        "error at setup" in lowered
+        or "fixture" in lowered
+        or "root = tk.tk()" in lowered
+        or "root=tk.tk()" in lowered
+        or "_tkinter.tclerror" in lowered
+    )
+    if not setup_failure:
+        return None
+    refs = []
+    if proof_ref.get("ref_id"):
+        refs.append(f"{proof_ref.get('ref_type') or 'ledger_event'}:{proof_ref['ref_id']}")
+    required_caps = {
+        str(item).strip()
+        for item in (getattr(proof, "required_capabilities", ()) or ())
+        if str(item).strip()
+    }
+    harness_profile = str(getattr(proof, "harness_profile", "") or "")
+    if "desktop_gui_runtime" in required_caps or harness_profile == "desktop_gui_runtime":
+        code = "capability_probe_environment_mismatch"
+        message = (
+            "desktop_gui_runtime failed in the proof environment before "
+            "production code entered; the accepted capability is not bound "
+            "to this interpreter/env."
+        )
+    else:
+        code = "proof_execution_infra"
+        message = (
+            "Headless/unit proof attempted to create a real native Tk root, "
+            "and the proof environment cannot provide that runtime. This is "
+            "a proof/capability contract issue, not an implementation repair."
+        )
+    try:
+        persist_capability_binding(
+            drive_root,
+            CapabilityBinding(
+                capability_id="desktop_gui_runtime",
+                available=False,
+                env_id=env_id,
+                python_executable=python_executable,
+                env_hash=env_hash,
+                probe_command=tuple(getattr(getattr(proof, "execution", None), "command", ()) or ()),
+                reason=str(status.get("reason") or "tk_runtime_setup_failed"),
+            ),
+        )
+    except Exception:
+        pass
+    return {
+        "code": code,
+        "severity": "blocking",
+        "target_subtask_id": subtask_id,
+        "target_kind": "proof",
+        "contract_path": "proof.execution",
+        "capability_id": "desktop_gui_runtime",
+        "env_id": env_id,
+        "env_hash": env_hash,
+        "python_executable": python_executable,
+        "failure_phase": "fixture/setup/runtime_lifecycle",
+        "production_code_entered": False,
+        "tcl_tk_status": status,
+        "message": message,
+        "required_deltas": [
+            {
+                "op": "replace",
+                "path": "proof.harness_profile",
+                "replacement": "desktop_gui_headless",
+            },
+            {
+                "op": "remove",
+                "path": "proof.required_capabilities",
+                "values": ["desktop_gui_runtime"],
+            },
+        ],
+        "evidence_refs": refs,
+    }
+
+
+def _provision_workspace_environment(
+    ctx: ToolContext,
+    *,
+    workspace_id: str = "",
+    env_id: str = DEFAULT_EXECUTION_ENVIRONMENT_ID,
+    operations: list[dict[str, Any]] | None = None,
+    reason: str = "",
+    expected_artifacts: list[str] | None = None,
+) -> str:
+    """Sanctioned environment setup/probe path, separate from proof shell."""
+
+    if stop := _stop_requested_message(ctx, "provision_workspace_environment"):
+        return stop
+    if not _is_phase_run_context(ctx):
+        return "ERROR: provision_workspace_environment is only available during Umbrella phase runs."
+    workspace = str(workspace_id or _workspace_id_from_drive(ctx) or "").strip()
+    if not workspace:
+        return "ERROR: workspace_id is required."
+    ops = operations or []
+    if not isinstance(ops, list) or not ops:
+        return "ERROR: operations must be a non-empty array."
+    repo_root = _repo_root_from_phase_ctx(ctx)
+    workspace_root = _workspace_root_from_phase_ctx(ctx, workspace)
+    drive_root = pathlib.Path(getattr(ctx, "drive_root", "") or "")
+    env_record = resolve_execution_environment(
+        repo_root=repo_root,
+        workspace_root=workspace_root,
+        env_id=env_id or DEFAULT_EXECUTION_ENVIRONMENT_ID,
+        cwd=workspace_root,
+    )
+    persist_environment_record(drive_root, env_record)
+    from umbrella.contracts.runtime_probes import execute_probe_result
+    from umbrella.enforcement import diff_snapshots, restore_snapshot_changes, snapshot_workspace
+
+    results: list[dict[str, Any]] = []
+    protected_mutation: dict[str, Any] | None = None
+    expected = {
+        str(item).replace("\\", "/").strip().lstrip("/")
+        for item in (expected_artifacts or [])
+        if str(item).strip()
+    }
+    for raw in ops:
+        if not isinstance(raw, dict):
+            return "ERROR: each provisioning operation must be an object."
+        kind = str(raw.get("kind") or raw.get("operation") or "").strip()
+        if kind not in {
+            "python_dependency_install",
+            "pip_install",
+            "uv_sync",
+            "capability_probe",
+            "python_module_probe",
+        }:
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": "unsupported_provisioning_operation",
+                    "operation": raw,
+                    "allowed_operations": [
+                        "python_dependency_install",
+                        "pip_install",
+                        "uv_sync",
+                        "capability_probe",
+                        "python_module_probe",
+                    ],
+                }
+            )
+        if kind == "python_module_probe":
+            module = str(raw.get("module") or "").strip()
+            if not module:
+                return "ERROR: python_module_probe requires module."
+            command = [
+                env_record.python_executable,
+                "-c",
+                f"import {module}",
+            ]
+        elif kind == "capability_probe":
+            capability_id = str(raw.get("capability_id") or raw.get("capability") or "").strip()
+            probe = raw.get("probe")
+            if not capability_id or not isinstance(probe, dict):
+                return "ERROR: capability_probe requires capability_id and probe."
+            probe = dict(probe)
+            probe.setdefault("execution_environment_id", env_record.env_id)
+            probe_result = execute_probe_result(
+                probe,
+                workspace_root=workspace_root,
+                capability_tag=capability_id,
+                timeout_sec=float(probe.get("timeout_sec", raw.get("timeout_sec", 5.0))),
+            )
+            persist_capability_binding(
+                drive_root,
+                CapabilityBinding(
+                    capability_id=capability_id,
+                    available=bool(probe_result.get("available")),
+                    env_id=str(probe_result.get("execution_environment_id") or env_record.env_id),
+                    python_executable=str(probe_result.get("python_executable") or env_record.python_executable),
+                    cwd=str(probe_result.get("cwd") or env_record.cwd),
+                    env_hash=str(probe_result.get("env_hash") or env_record.env_hash),
+                    probe_command=tuple(str(item) for item in (probe_result.get("probe_command") or []))
+                    if isinstance(probe_result.get("probe_command"), list)
+                    else (),
+                    probe_exit_code=(
+                        int(probe_result.get("probe_exit_code"))
+                        if probe_result.get("probe_exit_code") is not None
+                        else None
+                    ),
+                    reason=str(probe_result.get("reason") or ""),
+                ),
+            )
+            results.append(
+                {
+                    "kind": kind,
+                    "capability_id": capability_id,
+                    "available": bool(probe_result.get("available")),
+                    "reason": str(probe_result.get("reason") or ""),
+                    "env_id": str(probe_result.get("execution_environment_id") or env_record.env_id),
+                    "env_hash": str(probe_result.get("env_hash") or env_record.env_hash),
+                }
+            )
+            continue
+        else:
+            if kind in {"python_dependency_install", "pip_install"}:
+                packages = [
+                    str(item).strip()
+                    for item in (raw.get("packages") or raw.get("dependencies") or [])
+                    if str(item).strip()
+                ] if isinstance(raw.get("packages") or raw.get("dependencies"), list) else []
+                command_raw = raw.get("command")
+                if isinstance(command_raw, list):
+                    command = [str(item) for item in command_raw]
+                elif packages:
+                    command = [
+                        env_record.python_executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        *packages,
+                    ]
+                else:
+                    return "ERROR: pip_install requires packages or command."
+                lowered = [str(item).strip().lower() for item in command]
+                if "-e" in lowered or "--editable" in lowered:
+                    return _json(
+                        {
+                            "status": "blocked",
+                            "reason": "editable_install_not_allowed_in_provisioning",
+                            "command": command,
+                            "message": (
+                                "Editable installs can write source-tree metadata "
+                                "and are not accepted as proof provisioning."
+                            ),
+                        }
+                    )
+            else:
+                command = ["uv", "sync"]
+        before = snapshot_workspace(workspace_root, capture_content=True)
+        env = dict(os.environ)
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+        proc = subprocess.run(
+            command,
+            cwd=workspace_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=max(10, int(raw.get("timeout_sec") or 120)),
+            check=False,
+        )
+        changes = diff_snapshots(before, snapshot_workspace(workspace_root))
+        protected_changes = [
+            change.path
+            for change in changes
+            if change.path not in expected
+            and not change.path.startswith((".venv/", ".umbrella_scratch/", ".memory/"))
+        ]
+        if protected_changes:
+            rollback = restore_snapshot_changes(before, changes)
+            protected_mutation = {
+                "status": "blocked",
+                "reason": "provisioning_workspace_mutation_guard",
+                "operation": kind,
+                "command": command,
+                "protected_changes": protected_changes,
+                "rollback": rollback,
+            }
+            break
+        results.append(
+            {
+                "kind": kind,
+                "command": command,
+                "exit_code": proc.returncode,
+                "stdout_tail": (proc.stdout or "")[-1200:],
+                "stderr_tail": (proc.stderr or "")[-1200:],
+            }
+        )
+        if proc.returncode != 0:
+            break
+    payload: dict[str, Any] = {
+        "status": "blocked" if protected_mutation else "ok",
+        "workspace_id": workspace,
+        "reason": str(reason or "").strip(),
+        "environment_record": env_record.to_dict(),
+        "operations": results,
+    }
+    if protected_mutation:
+        payload.update(protected_mutation)
+    return _json(payload)
+
+
 def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
     """Run the active subtask's typed proof and return ledger-backed completion refs."""
 
@@ -2401,6 +2793,20 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
     command = list(proof.execution.command)
     if not command:
         return f"ERROR: subtask `{resolved_id}` proof has an empty command."
+    proof_env_id = _proof_execution_environment_id(proof)
+    proof_subdir = str(proof.execution.subdir or "").strip().strip("/\\")
+    proof_cwd = workspace_root / proof_subdir if proof_subdir else workspace_root
+    environment_record = resolve_execution_environment(
+        repo_root=repo_root,
+        workspace_root=workspace_root,
+        env_id=proof_env_id,
+        cwd=proof_cwd,
+        env_overrides=proof.execution.env,
+    )
+    try:
+        persist_environment_record(pathlib.Path(ctx.drive_root), environment_record)
+    except Exception:
+        log.debug("execution environment record persist failed", exc_info=True)
 
     if _proof_uses_managed_runtime(proof):
         raw = _run_managed_runtime_proof(
@@ -2417,7 +2823,8 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
             command=command,
             subdir=proof.execution.subdir,
             timeout_seconds=max(10, int(proof.execution.timeout_sec or 120)),
-            allow_dependency_install=proof.execution.kind in {"build", "command"},
+            allow_dependency_install=False,
+            extra_env=proof.execution.env,
         )
     try:
         import json as json_module
@@ -2496,6 +2903,9 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
             "passed": passed,
             "exit_code": exit_code,
             "proof_kind": proof.execution.kind,
+            "execution_environment_id": environment_record.env_id,
+            "env_hash": environment_record.env_hash,
+            "python_executable": environment_record.python_executable,
             "workspace_hash": ws_hash,
             "diff_hash": diff_h,
             "skip_only": skip_only,
@@ -2523,6 +2933,8 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
                 "command": command,
                 "proof_kind": proof.execution.kind,
                 "harness_profile": proof.harness_profile,
+                "execution_environment_id": environment_record.env_id,
+                "env_hash": environment_record.env_hash,
             },
             result=ledger_result,
             touched_files=[],
@@ -2540,6 +2952,10 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
         "verifier_id": "run_subtask_proof",
         "passed": passed,
         "ledger_hash": proof_ledger.event_hash,
+        "execution_environment_id": environment_record.env_id,
+        "env_hash": environment_record.env_hash,
+        "proof_env_hash": environment_record.env_hash,
+        "python_executable": environment_record.python_executable,
     }
     proof_ref = {
         "ref_type": "ledger_event",
@@ -2586,6 +3002,31 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
             evidence_refs=(f"ledger_event:{proof_ledger.event_id}",),
         )
         oracle_issue_payloads = contract_issues_payload(oracle_issues)
+    infra_issue_payloads: list[dict[str, Any]] = []
+    if not passed:
+        infra_issue = _tk_root_setup_failure_issue(
+            output=failure_output,
+            proof=proof,
+            subtask_id=resolved_id,
+            drive_root=pathlib.Path(ctx.drive_root),
+            env_id=environment_record.env_id,
+            env_hash=environment_record.env_hash,
+            python_executable=environment_record.python_executable,
+            proof_ref=proof_ref,
+        )
+        if infra_issue:
+            infra_issue_payloads.append(infra_issue)
+        infra_issue_payloads.extend(
+            _proof_required_capability_issues(
+                drive_root=pathlib.Path(ctx.drive_root),
+                proof=proof,
+                subtask_id=resolved_id,
+                env_id=environment_record.env_id,
+                env_hash=environment_record.env_hash,
+                proof_ref=proof_ref,
+            )
+        )
+    contract_issue_payloads = [*oracle_issue_payloads, *infra_issue_payloads]
 
     if blocking_materialization_issues:
         issue_details = "; ".join(
@@ -2609,8 +3050,8 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
                     json_ready(issue) for issue in blocking_materialization_issues
                 ],
                 **(
-                    {"contract_issues": oracle_issue_payloads}
-                    if oracle_issue_payloads
+                    {"contract_issues": contract_issue_payloads}
+                    if contract_issue_payloads
                     else {}
                 ),
                 "next_step": (
@@ -2665,8 +3106,13 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
             "verification_report": verification_report,
             "proof_ref": proof_ref,
             **(
-                {"contract_issues": oracle_issue_payloads}
-                if oracle_issue_payloads
+                {"contract_issues": contract_issue_payloads}
+                if contract_issue_payloads
+                else {}
+            ),
+            **(
+                {"proof_failure_classification": infra_issue_payloads[0]}
+                if infra_issue_payloads
                 else {}
             ),
             "completion_contract_hint": completion_hint,
@@ -3367,6 +3813,7 @@ __all__ = [
     '_edit_subtask_card',
     '_request_scope_change',
     '_request_watcher_review',
+    '_provision_workspace_environment',
     '_mirror_watcher_review_to_palace',
     '_mirror_phase_plan_mutation_to_palace',
     '_harness_run',

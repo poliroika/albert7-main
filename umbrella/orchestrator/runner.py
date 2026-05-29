@@ -487,7 +487,7 @@ class PhaseRunner:
                 is_recovery_route = (
                     isinstance(decision, dict)
                     and str(decision.get("kind") or "").strip()
-                    == "plan_contract_revision"
+                    in {"plan_contract_revision", "proof_execution_infra"}
                 )
                 if (
                     not is_recovery_route
@@ -621,7 +621,10 @@ class PhaseRunner:
             decision = payload.get("recovery_decision")
             if not isinstance(decision, dict):
                 continue
-            if str(decision.get("kind") or "").strip() != "plan_contract_revision":
+            if str(decision.get("kind") or "").strip() not in {
+                "plan_contract_revision",
+                "proof_execution_infra",
+            }:
                 continue
             loop_target = str(
                 decision.get("loop_back_target")
@@ -1728,7 +1731,7 @@ class PhaseRunner:
             if (
                 isinstance(decision, dict)
                 and str(decision.get("kind") or "").strip()
-                == "plan_contract_revision"
+                in {"plan_contract_revision", "proof_execution_infra"}
             ):
                 explicit_target = str(
                     decision.get("loop_back_target")
@@ -3325,8 +3328,8 @@ class PhaseRunner:
                             "loop_back_target": route_decision.get("loop_back_target")
                             or "plan",
                             "retry_reason": (
-                                "recovery:plan_contract_revision: "
-                                "bad generated test/proof contract"
+                                "recovery:typed_recovery_route: "
+                                "plan/proof contract requires revision"
                             ),
                             "route_decision": route_decision,
                         }
@@ -3357,8 +3360,8 @@ class PhaseRunner:
                         "loop_back_target": route_decision.get("loop_back_target")
                         or "plan",
                         "retry_reason": (
-                            "recovery:plan_contract_revision: "
-                            "bad generated test/proof contract"
+                            "recovery:typed_recovery_route: "
+                            "plan/proof contract requires revision"
                         ),
                         "route_decision": route_decision,
                     }

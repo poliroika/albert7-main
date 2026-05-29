@@ -501,6 +501,75 @@ def test_recovery_decision_routes_independent_of_review_status(
     )
 
 
+def test_proof_execution_infra_recovery_routes_to_plan(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    drive = repo / "workspaces" / "demo" / ".memory" / "drive"
+    state = drive / "state"
+    state.mkdir(parents=True)
+    runner = PhaseRunner(repo_root=repo, workspace_id="demo", drive_root=drive)
+    task_id = "run-1:execute:1"
+    started_at = time.time()
+    (state / "phase_control_signals.jsonl").write_text(
+        json.dumps(
+            {
+                "signal_id": "review-1",
+                "created_at": started_at + 1,
+                "kind": "request_watcher_review",
+                "task_id": task_id,
+                "run_id": "run-1",
+                "phase": "execute",
+                "payload": {
+                    "status": "review_recorded",
+                    "verdict": "proof_execution_infra",
+                    "loop_back_target": "plan",
+                    "issues": [
+                        {
+                            "code": "proof_execution_infra",
+                            "severity": "blocking",
+                            "env_hash": "env123",
+                            "capability_id": "desktop_gui_runtime",
+                        }
+                    ],
+                    "recovery_decision": {
+                        "kind": "proof_execution_infra",
+                        "trigger_code": "proof_execution_infra",
+                        "active_subtask_id": "calculator-gui",
+                        "loop_back_target": "plan",
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    route = runner._latest_recovery_route_decision(
+        task_id=task_id,
+        phase_started_at=started_at,
+    )
+
+    assert route["loop_back_target"] == "plan"
+    assert route["recovery_decision"]["kind"] == "proof_execution_infra"
+    phase_node = PhaseNode(id="execute", manifest_id="execute", status="running")
+    phase_node.started_at = started_at
+    plan = PhasePlan(
+        plan_id="p1",
+        workspace_id="demo",
+        run_id="run-1",
+        nodes=[phase_node, PhaseNode(id="plan", manifest_id="plan", status="done")],
+    )
+    assert (
+        runner._phase_loop_back_target(
+            phase_node=phase_node,
+            outcome={"task_id": task_id},
+            plan=plan,
+        )
+        == "plan"
+    )
+
+
 def test_recovery_route_overlay_carries_typed_decision(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     drive = repo / "workspaces" / "demo" / ".memory" / "drive"

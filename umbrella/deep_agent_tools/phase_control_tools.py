@@ -640,6 +640,10 @@ def get_tools() -> list[ToolEntry]:
                                             "oracle_domain_mismatch",
                                             "contradictory_required_behavior",
                                             "invalid_generated_test_contract",
+                                            "proof_execution_infra",
+                                            "capability_probe_environment_mismatch",
+                                            "dependency_provision_required",
+                                            "headless_proof_uses_real_gui_root",
                                         ],
                                     },
                                     "target_subtask_id": {"type": "string"},
@@ -671,6 +675,11 @@ def get_tools() -> list[ToolEntry]:
                                         "type": "array",
                                         "items": {"type": "string"},
                                     },
+                                    "env_id": {"type": "string"},
+                                    "env_hash": {"type": "string"},
+                                    "capability_id": {"type": "string"},
+                                    "failure_phase": {"type": "string"},
+                                    "message": {"type": "string"},
                                     "evidence": {"type": "string"},
                                 },
                             },
@@ -679,6 +688,68 @@ def get_tools() -> list[ToolEntry]:
                 },
             },
             handler=_request_watcher_review,
+        ),
+        ToolEntry(
+            name="provision_workspace_environment",
+            schema={
+                "name": "provision_workspace_environment",
+                "description": (
+                    "Sanctioned environment provisioning/probing path. Use this "
+                    "for dependency installs, module probes, and capability "
+                    "probes; run_workspace_command/run_subtask_proof remain "
+                    "read-only verification and must not install dependencies."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["env_id", "operations", "reason"],
+                    "properties": {
+                        "workspace_id": {"type": "string"},
+                        "env_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "expected_artifacts": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "operations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                            "python_dependency_install",
+                                            "uv_sync",
+                                            "pip_install",
+                                            "capability_probe",
+                                            "python_module_probe",
+                                        ],
+                                    },
+                                    "packages": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "dependencies": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "command": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "module": {"type": "string"},
+                                    "capability_id": {"type": "string"},
+                                    "capability": {"type": "string"},
+                                    "probe": {"type": "object"},
+                                    "timeout_sec": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            handler=_provision_workspace_environment,
         ),
         ToolEntry(
             name="harness_run",

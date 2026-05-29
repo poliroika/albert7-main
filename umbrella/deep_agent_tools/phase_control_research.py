@@ -1590,6 +1590,10 @@ def _submit_capability_declaration(
         persist_runtime_capabilities,
         run_capability_probes,
     )
+    from umbrella.contracts.environments import (
+        CapabilityBinding,
+        persist_capability_binding,
+    )
 
     from umbrella.deep_agent_tools.phase_control_actions import (
         _repo_root_from_phase_ctx,
@@ -1661,6 +1665,35 @@ def _submit_capability_declaration(
     for tag, entry in merged_caps.items():
         if isinstance(entry, dict) and str(entry.get("source") or "") == "probe":
             probe_audit[str(tag)] = bool(entry.get("available"))
+            env_id = str(entry.get("execution_environment_id") or "").strip()
+            env_hash = str(entry.get("env_hash") or "").strip()
+            if env_id and env_hash:
+                try:
+                    persist_capability_binding(
+                        drive_root,
+                        CapabilityBinding(
+                            capability_id=str(tag),
+                            available=bool(entry.get("available")),
+                            env_id=env_id,
+                            python_executable=str(entry.get("python_executable") or ""),
+                            cwd=str(entry.get("cwd") or ""),
+                            env_hash=env_hash,
+                            probe_command=tuple(
+                                str(item)
+                                for item in (entry.get("probe_command") or [])
+                            )
+                            if isinstance(entry.get("probe_command"), list)
+                            else (),
+                            probe_exit_code=(
+                                int(entry.get("probe_exit_code"))
+                                if entry.get("probe_exit_code") is not None
+                                else None
+                            ),
+                            reason=str(entry.get("reason") or ""),
+                        ),
+                    )
+                except Exception:
+                    log.debug("capability binding persist failed", exc_info=True)
 
     normalized_status = str(status or "submitted").strip().lower()
     discovery_rows = _normalize_capability_discovery_rows(

@@ -4,6 +4,18 @@ from umbrella.contracts.compiler import ContractCompiler
 from umbrella.contracts.decision import PhaseDecisionEngine, decide_phase_transition
 from umbrella.contracts.evidence import EvidenceResolver, build_workspace_context
 from umbrella.contracts.hashing import diff_hash, hash_value, workspace_hash
+from umbrella.contracts.environments import (
+    DEFAULT_EXECUTION_ENVIRONMENT_ID,
+    CapabilityBinding,
+    ExecutionEnvironmentRecord,
+    classify_tcl_tk_status,
+    find_capability_binding,
+    load_capability_bindings,
+    load_environment_records,
+    persist_capability_binding,
+    persist_environment_record,
+    resolve_execution_environment,
+)
 from umbrella.contracts.harness_profiles import (
     HarnessProfile,
     all_harness_profiles,
@@ -71,6 +83,8 @@ __all__ = [
     "ContractValidator",
     "EvidenceRef",
     "EvidenceResolver",
+    "CapabilityBinding",
+    "ExecutionEnvironmentRecord",
     "HarnessProfile",
     "PhaseDecision",
     "PhaseDecisionEngine",
@@ -91,6 +105,7 @@ __all__ = [
     "build_workspace_context",
     "all_harness_profiles",
     "build_harness_contract_payload",
+    "DEFAULT_EXECUTION_ENVIRONMENT_ID",
     "BAD_ORACLE_REVIEW_CODES",
     "canonicalize_phase_plan",
     "compile_phase_plan",
@@ -101,8 +116,15 @@ __all__ = [
     "generated_oracle_contract_issues",
     "hash_value",
     "json_ready",
+    "classify_tcl_tk_status",
+    "find_capability_binding",
+    "load_capability_bindings",
+    "load_environment_records",
     "known_harness_profile_ids",
+    "persist_capability_binding",
+    "persist_environment_record",
     "probe_required_capability_ids",
+    "resolve_execution_environment",
     "to_policy_input",
     "validate_completion_contract",
     "validate_completion_materialization",

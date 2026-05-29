@@ -237,6 +237,7 @@ class ProofExecutionSpec:
     shell: bool = False
     subdir: str = ""
     env: dict[str, str] = field(default_factory=dict)
+    execution_environment_id: str = ""
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ProofExecutionSpec":
@@ -254,6 +255,12 @@ class ProofExecutionSpec:
             }
             if isinstance(value.get("env"), dict)
             else {},
+            execution_environment_id=str(
+                value.get("execution_environment_id")
+                or value.get("environment_id")
+                or value.get("env_id")
+                or ""
+            ).strip(),
         )
 
 
@@ -329,6 +336,15 @@ class ProofSpec:
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ProofSpec":
         refs = value.get("evidence_refs") or ()
+        execution_raw = dict(value.get("execution") or {})
+        if (
+            isinstance(execution_raw, dict)
+            and "execution_environment_id" not in execution_raw
+            and value.get("execution_environment_id")
+        ):
+            execution_raw["execution_environment_id"] = value.get(
+                "execution_environment_id"
+            )
         harness = value.get("harness")
         harness_profile = _contract_string(
             value.get("harness_profile") or value.get("harness_id")
@@ -343,7 +359,7 @@ class ProofSpec:
         if isinstance(raw_options, dict):
             harness_options = dict(raw_options)
         return cls(
-            execution=ProofExecutionSpec.from_mapping(value.get("execution") or {}),
+            execution=ProofExecutionSpec.from_mapping(execution_raw),
             oracle=ProofOracleSpec.from_mapping(value.get("oracle") or {}),
             scope=ProofScopeSpec.from_mapping(value.get("scope") or {}),
             anti_gaming=ProofAntiGamingSpec.from_mapping(value.get("anti_gaming") or {}),

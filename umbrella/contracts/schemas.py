@@ -81,6 +81,10 @@ VALID_REVIEW_CODES = (
     "oracle_domain_mismatch",
     "contradictory_required_behavior",
     "invalid_generated_test_contract",
+    "proof_execution_infra",
+    "capability_probe_environment_mismatch",
+    "dependency_provision_required",
+    "headless_proof_uses_real_gui_root",
 )
 
 PLAN_REVISION_DELTA_SCHEMA = {
@@ -210,8 +214,15 @@ PROOF_CONTRACT_SCHEMA = {
                 "timeout_sec": {"type": "integer"},
                 "shell": {"type": "boolean"},
                 "subdir": {"type": "string"},
+                "execution_environment_id": {"type": "string"},
+                "environment_id": {"type": "string"},
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
             },
         },
+        "execution_environment_id": {"type": "string"},
         "oracle": {
             "type": "object",
             "required": ["oracle_type", "required_properties"],
@@ -399,6 +410,11 @@ REVIEW_ISSUE_SCHEMA = {
         "invalid_values": {"type": "array", "items": {"type": "string"}},
         "required_deltas": {"type": "array", "items": PLAN_REVISION_DELTA_SCHEMA},
         "failure_hash": {"type": "string"},
+        "failure_phase": {"type": "string"},
+        "production_code_entered": {"type": "boolean"},
+        "capability_id": {"type": "string"},
+        "env_id": {"type": "string"},
+        "env_hash": {"type": "string"},
         "message": {"type": "string"},
         "evidence_refs": {"type": "array", "items": EVIDENCE_REF_SCHEMA},
     },
@@ -424,6 +440,10 @@ VERIFICATION_REPORT_REF_SCHEMA = {
         "verifier_id": {"type": "string"},
         "passed": {"type": "boolean"},
         "ledger_hash": {"type": "string"},
+        "execution_environment_id": {"type": "string"},
+        "env_hash": {"type": "string"},
+        "proof_env_hash": {"type": "string"},
+        "python_executable": {"type": "string"},
     },
 }
 

@@ -570,7 +570,8 @@ def _check_internal_phase_route_requested(
     decision = payload.get("recovery_decision")
     if not isinstance(decision, dict):
         return None
-    if str(decision.get("kind") or "").strip() != "plan_contract_revision":
+    decision_kind = str(decision.get("kind") or "").strip()
+    if decision_kind not in {"plan_contract_revision", "proof_execution_infra"}:
         return None
     loop_target = str(
         decision.get("loop_back_target") or payload.get("loop_back_target") or ""
@@ -580,7 +581,7 @@ def _check_internal_phase_route_requested(
     if content and content.strip():
         llm_trace["assistant_notes"].append(content.strip()[:320])
     return (
-        "Internal recovery route requested: plan_contract_revision -> plan",
+        f"Internal recovery route requested: {decision_kind} -> plan",
         accumulated_usage,
         llm_trace,
     )

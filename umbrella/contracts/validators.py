@@ -45,6 +45,10 @@ from umbrella.contracts.runtime_probes import (
     effective_runtime_capabilities,
     proof_requires_capability,
 )
+from umbrella.contracts.environments import (
+    DEFAULT_EXECUTION_ENVIRONMENT_ID,
+    find_capability_binding,
+)
 from umbrella.contracts.schemas import VALID_REVIEW_CODES
 from umbrella.contracts.oracle_validator import (
     BAD_ORACLE_REVIEW_CODES,
@@ -394,6 +398,11 @@ def validate_proof_spec(
             )
         )
     if proof.harness_profile == "desktop_gui_runtime":
+        env_id = str(
+            proof.execution.execution_environment_id
+            or proof.harness_options.get("execution_environment_id")
+            or DEFAULT_EXECUTION_ENVIRONMENT_ID
+        ).strip()
         options = proof.harness_options if isinstance(proof.harness_options, dict) else {}
         if execution.kind != "command":
             issues.append(
@@ -441,6 +450,26 @@ def validate_proof_spec(
                     subtask_id=subtask_id,
                 )
             )
+        if drive_root is not None:
+            binding = find_capability_binding(
+                drive_root,
+                capability_id="desktop_gui_runtime",
+                env_id=env_id,
+            )
+            if binding is None or not binding.available:
+                issues.append(
+                    _issue(
+                        "capability_probe_failed",
+                        (
+                            "desktop_gui_runtime proof requires an available "
+                            "desktop_gui_runtime capability binding for the "
+                            f"same execution environment `{env_id}`. Import-only "
+                            "or another interpreter's probe is not sufficient."
+                        ),
+                        phase=phase,
+                        subtask_id=subtask_id,
+                    )
+                )
         if not proof.harness_options:
             issues.append(
                 _issue(

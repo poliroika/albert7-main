@@ -495,6 +495,7 @@ def run_workspace_command(
     subdir: str = "",
     timeout_seconds: int = _RUN_WORKSPACE_DEFAULT_TIMEOUT_S,
     allow_dependency_install: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """Run non-interactive checks/tests inside a host-repo workspace."""
     try:
@@ -619,16 +620,17 @@ def run_workspace_command(
                     ),
                 }
             )
-        if _looks_like_dependency_install(cmd) and not allow_dependency_install:
+        if _looks_like_dependency_install(cmd):
             return _json(
                 {
                     "status": "blocked",
                     "reason": "dependency_install_guard",
                     "command": cmd,
+                    "allow_dependency_install_requested": bool(allow_dependency_install),
                     "next_step": (
-                        "Record the missing dependency and either use existing project tooling "
-                        "or call again with allow_dependency_install=true after explaining why "
-                        "the install is required."
+                        "Dependency/environment provisioning is not proof. Use "
+                        "`provision_workspace_environment` for sanctioned "
+                        "environment setup, then rerun read-only verification."
                     ),
                 }
             )
@@ -714,7 +716,7 @@ def run_workspace_command(
         cmd = _wrap_compound_command_for_host(cmd)
         phase = phase_from_context(ctx)
         before_snapshot = snapshot_workspace(workspace_root, capture_content=True)
-        with _workspace_public_llm_env():
+        with _workspace_public_llm_env(extra_env):
             session = get_or_create_session(ctx, workspace_id)
             result = session.run(cmd, cwd=str(cwd), timeout=timeout)
         changes = diff_snapshots(before_snapshot, snapshot_workspace(workspace_root))

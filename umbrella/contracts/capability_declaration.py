@@ -157,6 +157,10 @@ class CapabilityEntry:
     source: str = "probe"
     reason: str = ""
     probe: dict[str, Any] | None = None
+    execution_environment_id: str = ""
+    python_executable: str = ""
+    cwd: str = ""
+    env_hash: str = ""
 
     @classmethod
     def from_mapping(cls, value: Any) -> "CapabilityEntry | None":
@@ -171,6 +175,14 @@ class CapabilityEntry:
             source=source,
             reason=str(value.get("reason") or "").strip(),
             probe=probe if isinstance(probe, dict) else None,
+            execution_environment_id=str(
+                value.get("execution_environment_id")
+                or value.get("env_id")
+                or ""
+            ).strip(),
+            python_executable=str(value.get("python_executable") or "").strip(),
+            cwd=str(value.get("cwd") or "").strip(),
+            env_hash=str(value.get("env_hash") or "").strip(),
         )
 
 
@@ -201,6 +213,14 @@ class CapabilityDeclaration:
             }
             if entry.probe:
                 item["probe"] = entry.probe
+            if entry.execution_environment_id:
+                item["execution_environment_id"] = entry.execution_environment_id
+            if entry.python_executable:
+                item["python_executable"] = entry.python_executable
+            if entry.cwd:
+                item["cwd"] = entry.cwd
+            if entry.env_hash:
+                item["env_hash"] = entry.env_hash
             caps_out[key] = item
         return {
             "schema_version": self.schema_version,

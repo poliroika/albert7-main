@@ -14,6 +14,10 @@ from umbrella.contracts.capability_declaration import (
     load_capability_declaration,
     validate_proof_against_capabilities,
 )
+from umbrella.contracts.environments import (
+    DEFAULT_EXECUTION_ENVIRONMENT_ID,
+    resolve_execution_environment,
+)
 
 log = logging.getLogger(__name__)
 
@@ -84,24 +88,77 @@ def validate_probe_spec(spec: Any, *, capability_tag: str = "") -> str | None:
     return None
 
 
-def execute_probe(
+def _repo_root_for_workspace(workspace_root: Path) -> Path:
+    try:
+        parts = workspace_root.resolve().parts
+        if "workspaces" in parts:
+            idx = len(parts) - 1 - list(reversed(parts)).index("workspaces")
+            if idx > 0:
+                return Path(*parts[:idx])
+    except Exception:
+        pass
+    return workspace_root.parent.parent
+
+
+def _python_command_rewritten(argv: tuple[str, ...], python_executable: str) -> tuple[str, ...]:
+    if not argv or not python_executable:
+        return argv
+    first = Path(str(argv[0])).name.lower()
+    if first in {"python", "python3", "py", "python.exe", "python3.exe", "py.exe"}:
+        return (python_executable, *argv[1:])
+    return argv
+
+
+def execute_probe_result(
     spec: dict[str, Any],
     *,
     workspace_root: Path,
     capability_tag: str = "",
     timeout_sec: float = 5.0,
-) -> tuple[bool, str]:
+) -> dict[str, Any]:
     issue = validate_probe_spec(spec, capability_tag=capability_tag)
+    env_id = str(
+        spec.get("execution_environment_id")
+        or spec.get("environment_id")
+        or spec.get("env_id")
+        or DEFAULT_EXECUTION_ENVIRONMENT_ID
+    ).strip()
+    repo_root = _repo_root_for_workspace(workspace_root)
+    env_record = resolve_execution_environment(
+        repo_root=repo_root,
+        workspace_root=workspace_root,
+        env_id=env_id,
+        cwd=workspace_root / str(spec.get("cwd") or "").strip()
+        if str(spec.get("cwd") or "").strip()
+        else workspace_root,
+    )
     if issue:
-        return False, issue
+        return {
+            "available": False,
+            "reason": issue,
+            "execution_environment_id": env_record.env_id,
+            "python_executable": env_record.python_executable,
+            "cwd": env_record.cwd,
+            "env_hash": env_record.env_hash,
+            "probe_exit_code": None,
+        }
     argv = tuple(str(item) for item in spec.get("command") or ())
+    argv = _python_command_rewritten(argv, env_record.python_executable)
     expect_exit = int(spec.get("expect_exit", 0))
     cwd = str(spec.get("cwd") or "").strip()
     run_cwd = workspace_root
     if cwd:
         candidate = (workspace_root / cwd).resolve()
         if workspace_root.resolve() not in candidate.parents and candidate != workspace_root.resolve():
-            return False, "probe.cwd must stay inside workspace"
+            return {
+                "available": False,
+                "reason": "probe.cwd must stay inside workspace",
+                "execution_environment_id": env_record.env_id,
+                "python_executable": env_record.python_executable,
+                "cwd": str(candidate),
+                "env_hash": env_record.env_hash,
+                "probe_exit_code": None,
+            }
         run_cwd = candidate
     try:
         result = subprocess.run(
@@ -114,11 +171,47 @@ def execute_probe(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.debug("capability probe failed: %s", exc, exc_info=True)
-        return False, str(exc)
-    if result.returncode != expect_exit:
+        return {
+            "available": False,
+            "reason": str(exc),
+            "execution_environment_id": env_record.env_id,
+            "python_executable": env_record.python_executable,
+            "cwd": str(run_cwd),
+            "env_hash": env_record.env_hash,
+            "probe_command": list(argv),
+            "probe_exit_code": None,
+        }
+    reason = ""
+    available = result.returncode == expect_exit
+    if not available:
         detail = (result.stderr or result.stdout or b"").decode("utf-8", errors="replace")[:200]
-        return False, f"exit {result.returncode} (expected {expect_exit}){': ' + detail if detail else ''}"
-    return True, ""
+        reason = f"exit {result.returncode} (expected {expect_exit}){': ' + detail if detail else ''}"
+    return {
+        "available": available,
+        "reason": reason,
+        "execution_environment_id": env_record.env_id,
+        "python_executable": env_record.python_executable,
+        "cwd": str(run_cwd),
+        "env_hash": env_record.env_hash,
+        "probe_command": list(argv),
+        "probe_exit_code": int(result.returncode),
+    }
+
+
+def execute_probe(
+    spec: dict[str, Any],
+    *,
+    workspace_root: Path,
+    capability_tag: str = "",
+    timeout_sec: float = 5.0,
+) -> tuple[bool, str]:
+    result = execute_probe_result(
+        spec,
+        workspace_root=workspace_root,
+        capability_tag=capability_tag,
+        timeout_sec=timeout_sec,
+    )
+    return bool(result.get("available")), str(result.get("reason") or "")
 
 
 def run_capability_probes(
@@ -144,21 +237,28 @@ def run_capability_probes(
             continue
         probe = raw.get("probe")
         if isinstance(probe, dict):
-            available, reason = execute_probe(
+            probe_result = execute_probe_result(
                 probe,
                 workspace_root=workspace_root,
                 capability_tag=name,
                 timeout_sec=float(probe.get("timeout_sec", 5.0)),
             )
             merged[name] = {
-                "available": available,
+                "available": bool(probe_result.get("available")),
                 "source": "probe",
-                "reason": reason,
+                "reason": str(probe_result.get("reason") or ""),
                 "probe": probe,
+                "execution_environment_id": str(
+                    probe_result.get("execution_environment_id") or ""
+                ),
+                "python_executable": str(probe_result.get("python_executable") or ""),
+                "cwd": str(probe_result.get("cwd") or ""),
+                "env_hash": str(probe_result.get("env_hash") or ""),
             }
-            env_id = str(probe.get("execution_environment_id") or "").strip()
-            if env_id:
-                merged[name]["execution_environment_id"] = env_id
+            if probe_result.get("probe_command"):
+                merged[name]["probe_command"] = probe_result["probe_command"]
+            if probe_result.get("probe_exit_code") is not None:
+                merged[name]["probe_exit_code"] = int(probe_result["probe_exit_code"])
             continue
         merged[name] = {
             "available": bool(raw.get("available")),

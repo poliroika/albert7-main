@@ -2384,6 +2384,24 @@ def _active_harness_validator_flags(ctx: Any) -> frozenset[str]:
     active, _, _ = _active_execute_subtask_for_write_scope(ctx)
     if active:
         flags.update(validator_flags_for_subtask(active))
+        proof = active.get("proof")
+        if isinstance(proof, dict):
+            harness = str(proof.get("harness_profile") or "").strip()
+            required_caps = {
+                str(item).strip()
+                for item in (proof.get("required_capabilities") or [])
+                if str(item).strip()
+            } if isinstance(proof.get("required_capabilities"), list) else set()
+            anti = proof.get("anti_gaming")
+            requires_real_runtime = bool(
+                isinstance(anti, dict) and anti.get("requires_real_runtime")
+            )
+            if (
+                harness != "desktop_gui_runtime"
+                and "desktop_gui_runtime" not in required_caps
+                and not requires_real_runtime
+            ):
+                flags.add("no_native_gui_root_in_unit_proof")
     return frozenset(flags)
 
 

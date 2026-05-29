@@ -1596,6 +1596,15 @@ _ALLOWED_RETRY_PROOF_KINDS = frozenset(
     }
 )
 
+_PROOF_EXECUTION_INFRA_CODES = frozenset(
+    {
+        "proof_execution_infra",
+        "capability_probe_environment_mismatch",
+        "dependency_provision_required",
+        "headless_proof_uses_real_gui_root",
+    }
+)
+
 
 def _replacement_proof_kind(value: Any) -> str:
     if not isinstance(value, dict):
@@ -1621,6 +1630,9 @@ class RetryContractIssue:
         "invalid_generated_test_contract",
         "proof_scope_mismatch",
         "proof_execution_infra",
+        "capability_probe_environment_mismatch",
+        "dependency_provision_required",
+        "headless_proof_uses_real_gui_root",
         "need_more_context",
     ]
     severity: Literal["info", "warning", "blocking"]
@@ -1632,6 +1644,10 @@ class RetryContractIssue:
     required_replacements: tuple[ContractDelta, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     failure_hash: str = ""
+    env_id: str = ""
+    env_hash: str = ""
+    capability_id: str = ""
+    failure_phase: str = ""
     evidence: str = ""
 
     def to_payload(self) -> dict[str, Any]:
@@ -1653,6 +1669,14 @@ class RetryContractIssue:
             payload["evidence_refs"] = list(self.evidence_refs)
         if self.failure_hash:
             payload["failure_hash"] = self.failure_hash
+        if self.env_id:
+            payload["env_id"] = self.env_id
+        if self.env_hash:
+            payload["env_hash"] = self.env_hash
+        if self.capability_id:
+            payload["capability_id"] = self.capability_id
+        if self.failure_phase:
+            payload["failure_phase"] = self.failure_phase
         if self.evidence:
             payload["evidence"] = self.evidence
         return payload
@@ -1849,6 +1873,78 @@ def _typed_contract_issues_from_latest_failure(
     return issues
 
 
+def _proof_execution_infra_issues_from_latest_failure(
+    *,
+    subtask_id: str,
+    latest_failure: dict[str, Any],
+) -> list[RetryContractIssue]:
+    issues: list[RetryContractIssue] = []
+    failure_hash = _retry_failure_hash(latest_failure)
+    raw_issues = latest_failure.get("contract_issues")
+    default_evidence_refs = tuple(
+        str(item).strip()
+        for item in (latest_failure.get("evidence_refs") or [])
+        if str(item).strip()
+    ) if isinstance(latest_failure.get("evidence_refs"), list) else ()
+    if isinstance(raw_issues, list):
+        for raw in raw_issues:
+            if not isinstance(raw, dict):
+                continue
+            code = str(raw.get("code") or "").strip()
+            if code not in _PROOF_EXECUTION_INFRA_CODES:
+                continue
+            target = str(raw.get("target_subtask_id") or subtask_id).strip()
+            if not target:
+                continue
+            raw_deltas = raw.get("required_deltas")
+            deltas = tuple(
+                delta
+                for delta in (
+                    _contract_delta_from_payload(item)
+                    for item in (raw_deltas or [])
+                )
+                if delta is not None
+            ) if isinstance(raw_deltas, list) else ()
+            issues.append(
+                RetryContractIssue(
+                    code=code,  # type: ignore[arg-type]
+                    severity="blocking",
+                    target_subtask_id=target,
+                    target_path=str(raw.get("target_path") or "").strip(),
+                    contract_path=str(raw.get("contract_path") or "proof.execution"),
+                    required_replacements=deltas,
+                    evidence_refs=tuple(
+                        str(item).strip()
+                        for item in (raw.get("evidence_refs") or [])
+                        if str(item).strip()
+                    ) if isinstance(raw.get("evidence_refs"), list) else default_evidence_refs,
+                    failure_hash=str(raw.get("failure_hash") or failure_hash),
+                    env_id=str(raw.get("env_id") or "").strip(),
+                    env_hash=str(raw.get("env_hash") or "").strip(),
+                    capability_id=str(raw.get("capability_id") or "").strip(),
+                    failure_phase=str(raw.get("failure_phase") or "").strip(),
+                    evidence=str(
+                        raw.get("message")
+                        or raw.get("evidence")
+                        or latest_failure.get("output_excerpt")
+                        or ""
+                    ).strip(),
+                )
+            )
+    classification = latest_failure.get("proof_failure_classification")
+    if isinstance(classification, dict):
+        nested = dict(latest_failure)
+        nested["contract_issues"] = [classification]
+        nested.pop("proof_failure_classification", None)
+        issues.extend(
+            _proof_execution_infra_issues_from_latest_failure(
+                subtask_id=subtask_id,
+                latest_failure=nested,
+            )
+        )
+    return issues
+
+
 def _normalise_requested_contract_issues(
     raw_issues: Any,
     *,
@@ -1867,7 +1963,7 @@ def _normalise_requested_contract_issues(
         if not isinstance(raw, dict):
             continue
         code = str(raw.get("code") or "").strip()
-        if code not in BAD_ORACLE_REVIEW_CODES:
+        if code not in BAD_ORACLE_REVIEW_CODES and code not in _PROOF_EXECUTION_INFRA_CODES:
             continue
         target = str(raw.get("target_subtask_id") or subtask_id).strip()
         contract_path = str(raw.get("contract_path") or "").strip()
@@ -1886,6 +1982,8 @@ def _normalise_requested_contract_issues(
         ] if isinstance(raw.get("required_deltas"), list) else []
         if not contract_path and deltas:
             contract_path = str(deltas[0].get("path") or "").strip()
+        if not contract_path and code in _PROOF_EXECUTION_INFRA_CODES:
+            contract_path = "proof.execution"
         if not contract_path:
             continue
         if (
@@ -1920,9 +2018,16 @@ def _normalise_requested_contract_issues(
             "required_deltas": deltas,
             "evidence_refs": evidence_refs,
         }
+        for key in ("env_id", "env_hash", "capability_id", "failure_phase"):
+            value = str(raw.get(key) or "").strip()
+            if value:
+                item[key] = value
         evidence = str(raw.get("evidence") or "").strip()
         if evidence:
             item["evidence"] = evidence
+        message = str(raw.get("message") or "").strip()
+        if message:
+            item["message"] = message
         normalised.append(item)
     return normalised
 
@@ -2119,6 +2224,13 @@ def _same_blocker_fingerprint(
         if isinstance(active_subtask, dict)
         else {}
     )
+    issue_env = ""
+    issue_capability = ""
+    for issue in decision.issues:
+        if not isinstance(issue, dict):
+            continue
+        issue_env = issue_env or str(issue.get("env_hash") or "")
+        issue_capability = issue_capability or str(issue.get("capability_id") or "")
     task_id = str(state.get("task_id") or getattr(ctx, "task_id", "") or "")
     return hash_value(
         {
@@ -2131,6 +2243,8 @@ def _same_blocker_fingerprint(
             "failure_hash": decision.failure_hash,
             "blocker_code": decision.trigger_code,
             "decision_kind": decision.kind,
+            "env_hash": issue_env,
+            "capability_id": issue_capability,
             "workspace_change_marker": {
                 "latest_repair_pos": state.get("latest_repair_pos"),
                 "latest_repair_time": state.get("latest_repair_time"),
@@ -2423,6 +2537,66 @@ def _implementation_repair_decision(
     )
 
 
+def _proof_execution_infra_decision(
+    *,
+    subtask_id: str,
+    latest_failure: dict[str, Any],
+    infra_issues: list[RetryContractIssue],
+) -> RecoveryDecision:
+    failure_hash = _retry_failure_hash(latest_failure)
+    issues = [issue.to_payload() for issue in infra_issues]
+    primary = infra_issues[0] if infra_issues else None
+    evidence_refs: list[str] = []
+    for issue in infra_issues:
+        for ref in issue.evidence_refs:
+            if ref and ref not in evidence_refs:
+                evidence_refs.append(ref)
+    allowed = [
+        "provision the execution environment with provision_workspace_environment",
+        "route to plan and switch the proof to a headless/controller strategy",
+        "route to research/preflight to refresh capability bindings",
+    ]
+    forbidden = [
+        "patch production source for a setup-only Tk/Tcl/display failure",
+        "edit tests directly after a failing proof",
+        "treat import tkinter as desktop_gui_runtime proof",
+        "rerun execute under the same stale proof environment",
+    ]
+    return RecoveryDecision(
+        decision_id=hash_value(
+            {
+                "kind": "proof_execution_infra",
+                "subtask_id": subtask_id,
+                "failure_hash": failure_hash,
+                "issues": issues,
+            }
+        )[:16],
+        kind="proof_execution_infra",
+        trigger_code=(primary.code if primary else "proof_execution_infra"),
+        active_subtask_id=(primary.target_subtask_id if primary else subtask_id),
+        failure_hash=failure_hash,
+        loop_back_target="plan",
+        issues=issues,
+        required_plan_changes=[
+            {
+                "id": f"proof-execution-infra-{idx}",
+                "target_subtask_id": issue.target_subtask_id or subtask_id,
+                "severity": "blocking",
+                "reason_code": issue.code,
+                "source": "RecoveryDecision.proof_execution_infra",
+                "path": issue.contract_path or "proof.execution",
+                "op": "semantic_diff",
+                "evidence_refs": list(issue.evidence_refs),
+            }
+            for idx, issue in enumerate(infra_issues, start=1)
+        ],
+        allowed_next_actions=allowed,
+        forbidden_next_actions=forbidden,
+        evidence_refs=evidence_refs,
+        evidence=(primary.evidence if primary else ""),
+    )
+
+
 def _need_typed_issue_decision(
     *,
     subtask_id: str,
@@ -2507,6 +2681,18 @@ def _retry_watcher_verdict_payload(
             "can_edit_tests": False,
             "requires_plan_mutation": False,
             "loop_back_target": "none",
+            "issues": decision.issues,
+            "required_plan_changes": decision.required_plan_changes,
+            "allowed_next_actions": decision.allowed_next_actions,
+            "forbidden_next_actions": decision.forbidden_next_actions,
+        }
+    if decision.kind == "proof_execution_infra":
+        return {
+            **base,
+            "verdict": "proof_execution_infra",
+            "can_edit_tests": False,
+            "requires_plan_mutation": True,
+            "loop_back_target": decision.loop_back_target,
             "issues": decision.issues,
             "required_plan_changes": decision.required_plan_changes,
             "allowed_next_actions": decision.allowed_next_actions,
@@ -2735,6 +2921,9 @@ def _phase_subtask_retry_watcher_review_payload(
         ):
             if isinstance(payload.get(key), list):
                 latest_failure[key] = payload.get(key)
+        for key in ("proof_failure_classification", "verification_report"):
+            if isinstance(payload.get(key), dict):
+                latest_failure[key] = payload.get(key)
     requested_contract_issues = _normalise_requested_contract_issues(
         contract_issues,
         subtask_id=str(state.get("subtask_id") or ""),
@@ -2751,6 +2940,10 @@ def _phase_subtask_retry_watcher_review_payload(
         subtask_id=subtask_id,
         latest_failure=latest_failure,
     )
+    infra_issues = _proof_execution_infra_issues_from_latest_failure(
+        subtask_id=subtask_id,
+        latest_failure=latest_failure,
+    )
     text_lints = _bad_generated_success_test_text_lints(
         reason=str(reason or ""),
         latest_failure=latest_failure,
@@ -2762,6 +2955,13 @@ def _phase_subtask_retry_watcher_review_payload(
             proof_command=proof_command,
             latest_failure=latest_failure,
             plan_revision_patch=plan_revision_patch,
+        )
+    elif infra_issues:
+        status = "review_recorded"
+        decision = _proof_execution_infra_decision(
+            subtask_id=subtask_id,
+            latest_failure=latest_failure,
+            infra_issues=infra_issues,
         )
     else:
         status = (
@@ -2831,6 +3031,14 @@ def _phase_subtask_retry_watcher_review_payload(
         review["plan_revision_patch"] = plan_revision_patch
         review["recommendation"] = _plan_revision_retry_recommendation(
             plan_revision_patch
+        )
+    elif decision.kind == "proof_execution_infra":
+        review["recommendation"] = (
+            "This proof failed in environment/capability setup before "
+            "implementation behavior could be evaluated. Do not patch source "
+            "for this blocker. Provision the matching execution environment, "
+            "refresh capability bindings, or revise the proof strategy in plan "
+            "to a headless/controller proof."
         )
     elif decision.kind == "need_more_context":
         review["recommendation"] = (
