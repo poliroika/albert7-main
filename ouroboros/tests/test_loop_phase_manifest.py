@@ -1186,7 +1186,8 @@ def test_required_phase_completion_nudge_forces_mark_after_typed_proof(tmp_path)
         trace_tool_calls=trace_tool_calls,
     )
     assert forced == "mark_subtask_complete"
-    assert "completion_contract_hint" in messages[-1]["content"]
+    assert "mark_subtask_complete(claim=" in messages[-1]["content"]
+    assert "completion_contract_hint" not in messages[-1]["content"]
 
 
 def test_required_phase_completion_nudge_ignores_shell_success_for_typed_proof(tmp_path):
@@ -1468,6 +1469,29 @@ def test_submit_final_review_loop_back_writes_phase_exit_decision(tmp_path):
         "phase_label": "final_review",
         "verification_summary": "Verification failed: pytest:tests",
     }
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    (logs / "tools.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": ctx.task_id,
+                "tool": "run_workspace_verify",
+                "result_preview": json.dumps(
+                    {
+                        "passed": False,
+                        "failed_step_count": 1,
+                        "summary": "Verification failed: pytest:tests",
+                        "verification_report_ref": {
+                            "report_id": "verify-ledger-1",
+                            "ledger_hash": "ledger-hash-1",
+                        },
+                    }
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     result = _submit_final_review(
         ctx,
@@ -1783,7 +1807,7 @@ def test_subtask_review_loop_back_to_plan_requires_typed_recovery(tmp_path):
     assert not (state_dir / "phase_control_signal.json").exists()
 
 
-def test_mark_subtask_complete_accepts_phase_level_phase_run(tmp_path):
+def test_mark_subtask_complete_rejects_phase_level_without_active_work_item(tmp_path):
     import sys, json
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from ouroboros.tools.phase_control import _mark_subtask_complete
@@ -1806,21 +1830,12 @@ def test_mark_subtask_complete_accepts_phase_level_phase_run(tmp_path):
     ctx.context_overlays = {"phase_node": {"id": "execute", "manifest_id": "execute"}}
     ctx.loop_state_view = {"phase_label": "linear"}
 
-    result = _mark_subtask_complete(
-        ctx,
-        subtask_id="run-1:execute",
-        notes="implemented and verified",
-        evidence=["run_workspace_verify passed"],
-    )
+    result = _mark_subtask_complete(ctx, notes="implemented and verified")
 
-    assert result.startswith("OK:")
-    signal = json.loads((state_dir / "phase_control_signal.json").read_text())
-    assert signal["kind"] == "mark_subtask_complete"
-    payload = signal["payload"]
-    assert payload["phase_level"] is True
-    assert payload["phase_id"] == "execute"
-    assert payload["subtask_id"] == "execute"
-    assert payload["requested_subtask_id"] == "run-1:execute"
+    payload = json.loads(result)
+    assert payload["error"] == "NO_ACTIVE_WORK_ITEM"
+    assert payload["required_next_action"] == "materialize_work_item"
+    assert not (state_dir / "phase_control_signal.json").exists()
 
 
 def test_mark_subtask_complete_rejects_unknown_subtask_when_cards_exist(tmp_path):
@@ -1852,7 +1867,9 @@ def test_mark_subtask_complete_rejects_unknown_subtask_when_cards_exist(tmp_path
 
     result = _mark_subtask_complete(ctx, subtask_id="missing")
 
-    assert result == "ERROR: subtask 'missing' not found in plan"
+    payload = json.loads(result)
+    assert payload["error"] == "MODEL_SUPPLIED_COMPLETION_FIELDS_REJECTED"
+    assert payload["rejected_fields"] == ["subtask_id"]
     assert not (state_dir / "phase_control_signal.json").exists()
 
 
@@ -1864,6 +1881,7 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
     from ouroboros.tools.phase_control import _mark_subtask_complete
     from ouroboros.tools.registry import ToolContext
     from umbrella.contracts.hashing import diff_hash, hash_value, workspace_hash
+    from umbrella.contracts.work_items import WorkItem, save_active_work_item
     from umbrella.enforcement.ledger import append_supervisor_ledger_event
     from umbrella.memory.palace import facade
 
@@ -1890,7 +1908,9 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
     workspace = tmp_path / "workspaces" / "ws1"
     drive = workspace / ".memory" / "drive"
     state_dir = drive / "state"
+    logs_dir = drive / "logs"
     state_dir.mkdir(parents=True)
+    logs_dir.mkdir(parents=True)
     (state_dir / "phase_plan.json").write_text(json.dumps(plan))
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
@@ -1918,27 +1938,15 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
         tool="run_subtask_proof",
         result=report_result,
     )
-    completion_contract = {
+    proof_ref = {
+        "ref_type": "ledger_event",
+        "ref_id": event.event_id,
+        "hash": event.event_hash,
+        "produced_by": "verifier",
+        "phase": "execute",
         "subtask_id": "build-core",
-        "status": "done",
-        "completed_claims": [
-            {
-                "claim_id": "build-core.claim.1",
-                "text": "Built the core models.",
-                "proof_refs": [
-                    {
-                        "ref_type": "ledger_event",
-                        "ref_id": event.event_id,
-                        "hash": event.event_hash,
-                        "produced_by": "verifier",
-                        "phase": "execute",
-                        "subtask_id": "build-core",
-                    }
-                ],
-            }
-        ],
-        "changed_files": [],
-        "verification_report": {
+    }
+    verification_report = {
             "report_id": event.event_id,
             "report_hash": report_hash,
             "workspace_hash": ws_hash,
@@ -1947,13 +1955,42 @@ def test_mark_subtask_complete_promotes_summary_and_evidence_to_phase_memory(
             "verifier_id": "verifier",
             "passed": True,
             "ledger_hash": event.event_hash,
-        },
-        "notes": "Built the core models.",
     }
+    (logs_dir / "tools.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": "run-1:execute",
+                "tool": "run_subtask_proof",
+                "args": {"subtask_id": "build-core"},
+                "result_preview": json.dumps(
+                    {
+                        "passed": True,
+                        "subtask_id": "build-core",
+                        "proof_ref": proof_ref,
+                        "verification_report": verification_report,
+                        "completion_contract_hint": {"changed_files": []},
+                    }
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    save_active_work_item(
+        drive,
+        WorkItem(
+            id="work:build-core",
+            kind="implementation_repair",
+            source_phase="execute",
+            target_phase="execute",
+            active_subtask_id="build-core",
+        ),
+    )
 
     result = _mark_subtask_complete(
         ctx,
-        completion_contract=completion_contract,
+        claim="Built the core models.",
+        notes="Built the core models.",
     )
 
     assert result == "OK: Subtask 'build-core' marked complete"
@@ -2026,8 +2063,14 @@ def test_mark_subtask_complete_rejects_failed_status_for_phase_subtask(tmp_path)
         evidence=["Required success_test was passed but phase completion was rejected"],
     )
 
-    assert result.startswith("ERROR:")
-    assert "can only be closed with status='done'" in result
+    payload = json.loads(result)
+    assert payload["error"] == "MODEL_SUPPLIED_COMPLETION_FIELDS_REJECTED"
+    assert set(payload["rejected_fields"]) == {
+        "subtask_id",
+        "status",
+        "summary",
+        "evidence",
+    }
     updated = json.loads((state_dir / "phase_plan.json").read_text())
     assert updated["nodes"][0]["subtasks"][0]["status"] == "pending"
     assert not (state_dir / "phase_control_signal.json").exists()
@@ -2108,8 +2151,9 @@ def test_mark_subtask_complete_rejects_untyped_empty_completion_after_success_te
 
     result = _mark_subtask_complete(ctx, subtask_id="1.1")
 
-    assert result.startswith("ERROR: mark_subtask_complete contract rejected")
-    assert "completion_contract is required" in result
+    payload = json.loads(result)
+    assert payload["error"] == "MODEL_SUPPLIED_COMPLETION_FIELDS_REJECTED"
+    assert payload["rejected_fields"] == ["subtask_id"]
     updated = json.loads((state_dir / "phase_plan.json").read_text(encoding="utf-8"))
     assert updated["nodes"][0]["subtasks"][0]["status"] == "pending"
     assert not (state_dir / "phase_control_signal.json").exists()
@@ -2191,8 +2235,9 @@ def test_mark_subtask_complete_rejects_captured_openai_runtime_memory_claim(tmp_
         ],
     )
 
-    assert result.startswith("ERROR: mark_subtask_complete rejected")
-    assert "OPENAI_*" in result
+    payload = json.loads(result)
+    assert payload["error"] == "MODEL_SUPPLIED_COMPLETION_FIELDS_REJECTED"
+    assert set(payload["rejected_fields"]) == {"subtask_id", "summary", "evidence"}
     updated = json.loads((state_dir / "phase_plan.json").read_text(encoding="utf-8"))
     assert updated["nodes"][0]["subtasks"][0]["status"] == "pending"
     assert not (state_dir / "phase_control_signal.json").exists()

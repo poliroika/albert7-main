@@ -9,6 +9,7 @@ from umbrella.deep_agent_tools.phase_control_base import *
 from umbrella.deep_agent_tools.phase_control_research import *
 from umbrella.deep_agent_tools.phase_control_retry import (
     _final_review_e2e_gate,
+    _latest_logged_tool_result,
     _phase_subtask_retry_escalation_block,
     _phase_subtask_retry_state,
     _phase_subtask_retry_watcher_review_payload,
@@ -24,6 +25,7 @@ from umbrella.contracts import (
     ContractValidator,
     EvidenceRef,
     PhaseExitDecision,
+    ProofSpec,
     ReviewContract,
     ReviewIssue,
     ResearchSummaryContract,
@@ -56,9 +58,14 @@ from umbrella.contracts.environments import (
     persist_environment_record,
     resolve_execution_environment,
 )
+from umbrella.contracts.work_items import (
+    complete_active_work_item,
+    load_active_work_item,
+)
 from umbrella.contracts.contract_paths import (
     InvalidContractPath,
     normalize_contract_path,
+    suggest_contract_path,
     validate_delta_path,
 )
 from umbrella.deep_agent_tools.phase_control_retry import (
@@ -1672,6 +1679,81 @@ def _append_unique_review_change(
     changes.append(change)
 
 
+_GENERATED_ORACLE_DELTA_HINTS = frozenset(
+    {
+        "oracle_claim",
+        "oracle_claims",
+        "expected_output",
+        "expected_behavior",
+        "expected_result",
+        "actual_output",
+        "test_ref",
+        "generated_test",
+    }
+)
+
+
+def _normalize_review_issue_path(raw_path: str) -> str:
+    try:
+        return normalize_contract_path(raw_path).path
+    except InvalidContractPath as exc:
+        if exc.suggestion:
+            return exc.suggestion
+        raise
+
+
+def _review_issue_anchor_path(item: dict[str, Any]) -> str:
+    for key in ("contract_path", "target_path"):
+        path = str(item.get(key) or "").strip()
+        if path:
+            return path
+    return ""
+
+
+def _generated_oracle_delta_path(raw_path: str, item: dict[str, Any]) -> str:
+    text = str(raw_path or "").strip().lower()
+    anchor = _review_issue_anchor_path(item)
+    code = str(item.get("code") or "").strip()
+    if anchor == "proof.generated_test_contract.oracle_claims":
+        return anchor
+    if code == "bad_generated_oracle" and (
+        anchor == "proof.generated_test_contract"
+        or anchor == "proof.generated_test_contract.oracle_claims"
+    ):
+        return "proof.generated_test_contract.oracle_claims"
+    if code == "bad_generated_oracle" and any(
+        hint in text for hint in _GENERATED_ORACLE_DELTA_HINTS
+    ):
+        return "proof.generated_test_contract.oracle_claims"
+    if (
+        anchor.startswith("proof.generated_test_contract")
+        and any(hint in text for hint in _GENERATED_ORACLE_DELTA_HINTS)
+    ):
+        return "proof.generated_test_contract.oracle_claims"
+    return ""
+
+
+def _normalize_review_required_delta(
+    delta: dict[str, Any],
+    *,
+    issue: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return validate_delta_path(delta)
+    except InvalidContractPath as exc:
+        candidate = exc.suggestion or suggest_contract_path(str(delta.get("path") or ""))
+        if not candidate:
+            candidate = _generated_oracle_delta_path(
+                str(delta.get("path") or ""),
+                issue,
+            )
+        if not candidate:
+            raise
+        normalized = dict(delta)
+        normalized["path"] = normalize_contract_path(candidate).path
+        return normalized
+
+
 def _normalize_review_control_paths(
     *,
     ctx: ToolContext,
@@ -1689,7 +1771,7 @@ def _normalize_review_control_paths(
             if not raw_path:
                 continue
             try:
-                item[key] = normalize_contract_path(raw_path).path
+                item[key] = _normalize_review_issue_path(raw_path)
             except InvalidContractPath as exc:
                 return {}, _invalid_contract_path_message(
                     exc,
@@ -1702,7 +1784,9 @@ def _normalize_review_control_paths(
                 if not isinstance(delta, dict):
                     continue
                 try:
-                    normalized_deltas.append(validate_delta_path(delta))
+                    normalized_deltas.append(
+                        _normalize_review_required_delta(delta, issue=item)
+                    )
                 except InvalidContractPath as exc:
                     return {}, _invalid_contract_path_message(
                         exc,
@@ -1970,6 +2054,16 @@ def _submit_final_review(
         gate = _final_review_e2e_gate(ctx)
         if gate:
             return gate
+    latest_verify: dict[str, Any] | None = None
+    if outcome == "loop_back":
+        latest_verify = _latest_logged_tool_result(ctx, "run_workspace_verify")
+        if not latest_verify:
+            return (
+                "ERROR: submit_final_review(outcome='loop_back') requires an "
+                "executed `run_workspace_verify` result from this final_review "
+                "phase. Failed verification is valid loop_back evidence, but "
+                "missing verification is not a valid control transition."
+            )
     target_phase = "execute" if outcome == "loop_back" else None
     typed_issues = tuple(
         ReviewIssue.from_mapping(item)
@@ -1979,12 +2073,36 @@ def _submit_final_review(
     typed_required_changes = tuple(
         dict(item) for item in (required_changes or []) if isinstance(item, dict)
     )
+    evidence_refs_payload: list[dict[str, Any]] = []
+    verification_summary = ""
+    if isinstance(latest_verify, dict):
+        verification_summary = str(latest_verify.get("summary") or "")[:4000]
+        report_ref = latest_verify.get("verification_report_ref")
+        if isinstance(report_ref, dict):
+            evidence_refs_payload.append(
+                {
+                    "ref_type": "verification_report",
+                    "ref_id": str(report_ref.get("report_id") or ""),
+                    "hash": str(report_ref.get("ledger_hash") or ""),
+                    "produced_by": "verifier",
+                    "phase": _phase_control_phase_id(ctx),
+                }
+            )
+    typed_evidence_refs = tuple(
+        EvidenceRef.from_mapping(item)
+        for item in evidence_refs_payload
+        if isinstance(item, dict)
+    )
     signal_payload = {
         "outcome": outcome,
         "notes": notes,
         "issues": [json_ready(item) for item in typed_issues],
         "required_changes": list(typed_required_changes),
     }
+    if evidence_refs_payload:
+        signal_payload["evidence_refs"] = evidence_refs_payload
+    if verification_summary:
+        signal_payload["verification_summary"] = verification_summary
     signal_id = _write_control_signal(ctx, "submit_final_review", signal_payload)
     try:
         view = getattr(ctx, "loop_state_view", {}) or {}
@@ -1993,9 +2111,11 @@ def _submit_final_review(
             task_id=str(getattr(ctx, "task_id", "") or ""),
             outcome=outcome,
             target_phase=target_phase,
+            evidence_refs=typed_evidence_refs,
             issues=typed_issues,
             required_changes=typed_required_changes,
-            verification_summary=str(view.get("verification_summary") or ""),
+            verification_summary=verification_summary
+            or str(view.get("verification_summary") or ""),
             source_tool_call_id=signal_id,
         )
         (_state_dir(ctx) / "phase_exit_decision_latest.json").write_text(
@@ -3189,12 +3309,40 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
     plan = _read_phase_plan(ctx)
     if plan is None:
         return "ERROR: phase_plan.json is missing; cannot resolve subtask proof."
-
+    if not str(subtask_id or "").strip():
+        active_work_item = load_active_work_item(pathlib.Path(ctx.drive_root))
+        return _json(
+            {
+                "error": "ACTIVE_SUBTASK_ID_REQUIRED",
+                "required_next_action": "run_subtask_proof",
+                "target_work_item_id": active_work_item.id if active_work_item else "",
+                "active_subtask_id": active_work_item.active_subtask_id if active_work_item else "",
+                "reason": "run_subtask_proof must be called with the active WorkItem subtask_id.",
+            }
+        )
     subtask = _resolve_execute_subtask(plan, subtask_id)
     if subtask is None:
         return (
             "ERROR: subtask not found or no pending subtask remains "
             f"(requested={subtask_id!r})."
+        )
+    active_work_item = load_active_work_item(pathlib.Path(ctx.drive_root))
+    if active_work_item is None:
+        from umbrella.contracts.work_items import ensure_active_work_item_for_subtask
+
+        active_work_item = ensure_active_work_item_for_subtask(
+            pathlib.Path(ctx.drive_root),
+            subtask,
+        )
+    if str(subtask_id or "").strip() != active_work_item.active_subtask_id:
+        return _json(
+            {
+                "error": "WORK_ITEM_SUBTASK_MISMATCH",
+                "required_next_action": "run_subtask_proof",
+                "target_work_item_id": active_work_item.id,
+                "active_subtask_id": active_work_item.active_subtask_id,
+                "requested_subtask_id": str(subtask_id or "").strip(),
+            }
         )
     if retry_block := _phase_subtask_retry_escalation_block(
         ctx, tool_name="run_subtask_proof"
@@ -3504,7 +3652,7 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
         ],
         "evidence_refs": [proof_ref],
         "verification_report": verification_report,
-        "notes": "Copy verification_report and proof_refs into mark_subtask_complete.",
+        "notes": "Verifier refs are server-owned; call mark_subtask_complete with only claim/notes.",
     }
     if passed:
         import time as _time
@@ -3541,9 +3689,10 @@ def _run_subtask_proof(ctx: ToolContext, *, subtask_id: str = "") -> str:
             ),
             "completion_contract_hint": completion_hint,
             "next_step": (
-                "If passed, call mark_subtask_complete(completion_contract=completion_contract_hint). "
-                "Do not rewrite completion_contract_hint.changed_files; it is the exact diff-hash input "
-                "used by this verifier report."
+                "If passed, call mark_subtask_complete(claim=..., notes=...). "
+                "Do not pass subtask_id, changed_files, hashes, evidence_refs, "
+                "or verification_report; Umbrella derives them from the active WorkItem "
+                "and this verifier ledger event."
             ),
         }
     )
@@ -3564,6 +3713,152 @@ def _completion_evidence_items(evidence: Any) -> list[str]:
     else:
         values = []
     return [str(item or "").strip() for item in values if str(item or "").strip()]
+
+
+def _latest_work_item_proof_payload(
+    ctx: ToolContext,
+    *,
+    subtask_id: str,
+) -> tuple[dict[str, Any], int, list[dict[str, Any]]]:
+    rows = _tool_log_rows_for_task(ctx, str(getattr(ctx, "task_id", "") or ""))
+    for idx in range(len(rows) - 1, -1, -1):
+        row = rows[idx]
+        if str(row.get("tool") or "") != "run_subtask_proof":
+            continue
+        payload = _json_obj_from_preview(
+            row.get("result_preview") or row.get("result") or ""
+        )
+        if str(payload.get("subtask_id") or "").strip() != subtask_id:
+            continue
+        return payload, idx, rows
+    return {}, -1, rows
+
+
+def _proof_changed_files_from_contract(
+    *,
+    active_subtask: dict[str, Any] | None,
+    proof_payload: dict[str, Any],
+) -> list[str]:
+    hint = proof_payload.get("completion_contract_hint")
+    if isinstance(hint, dict):
+        changed = hint.get("changed_files")
+        if isinstance(changed, list):
+            out = [
+                str(item or "").strip().replace("\\", "/").lstrip("/")
+                for item in changed
+                if str(item or "").strip()
+            ]
+            if out:
+                return list(dict.fromkeys(out))
+    if active_subtask:
+        proof_raw = active_subtask.get("proof")
+        if isinstance(proof_raw, dict):
+            proof = ProofSpec.from_mapping(proof_raw)
+            return _proof_scope_changed_files(active_subtask, proof)
+    return []
+
+
+def _server_owned_completion_contract_from_latest_proof(
+    ctx: ToolContext,
+    *,
+    active_subtask: dict[str, Any],
+    claim: str,
+    notes: str,
+) -> tuple[CompletionContract | None, dict[str, Any] | None]:
+    work_item = load_active_work_item(pathlib.Path(ctx.drive_root))
+    if work_item is None:
+        return None, {
+            "error": "NO_ACTIVE_WORK_ITEM",
+            "required_next_action": "materialize_work_item",
+            "reason": "mark_subtask_complete requires an active WorkItem.",
+        }
+    subtask_id = work_item.active_subtask_id
+    proof_payload, proof_idx, rows = _latest_work_item_proof_payload(
+        ctx, subtask_id=subtask_id
+    )
+    if proof_idx < 0:
+        return None, {
+            "error": "PROOF_MISSING",
+            "required_next_action": "run_subtask_proof",
+            "target_work_item_id": work_item.id,
+            "active_subtask_id": subtask_id,
+            "reason": "No run_subtask_proof result exists for the active WorkItem.",
+        }
+    verification_report = proof_payload.get("verification_report")
+    proof_ref = proof_payload.get("proof_ref")
+    if not isinstance(verification_report, dict) or not isinstance(proof_ref, dict):
+        return None, {
+            "error": "PROOF_MALFORMED",
+            "required_next_action": "run_subtask_proof",
+            "target_work_item_id": work_item.id,
+            "active_subtask_id": subtask_id,
+            "reason": "Latest proof lacks verifier ledger refs.",
+        }
+    if verification_report.get("passed") is not True or proof_payload.get("passed") is not True:
+        return None, {
+            "error": "PROOF_FAILED",
+            "required_next_action": "repair_or_loop_back",
+            "target_work_item_id": work_item.id,
+            "active_subtask_id": subtask_id,
+            "proof_ref": proof_ref,
+        }
+    changed_files = _proof_changed_files_from_contract(
+        active_subtask=active_subtask,
+        proof_payload=proof_payload,
+    )
+    workspace_id = _workspace_id_from_drive(ctx)
+    workspace_root = _workspace_root_from_phase_ctx(ctx, workspace_id)
+    current_ws_hash = workspace_hash(workspace_root)
+    current_diff_hash = diff_hash(workspace_root, changed_files)
+    if str(verification_report.get("workspace_hash") or "") != current_ws_hash:
+        return None, {
+            "error": "PROOF_STALE",
+            "required_next_action": "run_subtask_proof",
+            "target_work_item_id": work_item.id,
+            "active_subtask_id": subtask_id,
+            "reason": "workspace_hash_changed_after_proof",
+            "proof_workspace_hash": str(verification_report.get("workspace_hash") or ""),
+            "current_workspace_hash": current_ws_hash,
+        }
+    if str(verification_report.get("diff_hash") or "") != current_diff_hash:
+        return None, {
+            "error": "PROOF_STALE",
+            "required_next_action": "run_subtask_proof",
+            "target_work_item_id": work_item.id,
+            "active_subtask_id": subtask_id,
+            "reason": "diff_hash_changed_after_proof",
+            "proof_diff_hash": str(verification_report.get("diff_hash") or ""),
+            "current_diff_hash": current_diff_hash,
+        }
+    for row in rows[proof_idx + 1:]:
+        if _tool_row_is_successful_repair_write(row):
+            return None, {
+                "error": "PROOF_STALE",
+                "required_next_action": "run_subtask_proof",
+                "target_work_item_id": work_item.id,
+                "active_subtask_id": subtask_id,
+                "reason": "workspace_write_after_proof",
+            }
+    text = str(claim or "").strip() or (
+        f"Active WorkItem `{work_item.id}` proof passed and was server-committed."
+    )
+    raw_contract = {
+        "subtask_id": subtask_id,
+        "status": "done",
+        "changed_files": changed_files,
+        "deleted_files": [],
+        "completed_claims": [
+            {
+                "claim_id": f"{subtask_id}.server_commit",
+                "text": text,
+                "proof_refs": [proof_ref],
+            }
+        ],
+        "evidence_refs": [proof_ref],
+        "verification_report": verification_report,
+        "notes": notes,
+    }
+    return CompletionContract.from_mapping(raw_contract), None
 
 
 def _completion_signal_payload(
@@ -3594,6 +3889,7 @@ def _completion_signal_payload(
 def _mark_subtask_complete(
     ctx: ToolContext,
     *,
+    claim: str = "",
     completion_contract: dict[str, Any] | None = None,
     subtask_id: str = "",
     notes: str = "",
@@ -3610,6 +3906,154 @@ def _mark_subtask_complete(
     """
     if stop := _stop_requested_message(ctx, "mark_subtask_complete"):
         return stop
+    if _is_phase_run_context(ctx):
+        supplied_model_owned = {
+            "completion_contract": completion_contract is not None,
+            "subtask_id": bool(str(subtask_id or "").strip()),
+            "status": str(status or "done").strip().lower() != "done",
+            "summary": bool(str(summary or "").strip()),
+            "evidence": bool(_completion_evidence_items(evidence)),
+        }
+        if any(supplied_model_owned.values()):
+            return _json(
+                {
+                    "error": "MODEL_SUPPLIED_COMPLETION_FIELDS_REJECTED",
+                    "rejected_fields": [
+                        key for key, present in supplied_model_owned.items() if present
+                    ],
+                    "required_next_action": "mark_subtask_complete",
+                    "accepted_schema": {"claim": "string", "notes": "string"},
+                    "reason": (
+                        "In phase-run execute, Umbrella runtime owns subtask_id, "
+                        "changed_files, diff_hash, evidence_hash, ledger hash, "
+                        "verification_report_hash, and proof freshness."
+                    ),
+                }
+            )
+        plan = _read_phase_plan(ctx)
+        if plan is None:
+            return _json(
+                {
+                    "error": "NO_PHASE_PLAN",
+                    "required_next_action": "materialize_work_item",
+                }
+            )
+        active_work_item = load_active_work_item(pathlib.Path(ctx.drive_root))
+        if active_work_item is None:
+            return _json(
+                {
+                    "error": "NO_ACTIVE_WORK_ITEM",
+                    "required_next_action": "materialize_work_item",
+                    "reason": "mark_subtask_complete is unavailable without active WorkItem.",
+                }
+            )
+        active_subtask = _resolve_execute_subtask(
+            plan,
+            active_work_item.active_subtask_id,
+        )
+        if active_subtask is None:
+            return _json(
+                {
+                    "error": "ACTIVE_WORK_ITEM_SUBTASK_MISSING",
+                    "required_next_action": "materialize_work_item",
+                    "target_work_item_id": active_work_item.id,
+                    "active_subtask_id": active_work_item.active_subtask_id,
+                }
+            )
+        typed_completion, structured_error = (
+            _server_owned_completion_contract_from_latest_proof(
+                ctx,
+                active_subtask=active_subtask,
+                claim=claim,
+                notes=notes,
+            )
+        )
+        if structured_error is not None:
+            return _json(structured_error)
+        assert typed_completion is not None
+        workspace_id = _workspace_id_from_drive(ctx)
+        context = build_workspace_context(
+            repo_root=_repo_root_from_phase_ctx(ctx),
+            workspace_root=_workspace_root_from_phase_ctx(ctx, workspace_id),
+            workspace_id=workspace_id,
+            changed_files=typed_completion.changed_files,
+        )
+        contract_issues = ContractValidator.validate(
+            ContractBundle(
+                run_id=_run_id(ctx),
+                workspace_id=workspace_id,
+                completions=(typed_completion,),
+            ),
+            context=context,
+        )
+        contract_issues.extend(
+            validate_completion_materialization(
+                typed_completion,
+                active_subtask=active_subtask,
+                workspace_root=str(context.workspace_root),
+                raw_completion=json_ready(typed_completion),
+                phase=_phase_control_phase_id(ctx),
+            )
+        )
+        if contract_issues:
+            return _contract_issue_message(
+                "mark_subtask_complete contract rejected", contract_issues
+            )
+        typed_refs = list(typed_completion.evidence_refs)
+        for completed_claim in typed_completion.completed_claims:
+            typed_refs.extend(completed_claim.proof_refs)
+        if typed_completion.verification_report is not None:
+            typed_refs.append(
+                typed_completion.verification_report.evidence_ref(
+                    phase=_phase_control_phase_id(ctx),
+                    subtask_id=typed_completion.subtask_id,
+                )
+            )
+        deduped_refs: list[EvidenceRef] = []
+        seen_refs: set[tuple[str, str, str]] = set()
+        for ref in typed_refs:
+            key = (ref.ref_type, ref.ref_id, ref.hash)
+            if key in seen_refs:
+                continue
+            seen_refs.add(key)
+            deduped_refs.append(ref)
+        typed_refs = deduped_refs
+        if memory_claim_issue := _completion_llm_memory_claim_issue(
+            subtask_id=typed_completion.subtask_id,
+            summary=(
+                typed_completion.completed_claims[0].text
+                if typed_completion.completed_claims
+                else ""
+            ),
+            notes=typed_completion.notes,
+            evidence=[],
+        ):
+            return memory_claim_issue
+        result = _mark_phase_subtask_complete(
+            ctx,
+            subtask_id=typed_completion.subtask_id,
+            notes=typed_completion.notes,
+            status=typed_completion.status,
+            summary=(
+                typed_completion.completed_claims[0].text
+                if typed_completion.completed_claims
+                else typed_completion.notes
+            ),
+            evidence=[
+                f"{ref.ref_type}:{ref.ref_id}"
+                for ref in typed_refs
+            ],
+            completion_contract=typed_completion,
+        )
+        if str(result or "").startswith("OK:"):
+            try:
+                complete_active_work_item(
+                    pathlib.Path(ctx.drive_root),
+                    active_work_item.id,
+                )
+            except Exception:
+                log.debug("active WorkItem completion cleanup failed", exc_info=True)
+        return result
     evidence_items = _completion_evidence_items(evidence)
     if memory_claim_issue := _completion_llm_memory_claim_issue(
         subtask_id=subtask_id or "active_subtask",

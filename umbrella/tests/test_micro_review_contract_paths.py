@@ -55,7 +55,7 @@ def test_submit_micro_review_normalizes_required_delta_paths(tmp_path) -> None:
     assert "proof.required_properties" not in latest
 
 
-def test_submit_micro_review_rejects_indexed_required_delta_path(tmp_path) -> None:
+def test_submit_micro_review_canonicalizes_indexed_required_delta_path(tmp_path) -> None:
     drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
     (drive / "state").mkdir(parents=True)
     ctx = SimpleNamespace(
@@ -89,8 +89,66 @@ def test_submit_micro_review_rejects_indexed_required_delta_path(tmp_path) -> No
         coverage=_COVERAGE,
     )
 
-    assert "invalid_recovery_contract" in result
-    assert "proof.oracle.required_properties" in result
+    assert result.startswith("OK:"), result
+    latest = (drive / "state" / "phase_control_signals.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "proof.oracle.required_properties" in latest
+    assert "proof.required_properties[0]" not in latest
+
+
+def test_submit_micro_review_canonicalizes_generated_oracle_issue_paths(
+    tmp_path,
+) -> None:
+    drive = tmp_path / "workspaces" / "demo" / ".memory" / "drive"
+    (drive / "state").mkdir(parents=True)
+    ctx = SimpleNamespace(
+        drive_root=drive,
+        task_id="run-1:plan_review",
+        current_task_type="phase_run",
+        context_overlays={"phase_node": {"id": "plan", "manifest_id": "plan"}},
+    )
+
+    result = _submit_micro_review(
+        ctx,
+        verdict="revise",
+        issues=[
+            {
+                "code": "bad_generated_oracle",
+                "severity": "blocking",
+                "target_subtask_id": "logic",
+                "contract_path": "proof.generated_test_contract.oracle_claims[3]",
+                "message": "Generated oracle claims an exact GUI text value.",
+                "required_deltas": [
+                    {
+                        "op": "replace",
+                        "path": "divide_returns_quotient.expected_output",
+                        "value": "Only assert displayed quotient behavior.",
+                    },
+                    {
+                        "op": "replace",
+                        "path": "oracle_claims.*.expected_output",
+                        "value": "Use behavior-level oracle claims.",
+                    },
+                ],
+            }
+        ],
+        loop_back_target="plan",
+        coverage=_COVERAGE,
+    )
+
+    assert result.startswith("OK:"), result
+    rows = [
+        json.loads(line)
+        for line in (drive / "state" / "phase_control_signals.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    latest = json.dumps(rows[-2]["payload"], sort_keys=True)
+    assert "proof.generated_test_contract.oracle_claims" in latest
+    assert "proof.generated_test_contract.oracle_claims[3]" not in latest
+    assert "divide_returns_quotient.expected_output" not in latest
+    assert "oracle_claims.*.expected_output" not in latest
 
 
 def test_submit_micro_review_compiles_required_plan_changes_to_targets(

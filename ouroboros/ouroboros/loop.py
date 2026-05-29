@@ -4190,24 +4190,23 @@ def _mark_subtask_complete_forced_nudge_extra(
         hint_subtask = str(hint.get("subtask_id") or subtask_id or "").strip()
         return (
             "\nThe active execute subtask proof has already passed. "
-            "Call `mark_subtask_complete(completion_contract=...)` using the "
-            "`completion_contract_hint` object from your latest passing "
+            "Call `mark_subtask_complete(claim=..., notes=...)`; Umbrella "
+            "will derive the completion contract from the active WorkItem and "
             "`run_subtask_proof` result"
             + (f" for subtask `{hint_subtask}`" if hint_subtask else "")
-            + ". Do not rewrite `changed_files` or `verification_report`."
+            + ". Do not pass subtask_id, changed_files, evidence_refs, "
+            "verification_report, or hash fields."
         )
     if subtask_id:
         return (
             "\nRun `run_subtask_proof(subtask_id="
             f'"{subtask_id}")` if you do not already have a passing proof. '
-            "When `passed` is true, call `mark_subtask_complete(completion_contract=...)` "
-            "with that result's `completion_contract_hint`. "
-            "Do not use legacy `summary`/`evidence` completion."
+            "When `passed` is true, call `mark_subtask_complete(claim=..., notes=...)`. "
+            "Do not use legacy `summary`/`evidence` completion or pass hash fields."
         )
     return (
-        "\nRun `run_subtask_proof` for the active subtask if proof is not already passing. "
-        "Then call `mark_subtask_complete(completion_contract=...)` with "
-        "`completion_contract_hint` from that tool result."
+        "\nRun `run_subtask_proof(subtask_id=...)` for the active subtask if proof is not already passing. "
+        "Then call `mark_subtask_complete(claim=..., notes=...)`."
     )
 
 

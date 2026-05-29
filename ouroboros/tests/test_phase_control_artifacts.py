@@ -5303,20 +5303,91 @@ def test_mark_subtask_complete_rejects_captured_ouroboros_only_alias_memory(tmp_
         "phase_node": {"id": "execute", "manifest_id": "execute"}
     }
     ctx.loop_state_view = {"phase_label": "linear"}
+    from umbrella.contracts.hashing import diff_hash, hash_value, workspace_hash
+    from umbrella.contracts.work_items import WorkItem, save_active_work_item
+    from umbrella.enforcement.ledger import append_supervisor_ledger_event
+
+    workspace = tmp_path / "workspaces" / "civilization"
+    ws_hash = workspace_hash(workspace)
+    diff_h = diff_hash(workspace, [])
+    report_hash = hash_value(
+        {
+            "subtask_id": "llm_agent_system",
+            "passed": True,
+            "workspace_hash": ws_hash,
+            "diff_hash": diff_h,
+        }
+    )
+    proof_ledger = append_supervisor_ledger_event(
+        repo_root=tmp_path,
+        workspace_id="civilization",
+        actor="verifier",
+        phase="execute",
+        tool="run_subtask_proof",
+        args={"subtask_id": "llm_agent_system"},
+        result={
+            "report_hash": report_hash,
+            "passed": True,
+            "workspace_hash": ws_hash,
+            "diff_hash": diff_h,
+        },
+    )
+    proof_ref = {
+        "ref_type": "ledger_event",
+        "ref_id": proof_ledger.event_id,
+        "hash": proof_ledger.event_hash,
+        "produced_by": "verifier",
+        "phase": "execute",
+        "subtask_id": "llm_agent_system",
+    }
+    verification_report = {
+        "report_id": proof_ledger.event_id,
+        "report_hash": report_hash,
+        "workspace_hash": ws_hash,
+        "diff_hash": diff_h,
+        "produced_after_event_id": "",
+        "verifier_id": "run_subtask_proof",
+        "passed": True,
+        "ledger_hash": proof_ledger.event_hash,
+    }
+    with (logs / "tools.jsonl").open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "task_id": "phase_web_40737336:execute",
+                    "tool": "run_subtask_proof",
+                    "args": {"subtask_id": "llm_agent_system"},
+                    "result_preview": json.dumps(
+                        {
+                            "passed": True,
+                            "subtask_id": "llm_agent_system",
+                            "proof_ref": proof_ref,
+                            "verification_report": verification_report,
+                            "completion_contract_hint": {"changed_files": []},
+                        }
+                    ),
+                }
+            )
+            + "\n"
+        )
+    save_active_work_item(
+        drive,
+        WorkItem(
+            id="work:llm-agent-system",
+            kind="implementation_repair",
+            source_phase="execute",
+            target_phase="execute",
+            active_subtask_id="llm_agent_system",
+        ),
+    )
 
     result = _mark_subtask_complete(
         ctx,
-        subtask_id="llm_agent_system",
-        summary=(
+        claim=(
             "Created agents.py with get_llm_runtime_config() supporting "
             "OUROBOROS_LLM_* variables exclusively."
         ),
-        evidence=[
-            (
-                "All 11 tests in tests/test_agents.py passed, including "
-                "test_get_llm_runtime_config_fallback_to_legacy."
-            )
-        ],
+        notes="Verifier-backed completion.",
     )
 
     assert result.startswith("ERROR: mark_subtask_complete rejected")
@@ -5390,11 +5461,12 @@ def test_mark_subtask_complete_accepts_supported_llm_alias_memory(tmp_path):
         "phase_node": {"id": "execute", "manifest_id": "execute"}
     }
     ctx.loop_state_view = {"phase_label": "linear"}
-    from umbrella.contracts.hashing import hash_value, workspace_hash
+    from umbrella.contracts.hashing import diff_hash, hash_value, workspace_hash
     from umbrella.enforcement.ledger import append_supervisor_ledger_event
 
     workspace = tmp_path / "workspaces" / "civilization"
     ws_hash = workspace_hash(workspace)
+    diff_h = diff_hash(workspace, [])
     report_hash = hash_value(
         {
             "subtask_id": "llm_agent_system",
@@ -5402,7 +5474,7 @@ def test_mark_subtask_complete_accepts_supported_llm_alias_memory(tmp_path):
             "exit_code": 0,
             "proof_kind": "pytest",
             "workspace_hash": ws_hash,
-            "diff_hash": "",
+            "diff_hash": diff_h,
             "skip_only": False,
         }
     )
@@ -5410,7 +5482,7 @@ def test_mark_subtask_complete_accepts_supported_llm_alias_memory(tmp_path):
         "report_hash": report_hash,
         "passed": True,
         "workspace_hash": ws_hash,
-        "diff_hash": "",
+        "diff_hash": diff_h,
     }
     proof_ledger = append_supervisor_ledger_event(
         repo_root=tmp_path,
@@ -5429,41 +5501,59 @@ def test_mark_subtask_complete_accepts_supported_llm_alias_memory(tmp_path):
         "phase": "execute",
         "subtask_id": "llm_agent_system",
     }
+    verification_report = {
+        "report_id": proof_ledger.event_id,
+        "report_hash": report_hash,
+        "workspace_hash": ws_hash,
+        "diff_hash": diff_h,
+        "produced_after_event_id": "",
+        "verifier_id": "run_subtask_proof",
+        "passed": True,
+        "ledger_hash": proof_ledger.event_hash,
+    }
+    (logs / "tools.jsonl").write_text(
+        (logs / "tools.jsonl").read_text(encoding="utf-8")
+        + json.dumps(
+            {
+                "task_id": "phase_web_40737336:execute",
+                "tool": "run_subtask_proof",
+                "args": {"subtask_id": "llm_agent_system"},
+                "result_preview": json.dumps(
+                    {
+                        "passed": True,
+                        "subtask_id": "llm_agent_system",
+                        "proof_ref": proof_ref,
+                        "verification_report": verification_report,
+                        "completion_contract_hint": {"changed_files": []},
+                    }
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    from umbrella.contracts.work_items import WorkItem, save_active_work_item
+
+    save_active_work_item(
+        drive,
+        WorkItem(
+            id="work:llm-agent-system",
+            kind="implementation_repair",
+            source_phase="execute",
+            target_phase="execute",
+            active_subtask_id="llm_agent_system",
+        ),
+    )
 
     result = _mark_subtask_complete(
         ctx,
-        subtask_id="llm_agent_system",
-        completion_contract={
-            "subtask_id": "llm_agent_system",
-            "status": "done",
-            "changed_files": [],
-            "completed_claims": [
-                {
-                    "claim_id": "llm_agent_system.proof",
-                    "text": "tests/test_agents.py passed.",
-                    "proof_refs": [proof_ref],
-                }
-            ],
-            "evidence_refs": [proof_ref],
-            "verification_report": {
-                "report_id": proof_ledger.event_id,
-                "report_hash": report_hash,
-                "workspace_hash": ws_hash,
-                "diff_hash": "",
-                "produced_after_event_id": "",
-                "verifier_id": "run_subtask_proof",
-                "passed": True,
-                "ledger_hash": proof_ledger.event_hash,
-            },
-            "notes": "Verifier-backed completion.",
-        },
-        summary=(
+        claim=(
             "Created get_llm_runtime_config() supporting "
             "LLM_API_KEY, "
             "LLM_BASE_URL, and "
             "LLM_MODEL."
         ),
-        evidence=["All 11 tests in tests/test_agents.py passed."],
+        notes="Verifier-backed completion.",
     )
 
     assert result == "OK: Subtask 'llm_agent_system' marked complete"

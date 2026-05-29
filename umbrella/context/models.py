@@ -121,6 +121,8 @@ class LLMInputBundle:
     memory_items: list[MemorySelection] = field(default_factory=list)
     authoritative_artifacts: list[LLMContextItem] = field(default_factory=list)
     contract_items: list[LLMContextItem] = field(default_factory=list)
+    active_work_item_id: str | None = None
+    active_work_item: dict[str, Any] | None = None
     active_subtask_id: str | None = None
     active_subtask: dict[str, Any] | None = None
     workspace_inventory: WorkspaceInventorySnapshot | None = None

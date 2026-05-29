@@ -983,7 +983,7 @@ def test_managed_runtime_prepares_workspace_python_and_env(
     assert captured["cwd"] == workspace
 
 
-def test_mark_subtask_complete_requires_typed_contract_for_phase_subtask(
+def test_mark_subtask_complete_rejects_model_owned_fields_for_phase_subtask(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path
@@ -1038,7 +1038,13 @@ def test_mark_subtask_complete_requires_typed_contract_for_phase_subtask(
         evidence=["ledger_event:proof-1"],
     )
 
-    assert "completion_contract is required" in raw
+    payload = json.loads(raw)
+    assert payload["error"] == "MODEL_SUPPLIED_COMPLETION_FIELDS_REJECTED"
+    assert payload["accepted_schema"] == {"claim": "string", "notes": "string"}
+    assert payload["required_next_action"] == "mark_subtask_complete"
+    assert "subtask_id" in payload["rejected_fields"]
+    assert "summary" in payload["rejected_fields"]
+    assert "evidence" in payload["rejected_fields"]
     saved = json.loads(plan_path.read_text(encoding="utf-8"))
     subtask = saved["nodes"][0]["subtasks"][0]
     assert subtask["status"] == "pending"

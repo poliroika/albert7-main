@@ -24,7 +24,13 @@ from umbrella.enforcement.workspace_toml import (
     verification_steps_from_toml as _verification_steps_from_toml,
     workspace_toml_verification_weakening_block,
 )
-from umbrella.contracts import hash_value, workspace_hash
+from umbrella.contracts import (
+    DEFAULT_EXECUTION_ENVIRONMENT_ID,
+    hash_value,
+    persist_environment_record,
+    resolve_execution_environment,
+    workspace_hash,
+)
 from umbrella.contracts.harness_profiles import (
     validator_flags_for_subtask,
     validator_flags_from_overlays,
@@ -2323,12 +2329,95 @@ def _execute_subtask_write_scope_block(
     planned: list[dict[str, Any]],
     seed_path: Path | None = None,
 ) -> dict[str, Any] | None:
-    # PhasePlan file lists are focus/proof metadata, not a hard source-edit
-    # sandbox. Shared project files such as package __init__, routes, config,
-    # and entrypoints often need to move across leaves as the implementation
-    # becomes coherent. Hard-blocking those edits created scope-mutation loops;
-    # the durable safety boundaries live in read freshness, workspace
-    # enforcement, shell mutation guards, and no-test-tampering.
+    del seed_path
+    if str(getattr(ctx, "current_task_type", "") or "") != "phase_run":
+        return None
+    if phase_from_context(ctx) != "execute":
+        return None
+    try:
+        from fnmatch import fnmatch
+
+        from umbrella.contracts.work_items import load_active_work_item
+
+        work_item = load_active_work_item(Path(ctx.drive_root))
+    except Exception:
+        work_item = None
+    overlays = getattr(ctx, "context_overlays", None)
+    overlay_requires_work_item = (
+        isinstance(overlays, dict)
+        and (
+            bool(overlays.get("active_work_item_id"))
+            or bool(overlays.get("active_work_item"))
+        )
+    )
+    if work_item is None:
+        if not overlay_requires_work_item:
+            return None
+        return {
+            "status": "blocked",
+            "reason": "active_work_item_required",
+            "message": (
+                "Execute write tools require an active runtime-owned WorkItem. "
+                "The control plane must materialize a WorkItem before the agent "
+                "can mutate workspace files."
+            ),
+            "required_next_action": "materialize_work_item",
+        }
+    allowed = {
+        _norm_workspace_rel_path(path)
+        for path in work_item.allowed_files
+        if _norm_workspace_rel_path(path)
+    }
+    forbidden = {
+        _norm_workspace_rel_path(path)
+        for path in work_item.forbidden_files
+        if _norm_workspace_rel_path(path)
+    }
+    touched = [
+        _norm_workspace_rel_path(item.get("path"))
+        for item in planned
+        if _norm_workspace_rel_path(item.get("path"))
+    ]
+    if not allowed:
+        return {
+            "status": "blocked",
+            "reason": "work_item_allowed_files_required",
+            "active_work_item_id": work_item.id,
+            "active_subtask_id": work_item.active_subtask_id,
+            "touched_files": touched,
+        }
+
+    def _matches(path: str, patterns: set[str]) -> bool:
+        for pattern in patterns:
+            if path == pattern:
+                return True
+            if pattern.endswith("/") and path.startswith(pattern):
+                return True
+            if fnmatch(path, pattern):
+                return True
+        return False
+
+    blocked_forbidden = [path for path in touched if _matches(path, forbidden)]
+    if blocked_forbidden:
+        return {
+            "status": "blocked",
+            "reason": "work_item_forbidden_file",
+            "active_work_item_id": work_item.id,
+            "active_subtask_id": work_item.active_subtask_id,
+            "forbidden_files": blocked_forbidden,
+            "allowed_files": sorted(allowed),
+        }
+    outside = [path for path in touched if not _matches(path, allowed)]
+    if outside:
+        return {
+            "status": "blocked",
+            "reason": "work_item_scope_mismatch",
+            "active_work_item_id": work_item.id,
+            "active_subtask_id": work_item.active_subtask_id,
+            "outside_allowed_files": outside,
+            "allowed_files": sorted(allowed),
+            "required_next_action": "request_scope_change",
+        }
     return None
 
 
@@ -3319,6 +3408,12 @@ def delete_workspace_file(
         )
         if blocked is not None or target is None:
             return _json(blocked or {"status": "error", "reason": "unknown"})
+        if scope_block := _execute_subtask_write_scope_block(
+            ctx,
+            planned=[{"path": rel_norm, "action": "delete"}],
+            seed_path=workspace_root,
+        ):
+            return _json(scope_block)
         if repair_block := _source_repair_delete_block(rel_norm, reason):
             return _json(repair_block)
         phase = phase_from_context(ctx)
@@ -3503,6 +3598,18 @@ def run_workspace_verify(
 
         repo_root = _resolve_umbrella_repo_root(ctx)
         workspace_root = _workspace_root(repo_root, workspace_id, ctx)
+        environment_record = resolve_execution_environment(
+            repo_root=repo_root,
+            workspace_root=workspace_root,
+            env_id=DEFAULT_EXECUTION_ENVIRONMENT_ID,
+            cwd=workspace_root,
+        )
+        try:
+            drive_root = getattr(ctx, "drive_root", None)
+            if drive_root:
+                persist_environment_record(Path(drive_root), environment_record)
+        except Exception:
+            log.debug("execution environment record persist failed", exc_info=True)
 
         steps = load_verification_spec(workspace_root)
         if not steps:
@@ -3603,6 +3710,8 @@ def run_workspace_verify(
                 "passed": bool(report.passed),
                 "workspace_hash": current_workspace_hash,
                 "diff_hash": current_diff_hash,
+                "execution_environment_id": environment_record.env_id,
+                "env_hash": environment_record.env_hash,
             }
             ledger_event = append_supervisor_ledger_event(
                 repo_root=repo_root,
@@ -3623,6 +3732,10 @@ def run_workspace_verify(
                 "verifier_id": "run_workspace_verify",
                 "passed": bool(report.passed),
                 "ledger_hash": ledger_event.event_hash,
+                "execution_environment_id": environment_record.env_id,
+                "env_hash": environment_record.env_hash,
+                "proof_env_hash": environment_record.env_hash,
+                "python_executable": environment_record.python_executable,
             }
         except Exception:
             log.debug("supervisor ledger append failed for verification", exc_info=True)
@@ -3638,6 +3751,9 @@ def run_workspace_verify(
                 "results": report_dict["results"],
                 "verify_run_id": verify_run_id,
                 "verification_report_ref": verification_report_ref,
+                "execution_environment": environment_record.to_dict(),
+                "execution_environment_id": environment_record.env_id,
+                "env_hash": environment_record.env_hash,
                 "failed_step_count": failed_required,
             }
         )

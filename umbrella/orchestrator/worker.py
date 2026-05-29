@@ -968,6 +968,8 @@ def build_phase_task(
         run_id=run_id,
     )
     active_subtask: dict[str, Any] | None = None
+    active_work_item: dict[str, Any] | None = None
+    active_work_item_obj = None
     subtask_memory_markdown = ""
     subtask_memory_scope_payload: dict[str, Any] | None = None
     workspace_root = pathlib.Path(repo_root) / "workspaces" / workspace_id if workspace_id else pathlib.Path(repo_root)
@@ -1022,6 +1024,18 @@ def build_phase_task(
                     )
                 except OSError:
                     log.debug("Failed to persist subtask memory scope", exc_info=True)
+    if manifest.id == "execute" and drive_root is not None and active_subtask:
+        try:
+            from umbrella.contracts.work_items import ensure_active_work_item_for_subtask
+
+            active_work_item_obj = ensure_active_work_item_for_subtask(
+                drive_root,
+                active_subtask,
+                attempt_id=str(phase_node.started_at or ""),
+            )
+            active_work_item = active_work_item_obj.to_dict()
+        except Exception:
+            log.debug("Failed to ensure active WorkItem", exc_info=True)
     palace_rules = _effective_palace_write_rules(
         manifest,
         research_depth=research_depth,
@@ -1063,6 +1077,16 @@ def build_phase_task(
             ],
         },
     }
+    if manifest.id == "execute":
+        try:
+            from umbrella.contracts.work_items import work_item_tool_filter
+
+            tool_filter = work_item_tool_filter(
+                tool_filter,
+                work_item=active_work_item_obj,
+            )
+        except Exception:
+            log.debug("Failed to apply WorkItem tool filter", exc_info=True)
     workspace_root = resolved_repo_root / "workspaces" / workspace_id
     from umbrella.contracts.capability_declaration import (
         ensure_probe_backed_declaration,
@@ -1160,6 +1184,9 @@ def build_phase_task(
         "effective_allowed_tools": list(tool_filter.get("allow") or []),
         "effective_allowed_skills": effective_allowed_skills,
     }
+    if active_work_item is not None:
+        overlays["active_work_item_id"] = active_work_item.get("id")
+        overlays["active_work_item"] = active_work_item
     if policy_conflict_payload is not None:
         overlays["policy_conflict"] = policy_conflict_payload
     harness_contract_markdown = ""
@@ -1187,6 +1214,7 @@ def build_phase_task(
             tool_filter=tool_filter,
             capability_envelope=capability_envelope,
             active_subtask=active_subtask,
+            active_work_item=active_work_item,
             phase_prompt_sections=phase_prompt_sections,
             authoritative_artifacts=authoritative_artifacts,
             recall_bundle=recall.to_payload(),

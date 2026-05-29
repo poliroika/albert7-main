@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import os
@@ -1393,6 +1394,17 @@ class PhaseRunner:
                 existing_contract,
                 revision_contract,
             )
+        materialized_work_items: list[dict[str, Any]] = []
+        if target is not None and loop_back_target == "execute":
+            materialized_work_items = self._materialize_execute_work_items_for_loopback(
+                plan=plan,
+                source_phase=phase_node,
+                target=target,
+                phase_exit_decision=phase_exit_decision,
+            )
+            if materialized_work_items:
+                overlay["work_items"] = materialized_work_items
+                overlay["active_work_item_id"] = materialized_work_items[0].get("id")
         phase_node.overlay = dict(overlay)
         if target is not None and target.id != phase_node.id:
             if (
@@ -1434,6 +1446,117 @@ class PhaseRunner:
             ),
         ))
         return result, envelope
+
+    def _materialize_execute_work_items_for_loopback(
+        self,
+        *,
+        plan: PhasePlan,
+        source_phase: PhaseNode,
+        target: PhaseNode,
+        phase_exit_decision: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(phase_exit_decision, dict):
+            return []
+        if str(phase_exit_decision.get("outcome") or "") != "loop_back":
+            return []
+        if source_phase.manifest_id not in {
+            "final_review",
+            "subtask_review",
+            "verify",
+            "execute",
+            "plan_review",
+        }:
+            return []
+        try:
+            from umbrella.contracts.work_items import (
+                materialize_work_items_from_phase_exit,
+                save_active_work_item,
+                save_work_item_queue,
+                work_item_to_repair_subtask,
+            )
+        except Exception:
+            log.debug("WorkItem materializer import failed", exc_info=True)
+            return []
+
+        execute_subtasks = [
+            json_ready(dataclasses.asdict(card))
+            for card in (target.subtasks or [])
+        ]
+        try:
+            work_items = materialize_work_items_from_phase_exit(
+                phase_exit_decision,
+                execute_subtasks=execute_subtasks,
+                attempt_id=str(time.time()),
+            )
+        except Exception:
+            log.debug("WorkItem materialization failed", exc_info=True)
+            return []
+        if not work_items:
+            return []
+
+        existing_ids = {card.id for card in (target.subtasks or [])}
+        target.subtasks = list(target.subtasks or [])
+        for item in work_items:
+            if item.active_subtask_id not in existing_ids:
+                raw = work_item_to_repair_subtask(item)
+                proof = (
+                    ProofSpec.from_mapping(raw["proof"])
+                    if isinstance(raw.get("proof"), dict)
+                    else None
+                )
+                target.subtasks.append(
+                    SubtaskCard(
+                        id=str(raw.get("id") or item.active_subtask_id),
+                        title=str(raw.get("title") or item.kind),
+                        goal=str(raw.get("goal") or item.kind),
+                        allowed_tools=frozenset(
+                            str(tool)
+                            for tool in (raw.get("allowed_tools") or [])
+                            if str(tool).strip()
+                        ),
+                        allowed_skills=frozenset(),
+                        proof=proof,
+                        memory_scope=dict(raw.get("memory_scope") or {})
+                        if isinstance(raw.get("memory_scope"), dict)
+                        else None,
+                        files_to_create=[
+                            str(path)
+                            for path in (raw.get("files_to_create") or [])
+                            if str(path).strip()
+                        ],
+                        files_to_change=[
+                            str(path)
+                            for path in (raw.get("files_to_change") or [])
+                            if str(path).strip()
+                        ],
+                        files_affected=[
+                            str(path)
+                            for path in (raw.get("files_affected") or [])
+                            if str(path).strip()
+                        ],
+                        status="pending",
+                    )
+                )
+                existing_ids.add(item.active_subtask_id)
+        try:
+            save_work_item_queue(self._drive_root, work_items)
+            save_active_work_item(self._drive_root, work_items[0])
+        except Exception:
+            log.debug("Persisting WorkItem queue failed", exc_info=True)
+        plan.version += 1
+        plan.edits_log.append(
+            PlanEdit(
+                timestamp=time.time(),
+                actor="umbrella.runtime",
+                patch={
+                    "op": "materialize_work_items",
+                    "source_phase": source_phase.id,
+                    "target_phase": target.id,
+                    "work_item_ids": [item.id for item in work_items],
+                },
+            )
+        )
+        return [item.to_dict() for item in work_items]
 
     @staticmethod
     def _invalidate_after_verify_loopback(
@@ -2854,6 +2977,30 @@ class PhaseRunner:
                 phase=phase_node.id,
             ))
             return None
+        if manifest.id == "execute":
+            active_work_item = (
+                task_overlays.get("active_work_item")
+                if isinstance(task_overlays, dict)
+                else None
+            )
+            if not isinstance(active_work_item, dict) or not str(
+                active_work_item.get("id") or ""
+            ).strip():
+                phase_node.status = "failed"
+                phase_node.ended_at = time.time()
+                save_plan(plan, self._drive_root)
+                yield self._emit(ResultEnvelope.failure(
+                    ErrorCode.EVIDENCE_VALIDATION_FAILED,
+                    (
+                        "invalid_control_transition: execute cannot start "
+                        "without an active WorkItem. Loop-back decisions must "
+                        "materialize typed repair WorkItems before prompting "
+                        "the agent."
+                    ),
+                    run_id=run_id,
+                    phase=phase_node.id,
+                ))
+                return None
         selected_research_depth = ""
         overlays = task_overlays
         if isinstance(overlays, dict):

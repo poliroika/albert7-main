@@ -271,6 +271,7 @@ def compile_phase_context(
     tool_filter: dict | None = None,
     capability_envelope: dict | None = None,
     active_subtask: dict | None = None,
+    active_work_item: dict | None = None,
     phase_prompt_sections: list[dict[str, str]] | None = None,
     authoritative_artifacts: list[dict[str, str]] | None = None,
     recall_bundle: dict[str, Any] | None = None,
@@ -326,6 +327,34 @@ def compile_phase_context(
         if isinstance(active_subtask, dict)
         else ""
     )
+    active_work_item_id = (
+        str(active_work_item.get("id") or "").strip()
+        if isinstance(active_work_item, dict)
+        else ""
+    )
+    if phase_id == "execute" and active_work_item:
+        work_item_ref = ContextSourceRef(
+            kind="work_item",
+            path="active_work_item",
+            phase=phase_id,
+            run_id=run_id,
+            hash=hash_value(
+                json.dumps(active_work_item, sort_keys=True, ensure_ascii=False)
+            ),
+        )
+        user_sections.append(
+            LLMContextItem(
+                id="active_work_item",
+                role="work_item_contract",
+                title="Active WorkItem",
+                text=json.dumps(active_work_item, ensure_ascii=False, indent=2)[:6000],
+                source=work_item_ref,
+                freshness="current_run",
+                trust="system",
+                include_reason="runtime_owned_execute_commit_contract",
+            )
+        )
+        source_refs.append(work_item_ref)
     if phase_id == "execute" and active_subtask:
         envelope = _build_current_phase_envelope(
             phase_id=phase_id,
@@ -485,6 +514,8 @@ def compile_phase_context(
         "run_id": run_id,
         "system": [item.text[:200] for item in system_sections],
         "user": [item.text[:200] for item in user_sections],
+        "active_work_item_id": active_work_item_id,
+        "active_work_item": active_work_item,
         "active_subtask_id": active_subtask_id,
         "active_subtask": active_subtask,
         "tool_filter": tool_filter,
@@ -508,6 +539,8 @@ def compile_phase_context(
         memory_items=memory_items,
         authoritative_artifacts=[item for item in user_sections if item.role == "authoritative_artifact"],
         contract_items=contract_items,
+        active_work_item_id=active_work_item_id or None,
+        active_work_item=active_work_item,
         active_subtask_id=active_subtask_id or None,
         active_subtask=active_subtask,
         workspace_inventory=inventory,

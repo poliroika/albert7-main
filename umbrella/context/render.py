@@ -29,6 +29,8 @@ def bundle_to_overlay_dict(bundle: LLMInputBundle) -> dict[str, Any]:
         "user_sections": [_item_dict(item) for item in bundle.user_sections],
         "contract_items": [_item_dict(item) for item in bundle.contract_items],
         "memory_items": [asdict(item) for item in bundle.memory_items],
+        "active_work_item_id": bundle.active_work_item_id,
+        "active_work_item": bundle.active_work_item,
         "active_subtask_id": bundle.active_subtask_id,
         "active_subtask": bundle.active_subtask,
         "workspace_inventory": (

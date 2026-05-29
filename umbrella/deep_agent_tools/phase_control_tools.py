@@ -567,16 +567,19 @@ def get_tools() -> list[ToolEntry]:
                 "name": "mark_subtask_complete",
                 "description": (
                     "Mark the current internal Ouroboros subtask complete and "
-                    "emit the Umbrella phase signal. Phase-run completion "
-                    "requires a typed CompletionContract."
+                    "emit the Umbrella phase signal. In Umbrella phase-run "
+                    "execute, pass only claim/notes; the runtime derives the "
+                    "active WorkItem, subtask, proof refs, hashes, and "
+                    "CompletionContract."
                 ),
                 "parameters": {
                     "type": "object",
                     "required": [],
                     "properties": {
+                        "claim": {"type": "string"},
+                        "notes": {"type": "string"},
                         "completion_contract": COMPLETION_CONTRACT_SCHEMA,
                         "subtask_id": {"type": "string"},
-                        "notes": {"type": "string"},
                         "status": {
                             "type": "string",
                             "enum": ["done", "failed", "skipped"],
